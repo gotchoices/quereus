@@ -99,7 +99,8 @@ export interface Peer {
  * `ordersDdl` (defaults to DEFAULT_ORDERS_DDL). `disposition` overrides
  * `unknownTableDisposition` in the SyncConfig; `config` overrides any other
  * SyncConfig fields (e.g. `allowResurrection`). `beforeSync` runs before the sync module
- * attaches, so its tables and rows have no sync records at all.
+ * attaches, so its tables and rows have no sync records at all; a function can also
+ * register modules for them.
  */
 export async function makePeer(
 	name: string,
@@ -108,7 +109,7 @@ export async function makePeer(
 		disposition?: UnknownTableDisposition;
 		ordersDdl?: string;
 		config?: Partial<SyncConfig>;
-		beforeSync?: string;
+		beforeSync?: string | ((db: Database) => Promise<void>);
 	},
 ): Promise<Peer> {
 	const { provider } = createInMemoryProvider();
@@ -116,7 +117,8 @@ export async function makePeer(
 	const db = new Database();
 	const storeModule = new StoreModule(provider, events);
 	db.registerModule('store', storeModule);
-	if (opts?.beforeSync) await db.exec(opts.beforeSync);
+	if (typeof opts?.beforeSync === 'function') await opts.beforeSync(db);
+	else if (opts?.beforeSync) await db.exec(opts.beforeSync);
 	const applyToStore = createStoreAdapter({ db, storeModule, events });
 
 	const config: SyncConfig = {

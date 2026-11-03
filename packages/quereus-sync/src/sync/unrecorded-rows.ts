@@ -23,6 +23,7 @@ import {
 	type TransactionCommitBatch,
 } from '@quereus/quereus';
 import { encodePkIdentity } from '../metadata/keys.js';
+import type { AdoptedRows } from './manager.js';
 import type { SchemaObjectKind } from './protocol.js';
 import { DATA_FLUSH_SIZE, scanLiveColumns } from './snapshot-coverage.js';
 import { listSnapshotCheckpoints } from './snapshot-checkpoint.js';
@@ -46,6 +47,14 @@ export async function findTablesWithUnrecordedRows(ctx: SyncContext): Promise<Ar
 	return found;
 }
 
+/** A table that may hold unrecorded rows. */
+interface CheckedTable {
+	schema: string;
+	table: string;
+	keyColumns: readonly string[];
+	definition: TableSchema;
+}
+
 /**
  * Every table a snapshot could delete unrecorded rows from. A materialized view's rows
  * are derived and never carry cells. A memory table has no external write path, so a
@@ -57,11 +66,8 @@ export async function findTablesWithUnrecordedRows(ctx: SyncContext): Promise<Ar
  * tables (`quereus.engine_managed`) included. If a local-only module becomes common, let
  * tables opt out rather than widening this name check.
  */
-function tablesToCheck(
-	ctx: SyncContext,
-	db: Database,
-): Array<{ schema: string; table: string; keyColumns: readonly string[]; definition: TableSchema }> {
-	const tables: Array<{ schema: string; table: string; keyColumns: readonly string[]; definition: TableSchema }> = [];
+function tablesToCheck(ctx: SyncContext, db: Database): CheckedTable[] {
+	const tables: CheckedTable[] = [];
 	for (const schema of db.schemaManager._getAllSchemas()) {
 		for (const definition of schema.getAllTables()) {
 			const { schemaName, name, vtabModuleName } = definition;
@@ -148,8 +154,8 @@ async function writesSettled(ctx: SyncContext): Promise<void> {
 export async function adoptUnrecordedRows(
 	ctx: SyncContext,
 	record: (batch: TransactionCommitBatch) => Promise<void>,
-): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
-	const adopted = { tables: [] as Array<{ schema: string; table: string }>, rows: 0 };
+): Promise<AdoptedRows> {
+	const adopted: AdoptedRows = { tables: [], rows: 0 };
 	const db = ctx.db;
 	if (!db || !ctx.applyToStore) {
 		console.warn('[Sync] adoptUnrecordedRows did nothing: this peer has no engine to read rows through');
@@ -160,6 +166,10 @@ export async function adoptUnrecordedRows(
 	}
 
 	for (const { schema, table, definition } of tablesToCheck(ctx, db)) {
+		if (!receiversCanWrite(definition)) {
+			console.warn(`[Sync] Not adopting ${schema}.${table}: other devices cannot write to a table using module '${definition.vtabModuleName}'`);
+			continue;
+		}
 		const rows = await adoptTable(ctx, db, definition, record);
 		if (rows > 0) {
 			adopted.tables.push({ schema, table });
@@ -167,6 +177,20 @@ export async function adoptUnrecordedRows(
 		}
 	}
 	return adopted;
+}
+
+/**
+ * Whether a receiver could apply this table's rows. The apply path writes only to store
+ * tables, directly or through a wrapper exposing the store as `underlying`, the ownership
+ * rule of `StoreModule.getTableForExternalWrite`. One row of any other table fails the
+ * receiver's whole batch, so it would stop every other device from syncing and every new
+ * device from bootstrapping. Such a table cannot sync in any direction today.
+ */
+function receiversCanWrite(table: TableSchema): boolean {
+	const writable = (module: unknown): boolean =>
+		typeof (module as { getTableForExternalWrite?: unknown } | undefined)?.getTableForExternalWrite === 'function';
+	const module: unknown = table.vtabModule;
+	return writable(module) || writable((module as { underlying?: unknown } | undefined)?.underlying);
 }
 
 /**
@@ -242,15 +266,21 @@ function insertEvent(table: TableSchema, pk: SqlValue[], row: Row): DatabaseData
  * and aborts a new device's snapshot (docs/sync.md § Unknown-Table Disposition).
  * The DDL is what the store module puts on its own create events: no `db` argument, so
  * fully qualified, and byte-identical across devices adopting the same table.
+ *
+ * A table announced here gets every index announced after it, whatever the index's own
+ * migrations say. A receiver replays an older `add_index` ahead of this create, finds no
+ * table, and converges without the index.
  */
 async function missingCreateEvents(ctx: SyncContext, table: TableSchema): Promise<DatabaseSchemaChangeEvent[]> {
 	const { schemaName, name, vtabModuleName: moduleName } = table;
 	const events: DatabaseSchemaChangeEvent[] = [];
-	if (!await hasLiveCreate(ctx, schemaName, 'table', name)) {
+	const tableAnnounced = await hasLiveCreate(ctx, schemaName, 'table', name);
+	if (!tableAnnounced) {
 		events.push({ type: 'create', objectType: 'table', moduleName, schemaName, objectName: name, ddl: generateTableDDL(table), remote: false });
 	}
 	for (const index of table.indexes ?? []) {
-		if (isHiddenImplicitIndex(table, index.name) || await hasLiveCreate(ctx, schemaName, 'index', index.name)) continue;
+		if (isHiddenImplicitIndex(table, index.name)) continue;
+		if (tableAnnounced && await hasLiveCreate(ctx, schemaName, 'index', index.name)) continue;
 		events.push({ type: 'create', objectType: 'index', moduleName, schemaName, objectName: index.name, ddl: generateIndexDDL(index, table), remote: false });
 	}
 	return events;
@@ -265,6 +295,12 @@ async function missingCreateEvents(ctx: SyncContext, table: TableSchema): Promis
  * NOTE: a rename counts as a create, on the assumption that the old name's stream holds
  * one. A table created before sync attached and renamed since breaks that: a receiver has
  * neither name, so it converges without a table. If that shows up, follow `fromTable`.
+ *
+ * NOTE: streams can also read live after the object has gone. A rename files under the new
+ * name, so a table renamed away leaves its old name's stream ending on `create_table`, and
+ * `drop table` records no `drop_index`, so a dropped table's index stream ends on
+ * `add_index`. A table or index created under such a name while detached is then not
+ * announced. If that shows up, compare against the owning table's latest create.
  */
 async function hasLiveCreate(ctx: SyncContext, schema: string, kind: SchemaObjectKind, name: string): Promise<boolean> {
 	let live = false;

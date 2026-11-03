@@ -4,9 +4,9 @@
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
+import { Database, MemoryTableModule } from '@quereus/quereus';
 import { InMemoryKVStore, StoreEventEmitter, StoreModule, type KVStore } from '@quereus/store';
-import { collect, closePeer, createInMemoryProvider, localWrite, makePeer, relay, settle, toStream, type Peer } from './_peer-harness.js';
+import { collect, closePeer, createInMemoryProvider, localWrite, makePeer, relay, relayAll, settle, toStream, type Peer } from './_peer-harness.js';
 import { createSyncModule } from '../../src/create-sync-module.js';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
@@ -238,6 +238,35 @@ describe('adoptUnrecordedRows', () => {
 		const types: string[] = [];
 		for await (const { type } of migrations.getAllMigrations('main', 'table', 'orders')) types.push(type);
 		expect(types).to.deep.equal(['create_table', 'drop_table', 'create_table']);
+	});
+
+	it('announces an index again after a table it announces late, or a receiver ends up without it', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (1, 'one')` });
+		await localWrite(peer, 'create index orders_note on orders (note)');
+		await peer.manager.adoptUnrecordedRows();
+
+		const delta = await makePeer('delta');
+		await relayAll(peer, delta);
+		const snapshot = await makePeer('snapshot');
+		await snapshot.manager.applySnapshotStream(toStream(await chunksOf(peer)));
+
+		for (const receiver of [delta, snapshot]) {
+			expect(await collect(receiver.db, 'select id from orders')).to.deep.equal([{ id: 1 }]);
+			expect(receiver.db.schemaManager.getTable('main', 'orders')?.indexes?.map(index => index.name)).to.deep.equal(['orders_note']);
+			await closePeer(receiver);
+		}
+	});
+
+	it('leaves a table no receiver could write, whose rows would fail the receiver batch', async () => {
+		peer = await makePeer('a', {
+			beforeSync: async db => {
+				db.registerModule('plugin', new MemoryTableModule());
+				await db.exec(`create table p (id integer primary key) using plugin; insert into p values (1)`);
+			},
+		});
+
+		expect(await peer.manager.adoptUnrecordedRows()).to.deep.equal({ tables: [], rows: 0 });
+		expect(await peer.manager.getChangesSince(generateSiteId())).to.deep.equal([]);
 	});
 
 	it('refuses while an explicit transaction is open, and the commit chain carries on', async () => {

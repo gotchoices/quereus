@@ -24,6 +24,7 @@ import {
   type SyncEventEmitter,
   type HLC,
   type SiteId,
+  type AdoptedRows,
   type ClientMessage,
   type GetSnapshotMessage,
   type ResumeSnapshotMessage,
@@ -1051,7 +1052,7 @@ export class SyncClient {
    */
   private async adoptUnrecordedRows(): Promise<UnrecordedRowsVerdict> {
     const socket = this.ws;
-    let adopted: Awaited<ReturnType<SyncManager['adoptUnrecordedRows']>>;
+    let adopted: AdoptedRows;
     try {
       const resuming = (await this.syncManager.listSnapshotCheckpoints()).length > 0;
       if (resuming || this.snapshotTransferPromise) return this.ws === socket ? 'clear' : 'stopped';

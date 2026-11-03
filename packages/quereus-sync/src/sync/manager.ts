@@ -11,6 +11,14 @@ import type { SiteId } from '../clock/site.js';
 import type { ApplyResult, ChangeSet, Snapshot, SnapshotChunk, SnapshotProgress } from './protocol.js';
 import type { BasisTableLifecycleRecord } from '../metadata/basis-lifecycle.js';
 
+/** What {@link SyncManager.adoptUnrecordedRows} recorded. */
+export interface AdoptedRows {
+  /** The tables that had rows recorded. */
+  tables: Array<{ schema: string; table: string }>;
+  /** How many rows were recorded, across those tables. */
+  rows: number;
+}
+
 /**
  * Main sync manager interface.
  *
@@ -117,14 +125,15 @@ export interface SyncManager {
    * the time of adoption, so they beat older edits of the same key elsewhere.
    * Idempotent: a row that has a record is skipped, so an interrupted run is finished
    * by calling this again. Returns what was recorded. On a peer with no engine it does
-   * nothing and logs a warning.
+   * nothing and logs a warning. A table outside the store module is skipped with a
+   * warning, because no receiver could write its rows.
    *
    * Rejects, recording nothing further, while a snapshot checkpoint exists (the apply
    * cleared the metadata, so every row would be stamped as new) or while an explicit
    * transaction is open (its uncommitted rows look unrecorded, and may yet roll back).
    * A snapshot apply started during a run waits for it to finish.
    */
-  adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }>;
+  adoptUnrecordedRows(): Promise<AdoptedRows>;
 
   /**
    * Update the last sync state for a peer.

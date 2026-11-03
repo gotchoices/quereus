@@ -886,8 +886,14 @@ class QuereusWorker implements QuereusWorkerAPI {
       // Someone switching from "store" to "sync" almost certainly wants to keep their data.
       unrecordedRows: 'adopt',
       onStatusChange: (status: SyncClientStatus) => {
+        const changed = status.status !== this.syncStatus.status;
         // Convert SyncClient status to our SyncStatus type
         this.syncStatus = status as SyncStatus;
+        // The UI re-reads the status only on a state-change event, and the client's
+        // move to `synced` comes with none of its own.
+        if (changed) {
+          this.addSyncEvent({ type: 'state-change', timestamp: Date.now(), message: `Sync status: ${status.status}` });
+        }
       },
       onSyncEvent: (event: SyncClientEvent) => {
         // Forward SyncClient events to our event history

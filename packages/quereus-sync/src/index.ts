@@ -176,7 +176,7 @@ export {
 } from './sync/conflict-resolvers.js';
 
 // Sync manager
-export { type SyncManager, type SnapshotCheckpoint } from './sync/manager.js';
+export { type AdoptedRows, type SyncManager, type SnapshotCheckpoint } from './sync/manager.js';
 export { SyncManagerImpl } from './sync/sync-manager-impl.js';
 
 // Store adapter for applying remote changes

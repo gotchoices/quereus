@@ -59,7 +59,7 @@ import {
 import { migrationObjectKind } from './protocol.js';
 import { createPkKeyingResolver, resolvePkKeying, type PkKeyingResolver } from '../metadata/pk-identity.js';
 import { TableIdentityStore, withIdentityRecovery } from '../metadata/table-identity.js';
-import type { SyncManager, SnapshotCheckpoint } from './manager.js';
+import type { AdoptedRows, SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
 	SyncConfig,
 	ChangeSet,
@@ -1620,7 +1620,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return findTablesWithUnrecordedRowsImpl(this);
 	}
 
-	adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+	adoptUnrecordedRows(): Promise<AdoptedRows> {
 		const adopting = this.adoptOnCommitChain();
 		this.adoptionsInFlight = Promise.allSettled([this.adoptionsInFlight, adopting]).then(() => undefined);
 		return adopting;
@@ -1638,7 +1638,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *
 	 * The caller receives a failure; the chain itself carries on.
 	 */
-	private async adoptOnCommitChain(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+	private async adoptOnCommitChain(): Promise<AdoptedRows> {
 		await this.appliesDrained();
 		const adopting = this.commitChain.then(() => withIdentityRecovery(
 			this.tableIdentity,
