@@ -145,8 +145,8 @@ export interface SyncManager {
    * record died before that cleanup existed is orphaned forever unless something
    * scans the log itself. A dropped table's entries wait for this pass too: the drop
    * deletes its records, not their index entries. Nothing is incorrect while orphans
-   * remain (a resolved-to-`null` entry already produces no output), so this is a storage/scan-cost cleanup,
-   * safe to run at any time with no peer coordination.
+   * remain (a resolved-to-`null` entry already produces no output), so this is a
+   * storage/scan-cost cleanup, safe to run at any time with no peer coordination.
    *
    * Host-driven — call from the same periodic maintenance path as
    * {@link pruneTombstones} / {@link pruneQuarantine} / {@link evictExpiredBasisTables};

@@ -58,3 +58,30 @@ describe('table identity index after a failed standalone write', () => {
 		expect(record?.value).to.equal('kept');
 	});
 });
+
+describe('table identity when a name is reused while its retirement is scanning', () => {
+	it('keeps the mapping a concurrent commit filed for the name', async () => {
+		const kv = new InMemoryKVStore();
+		const tables = new TableIdentityStore(kv);
+		await tables.load();
+		const seed = kv.batch();
+		tables.ensure('main', 't', seed);
+		await seed.write();
+
+		const retireBatch = kv.batch();
+		const retiring = tables.retire('main', 't', retireBatch);
+
+		// The retirement is suspended in its record scan, so this runs as a local
+		// `create table t` committing in that gap would.
+		const createBatch = kv.batch();
+		const reborn = tables.ensure('main', 't', createBatch);
+		await createBatch.write();
+
+		await retiring;
+		await retireBatch.write();
+
+		const reopened = new TableIdentityStore(kv);
+		await reopened.load();
+		expect(reopened.generationOf('main', 't')).to.equal(reborn);
+	});
+});

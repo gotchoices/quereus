@@ -180,15 +180,20 @@ export class TableIdentityStore implements TableIdentityResolver {
 	 * The name forgets the generation BEFORE the first await, so nothing that runs
 	 * during the scan can resolve the name to it and file a new record under it. A
 	 * failed scan is the same recovery as a failed commit ({@link withIdentityRecovery}).
+	 *
+	 * The `tg:` delete is staged AFTER the scan, and only if the name is still free. A
+	 * commit during the scan can give the name a new generation (a local `create table
+	 * t`, a rename onto it), and this batch commits later: deleting the key then would
+	 * erase that mapping and strand the new table's records at the next open.
 	 */
 	async retire(schema: string, table: string, batch: WriteBatch): Promise<void> {
 		const generation = this.generationOf(schema, table);
 		if (generation === undefined) return;
 
-		batch.delete(buildTableGenerationKey(schema, table));
 		this.byName.delete(joinKeyParts(schema, table));
 		this.byGeneration.delete(generation);
 		await this.stageRecordDeletions(generation, batch);
+		if (this.generationOf(schema, table) === undefined) batch.delete(buildTableGenerationKey(schema, table));
 	}
 
 	/**

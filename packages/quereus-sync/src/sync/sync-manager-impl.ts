@@ -1352,9 +1352,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * was dropped, and its records with it, so the entry waits for
 	 * {@link repairChangeLog}). The authoritative HLC, value AND pk come from the
 	 * current version record, not the log key — the key carries only the lossy pk
-	 * identity — and
-	 * the change is addressed by the table's CURRENT name, which is how a fact
-	 * recorded before a rename ships under the name the peer will know it by.
+	 * identity — and the change is addressed by the table's CURRENT name, which is
+	 * how a fact recorded before a rename ships under the name the peer will know
+	 * it by.
 	 */
 	private async resolveLogEntry(logEntry: ChangeLogEntry): Promise<Change | null> {
 		const name = this.tableIdentity.nameOf(logEntry.generation);
@@ -1673,9 +1673,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * includes every entry of a RETIRED table generation: a drop deletes the table's
 	 * `cv:`/`tb:` records ({@link TableIdentityStore.retire}) but leaves their index
 	 * entries, which only a scan of the HLC-first log can find, to this sweep. Full
-	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix orphans (or one already
-	 * repaired) resolves every entry and deletes nothing, so a caught-up replica
-	 * pays only the scan.
+	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix orphans
+	 * (or one already repaired) resolves every entry and deletes nothing, so a
+	 * caught-up replica pays only the scan.
 	 *
 	 * NOTE: the scan is one KV point-read per change-log entry, and the log holds
 	 * roughly one entry per live cell, so a caught-up replica still pays O(live
