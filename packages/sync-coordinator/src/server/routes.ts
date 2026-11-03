@@ -44,6 +44,7 @@ export function registerRoutes(
   };
 
   // Validate database ID from path parameter
+  // NOTE: IDs over Fastify's default 100-character maxParamLength never reach this check: the router answers 414 with no CORS header, while the WebSocket handshake accepts them. If a custom isValidDatabaseId hook permits longer IDs, set maxParamLength in server.ts.
   const validateDatabaseId = (request: FastifyRequest, reply: FastifyReply): string | null => {
     const params = request.params as { databaseId?: string };
     const databaseId = params.databaseId;

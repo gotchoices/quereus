@@ -2235,7 +2235,7 @@ __metadata:
     chai: "npm:^6.2.2"
     commander: "npm:^15.0.0"
     debug: "npm:^4.4.3"
-    fastify: "npm:^5.8.5"
+    fastify: "npm:^5.12.5"
     mocha: "npm:^11.7.6"
     rimraf: "npm:^6.1.3"
     ts-node: "npm:^10.9.2"
@@ -5327,7 +5327,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"fastify@npm:^5.8.5":
+"fastify@npm:^5.12.5":
   version: 5.12.8
   resolution: "fastify@npm:5.12.8"
   dependencies:

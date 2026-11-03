@@ -15,6 +15,7 @@ export const EditorPanel: React.FC = () => {
   );
 
   useEffect(() => {
+    // NOTE: init() fetches Monaco from jsDelivr at the version @monaco-editor/loader pins (0.55.1), so the monaco-editor package supplies types only. That copy embeds DOMPurify 3.2.7, which the root dompurify resolution cannot reach. Fine while no Monaco provider is given markdown; if a hover, completion or similar provider is added, first move to a Monaco that embeds a patched DOMPurify.
     loader
       .init()
       .then((monaco) => {

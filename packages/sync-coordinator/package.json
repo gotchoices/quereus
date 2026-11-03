@@ -54,7 +54,7 @@
     "@quereus/sync": "workspace:^",
     "commander": "^15.0.0",
     "debug": "^4.4.3",
-    "fastify": "^5.8.5"
+    "fastify": "^5.12.5"
   },
   "devDependencies": {
     "@quereus/sync-client": "workspace:^",
