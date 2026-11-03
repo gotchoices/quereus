@@ -30,3 +30,9 @@ This run had one row, edited before connecting. Other orderings were not run.
 ## Expected behaviour
 
 No other replica materializes this row with cells missing. One option is for a local update of a row with no cell records to record every column, as an insert does and as adoption does for such rows. The other is to treat the row as unrecorded, so the `unrecordedRows` setting decides.
+
+## Gardener note (2026-11-03)
+
+Promoted ahead of the release because this reproduces under default options and silently defeats `unrecordedRows: 'refuse'`: other devices receive NULLs in `not null` columns.
+
+Design settled unless research finds it unsound: a local update of a row with no cell records records every column, as an insert and adoption do. Also run the orderings the ticket did not (several rows, some edited; an edit after connecting; a delete of an unrecorded row) and cover what they find. Keep the added read on the local update path cheap, and report what it costs.
