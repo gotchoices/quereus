@@ -19,7 +19,7 @@ import {
   makeClientPeer,
   collect,
   waitFor,
-  tick,
+  waitForSynced,
   type BootedCoordinator,
   type ClientPeer,
 } from './_e2e-harness.js';
@@ -61,10 +61,11 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
     await clientA.connect(coordinator.url, DB_ID);
     await clientB.connect(coordinator.url, DB_ID);
 
-    // connect() resolves on handshake_ack; the local-change subscription is set
-    // up in the post-ack continuation. Let that settle before any write so the
-    // first onLocalChange is not missed.
-    await tick(50);
+    // connect() resolves on handshake_ack, BEFORE the post-ack continuation runs
+    // the empty-replica snapshot bootstrap. A write landing during that bootstrap
+    // breaks the client's do-not-write contract and is silently lost, so hold
+    // every test's first write until both clients have finished it.
+    await waitForSynced(clientA, clientB);
   });
 
   afterEach(async () => {

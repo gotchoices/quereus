@@ -25,6 +25,7 @@ import {
   type SyncManager,
   type SyncEventEmitterImpl,
 } from '@quereus/sync';
+import type { SyncClient } from '@quereus/sync-client';
 import { createCoordinatorServer, type CoordinatorServer } from '../src/server/server.js';
 import { DEFAULT_CONFIG } from '../src/config/index.js';
 
@@ -169,5 +170,15 @@ export async function waitFor(
   throw new Error(`waitFor timed out after ${timeoutMs}ms waiting for ${label}`);
 }
 
-/** Yield the event loop briefly (e.g. to let post-handshake setup settle). */
-export const tick = (ms = 50): Promise<void> => new Promise(r => setTimeout(r, ms));
+/**
+ * Wait until every client has finished its post-handshake flow. `isSynced` first
+ * turns true on the reply to the catch-up `get_changes`, which goes out only after
+ * any snapshot bootstrap has landed and just before the local-change subscription
+ * starts, so both are settled by the time that reply can be delivered.
+ */
+export async function waitForSynced(...clients: readonly SyncClient[]): Promise<void> {
+  await waitFor(
+    async () => clients.every(client => client.isSynced),
+    { label: 'clients to finish bootstrap and reach synced' },
+  );
+}
