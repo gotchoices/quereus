@@ -2,16 +2,19 @@
  * Key builders for CRDT metadata storage.
  *
  * Key prefixes (sync-specific):
- *   cv: - Column versions (HLC per column per row)
- *   tb: - Tombstones (deleted row markers)
+ *   cv: - Column versions (HLC per column per row), keyed by table GENERATION (see tg:)
+ *   tb: - Tombstones (deleted row markers), keyed by table generation
+ *   tg: - Table generation: the stable per-peer identity a `(schema, table)` name
+ *         currently resolves to (see `metadata/table-identity.ts`)
  *   tx: - Transaction records
  *   ps: - Peer sync state (received watermark: highest HLC pulled from a peer)
  *   pt: - Peer sent state (sent watermark: highest HLC pushed to a peer and acked)
  *   sm: - Schema migrations (keyed by object KIND as well as name — see buildSchemaMigrationKey)
  *   si: - Site identity
  *   hc: - HLC clock state
- *   cl: - Change log (HLC-indexed for efficient delta queries)
- *   qt: - Quarantine (held out-of-basis straggler changes)
+ *   cl: - Change log (HLC-indexed for efficient delta queries), keyed by table generation
+ *   qt: - Quarantine (held out-of-basis straggler changes) — keyed by NAME: it describes
+ *         a name the receiver does not have, not a table it does
  *   bl: - Basis-table lifecycle (mapped/derivation-source/unreferenced/detached bookkeeping)
  *   fv: - Sync-metadata format version (single record; see SYNC_METADATA_FORMAT_VERSION)
  *   sc: - Snapshot checkpoints (resume position of an interrupted streaming snapshot apply)
@@ -20,7 +23,7 @@
 import type { SqlValue } from '@quereus/quereus';
 import { serializeKeyNullGrouping } from '@quereus/quereus';
 import { assertNoUnpairedSurrogate } from '@quereus/store';
-import { type SiteId, siteIdToBase64, siteIdFromBase64 } from '../clock/site.js';
+import { type SiteId, siteIdToBase64, siteIdFromBase64, toBase64Url, fromBase64Url } from '../clock/site.js';
 import type { HLC } from '../clock/hlc.js';
 import type { SchemaObjectKind } from '../sync/protocol.js';
 
@@ -43,10 +46,19 @@ export const SYNC_KEY_PREFIX = {
   BASIS_LIFECYCLE: encoder.encode('bl:'),
   FORMAT_VERSION: encoder.encode('fv:'),
   SNAPSHOT_CHECKPOINT: encoder.encode('sc:'),
+  TABLE_GENERATION: encoder.encode('tg:'),
 } as const;
 
 /**
  * Current sync-metadata storage format version, persisted under the `fv:` key.
+ *
+ * Version 6: the per-row records (`cv:`/`tb:`/`cl:`) are keyed by the table's
+ * GENERATION — a random per-peer identity a `(schema, table)` name resolves to
+ * through the new `tg:` record (see `metadata/table-identity.ts`) — instead of by
+ * the name itself. A rename moves the name's `tg:` record and touches no row
+ * record; a drop retires the generation; a same-name re-create mints a fresh one.
+ * Version-5 records name a table where version 6 expects a generation, so they
+ * are unreadable under this layout.
  *
  * Version 5: schema migration RECORDS (`sm:` values) carry a length-prefixed
  * `fromTable` slot between the migration type and the DDL (see
@@ -73,7 +85,7 @@ export const SYNC_KEY_PREFIX = {
  * mismatches must re-bootstrap from a peer snapshot (see docs/sync.md
  * § Metadata format version).
  */
-export const SYNC_METADATA_FORMAT_VERSION = 5;
+export const SYNC_METADATA_FORMAT_VERSION = 6;
 
 /** Separator between a component's length and the component itself. */
 const SEPARATOR = ':';
@@ -193,33 +205,118 @@ export function encodeRawPkIdentity(pk: SqlValue[]): string {
   return encodePkIdentity(pk, RAW_PK_KEYING);
 }
 
+// ============================================================================
+// Table generation (`tg:`)
+// ============================================================================
+
+/** Byte length of a table generation: 16 random bytes, like a site id. */
+export const TABLE_GENERATION_BYTES = 16;
+
+/**
+ * A table GENERATION is the stable, per-peer identity every per-row record of a
+ * table is filed under: {@link TABLE_GENERATION_BYTES} random bytes rendered as
+ * base64url (22 characters, no padding — the same rendering as a site id). It is
+ * minted the first time a peer files anything for a `(schema, table)` name and is
+ * never reused; the name → generation mapping lives in the `tg:` record and the
+ * generation never appears on the wire. See `metadata/table-identity.ts`.
+ */
+export function mintTableGeneration(): string {
+  const bytes = new Uint8Array(TABLE_GENERATION_BYTES);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return toBase64Url(bytes);
+}
+
+/** Decode a generation string back to its 16 bytes — the record VALUE's form. */
+export function tableGenerationToBytes(generation: string): Uint8Array {
+  if (generation.length !== 22) {
+    throw new Error(`Invalid table generation length: ${generation.length}, expected 22`);
+  }
+  return fromBase64Url(generation);
+}
+
+/** Render a generation's 16 bytes as the string form the keys use. */
+export function tableGenerationFromBytes(bytes: Uint8Array): string {
+  if (bytes.length !== TABLE_GENERATION_BYTES) {
+    throw new Error(`Invalid table generation byte length: ${bytes.length}, expected ${TABLE_GENERATION_BYTES}`);
+  }
+  return toBase64Url(bytes);
+}
+
+/**
+ * Build a table generation key.
+ * Format: tg:{n}:{schema}{n}:{table}
+ *
+ * One record per currently-named table; the value carries the generation (see
+ * `serializeTableGeneration` in `metadata/table-identity.ts`). Keyed by NAME —
+ * this is the one record family that maps a name to its generation, and a rename
+ * moves it (delete the old-name key, write the new-name key, same generation).
+ */
+export function buildTableGenerationKey(schemaName: string, tableName: string): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName);
+  return buildTablePrefix('tg:', schemaName, tableName);
+}
+
+/**
+ * Parse a table generation key back to its `(schema, table)` name — the inverse
+ * of {@link buildTableGenerationKey}. Returns null for a key outside the prefix
+ * or with a malformed suffix.
+ */
+export function parseTableGenerationKey(key: Uint8Array): { schema: string; table: string } | null {
+  const keyStr = decoder.decode(key);
+  if (!keyStr.startsWith('tg:')) return null;
+
+  const split = splitKeyParts(keyStr.slice(3), 2);
+  if (!split || split.remainder.length !== 0) return null;
+
+  const [schema, table] = split.parts;
+  return { schema, table };
+}
+
+/**
+ * Build scan bounds over every table generation record. Bounded by the table
+ * count, so `TableIdentityStore.load` reads the whole prefix into memory.
+ */
+export function buildAllTableGenerationScanBounds(): { gte: Uint8Array; lt: Uint8Array } {
+  return {
+    gte: SYNC_KEY_PREFIX.TABLE_GENERATION,
+    lt: incrementLastByte(SYNC_KEY_PREFIX.TABLE_GENERATION),
+  };
+}
+
+// ============================================================================
+// Per-row records (`cv:` / `tb:` / `cl:`), keyed by table generation
+// ============================================================================
+
 /**
  * Build a column version key.
- * Format: cv:{n}:{schema}{n}:{table}{n}:{identity}{n}:{column}
+ * Format: cv:{n}:{generation}{n}:{identity}{n}:{column}
  *
- * Every component is length-prefixed — see {@link joinKeyParts}.
+ * Every component is length-prefixed — see {@link joinKeyParts}. The generation
+ * is fixed-length base64url and could go bare, but one encoding for every
+ * component keeps the parsers uniform.
  */
 export function buildColumnVersionKey(
-  schemaName: string,
-  tableName: string,
+  generation: string,
   identity: string,
   column: string
 ): Uint8Array {
-  assertKeyableIdentifiers(schemaName, tableName, column);
-  return encoder.encode(`cv:${joinKeyParts(schemaName, tableName, identity, column)}`);
+  assertKeyableIdentifiers(column);
+  return encoder.encode(`cv:${joinKeyParts(generation, identity, column)}`);
 }
 
 /**
  * Build a tombstone key.
- * Format: tb:{n}:{schema}{n}:{table}{n}:{identity}
+ * Format: tb:{n}:{generation}{n}:{identity}
  */
 export function buildTombstoneKey(
-  schemaName: string,
-  tableName: string,
+  generation: string,
   identity: string
 ): Uint8Array {
-  assertKeyableIdentifiers(schemaName, tableName);
-  return encoder.encode(`tb:${joinKeyParts(schemaName, tableName, identity)}`);
+  return encoder.encode(`tb:${joinKeyParts(generation, identity)}`);
 }
 
 /**
@@ -268,7 +365,7 @@ export function parsePeerStateKey(key: Uint8Array): SiteId | null {
  *
  * The kind sits BEFORE the object name so one object's migrations stay a single
  * exact prefix (and stay contiguous by version within it). Kept separate from
- * {@link buildTablePrefix}, which the two-component `cv:`/`tb:`/`qt:`/`bl:`
+ * {@link buildTablePrefix}, which the name-keyed two-component `tg:`/`qt:`/`bl:`
  * families share.
  */
 function buildSchemaMigrationPrefix(
@@ -312,54 +409,55 @@ function buildTablePrefix(prefix: string, schemaName: string, tableName: string)
   return encoder.encode(`${prefix}${joinKeyParts(schemaName, tableName)}`);
 }
 
+/**
+ * Build a prefix over one table GENERATION under `prefix` — exact for the same
+ * reason {@link buildTablePrefix} is (the component carries its own length).
+ */
+function buildGenerationPrefix(prefix: string, generation: string): Uint8Array {
+  return encoder.encode(`${prefix}${joinKeyParts(generation)}`);
+}
+
 /** Scan bounds over an exact byte prefix. */
 function prefixBounds(prefix: Uint8Array): { gte: Uint8Array; lt: Uint8Array } {
   return { gte: prefix, lt: incrementLastByte(prefix) };
 }
 
 /**
- * Build scan bounds for all column versions of a table.
- * Returns keys to scan cv:{n}:{schema}{n}:{table}*
+ * Build scan bounds for all column versions of a table generation.
+ * Returns keys to scan cv:{n}:{generation}*
  */
 export function buildTableColumnVersionScanBounds(
-  schemaName: string,
-  tableName: string,
+  generation: string,
 ): { gte: Uint8Array; lt: Uint8Array } {
-  return prefixBounds(buildTablePrefix('cv:', schemaName, tableName));
+  return prefixBounds(buildGenerationPrefix('cv:', generation));
 }
 
 /**
  * The key prefix shared by every column version of one row:
- * `cv:{n}:{schema}{n}:{table}{n}:{identity}`.
+ * `cv:{n}:{generation}{n}:{identity}`.
  */
-function buildColumnVersionRowPrefix(
-  schemaName: string,
-  tableName: string,
-  identity: string
-): string {
-  return `cv:${joinKeyParts(schemaName, tableName, identity)}`;
+function buildColumnVersionRowPrefix(generation: string, identity: string): string {
+  return `cv:${joinKeyParts(generation, identity)}`;
 }
 
 /**
  * Build scan bounds for all column versions of a row.
- * Returns keys to scan cv:{n}:{schema}{n}:{table}{n}:{identity}*
+ * Returns keys to scan cv:{n}:{generation}{n}:{identity}*
  */
 export function buildColumnVersionScanBounds(
-  schemaName: string,
-  tableName: string,
+  generation: string,
   identity: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  return prefixBounds(encoder.encode(buildColumnVersionRowPrefix(schemaName, tableName, identity)));
+  return prefixBounds(encoder.encode(buildColumnVersionRowPrefix(generation, identity)));
 }
 
 /**
- * Build scan bounds for all tombstones in a table.
+ * Build scan bounds for all tombstones of a table generation.
  */
 export function buildTombstoneScanBounds(
-  schemaName: string,
-  tableName: string
+  generation: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  return prefixBounds(buildTablePrefix('tb:', schemaName, tableName));
+  return prefixBounds(buildGenerationPrefix('tb:', generation));
 }
 
 /**
@@ -422,49 +520,49 @@ export function buildAllSchemaMigrationsScanBounds(): { gte: Uint8Array; lt: Uin
 
 /**
  * Parse a column version key to extract components.
- * Key format: cv:{n}:{schema}{n}:{table}{n}:{identity}{n}:{column}
+ * Key format: cv:{n}:{generation}{n}:{identity}{n}:{column}
  *
- * Returns the pk IDENTITY string — the identity is lossy and cannot be decoded
- * back to values; the raw pk lives in the record VALUE (`ColumnVersion.pk`).
- * The per-component length prefixes make every split unambiguous regardless of
- * what characters any component contains.
+ * Returns the table GENERATION (resolve it to a name through
+ * `TableIdentityStore.nameOf`; `undefined` there means a retired table's leftover)
+ * and the pk IDENTITY string — the identity is lossy and cannot be decoded back to
+ * values; the raw pk lives in the record VALUE (`ColumnVersion.pk`). The
+ * per-component length prefixes make every split unambiguous regardless of what
+ * characters any component contains.
  */
 export function parseColumnVersionKey(key: Uint8Array): {
-  schema: string;
-  table: string;
+  generation: string;
   identity: string;
   column: string;
 } | null {
   const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('cv:')) return null;
 
-  const split = splitKeyParts(keyStr.slice(3), 4);
+  const split = splitKeyParts(keyStr.slice(3), 3);
   if (!split || split.remainder.length !== 0) return null;
 
-  const [schema, table, identity, column] = split.parts;
-  return { schema, table, identity, column };
+  const [generation, identity, column] = split.parts;
+  return { generation, identity, column };
 }
 
 /**
  * Parse a tombstone key to extract components.
- * Key format: tb:{n}:{schema}{n}:{table}{n}:{identity}
+ * Key format: tb:{n}:{generation}{n}:{identity}
  *
- * Returns the pk IDENTITY string; the raw pk lives in the record VALUE
- * (`Tombstone.pk`).
+ * Returns the table generation and the pk IDENTITY string; the raw pk lives in
+ * the record VALUE (`Tombstone.pk`).
  */
 export function parseTombstoneKey(key: Uint8Array): {
-  schema: string;
-  table: string;
+  generation: string;
   identity: string;
 } | null {
   const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('tb:')) return null;
 
-  const split = splitKeyParts(keyStr.slice(3), 3);
+  const split = splitKeyParts(keyStr.slice(3), 2);
   if (!split || split.remainder.length !== 0) return null;
 
-  const [schema, table, identity] = split.parts;
-  return { schema, table, identity };
+  const [generation, identity] = split.parts;
+  return { generation, identity };
 }
 
 /**
@@ -530,7 +628,7 @@ export function deserializeHLCFromKey(buffer: Uint8Array): HLC {
 
 /**
  * Build a change log key.
- * Format: cl:{hlc_bytes}{type_byte}{n}:{schema}{n}:{table}{n}:{identity}[{n}:{column}]
+ * Format: cl:{hlc_bytes}{type_byte}{n}:{generation}{n}:{identity}[{n}:{column}]
  *
  * The HLC comes first to enable efficient range scans by time.
  * type_byte: 0x01 for column change, 0x02 for delete
@@ -539,20 +637,19 @@ export function deserializeHLCFromKey(buffer: Uint8Array): HLC {
 export function buildChangeLogKey(
   hlc: HLC,
   entryType: ChangeLogEntryType,
-  schemaName: string,
-  tableName: string,
+  generation: string,
   identity: string,
   column?: string
 ): Uint8Array {
-  assertKeyableIdentifiers(schemaName, tableName, ...(column !== undefined ? [column] : []));
+  assertKeyableIdentifiers(...(column !== undefined ? [column] : []));
   const hlcBytes = serializeHLCForKey(hlc);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
   // `!== undefined`, not truthiness: a zero-length column name must still emit its
-  // (empty) component, or the builder would write 3 parts where `parseChangeLogKey`
-  // demands 4 for a `column` entry and the record would read back as unparseable.
+  // (empty) component, or the builder would write 2 parts where `parseChangeLogKey`
+  // demands 3 for a `column` entry and the record would read back as unparseable.
   const suffix = column !== undefined
-    ? joinKeyParts(schemaName, tableName, identity, column)
-    : joinKeyParts(schemaName, tableName, identity);
+    ? joinKeyParts(generation, identity, column)
+    : joinKeyParts(generation, identity);
   const suffixBytes = encoder.encode(suffix);
 
   // cl: (3) + hlc (30) + type (1) + suffix
@@ -614,8 +711,7 @@ function incrementHLCBytes(hlcBytes: Uint8Array): Uint8Array {
 export function parseChangeLogKey(key: Uint8Array): {
   hlc: HLC;
   entryType: ChangeLogEntryType;
-  schema: string;
-  table: string;
+  generation: string;
   identity: string;
   column?: string;
 } | null {
@@ -633,16 +729,16 @@ export function parseChangeLogKey(key: Uint8Array): {
 
   const suffixStr = decoder.decode(key.slice(34));
 
-  // Parse suffix: {n}:{schema}{n}:{table}{n}:{identity}[{n}:{column}]
-  const split = splitKeyParts(suffixStr, entryType === 'column' ? 4 : 3);
+  // Parse suffix: {n}:{generation}{n}:{identity}[{n}:{column}]
+  const split = splitKeyParts(suffixStr, entryType === 'column' ? 3 : 2);
   if (!split || split.remainder.length !== 0) return null;
 
-  const [schema, table, identity] = split.parts;
+  const [generation, identity] = split.parts;
   if (entryType === 'column') {
-    return { hlc, entryType, schema, table, identity, column: split.parts[3] };
+    return { hlc, entryType, generation, identity, column: split.parts[2] };
   }
   // Delete entry - no column
-  return { hlc, entryType, schema, table, identity };
+  return { hlc, entryType, generation, identity };
 }
 
 /**

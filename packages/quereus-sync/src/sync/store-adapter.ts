@@ -179,18 +179,25 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
       return finalizeBootstrap(db, applyOptions);
     }
 
+    const executedSchemaChanges: SchemaChangeToApply[] = [];
     const result: ApplyToStoreResult = {
       dataChangesApplied: 0,
       schemaChangesApplied: 0,
+      executedSchemaChanges,
       errors: [],
     };
 
     // Both phases share one accounting path, so a validating alteration's failure
-    // reaches `result.errors` exactly as a pre-data one always did.
+    // reaches `result.errors` exactly as a pre-data one always did. The executed
+    // list keeps run order across the two phases; the three identity-changing kinds
+    // (create / drop / rename table) are never deferred, so among themselves they
+    // stay in the caller's HLC order.
     const applySchemaPhase = async (phase: readonly SchemaChangeToApply[]): Promise<void> => {
       for (const schemaChange of phase) {
         try {
-          await applySchemaChange(db, events, schemaChange, applyOptions);
+          if (await applySchemaChange(db, events, schemaChange, applyOptions)) {
+            executedSchemaChanges.push(schemaChange);
+          }
           result.schemaChangesApplied++;
         } catch (error) {
           result.errors.push({
@@ -319,7 +326,7 @@ async function finalizeBootstrap(
     await db.notifyExternalChange(name, schemaName);
   }
 
-  return { dataChangesApplied: 0, schemaChangesApplied: 0, errors: [] };
+  return { dataChangesApplied: 0, schemaChangesApplied: 0, executedSchemaChanges: [], errors: [] };
 }
 
 /**
@@ -614,13 +621,12 @@ function decideAbsentIndexCreate(db: Database, change: SchemaChangeToApply): Sch
  * record "converged" for a divergence that is not — the same posture as a
  * divergent `create_table` (see {@link assertDefinitionMatches}'s NOTE).
  *
- * NOTE: sync's per-row bookkeeping (`cv:`/`tb:`/`cl:`) is keyed by table name,
- * so both origin and receiver strand it at the old name and start empty at the
- * new one — later conflict resolution and tombstone blocking lose their history
- * for the renamed table (an old delete no longer blocks a replayed insert).
- * Pre-existing for a purely local rename; replicating the rename makes it
- * happen on every peer. Tracked as
- * `bug-sync-rename-and-pk-change-strand-crdt-metadata` (tickets/backlog).
+ * Sync's per-row bookkeeping (`cv:`/`tb:`/`cl:`) follows the table across the
+ * rename: it is keyed by the table's generation, and an EXECUTED rename moves
+ * that generation to the new name on the receiver (via the executed list this
+ * adapter returns), exactly as the origin's local capture did
+ * (`metadata/table-identity.ts`). An `already-applied` verdict here therefore
+ * moves nothing — the receiver's own rename already did.
  */
 function decideRenameTable(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
   if (change.fromTable === undefined) {
@@ -969,9 +975,11 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
     case 'alterPrimaryKey': {
       // NOTE: replicating a PK change re-keys the table on EVERY peer, and sync's
       // cv:/tb:/cl: metadata is filed under the row's old pk identity — so conflict
-      // resolution for existing rows silently restarts from empty. Pre-existing for
-      // a local PK change; tracked as
-      // `bug-sync-rename-and-pk-change-strand-crdt-metadata` (tickets/backlog).
+      // resolution for existing rows silently restarts from empty. The table
+      // component of those keys now survives (it is the table's generation, not its
+      // name), but the row component does not; re-filing it is the sibling ticket
+      // `sync-rekey-bookkeeping-on-primary-key-change`, which runs its pass from the
+      // executed list this adapter returns.
       const wanted = action.columns;
       const current = local.primaryKeyDefinition;
       const same = wanted.length === current.length && wanted.every((w, i) => {
@@ -1063,14 +1071,17 @@ function sortedIndexKey(columns: readonly number[]): string {
 }
 
 /**
- * Apply one schema change (DDL) to the database, idempotently.
+ * Apply one schema change (DDL) to the database, idempotently. Returns whether
+ * the DDL actually RAN — `false` for a blank migration and for one the catalog
+ * showed already applied — so the caller can report what executed
+ * (`ApplyToStoreResult.executedSchemaChanges`).
  */
 async function applySchemaChange(
   db: Database,
   events: StoreEventEmitter,
   change: SchemaChangeToApply,
   _options: ApplyToStoreOptions
-): Promise<void> {
+): Promise<boolean> {
   // A blank `ddl` can still reach here from a peer on an older build (blank
   // drop/index/alter migrations). Such a migration runs nothing; skip it before
   // deciding anything (an empty string is not a parseable statement).
@@ -1088,14 +1099,14 @@ async function applySchemaChange(
       `[Sync] Received ${change.type} for ${change.schema}.${change.table} with no DDL — `
         + `not applied; this peer's schema is unchanged`,
     );
-    return;
+    return false;
   }
 
   if (decideSchemaChange(db, change) === 'already-applied') {
     console.debug(
       `[Sync] Remote ${change.type} for ${change.schema}.${change.table} already applied locally — converging without re-executing DDL`
     );
-    return;
+    return false;
   }
 
   // Mark every schema event the replicated DDL emits as remote, so the
@@ -1118,6 +1129,7 @@ async function applySchemaChange(
   } finally {
     for (const name of scopeNames) events.endRemoteSchemaScope(change.schema, name);
   }
+  return true;
 }
 
 /**

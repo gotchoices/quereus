@@ -601,6 +601,19 @@ export interface ApplyToStoreResult {
   dataChangesApplied: number;
   /** Number of schema changes successfully applied. */
   schemaChangesApplied: number;
+  /**
+   * The schema changes whose DDL this call actually RAN, in the order they ran —
+   * not the ones it found already applied (whose tables, and so whose sync
+   * bookkeeping, survive untouched) and not the ones that errored. The consumer
+   * drives table-identity transitions from this list (a `drop_table` that ran
+   * retires the table's generation; a `rename_table` that ran moves it — see
+   * `metadata/table-identity.ts`). Absent ⇒ the consumer treats EVERY admitted
+   * `create_table` / `drop_table` / `rename_table` as executed, which is the rule
+   * for a deployment with no `applyToStore` at all (a relay-only coordinator has
+   * no catalog to converge against, so every admitted migration is its truth);
+   * the store adapter always fills it.
+   */
+  executedSchemaChanges?: SchemaChangeToApply[];
   /** Errors encountered (empty if all succeeded). */
   errors: Array<{ change: DataChangeToApply | SchemaChangeToApply; error: Error }>;
   /**

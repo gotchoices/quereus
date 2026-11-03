@@ -30,7 +30,9 @@ import { persistHLCState, throwIfApplyErrors, toError } from './sync-context.js'
  * the store, emit `status:'error'` and rethrow on a whole-batch throw, surface any
  * reported assertion violations, then abort (throw) on any per-change
  * `ApplyToStoreResult.errors` — all BEFORE the caller commits any CRDT metadata.
- * No-op when there is no `applyToStore` callback or nothing to apply.
+ * No-op (returning `undefined`) when there is no `applyToStore` callback or
+ * nothing to apply; otherwise returns the adapter's result so the caller can read
+ * which schema changes executed ({@link executedSchemaChanges}).
  *
  * The two failure shapes are mutually exclusive (a throw never reaches
  * `throwIfApplyErrors`), so `status:'error'` is emitted at most once. The
@@ -60,8 +62,8 @@ export async function applyDataToStore(
 	dataChanges: DataChangeToApply[],
 	schemaChanges: SchemaChangeToApply[],
 	options: ApplyToStoreOptions,
-): Promise<void> {
-	if (!ctx.applyToStore || (dataChanges.length === 0 && schemaChanges.length === 0)) return;
+): Promise<ApplyToStoreResult | undefined> {
+	if (!ctx.applyToStore || (dataChanges.length === 0 && schemaChanges.length === 0)) return undefined;
 
 	let result: ApplyToStoreResult;
 	try {
@@ -92,6 +94,21 @@ export async function applyDataToStore(
 	// metadata committed, so the whole batch re-resolves and re-applies
 	// idempotently on the next sync. See throwIfApplyErrors / docs/sync.md.
 	throwIfApplyErrors(ctx, result);
+	return result;
+}
+
+/**
+ * The schema changes of one admitted unit whose table-identity transitions must
+ * now be applied (`metadata/table-identity.ts`): what the adapter reported it
+ * EXECUTED, or — with no adapter at all (relay-only, no catalog) or an adapter
+ * that does not report — every change the unit admitted. See
+ * `ApplyToStoreResult.executedSchemaChanges`.
+ */
+export function executedSchemaChanges(
+	schemaChanges: readonly SchemaChangeToApply[],
+	result: ApplyToStoreResult | undefined,
+): readonly SchemaChangeToApply[] {
+	return result?.executedSchemaChanges ?? schemaChanges;
 }
 
 /**
@@ -108,8 +125,12 @@ export interface AdmissionGroup {
 	readonly dataChanges: DataChangeToApply[];
 	readonly schemaChanges: SchemaChangeToApply[];
 	readonly applyOptions: ApplyToStoreOptions;
-	/** Commit this unit's CRDT metadata. Runs ONLY after the data write landed. */
-	readonly commitMetadata: () => Promise<void>;
+	/**
+	 * Commit this unit's CRDT metadata. Runs ONLY after the data write landed, and
+	 * receives the schema changes that EXECUTED there ({@link executedSchemaChanges})
+	 * so it can apply their table-identity transitions before filing any record.
+	 */
+	readonly commitMetadata: (executed: readonly SchemaChangeToApply[]) => Promise<void>;
 	/**
 	 * Local HLC clock watermark to merge in on full-unit success. The per-PEER
 	 * `lastSyncHLC` is the transport caller's concern (it differs per modality and
@@ -125,8 +146,8 @@ export interface AdmissionGroup {
  * watermark idempotently".
  */
 export async function admitGroup(ctx: SyncContext, group: AdmissionGroup): Promise<void> {
-	await applyDataToStore(ctx, group.dataChanges, group.schemaChanges, group.applyOptions);
-	await group.commitMetadata();                    // metadata SECOND
+	const result = await applyDataToStore(ctx, group.dataChanges, group.schemaChanges, group.applyOptions);
+	await group.commitMetadata(executedSchemaChanges(group.schemaChanges, result)); // metadata SECOND
 	if (group.watermarkHLC) {
 		ctx.hlcManager.receive(group.watermarkHLC);    // monotonic merge, idempotent
 		await persistHLCState(ctx);

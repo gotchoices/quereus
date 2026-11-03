@@ -352,32 +352,38 @@ set). Two things make the data path survive the rename:
   triggers the reactive held-change drain for that name, the same as a `create_table`; a
   declined one does not, because nothing reappeared.
 - **A table keeps whatever history is really its own.** The companion read-free verdict —
-  "the bookkeeping stranded under this name describes some OTHER table, so these rows must
-  resolve without consulting local cell versions and tombstones" — follows table identity,
-  not the name. The simulation records, per name, which table's bookkeeping is filed there
-  (`historyName`); a rename moves the table but not its records. So a name vacated by a
-  `drop_table` and refilled — by a `create_table`, or by renaming a DIFFERENT table into
-  it, the ordinary table-swap migration — resolves read-free, while a name vacated by a
-  rename AWAY and then renamed BACK gets its own table returned to it and resolves
-  normally: a stored tombstone still blocks a re-delivered row.
+  "the generation this name resolves to right now belongs to a table this batch destroys,
+  so these rows must resolve without consulting local cell versions and tombstones" —
+  follows table identity, not the name. The simulation records, per name, which table's
+  history Phase 1 can still read by that name (`historyName`); Phase 1 runs before Phase 2
+  moves or retires any generation, so a renamed table's records still answer to its OLD
+  name at that point. So a name vacated by a `drop_table` and refilled — by a
+  `create_table`, or by renaming a DIFFERENT table into it, the ordinary table-swap
+  migration — resolves read-free, while a name vacated by a rename AWAY and then renamed
+  BACK gets its own table, and its own generation, returned to it and resolves normally: a
+  stored tombstone still blocks a re-delivered row.
+- **The bookkeeping follows the table.** Sync's per-row records are keyed by the table's
+  *generation*, not its name (`docs/sync.md` § Table identity): the origin's local capture
+  moves the generation to the new name, and a receiver that *executes* the replicated
+  rename does the same from the store adapter's executed list, so conflict resolution and
+  tombstone blocking keep their history across the rename on every peer. Every fact —
+  pre-rename ones included — ships under the table's *current* name, so a from-zero
+  re-pull and a post-rename snapshot both address the renamed table correctly.
 - **Same-transaction writes.** The engine relabels a transaction's already-batched data
   events to the new name before commit (`renameBatchedEvents`), so a rename in the same
   transaction as writes files every fact under the new name.
 
 Two caveats:
 
-- **CRDT metadata is stranded at the old name.** Sync's per-row bookkeeping
-  (`cv:`/`tb:`/`cl:`) is keyed by table name, so both origin and receiver abandon it at
-  the old name and start empty at the new one — later conflict resolution and tombstone
-  blocking lose their history for the renamed table (an old delete no longer blocks a
-  replayed insert), a from-zero delta re-pull diverts pre-rename facts (still filed under
-  the old name) to the unknown-table disposition, and a snapshot taken after the rename
-  ships pre-rename rows under the retired name. Pre-existing for a purely local rename;
-  replicating the rename makes it happen on every peer. Tracked as
-  `bug-sync-rename-and-pk-change-strand-crdt-metadata`.
-- **Storage format bump.** Stored migration records gained a length-prefixed `fromTable`
-  slot before the DDL, so `SYNC_METADATA_FORMAT_VERSION` is now 5 — a replica with v4
-  metadata refuses to start and must re-bootstrap from a peer snapshot.
+- **An undecidable rename diverts the pre-rename rows too.** Because the origin addresses
+  every fact by the table's current name, a receiver that cannot decide the rename (no
+  `fromTable`, or its old table was dropped locally) sees rows for a name it does not
+  have and diverts them all — including rows written before the rename, which an older
+  build would have landed in the old table. The receiver's old table is not resurrected
+  from them.
+- **Storage format bump.** Per-row records are now keyed by table generation, so
+  `SYNC_METADATA_FORMAT_VERSION` is 6 — a replica with v5 metadata refuses to start and
+  must re-bootstrap from a peer snapshot (`docs/sync.md` § Metadata format version).
 
 **The tag / maintained arms** (`SET TAGS`, `ADD TAGS`, `DROP TAGS`,
 `SET`/`DROP MAINTAINED`) still do not replicate. These are catalog-only and emit no
@@ -392,9 +398,10 @@ backfilled values themselves never cross the wire.
 
 **Re-keying strands CRDT metadata.** Sync's `cv:` / `tb:` / `cl:` keys are filed under
 the row's primary-key identity, so `alter primary key` abandons the metadata of every
-existing row and later conflict resolution silently starts from empty. Pre-existing for a
-*local* primary-key change; replicating the statement makes it happen on every peer.
-Tracked as `bug-sync-rename-and-pk-change-strand-crdt-metadata`.
+existing row and later conflict resolution silently starts from empty (the table
+component of those keys — the generation — survives the change; the row component does
+not). Pre-existing for a *local* primary-key change; replicating the statement makes it
+happen on every peer. Tracked as `sync-rekey-bookkeeping-on-primary-key-change`.
 
 The receiver still warns in `applySchemaChange`'s blank-DDL early return, naming
 migration type, schema and table — a blank migration can now only come from an

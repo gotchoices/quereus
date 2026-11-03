@@ -5,18 +5,21 @@
 import { expect } from 'chai';
 import { ChangeLogStore } from '../../src/metadata/change-log.js';
 import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
+import { TableIdentityStore } from '../../src/metadata/table-identity.js';
 import { type HLC, compareHLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
 
 describe('ChangeLogStore', () => {
   let kv: InMemoryKVStore;
+  let tables: TableIdentityStore;
   let store: ChangeLogStore;
   let siteId: Uint8Array;
 
   beforeEach(() => {
     kv = new InMemoryKVStore();
-    store = new ChangeLogStore(kv, () => RAW_PK_KEYING);
+    tables = new TableIdentityStore(kv);
+    store = new ChangeLogStore(kv, () => RAW_PK_KEYING, tables);
     siteId = generateSiteId();
   });
 
@@ -34,8 +37,9 @@ describe('ChangeLogStore', () => {
       }
 
       expect(entries).to.have.lengthOf(1);
-      expect(entries[0].schema).to.equal('main');
-      expect(entries[0].table).to.equal('users');
+      // The entry carries the table's GENERATION, minted by this first write.
+      expect(entries[0].generation).to.equal(tables.generationOf('main', 'users'));
+      expect(tables.nameOf(entries[0].generation)).to.deep.equal({ schema: 'main', table: 'users' });
       expect(entries[0].column).to.equal('name');
       expect(entries[0].entryType).to.equal('column');
     });

@@ -1,14 +1,17 @@
 /**
  * Tests for sync metadata key encoding.
  *
- * Two load-bearing invariants:
+ * Three load-bearing invariants:
  *  - the lexicographic byte order of `cl:` keys MUST equal `compareHLC`, so that a
  *    range scan over the key space visits entries in HLC order. The opSeq bytes sit
  *    after siteId (the last tiebreak), so they must round-trip and must order facts
  *    of the same transaction;
- *  - every variable-length component (schema, table, pk identity, column) is
- *    length-prefixed, so a name containing `:` or `.` can neither shift a parse nor
- *    let one table's scan bounds swallow another's keys.
+ *  - every variable-length component (schema, table, generation, pk identity,
+ *    column) is length-prefixed, so a name containing `:` or `.` can neither shift
+ *    a parse nor let one table's scan bounds swallow another's keys;
+ *  - the per-row families (`cv:`/`tb:`/`cl:`) are keyed by the table's GENERATION,
+ *    never its name; the name lives only in the `tg:` record that maps it to the
+ *    generation (format version 6, `metadata/table-identity.ts`).
  */
 
 import { expect } from 'chai';
@@ -25,6 +28,9 @@ import {
   parseTombstoneKey,
   buildSchemaMigrationKey,
   parseSchemaMigrationKey,
+  buildTableGenerationKey,
+  parseTableGenerationKey,
+  buildAllTableGenerationScanBounds,
   buildTableColumnVersionScanBounds,
   buildColumnVersionScanBounds,
   buildTombstoneScanBounds,
@@ -33,11 +39,19 @@ import {
   buildQuarantineScanBounds,
   encodeRawPkIdentity,
   encodePkIdentity,
+  mintTableGeneration,
+  tableGenerationToBytes,
+  tableGenerationFromBytes,
   RAW_PK_KEYING,
+  SYNC_METADATA_FORMAT_VERSION,
 } from '../../src/metadata/keys.js';
 
 const siteA = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 const siteB = new Uint8Array([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+/** Two fixed generations (22 base64url chars each), so key bytes are deterministic. */
+const GEN_A = 'AAAAAAAAAAAAAAAAAAAAAA';
+const GEN_B = 'BBBBBBBBBBBBBBBBBBBBBB';
 
 /** Lexicographic comparison of two byte arrays (the KV store's key order). */
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -100,15 +114,14 @@ describe('change-log key encoding', () => {
     it('should round-trip a column entry at the new 30-byte offsets', () => {
       const hlc = createHLC(1000n, 7, siteA, 99);
       const identity = encodeRawPkIdentity([1, 'x']);
-      const key = buildChangeLogKey(hlc, 'column', 'main', 'users', identity, 'name');
+      const key = buildChangeLogKey(hlc, 'column', GEN_A, identity, 'name');
       // cl:(3) + hlc(30) + type(1) + suffix
       expect(key.length).to.be.greaterThan(34);
 
       const parsed = parseChangeLogKey(key);
       expect(parsed).to.not.be.null;
       expect(parsed!.entryType).to.equal('column');
-      expect(parsed!.schema).to.equal('main');
-      expect(parsed!.table).to.equal('users');
+      expect(parsed!.generation).to.equal(GEN_A);
       expect(parsed!.column).to.equal('name');
       expect(parsed!.identity).to.equal(identity);
       expect(parsed!.hlc.opSeq).to.equal(99);
@@ -118,11 +131,12 @@ describe('change-log key encoding', () => {
     it('should round-trip a delete entry (no column)', () => {
       const hlc = createHLC(1000n, 1, siteB, 3);
       const identity = encodeRawPkIdentity([42]);
-      const key = buildChangeLogKey(hlc, 'delete', 'main', 'orders', identity);
+      const key = buildChangeLogKey(hlc, 'delete', GEN_A, identity);
       const parsed = parseChangeLogKey(key);
       expect(parsed).to.not.be.null;
       expect(parsed!.entryType).to.equal('delete');
       expect(parsed!.column).to.be.undefined;
+      expect(parsed!.generation).to.equal(GEN_A);
       expect(parsed!.identity).to.equal(identity);
       expect(parsed!.hlc.opSeq).to.equal(3);
     });
@@ -137,7 +151,7 @@ describe('change-log key encoding', () => {
         createHLC(2000n, 0, siteA, 0),
       ];
       const keyFor = (h: HLC): Uint8Array =>
-        buildChangeLogKey(h, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
+        buildChangeLogKey(h, 'column', GEN_A, encodeRawPkIdentity([1]), 'c');
 
       for (const x of hlcs) {
         for (const y of hlcs) {
@@ -159,8 +173,8 @@ describe('change-log key encoding', () => {
       const next = createHLC(1000n, 1, siteA, 6); // next fact, strictly after
       const { gte, lt } = buildChangeLogScanBoundsAfter(since);
 
-      const sinceKey = buildChangeLogKey(since, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
-      const nextKey = buildChangeLogKey(next, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
+      const sinceKey = buildChangeLogKey(since, 'column', GEN_A, encodeRawPkIdentity([1]), 'c');
+      const nextKey = buildChangeLogKey(next, 'column', GEN_A, encodeRawPkIdentity([1]), 'c');
 
       // The boundary entry itself is excluded (key < gte).
       expect(compareBytes(sinceKey, gte)).to.be.lessThan(0);
@@ -173,22 +187,20 @@ describe('change-log key encoding', () => {
       const since = createHLC(5000n, 3, siteB, 10);
       const { gte } = buildChangeLogScanBoundsAfter(since);
       const earlier = createHLC(5000n, 3, siteB, 0);
-      const earlierKey = buildChangeLogKey(earlier, 'delete', 'main', 't', encodeRawPkIdentity([7]));
+      const earlierKey = buildChangeLogKey(earlier, 'delete', GEN_A, encodeRawPkIdentity([7]));
       expect(compareBytes(earlierKey, gte)).to.be.lessThan(0);
     });
 
-    it('rejects a table name carrying an unpaired surrogate rather than folding it to U+FFFD', () => {
+    it('rejects a column name carrying an unpaired surrogate rather than folding it to U+FFFD', () => {
       // Mirrors @quereus/store's catalog-key guard (bug-store-catalog-key-lone-surrogate-
       // identifier-collision): `TextEncoder` folds an unpaired surrogate to U+FFFD, so two
-      // distinct table names differing only in a lone surrogate would otherwise share one
-      // change-log key prefix. `buildChangeLogKey` guards the schema/table/column identifier
-      // arguments via `assertNoUnpairedSurrogate` (imported from `@quereus/store`) before
-      // building the key.
+      // distinct column names differing only in a lone surrogate would otherwise share one
+      // change-log key. `buildChangeLogKey` guards the column identifier argument via
+      // `assertNoUnpairedSurrogate` (imported from `@quereus/store`) before building the
+      // key; the table NAME no longer appears in the key at all (see `tg:` below).
       const hlc = createHLC(1000n, 1, siteA, 0);
       const identity = encodeRawPkIdentity([1]);
-      expect(() => buildChangeLogKey(hlc, 'column', 'main', '\uD800', identity, 'c'))
-        .to.throw(/unpaired surrogate/i);
-      expect(() => buildChangeLogKey(hlc, 'column', 'main', 't', identity, '\uD800'))
+      expect(() => buildChangeLogKey(hlc, 'column', GEN_A, identity, '\uD800'))
         .to.throw(/unpaired surrogate/i);
     });
 
@@ -211,7 +223,7 @@ describe('change-log key encoding', () => {
       expect(Array.from(carried.siteId)).to.deep.equal(Array.from(expectedSite));
 
       // The boundary fact (max opSeq) is therefore excluded by the scan.
-      const boundaryKey = buildChangeLogKey(since, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
+      const boundaryKey = buildChangeLogKey(since, 'column', GEN_A, encodeRawPkIdentity([1]), 'c');
       expect(compareBytes(boundaryKey, gte)).to.be.lessThan(0);
     });
   });
@@ -235,9 +247,10 @@ describe('change-log key encoding', () => {
       // A string pk containing ':' and a column name containing ':' — the length
       // prefix keeps the split exact where a last-colon split would misparse.
       const identity = encodeRawPkIdentity(['a:b']);
-      const key = buildColumnVersionKey('main', 't', identity, 'col:on');
+      const key = buildColumnVersionKey(GEN_A, identity, 'col:on');
       const parsed = parseColumnVersionKey(key);
       expect(parsed).to.not.be.null;
+      expect(parsed!.generation).to.equal(GEN_A);
       expect(parsed!.identity).to.equal(identity);
       expect(parsed!.column).to.equal('col:on');
     });
@@ -249,49 +262,93 @@ describe('change-log key encoding', () => {
   });
 
   describe('buildColumnVersionKey', () => {
-    it('rejects a schema, table, or column name carrying an unpaired surrogate', () => {
+    it('rejects a column name carrying an unpaired surrogate', () => {
       const identity = encodeRawPkIdentity([1]);
-      expect(() => buildColumnVersionKey('\uD800', 't', identity, 'c')).to.throw(/unpaired surrogate/i);
-      expect(() => buildColumnVersionKey('main', '\uD800', identity, 'c')).to.throw(/unpaired surrogate/i);
-      expect(() => buildColumnVersionKey('main', 't', identity, '\uD800')).to.throw(/unpaired surrogate/i);
+      expect(() => buildColumnVersionKey(GEN_A, identity, '\uD800')).to.throw(/unpaired surrogate/i);
     });
 
     it('still builds a key for a clean identifier', () => {
-      expect(() => buildColumnVersionKey('main', 't', encodeRawPkIdentity([1]), 'c')).to.not.throw();
+      expect(() => buildColumnVersionKey(GEN_A, encodeRawPkIdentity([1]), 'c')).to.not.throw();
     });
   });
 
-  // Every metadata key component — schema, table, pk identity, column — is
-  // arbitrary user text: `create table "a:b" (...)` and `create table "a.b" (...)`
-  // are both legal SQL. Before every component was length-prefixed, the
-  // `{schema}.{table}:` prefix split at the first `.` and first `:`, so a table
-  // named `a:b` either failed to parse (cv/cl — the record was silently dropped
-  // from every sync path and deleted on the next snapshot apply) or parsed back
-  // CONFIDENTLY WRONG as table `a` (tb — a tombstone that could delete a row of a
-  // DIFFERENT table on the receiver). See bug-sync-metadata-key-delimiters-ambiguous.
-  describe('separator-bearing identifiers round-trip through every key family', () => {
-    const NASTY = ['a:b', 'a.b', 'x:y.z:', '.:', 'a'];
+  // Format version 6: the per-row families carry the table's GENERATION, never its
+  // name, so a rename moves one `tg:` record and a drop retires one generation
+  // without touching a single row record. The name ↔ generation record is the only
+  // name-keyed per-table family, and it carries the same length-prefix guarantees
+  // the row families used to need for names.
+  describe('table generation (tg:) keys', () => {
+    const NASTY = ['a:b', 'a.b', 'x:y.z:', '.:', 'a', ''];
 
-    it('parseColumnVersionKey recovers every component verbatim', () => {
+    it('the format version is 6 — generation-keyed per-row records', () => {
+      expect(SYNC_METADATA_FORMAT_VERSION).to.equal(6);
+    });
+
+    it('a minted generation is 22 base64url characters that round-trip through 16 bytes', () => {
+      const generation = mintTableGeneration();
+      expect(generation).to.match(/^[A-Za-z0-9_-]{22}$/);
+      const bytes = tableGenerationToBytes(generation);
+      expect(bytes.length).to.equal(16);
+      expect(tableGenerationFromBytes(bytes)).to.equal(generation);
+      expect(mintTableGeneration(), 'two mints differ').to.not.equal(generation);
+    });
+
+    it('parseTableGenerationKey recovers schema and table verbatim', () => {
       for (const schema of NASTY) {
         for (const table of NASTY) {
-          const identity = encodeRawPkIdentity([`pk:${table}.`]);
-          for (const column of NASTY) {
-            const parsed = parseColumnVersionKey(buildColumnVersionKey(schema, table, identity, column));
-            expect(parsed, `cv ${schema}/${table}/${column}`).to.not.be.null;
-            expect(parsed!).to.deep.equal({ schema, table, identity, column });
-          }
+          const parsed = parseTableGenerationKey(buildTableGenerationKey(schema, table));
+          expect(parsed, `tg ${schema}/${table}`).to.not.be.null;
+          expect(parsed!).to.deep.equal({ schema, table });
         }
       }
     });
 
-    it('parseTombstoneKey recovers every component verbatim (no cross-table misattribution)', () => {
-      for (const schema of NASTY) {
-        for (const table of NASTY) {
-          const identity = encodeRawPkIdentity([1]);
-          const parsed = parseTombstoneKey(buildTombstoneKey(schema, table, identity));
-          expect(parsed, `tb ${schema}/${table}`).to.not.be.null;
-          expect(parsed!).to.deep.equal({ schema, table, identity });
+    it('rejects a schema or table name carrying an unpaired surrogate', () => {
+      expect(() => buildTableGenerationKey('\uD800', 't')).to.throw(/unpaired surrogate/i);
+      expect(() => buildTableGenerationKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
+    });
+
+    it('every tg: key falls inside the all-generations scan bounds and no cv: key does', () => {
+      const within = (key: Uint8Array, bounds: { gte: Uint8Array; lt: Uint8Array }): boolean =>
+        compareBytes(key, bounds.gte) >= 0 && compareBytes(key, bounds.lt) < 0;
+      const all = buildAllTableGenerationScanBounds();
+      expect(within(buildTableGenerationKey('main', 'orders'), all)).to.be.true;
+      expect(within(buildTableGenerationKey('', ''), all)).to.be.true;
+      expect(within(buildColumnVersionKey(GEN_A, encodeRawPkIdentity([1]), 'c'), all)).to.be.false;
+    });
+
+    it('parsers reject a foreign prefix, a truncated key, and trailing bytes', () => {
+      const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+      expect(parseTableGenerationKey(enc('tb:4:main1:t'))).to.be.null;
+      expect(parseTableGenerationKey(enc('tg:99:main'))).to.be.null;
+      expect(parseTableGenerationKey(enc('tg:4:main1:t!'))).to.be.null;
+    });
+  });
+
+  // The pk identity and column are arbitrary text: a pk identity freely contains `:`
+  // (type tags) and `\0`, and `create table t ("a:b" text)` is legal SQL. Every
+  // component is length-prefixed, so none of that can shift a parse.
+  describe('separator-bearing components round-trip through every per-row key family', () => {
+    const NASTY = ['a:b', 'a.b', 'x:y.z:', '.:', 'a'];
+
+    it('parseColumnVersionKey recovers every component verbatim', () => {
+      for (const generation of [GEN_A, GEN_B]) {
+        const identity = encodeRawPkIdentity([`pk:${generation}.`]);
+        for (const column of NASTY) {
+          const parsed = parseColumnVersionKey(buildColumnVersionKey(generation, identity, column));
+          expect(parsed, `cv ${generation}/${column}`).to.not.be.null;
+          expect(parsed!).to.deep.equal({ generation, identity, column });
+        }
+      }
+    });
+
+    it('parseTombstoneKey recovers every component verbatim (no cross-generation misattribution)', () => {
+      for (const generation of [GEN_A, GEN_B]) {
+        for (const pk of NASTY) {
+          const identity = encodeRawPkIdentity([pk]);
+          const parsed = parseTombstoneKey(buildTombstoneKey(generation, identity));
+          expect(parsed, `tb ${generation}/${pk}`).to.not.be.null;
+          expect(parsed!).to.deep.equal({ generation, identity });
         }
       }
     });
@@ -322,26 +379,22 @@ describe('change-log key encoding', () => {
 
     it('parseChangeLogKey recovers every component verbatim, column and delete alike', () => {
       const hlc = createHLC(1000n, 1, siteA, 0);
-      for (const schema of NASTY) {
-        for (const table of NASTY) {
-          const identity = encodeRawPkIdentity(['a:b.c']);
-          for (const column of NASTY) {
-            const parsed = parseChangeLogKey(
-              buildChangeLogKey(hlc, 'column', schema, table, identity, column));
-            expect(parsed, `cl column ${schema}/${table}/${column}`).to.not.be.null;
-            expect(parsed!.schema).to.equal(schema);
-            expect(parsed!.table).to.equal(table);
-            expect(parsed!.identity).to.equal(identity);
-            expect(parsed!.column).to.equal(column);
-          }
-
-          const del = parseChangeLogKey(buildChangeLogKey(hlc, 'delete', schema, table, identity));
-          expect(del, `cl delete ${schema}/${table}`).to.not.be.null;
-          expect(del!.schema).to.equal(schema);
-          expect(del!.table).to.equal(table);
-          expect(del!.identity).to.equal(identity);
-          expect(del!.column).to.be.undefined;
+      for (const generation of [GEN_A, GEN_B]) {
+        const identity = encodeRawPkIdentity(['a:b.c']);
+        for (const column of NASTY) {
+          const parsed = parseChangeLogKey(
+            buildChangeLogKey(hlc, 'column', generation, identity, column));
+          expect(parsed, `cl column ${generation}/${column}`).to.not.be.null;
+          expect(parsed!.generation).to.equal(generation);
+          expect(parsed!.identity).to.equal(identity);
+          expect(parsed!.column).to.equal(column);
         }
+
+        const del = parseChangeLogKey(buildChangeLogKey(hlc, 'delete', generation, identity));
+        expect(del, `cl delete ${generation}`).to.not.be.null;
+        expect(del!.generation).to.equal(generation);
+        expect(del!.identity).to.equal(identity);
+        expect(del!.column).to.be.undefined;
       }
     });
   });
@@ -349,27 +402,27 @@ describe('change-log key encoding', () => {
   describe('empty components and malformed keys', () => {
     it('a zero-length column still round-trips as a present component', () => {
       // The builders test `column !== undefined`, not truthiness: an empty column
-      // must still emit its (empty) component, or a `column` entry would carry 3
-      // parts where the parser demands 4 and read back as unparseable.
+      // must still emit its (empty) component, or a `column` entry would carry 2
+      // parts where the parser demands 3 and read back as unparseable.
       const identity = encodeRawPkIdentity([1]);
-      const cv = parseColumnVersionKey(buildColumnVersionKey('main', 't', identity, ''));
+      const cv = parseColumnVersionKey(buildColumnVersionKey(GEN_A, identity, ''));
       expect(cv!.column).to.equal('');
 
       const hlc = createHLC(1000n, 1, siteA, 0);
-      const cl = parseChangeLogKey(buildChangeLogKey(hlc, 'column', 'main', 't', identity, ''));
+      const cl = parseChangeLogKey(buildChangeLogKey(hlc, 'column', GEN_A, identity, ''));
       expect(cl, 'an empty column name is still a parseable column entry').to.not.be.null;
       expect(cl!.column).to.equal('');
       expect(cl!.identity).to.equal(identity);
     });
 
-    it('empty schema, table and identity round-trip', () => {
-      const cv = parseColumnVersionKey(buildColumnVersionKey('', '', '', ''));
-      expect(cv!).to.deep.equal({ schema: '', table: '', identity: '', column: '' });
-      expect(parseTombstoneKey(buildTombstoneKey('', '', ''))!)
-        .to.deep.equal({ schema: '', table: '', identity: '' });
+    it('empty identity and column round-trip', () => {
+      const cv = parseColumnVersionKey(buildColumnVersionKey(GEN_A, '', ''));
+      expect(cv!).to.deep.equal({ generation: GEN_A, identity: '', column: '' });
+      expect(parseTombstoneKey(buildTombstoneKey(GEN_A, ''))!)
+        .to.deep.equal({ generation: GEN_A, identity: '' });
     });
 
-    it('parsers reject a foreign prefix, a truncated key, and the old v2 layout', () => {
+    it('parsers reject a foreign prefix, a truncated key, and the older layouts', () => {
       const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
       // Wrong family.
       expect(parseColumnVersionKey(enc('tb:4:main1:t'))).to.be.null;
@@ -379,10 +432,15 @@ describe('change-log key encoding', () => {
       expect(parseTombstoneKey(enc('tb:x:main'))).to.be.null;
       expect(parseTombstoneKey(enc('tb::main'))).to.be.null;
       // Trailing bytes beyond the declared components.
-      expect(parseTombstoneKey(enc('tb:1:a1:b1:c!'))).to.be.null;
-      // A version-2 key (bare `.`/`:` layout) must not read back as version 3.
+      expect(parseTombstoneKey(enc('tb:1:a1:b!'))).to.be.null;
+      // A version-2 key (bare `.`/`:` layout) must not read back as version 6.
       expect(parseColumnVersionKey(enc('cv:main.t:3:s:1:v'))).to.be.null;
       expect(parseTombstoneKey(enc('tb:main.t:s:1'))).to.be.null;
+      // A version-5 key (name-keyed: schema, table, identity, column — FOUR parts for
+      // a cell) must not read back as version 6 (generation, identity, column — three):
+      // its extra component is trailing garbage to the three-part parser.
+      expect(parseColumnVersionKey(enc('cv:4:main1:t3:s:11:v'))).to.be.null;
+      expect(parseTombstoneKey(enc('tb:4:main1:t3:s:1'))).to.be.null;
       expect(parseSchemaMigrationKey(enc('sm:main.t:0000000007'))).to.be.null;
       // A version-3 sm: key (length-prefixed, but no object kind) must not read
       // back as version 4 — its `t` would otherwise parse as the kind component.
@@ -392,34 +450,34 @@ describe('change-log key encoding', () => {
     });
   });
 
-  describe('scan bounds stay exact under separator-bearing names', () => {
+  describe('scan bounds stay exact per generation and per row', () => {
     const within = (key: Uint8Array, bounds: { gte: Uint8Array; lt: Uint8Array }): boolean =>
       compareBytes(key, bounds.gte) >= 0 && compareBytes(key, bounds.lt) < 0;
 
-    // Sibling names chosen so a bare-`.`/bare-`:` layout would overlap: `a`'s
-    // prefix `…a:` is a prefix of `a:b`'s `…a:b:` under the old encoding.
     const identity = encodeRawPkIdentity([1]);
 
-    it('a table named "a" and one named "a:b" do not share cv: bounds', () => {
-      const keyA = buildColumnVersionKey('main', 'a', identity, 'v');
-      const keyAB = buildColumnVersionKey('main', 'a:b', identity, 'v');
+    it('two generations do not share cv: bounds', () => {
+      const keyA = buildColumnVersionKey(GEN_A, identity, 'v');
+      const keyB = buildColumnVersionKey(GEN_B, identity, 'v');
 
-      const boundsA = buildTableColumnVersionScanBounds('main', 'a');
-      const boundsAB = buildTableColumnVersionScanBounds('main', 'a:b');
+      const boundsA = buildTableColumnVersionScanBounds(GEN_A);
+      const boundsB = buildTableColumnVersionScanBounds(GEN_B);
 
-      expect(within(keyA, boundsA), '"a" in its own bounds').to.be.true;
-      expect(within(keyAB, boundsAB), '"a:b" in its own bounds').to.be.true;
-      expect(within(keyAB, boundsA), '"a:b" must NOT scan under "a"').to.be.false;
-      expect(within(keyA, boundsAB), '"a" must NOT scan under "a:b"').to.be.false;
+      expect(within(keyA, boundsA), 'A in its own bounds').to.be.true;
+      expect(within(keyB, boundsB), 'B in its own bounds').to.be.true;
+      expect(within(keyB, boundsA), 'B must NOT scan under A').to.be.false;
+      expect(within(keyA, boundsB), 'A must NOT scan under B').to.be.false;
     });
 
-    it('tb: and sm: bounds are likewise disjoint for "a" vs "a:b"', () => {
-      const tbA = buildTombstoneKey('main', 'a', identity);
-      const tbAB = buildTombstoneKey('main', 'a:b', identity);
-      expect(within(tbA, buildTombstoneScanBounds('main', 'a'))).to.be.true;
-      expect(within(tbAB, buildTombstoneScanBounds('main', 'a'))).to.be.false;
-      expect(within(tbA, buildTombstoneScanBounds('main', 'a:b'))).to.be.false;
+    it('tb: bounds are likewise disjoint per generation, and sm: bounds per name', () => {
+      const tbA = buildTombstoneKey(GEN_A, identity);
+      const tbB = buildTombstoneKey(GEN_B, identity);
+      expect(within(tbA, buildTombstoneScanBounds(GEN_A))).to.be.true;
+      expect(within(tbB, buildTombstoneScanBounds(GEN_A))).to.be.false;
+      expect(within(tbA, buildTombstoneScanBounds(GEN_B))).to.be.false;
 
+      // Sibling names chosen so a bare-`.`/bare-`:` layout would overlap: `a`'s
+      // prefix `…a:` is a prefix of `a:b`'s `…a:b:` under the old encoding.
       const smA = buildSchemaMigrationKey('main', 'table', 'a', 1);
       const smAB = buildSchemaMigrationKey('main', 'table', 'a:b', 1);
       expect(within(smA, buildSchemaMigrationScanBounds('main', 'table', 'a'))).to.be.true;
@@ -443,12 +501,12 @@ describe('change-log key encoding', () => {
       // encodeRawPkIdentity('a') vs 'ab': one identity is a prefix of the other.
       const idA = encodeRawPkIdentity(['a']);
       const idAB = encodeRawPkIdentity(['ab']);
-      const keyA = buildColumnVersionKey('main', 't', idA, 'v');
-      const keyAB = buildColumnVersionKey('main', 't', idAB, 'v');
+      const keyA = buildColumnVersionKey(GEN_A, idA, 'v');
+      const keyAB = buildColumnVersionKey(GEN_A, idAB, 'v');
 
-      expect(within(keyA, buildColumnVersionScanBounds('main', 't', idA))).to.be.true;
-      expect(within(keyAB, buildColumnVersionScanBounds('main', 't', idA))).to.be.false;
-      expect(within(keyA, buildColumnVersionScanBounds('main', 't', idAB))).to.be.false;
+      expect(within(keyA, buildColumnVersionScanBounds(GEN_A, idA))).to.be.true;
+      expect(within(keyAB, buildColumnVersionScanBounds(GEN_A, idA))).to.be.false;
+      expect(within(keyA, buildColumnVersionScanBounds(GEN_A, idAB))).to.be.false;
     });
 
     it('the schema-only quarantine prefix cannot match a different schema', () => {

@@ -19,8 +19,10 @@ import { expect } from 'chai';
 import { generateIndexDDL } from '@quereus/quereus';
 import type { SchemaChangeEvent } from '@quereus/store';
 import {
+	changesFor,
 	closePeer,
 	collect,
+	hasOrders,
 	localWrite,
 	makePeer,
 	relayAll,
@@ -107,17 +109,23 @@ describe('schema DDL replication', () => {
 			expect(b.db.schemaManager.getTable('main', 'orders')).to.be.undefined;
 		});
 
-		it('applies alongside row changes for the dropped table without resurrecting it', async () => {
-			// DDL runs before DML, so the batch's own drop makes `orders` unknown for
-			// the data phase (`computeBatchTableFates`) and its rows divert instead of
-			// hitting a missing table. Previously unexercised: the drop was a no-op.
+		it('ships none of the dropped table\'s row changes and does not resurrect it', async () => {
+			// The drop retires the table's generation on the origin
+			// (`metadata/table-identity.ts`), so the rows written before it are orphans
+			// the delta pull never carries — only the `drop_table` DDL ships. (Rows that
+			// DO reach a receiver whose batch drops their table divert instead of
+			// hitting a missing table; `unknown-table-disposition.spec.ts` pins that over
+			// a synthesized batch.)
 			await localWrite(a, "insert into orders values (1, 'from A')");
 			await localWrite(a, 'drop table orders');
+
+			const shipped = await changesFor(a, b.manager.getSiteId());
+			expect(hasOrders(shipped), 'no row change for the dropped table ships').to.equal(false);
 
 			const result = await relayAll(a, b);
 
 			expect(b.db.schemaManager.getTable('main', 'orders')).to.be.undefined;
-			expect(result.unknownTable ?? 0, 'diverted row changes').to.be.greaterThan(0);
+			expect(result.unknownTable, 'nothing arrives to divert').to.equal(undefined);
 		});
 
 		it('leaves no stale remote-event expectation when the dropped table had an index', async () => {

@@ -5,6 +5,7 @@
 import { expect } from 'chai';
 import { ColumnVersionStore, serializeColumnVersion, deserializeColumnVersion, decodeSqlValue, type ColumnVersion } from '../../src/metadata/column-version.js';
 import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
+import { TableIdentityStore } from '../../src/metadata/table-identity.js';
 import type { HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
@@ -191,7 +192,7 @@ describe('ColumnVersion', () => {
 
     beforeEach(() => {
       kv = new InMemoryKVStore();
-      store = new ColumnVersionStore(kv, () => RAW_PK_KEYING);
+      store = new ColumnVersionStore(kv, () => RAW_PK_KEYING, new TableIdentityStore(kv));
     });
 
     it('should store and retrieve column versions', async () => {

@@ -543,9 +543,10 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 
 | Prefix | Purpose | Format |
 |--------|---------|--------|
-| `cv:⟨schema⟩⟨table⟩⟨pkIdentity⟩⟨col⟩` | Column version | `{hlc, value, pk}` |
-| `tb:⟨schema⟩⟨table⟩⟨pkIdentity⟩` | Tombstone | `{hlc, createdAt, pk, priorRow?}` |
-| `cl:{hlc}{type}⟨schema⟩⟨table⟩⟨pkIdentity⟩[⟨col⟩]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
+| `tg:⟨schema⟩⟨table⟩` | Table generation — the per-peer identity this name's records are filed under (see *Table identity*) | `{generation (16 bytes), mintedAt}` |
+| `cv:⟨generation⟩⟨pkIdentity⟩⟨col⟩` | Column version | `{hlc, value, pk}` |
+| `tb:⟨generation⟩⟨pkIdentity⟩` | Tombstone | `{hlc, createdAt, pk, priorRow?}` |
+| `cl:{hlc}{type}⟨generation⟩⟨pkIdentity⟩[⟨col⟩]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*); the prefix and `buildTransactionKey` are reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state (received watermark) | `{lastSyncHlc}` |
 | `pt:{siteId}` | Peer sent state (highest HLC pushed to a peer and acked) | `{lastSyncHlc}` |
@@ -562,9 +563,12 @@ pk identity freely contains `:` (type tags) and `\0` (member separator) — so n
 can be reserved as a delimiter. Carrying each part's length makes every split exact and
 every key prefix unambiguous: a scan over table `a` cannot pick up table `a:b`. The
 tradeoff is length-major-then-text sort order rather than alphabetical; per-table and
-per-row *contiguity* — the only ordering the streaming snapshot relies on — is unaffected.
-Fixed-width components (the 30-byte HLC, the 1-byte change type, `sm:`'s zero-padded
-version) carry no prefix.
+per-row *contiguity* — the only ordering the streaming snapshot relies on — is unaffected
+(the per-row families are contiguous per *generation*, and the snapshot producer sorts the
+tables it streams by name, since generation order is random per peer). Fixed-width
+components (the 30-byte HLC, the 1-byte change type, `sm:`'s zero-padded version) carry no
+prefix; the generation (22 base64url characters) is length-prefixed anyway so every parser
+reads one encoding.
 
 Co-location buys atomic data+metadata updates within a transaction, one storage backend for both LevelDB and IndexedDB, and no additional database connections.
 
@@ -608,20 +612,75 @@ the collapse resolves by last-writer-wins rather than by chunk order. Mid-bootst
 ordering is guaranteed by the stream itself: all schema migrations precede all table data,
 so a table exists by the time its entries need keying.
 
+### Table identity
+
+A table's **name is not its identity**: `alter table t rename to u` keeps the table and
+changes the name, while `drop table t; create table t (…)` keeps the name and changes the
+table. The per-row records are therefore filed under a **table generation** rather than
+the name (`metadata/table-identity.ts`):
+
+- Each peer mints a random 128-bit generation for a `(schema, table)` the first time it
+  files anything for that name — lazily, inside the same write batch as the first record,
+  so a table that existed before sync attached, or one created by replicated DDL, gets its
+  generation with its first cell version or tombstone. The mapping is the `tg:` record;
+  the whole set (bounded by the table count) is held in memory and loaded at open.
+- A **rename moves the mapping** to the new name and touches no record. A **drop retires**
+  the generation: its records become unreachable orphans that every scan skips (the delta
+  extractors, the snapshot producers, the change-log resolver), and that a later repair
+  sweep removes from the change log; reclaiming the `cv:`/`tb:` records themselves is
+  `sync-retire-dropped-table-bookkeeping`. A **same-name re-create mints a fresh
+  generation** and so inherits nothing — the dropped incarnation's tombstones cannot block
+  the new table's rows.
+- Who drives the three transitions: local DDL through the transaction-commit capture
+  (`create`/`drop`/`alter`-with-`oldObjectName` table events, staged ahead of the same
+  transaction's data records so `drop t; create t; insert into t` files its rows under the
+  new generation), and replicated DDL through the list of schema changes the store adapter
+  reports it actually **executed** (`ApplyToStoreResult.executedSchemaChanges`) — a
+  migration found already applied moves nothing, because the receiver's own local DDL
+  already did. A deployment with no `applyToStore` at all (a relay-only coordinator, no
+  catalog) treats every admitted `create_table`/`drop_table`/`rename_table` as executed.
+- The generation is **local to each peer and never travels.** On the wire a change is
+  addressed by the table's *current* name at extraction time (the record's generation
+  resolves to its name), and the receiver resolves that name to its own current
+  generation — the same name-based convergence rule replicated DDL already uses
+  (`rename_table` carries old and new names; `decideRenameTable` decides against the
+  catalog). Two peers that independently create the same table (the usual app-startup
+  pattern) mint two unrelated generations and still converge by name, which is why a
+  creator-minted identity carried on the wire was rejected.
+- The apply path drains the local commit chain before resolving an inbound batch and
+  again before filing its metadata (`applyChanges`, `drainHeldChanges`): a local rename
+  whose `move` had not landed yet would otherwise let the inbound batch mint a second
+  generation for the new name.
+
+**What this does not solve.** A change recorded against one incarnation on peer X and
+applied to a different same-named incarnation on peer Y — X writes to `orders` while Y
+has already dropped and re-created it — lands in Y's new table. The receiver cannot tell
+which incarnation the sender addressed; that is a concurrent-DDL-versus-data race, the
+same class as the rename collision `decideRenameTable` refuses, and pre-existing.
+
 ### Metadata format version
 
 The `fv:` record stores the sync-metadata storage format version
-(`SYNC_METADATA_FORMAT_VERSION`, currently **5**: pk-identity keying, raw pk in record
-values, every variable-length key component length-prefixed, `sm:` keyed by object kind,
-and each `sm:` VALUE carrying a length-prefixed `fromTable` slot between the migration
-type and the DDL so a `rename_table` can name the table it renamed. Version 4 ended its
+(`SYNC_METADATA_FORMAT_VERSION`, currently **6**: the per-row records `cv:`/`tb:`/`cl:`
+are keyed by the table's *generation* through the new `tg:` record (see *Table identity*)
+instead of by the table name, so a rename moves one record and a drop retires one
+generation without touching a row record. Version 5 keyed those records by `(schema,
+table)`, which a rename stranded and a same-name re-create inherited; it also introduced
+pk-identity keying, raw pk in record values, every variable-length key component
+length-prefixed, `sm:` keyed by object kind, and each `sm:` VALUE carrying a
+length-prefixed `fromTable` slot between the migration type and the DDL so a
+`rename_table` can name the table it renamed — all retained. Version 4 ended its
 records with the DDL as "rest of buffer", leaving nowhere to append that slot; version 3
 lacked the object kind, so a table and a same-named index shared one version counter,
 silently suppressing each other's migrations; version 2 also lacked the length
 prefixes). `SyncManagerImpl.create` writes it on a fresh replica and refuses to open one
 whose stored version is missing (pre-versioning) or different: old keys are unreadable
 under the new layout and mixing the two would corrupt both. Recovery is to clear the
-replica's sync metadata and re-bootstrap from a peer snapshot — no in-place rewrite pass. Across a mixed 3/4 fleet an index migration is numbered differently at each
+replica's sync metadata and re-bootstrap from a peer snapshot — no in-place rewrite pass.
+**Release note for 6:** every existing replica's sync metadata is on version 5 and refuses
+to open under this build; each must be cleared and re-bootstrapped from a peer snapshot (the
+data in the store is untouched — only the `cv:`/`tb:`/`cl:` bookkeeping is rebuilt).
+Across a mixed 3/4 fleet an index migration is numbered differently at each
 end, so it duplicates rather than suppresses; `decideSchemaChange` no-ops the duplicate.
 
 ### Snapshot wire-format version

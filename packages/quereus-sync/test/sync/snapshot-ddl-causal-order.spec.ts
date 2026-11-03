@@ -94,11 +94,10 @@ describe('snapshot DDL is ordered causally, not by key', () => {
 });
 
 describe('snapshot DDL replays create-then-rename in causal order', () => {
-	// Own peers, NOT the shared beforeEach above: that one inserts a PRE-rename row,
-	// whose sync bookkeeping is keyed by table name and so would snapshot under the
-	// old name — a table the replayed DDL has renamed away
-	// (bug-sync-rename-and-pk-change-strand-crdt-metadata). Data here is inserted
-	// only after the rename.
+	// Own peers, NOT the shared beforeEach above: this spec is about the DDL replay
+	// order, so it keeps the data minimal — one row inserted after the rename. (A
+	// pre-rename row would ship under the new name too, now that the bookkeeping is
+	// keyed by table generation rather than name; see `metadata/table-identity.ts`.)
 	let sender: Peer;
 	let receiver: Peer;
 

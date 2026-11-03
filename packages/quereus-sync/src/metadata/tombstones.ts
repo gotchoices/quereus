@@ -11,6 +11,7 @@ import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc
 import { encodeSqlValue, decodeSqlValue } from './column-version.js';
 import { buildTombstoneKey, buildTombstoneScanBounds, encodePkIdentity } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
+import type { TableIdentityResolver } from './table-identity.js';
 
 /** Fixed-size head of a serialized tombstone: 30 bytes HLC + 8 bytes createdAt. */
 const TOMBSTONE_HEAD_BYTES = 38;
@@ -98,13 +99,17 @@ export function deserializeTombstone(buffer: Uint8Array): Tombstone {
  *
  * Every pk-taking method derives the record key's pk IDENTITY through the
  * per-table {@link PkKeyingResolver} passed at construction, so callers keep
- * addressing rows by raw pk while the storage keys collapse spellings.
+ * addressing rows by raw pk while the storage keys collapse spellings. The table
+ * component is the table's GENERATION via the {@link TableIdentityResolver} — a
+ * read for a name that never filed anything finds nothing; a batch write ensures
+ * the generation into the same batch (see `ColumnVersionStore`).
  */
 export class TombstoneStore {
   constructor(
     private readonly kv: KVStore,
     private readonly retentionHorizonMs: number,
     private readonly keying: PkKeyingResolver,
+    private readonly tables: TableIdentityResolver,
   ) {}
 
   private identity(schemaName: string, tableName: string, pk: SqlValue[]): string {
@@ -119,27 +124,30 @@ export class TombstoneStore {
     tableName: string,
     pk: SqlValue[]
   ): Promise<Tombstone | undefined> {
-    return this.getTombstoneByIdentity(schemaName, tableName, this.identity(schemaName, tableName, pk));
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return undefined;
+    return this.getTombstoneByIdentity(generation, identity);
   }
 
   /**
-   * Get the tombstone for a row by pk IDENTITY (as recovered from a parsed
-   * `tb:`/`cl:` key — no raw pk needed).
+   * Get the tombstone for a row by table generation and pk IDENTITY (as
+   * recovered from a parsed `tb:`/`cl:` key — no name and no raw pk needed).
    */
   async getTombstoneByIdentity(
-    schemaName: string,
-    tableName: string,
+    generation: string,
     identity: string
   ): Promise<Tombstone | undefined> {
-    const key = buildTombstoneKey(schemaName, tableName, identity);
+    const key = buildTombstoneKey(generation, identity);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeTombstone(data);
   }
 
   /**
-   * Create a tombstone for a deleted row. `priorRow` (optional) is the row's
-   * last-known image, persisted as best-effort audit/undo metadata.
+   * Create a tombstone for a deleted row (standalone write — one batch, so the
+   * generation mint, when needed, lands with the record). `priorRow` (optional)
+   * is the row's last-known image, persisted as best-effort audit/undo metadata.
    */
   async setTombstone(
     schemaName: string,
@@ -148,16 +156,17 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): Promise<void> {
-    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
-    const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
-    await this.kv.put(key, serializeTombstone(tombstone));
+    const batch = this.kv.batch();
+    this.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow);
+    await batch.write();
   }
 
   /**
    * Set tombstone in a batch. `priorRow` (optional) is the row's last-known image,
    * persisted as best-effort audit/undo metadata. The key's pk IDENTITY is always
    * derived locally — no caller-supplied-identity variant exists (see
-   * `ColumnVersionStore.setColumnVersionBatch`).
+   * `ColumnVersionStore.setColumnVersionBatch`). The table generation is ensured
+   * into the same batch.
    */
   setTombstoneBatch(
     batch: WriteBatch,
@@ -167,9 +176,10 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): void {
-    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.ensure(schemaName, tableName, batch);
     const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
-    batch.put(key, serializeTombstone(tombstone));
+    batch.put(buildTombstoneKey(generation, identity), serializeTombstone(tombstone));
   }
 
   /**
@@ -186,8 +196,10 @@ export class TombstoneStore {
     tableName: string,
     pk: SqlValue[]
   ): Promise<void> {
-    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
-    await this.kv.delete(key);
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return;
+    await this.kv.delete(buildTombstoneKey(generation, identity));
   }
 
   /**
@@ -224,7 +236,9 @@ export class TombstoneStore {
    * would mean threading one in or moving the sweep up a level.
    */
   async pruneExpired(schemaName: string, tableName: string): Promise<number> {
-    const bounds = buildTombstoneScanBounds(schemaName, tableName);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return 0;
+    const bounds = buildTombstoneScanBounds(generation);
     const now = Date.now();
     const batch = this.kv.batch();
     let count = 0;
@@ -248,7 +262,9 @@ export class TombstoneStore {
     schemaName: string,
     tableName: string
   ): AsyncIterable<{ pk: SqlValue[]; tombstone: Tombstone }> {
-    const bounds = buildTombstoneScanBounds(schemaName, tableName);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return;
+    const bounds = buildTombstoneScanBounds(generation);
 
     for await (const entry of this.kv.iterate(bounds)) {
       // The key holds only the lossy pk identity; the raw pk comes from the value.

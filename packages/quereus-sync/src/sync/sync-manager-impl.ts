@@ -57,6 +57,7 @@ import {
 } from '../metadata/keys.js';
 import { migrationObjectKind } from './protocol.js';
 import { createPkKeyingResolver, type PkKeyingResolver } from '../metadata/pk-identity.js';
+import { TableIdentityStore } from '../metadata/table-identity.js';
 import type { SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
 	SyncConfig,
@@ -174,6 +175,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
 	readonly basisLifecycle: BasisLifecycleStore;
+	readonly tableIdentity: TableIdentityStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 	private readonly getTableSchema?: GetTableSchemaCallback;
@@ -229,10 +231,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.getTableSchema = getTableSchema;
 		this.dropLocalTable = dropLocalTable;
 		this.pkKeying = createPkKeyingResolver(getTableSchema, keyNormalizerResolver);
-		this.columnVersions = new ColumnVersionStore(kv, this.pkKeying);
-		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs, this.pkKeying);
+		// Loaded by `create()` before any store is used; every per-row record store
+		// resolves its key's table component through it.
+		this.tableIdentity = new TableIdentityStore(kv);
+		this.columnVersions = new ColumnVersionStore(kv, this.pkKeying, this.tableIdentity);
+		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs, this.pkKeying, this.tableIdentity);
 		this.peerStates = new PeerStateStore(kv);
-		this.changeLog = new ChangeLogStore(kv, this.pkKeying);
+		this.changeLog = new ChangeLogStore(kv, this.pkKeying, this.tableIdentity);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
 		this.quarantine = new QuarantineStore(kv);
 		this.basisLifecycle = new BasisLifecycleStore(kv);
@@ -324,6 +329,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		const hlcManager = new HLCManager(siteId, hlcState);
 		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable, keyNormalizerResolver);
+
+		// The name ↔ generation map is bounded by the table count, so it is held whole
+		// in memory; load it before the first commit can be captured below.
+		await manager.tableIdentity.load();
 
 		// Capture local changes at the engine transaction boundary: one grouped
 		// `onTransactionCommit` batch ⇒ one transaction ⇒ one HLC. The store's
@@ -767,6 +776,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// staged-transaction-metadata.ts). Lives for this one commit.
 			const staged = new StagedTransactionMetadata((schema, table) => this.getPkKeying(schema, table));
 
+			// Table-identity transitions FIRST, ahead of the data records: `drop t;
+			// create t; insert into t` must file its rows under the NEW generation, and
+			// a rename's rows (relabelled to the new name by the engine) under the moved
+			// one. Same batch as everything else, so the mapping and the records that
+			// depend on it commit together.
+			this.applyLocalTableTransitions(kvBatch, localSchema);
+
 			// DDL before DML: migrations take the lowest opSeqs.
 			const versionCounters = new Map<string, number>();
 			for (const event of localSchema) {
@@ -793,6 +809,30 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				status: 'error',
 				error: toError(error),
 			});
+		}
+	}
+
+	/**
+	 * Map one transaction's LOCAL table lifecycle events onto the identity store's
+	 * three transitions (`metadata/table-identity.ts`): a `create` of a table ensures
+	 * its generation, a `drop` retires it, and an `alter` carrying `oldObjectName` —
+	 * the shape only the `RENAME TO` emit sites produce, see
+	 * {@link mapSchemaMigrationType} — moves it. Remote-flagged events never reach
+	 * here (the caller filtered them); their transitions are driven by the apply path
+	 * from the store adapter's executed list. Column and index events change the
+	 * table, not which table it is, and are skipped. Events are walked in emit
+	 * order, so a `drop t; create t` retires before it ensures.
+	 */
+	private applyLocalTableTransitions(batch: WriteBatch, localSchema: DatabaseSchemaChangeEvent[]): void {
+		for (const event of localSchema) {
+			if (event.objectType !== 'table') continue;
+			if (event.type === 'create') {
+				this.tableIdentity.ensure(event.schemaName, event.objectName, batch);
+			} else if (event.type === 'drop') {
+				this.tableIdentity.retire(event.schemaName, event.objectName, batch);
+			} else if (event.type === 'alter' && event.oldObjectName !== undefined) {
+				this.tableIdentity.move(event.schemaName, event.oldObjectName, event.objectName, batch);
+			}
 		}
 	}
 
@@ -1220,14 +1260,20 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Resolve a change-log entry to the live {@link Change} it references, or
 	 * `null` when the underlying column version / tombstone is gone — a stale log
 	 * entry (e.g. a column overwritten, or a row deleted after the entry was
-	 * written). The authoritative HLC, value AND pk come from the current version
-	 * record, not the log key — the key carries only the lossy pk identity.
+	 * written) — or when the entry's table generation has been RETIRED (the table
+	 * was dropped; its leftover records are unreachable orphans, so the entry is
+	 * one too). The authoritative HLC, value AND pk come from the current version
+	 * record, not the log key — the key carries only the lossy pk identity — and
+	 * the change is addressed by the table's CURRENT name, which is how a fact
+	 * recorded before a rename ships under the name the peer will know it by.
 	 */
 	private async resolveLogEntry(logEntry: ChangeLogEntry): Promise<Change | null> {
+		const name = this.tableIdentity.nameOf(logEntry.generation);
+		if (!name) return null;
+
 		if (logEntry.entryType === 'column') {
 			const cv = await this.columnVersions.getColumnVersionByIdentity(
-				logEntry.schema,
-				logEntry.table,
+				logEntry.generation,
 				logEntry.identity,
 				logEntry.column!,
 			);
@@ -1235,8 +1281,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			const columnChange: ColumnChange = {
 				type: 'column',
-				schema: logEntry.schema,
-				table: logEntry.table,
+				schema: name.schema,
+				table: name.table,
 				pk: cv.pk,
 				column: logEntry.column!,
 				value: cv.value,
@@ -1248,17 +1294,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			return columnChange;
 		}
 
-		const tombstone = await this.tombstones.getTombstoneByIdentity(
-			logEntry.schema,
-			logEntry.table,
-			logEntry.identity,
-		);
+		const tombstone = await this.tombstones.getTombstoneByIdentity(logEntry.generation, logEntry.identity);
 		if (!tombstone) return null;
 
 		const deletion: RowDeletion = {
 			type: 'delete',
-			schema: logEntry.schema,
-			table: logEntry.table,
+			schema: name.schema,
+			table: name.table,
 			pk: tombstone.pk,
 			hlc: tombstone.hlc,
 			// Re-emit the stored before-image (spread only when present) so a
@@ -1279,6 +1321,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * full scan + sort. It is left unbounded because it is the from-zero path: a
 	 * large initial range is expected to be served by a snapshot rather than this
 	 * delta path (docs/sync.md).
+	 *
+	 * Records of a RETIRED generation (a dropped table's leftovers) are skipped:
+	 * they describe an incarnation no peer should receive, and shipping a dropped
+	 * table's tombstone would delete the row of its same-named successor.
 	 */
 	private async collectAllChanges(peerSiteId: SiteId): Promise<Change[]> {
 		const changes: Change[] = [];
@@ -1287,14 +1333,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		for await (const entry of this.kv.iterate(cvBounds)) {
 			const parsed = parseColumnVersionKey(entry.key);
 			if (!parsed) continue;
+			const name = this.tableIdentity.nameOf(parsed.generation);
+			if (!name) continue;
 
 			const cv = deserializeColumnVersion(entry.value);
 			if (siteIdEquals(cv.hlc.siteId, peerSiteId)) continue;
 
 			const columnChange: ColumnChange = {
 				type: 'column',
-				schema: parsed.schema,
-				table: parsed.table,
+				schema: name.schema,
+				table: name.table,
 				pk: cv.pk,
 				column: parsed.column,
 				value: cv.value,
@@ -1308,14 +1356,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		for await (const entry of this.kv.iterate(tbBounds)) {
 			const parsed = parseTombstoneKey(entry.key);
 			if (!parsed) continue;
+			const name = this.tableIdentity.nameOf(parsed.generation);
+			if (!name) continue;
 
 			const tombstone = deserializeTombstone(entry.value);
 			if (siteIdEquals(tombstone.hlc.siteId, peerSiteId)) continue;
 
 			const deletion: RowDeletion = {
 				type: 'delete',
-				schema: parsed.schema,
-				table: parsed.table,
+				schema: name.schema,
+				table: name.table,
 				pk: tombstone.pk,
 				hlc: tombstone.hlc,
 				...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
@@ -1491,9 +1541,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				batch.delete(entry.key);
 				const parsed = parseTombstoneKey(entry.key);
 				if (parsed) {
-					// Identity-based delete: the parsed key already carries the identity, so
-					// no schema (which a since-retired table may no longer have) is needed.
-					this.changeLog.deleteEntryByIdentityBatch(batch, tombstone.hlc, 'delete', parsed.schema, parsed.table, parsed.identity);
+					// Generation + identity delete: the parsed key already carries both, so
+					// neither a name nor a schema (which a since-dropped table — a retired
+					// generation — no longer has) is needed. Expired orphans prune too.
+					this.changeLog.deleteEntryByIdentityBatch(batch, tombstone.hlc, 'delete', parsed.generation, parsed.identity);
 				} else {
 					console.warn('[Sync] Unparseable tombstone key during prune — its change-log entry is left orphaned');
 				}
@@ -1529,10 +1580,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Safe to run at any time, on any replica, with no peer coordination: an
 	 * entry that resolves to `null` already produced no output for
 	 * {@link collectChangesSince} (`resolveLogEntry` returning `null` is exactly
-	 * what makes it an orphan), so deleting it changes nothing observable. Full
-	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix
-	 * orphans (or one already repaired) resolves every entry and deletes nothing,
-	 * so a caught-up replica pays only the scan.
+	 * what makes it an orphan), so deleting it changes nothing observable. That
+	 * includes every entry of a RETIRED table generation — a dropped table's index
+	 * entries, which nothing can resolve by name any more. Full scan, same shape as
+	 * {@link pruneTombstones} — a replica with no pre-fix orphans (or one already
+	 * repaired) resolves every entry and deletes nothing, so a caught-up replica
+	 * pays only the scan.
 	 *
 	 * NOTE: the scan is one KV point-read per change-log entry, and the log holds
 	 * roughly one entry per live cell, so a caught-up replica still pays O(live
@@ -1558,8 +1611,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				batch,
 				logEntry.hlc,
 				logEntry.entryType,
-				logEntry.schema,
-				logEntry.table,
+				logEntry.generation,
 				logEntry.identity,
 				logEntry.column,
 			);

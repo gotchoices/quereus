@@ -5,6 +5,7 @@
 import { expect } from 'chai';
 import { TombstoneStore, serializeTombstone, deserializeTombstone, type Tombstone } from '../../src/metadata/tombstones.js';
 import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
+import { TableIdentityStore } from '../../src/metadata/table-identity.js';
 import { type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
@@ -104,7 +105,7 @@ describe('Tombstone', () => {
 
     beforeEach(() => {
       kv = new InMemoryKVStore();
-      store = new TombstoneStore(kv, TTL, () => RAW_PK_KEYING);
+      store = new TombstoneStore(kv, TTL, () => RAW_PK_KEYING, new TableIdentityStore(kv));
     });
 
     it('should store and retrieve tombstones', async () => {

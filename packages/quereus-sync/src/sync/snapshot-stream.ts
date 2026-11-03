@@ -24,6 +24,7 @@ import {
 	parseTombstoneKey,
 	parseChangeLogKey,
 	encodePkIdentity,
+	joinKeyParts,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
 import {
@@ -53,7 +54,8 @@ import {
 	reconcileCell,
 	type ReconciledRow,
 } from './snapshot-identity.js';
-import { applyDataToStore } from './admission.js';
+import { applyDataToStore, executedSchemaChanges } from './admission.js';
+import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
 
 /** Default chunk size for streaming snapshots. */
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
@@ -122,13 +124,26 @@ async function* streamSnapshotChunks(
 	const { snapshotId, siteId, hlc, chunkSize, completedTables, initialEntryCount } = opts;
 	const completedSet = completedTables ?? new Set<string>();
 
-	// Count tables and migrations for header
-	const tableKeys = new Map<string, { schema: string; table: string }>();
+	// Count tables and migrations for header. Records are keyed by table GENERATION;
+	// each resolves to the table's CURRENT name for the chunk headers (a fact filed
+	// before a rename ships under the name the receiver will know it by), and a
+	// retired generation — a dropped table's leftovers — is skipped outright. The
+	// scan visits tables in generation order, which is random per peer, so the
+	// tables are streamed sorted by name instead: a deterministic order is what a
+	// resumed transfer's `completedTables` and anyone reading a stored snapshot
+	// expect, and the table count bounds the sort.
+	const byName = new Map<string, { generation: string; schema: string; table: string }>();
 	const cvBounds = buildAllColumnVersionsScanBounds();
 	for await (const entry of ctx.kv.iterate(cvBounds)) {
 		const parsed = parseColumnVersionKey(entry.key);
-		if (parsed) tableKeys.set(`${parsed.schema}.${parsed.table}`, { schema: parsed.schema, table: parsed.table });
+		if (!parsed) continue;
+		const name = ctx.tableIdentity.nameOf(parsed.generation);
+		if (!name) continue;
+		byName.set(`${name.schema}.${name.table}`, { generation: parsed.generation, ...name });
 	}
+	const tableKeys = new Map(
+		[...byName].sort(([, a], [, b]) => joinKeyParts(a.schema, a.table).localeCompare(joinKeyParts(b.schema, b.table))),
+	);
 
 	// Collect migrations up front — the header needs their count anyway, and they must
 	// be emitted in causal order rather than `sm:` scan order (see `listAllMigrations`).
@@ -164,10 +179,10 @@ async function* streamSnapshotChunks(
 
 	// Stream each table, skipping completed ones
 	let totalEntries = initialEntryCount ?? 0;
-	for (const [tableKey, { schema, table }] of tableKeys) {
+	for (const [tableKey, { generation, schema, table }] of tableKeys) {
 		if (completedSet.has(tableKey)) continue;
 
-		const tableCvBounds = buildTableColumnVersionScanBounds(schema, table);
+		const tableCvBounds = buildTableColumnVersionScanBounds(generation);
 
 		// Yield table start (entry count filled in at table-end)
 		const tableStart: SnapshotTableStartChunk = {
@@ -231,17 +246,19 @@ async function* streamSnapshotChunks(
 	// pass), batched by `(schema, table)` into `chunkSize` chunks. A row whose columns
 	// were all deleted has a tombstone but no live column-versions, so its table may be
 	// absent from `tableKeys`; the global pass carries it regardless. The scan is
-	// key-sorted, so all tombstones for one `(schema, table)` are contiguous: every
-	// `tb:` key opens with that pair LENGTH-PREFIXED (`tb:{n}:{schema}{n}:{table}…`),
+	// key-sorted, so all tombstones for one table GENERATION are contiguous: every
+	// `tb:` key opens with the generation LENGTH-PREFIXED (`tb:{n}:{generation}…`),
 	// so one table's keys share an exact byte prefix that no other table's key can
-	// start with — no interleaving is possible, even between tables named `a` and
-	// `a:b`. A fresh chunk starts whenever the table changes or the batch fills.
+	// start with — no interleaving is possible. A fresh chunk starts whenever the
+	// generation changes or the batch fills; the chunk header carries the
+	// generation's CURRENT name, and a retired generation is skipped.
 	// NOTE: on a RESUMED transfer this re-emits ALL tombstones regardless of the
 	// checkpoint's completed tables (tombstones are not tracked per-table there). The
 	// consumer re-writes them idempotently (same key, same bytes) — a deliberate
 	// simplification (correctness over minimal bytes), not a bug.
 	const tsBounds = buildAllTombstonesScanBounds();
 	let tsEntries: Array<SnapshotTombstoneChunk['entries'][number]> = [];
+	let tsGeneration: string | undefined;
 	let tsSchema: string | undefined;
 	let tsTable: string | undefined;
 
@@ -249,15 +266,18 @@ async function* streamSnapshotChunks(
 		const parsed = parseTombstoneKey(entry.key);
 		if (!parsed) continue;
 
-		// Table boundary: flush the prior table's accumulated entries first.
-		if (parsed.schema !== tsSchema || parsed.table !== tsTable) {
+		// Generation boundary: flush the prior table's accumulated entries first.
+		if (parsed.generation !== tsGeneration) {
 			if (tsEntries.length > 0 && tsSchema !== undefined && tsTable !== undefined) {
 				yield buildTombstoneChunk(tsSchema, tsTable, tsEntries);
 			}
 			tsEntries = [];
-			tsSchema = parsed.schema;
-			tsTable = parsed.table;
+			tsGeneration = parsed.generation;
+			const name = ctx.tableIdentity.nameOf(parsed.generation);
+			tsSchema = name?.schema;
+			tsTable = name?.table;
 		}
+		if (tsSchema === undefined || tsTable === undefined) continue; // retired generation
 
 		const tombstone = deserializeTombstone(entry.value);
 		tsEntries.push({
@@ -349,33 +369,42 @@ function parseBootstrapTables(
 
 /**
  * Clear existing CRDT metadata (column versions, tombstones, change log) ahead
- * of applying a snapshot.
+ * of applying a snapshot. The `tg:` name → generation records are left alone:
+ * generations are local, and the rewritten records simply file under the same
+ * ones (a table the snapshot's DDL drops is retired by that DDL's transition).
  *
  * `preserveTables` names `schema.table` keys whose metadata must survive — on a
  * resumed transfer the sender skips already-completed tables and never re-emits
  * their metadata, so blanket-clearing would wipe state that is never rewritten.
- * With an empty `preserveTables` this deletes everything, identical to a fresh
- * full apply.
+ * Each name is mapped to the generation it resolves to NOW (the one the prior
+ * pass filed under); a name with none has nothing to preserve. With an empty
+ * `preserveTables` this deletes everything, identical to a fresh full apply.
  */
 async function clearExistingMetadata(
 	ctx: SyncContext,
 	preserveTables: ReadonlySet<string>,
 ): Promise<void> {
+	const preserveGenerations = new Set<string>();
+	for (const { schema, table } of parseBootstrapTables([...preserveTables])) {
+		const generation = ctx.tableIdentity.generationOf(schema, table);
+		if (generation !== undefined) preserveGenerations.add(generation);
+	}
+
 	const clearBatch = ctx.kv.batch();
 
 	for await (const entry of ctx.kv.iterate(buildAllColumnVersionsScanBounds())) {
 		const parsed = parseColumnVersionKey(entry.key);
-		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		if (parsed && preserveGenerations.has(parsed.generation)) continue;
 		clearBatch.delete(entry.key);
 	}
 	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
 		const parsed = parseTombstoneKey(entry.key);
-		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		if (parsed && preserveGenerations.has(parsed.generation)) continue;
 		clearBatch.delete(entry.key);
 	}
 	for await (const entry of ctx.kv.iterate(buildAllChangeLogScanBounds())) {
 		const parsed = parseChangeLogKey(entry.key);
-		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		if (parsed && preserveGenerations.has(parsed.generation)) continue;
 		clearBatch.delete(entry.key);
 	}
 
@@ -426,7 +455,19 @@ export async function applySnapshotStream(
 		// before the footer emits `status:'synced'` / clears the checkpoint — so the
 		// checkpoint stays in place and the transfer resumes/retries.
 		const ordered = sortMigrationsByHLC(pendingSchemaChanges);
-		await applyDataToStore(ctx, pendingDataChanges, ordered.map(p => p.change), { remote: true, bootstrap: true });
+		const schemaChanges = ordered.map(p => p.change);
+		const result = await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
+		// Table-identity transitions for the DDL that RAN (a replicated drop retires
+		// the name's generation, a rename moves it) — before any of this table's
+		// records are filed at `table-end` / in a tombstone chunk, which the ordering
+		// of the stream guarantees: every migration precedes the first `table-start`,
+		// whose flush is this one. See the same step in change-applicator.ts.
+		const executed = executedSchemaChanges(schemaChanges, result);
+		if (executed.length > 0) {
+			const identityBatch = ctx.kv.batch();
+			applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
+			await identityBatch.write();
+		}
 		// Record each migration only AFTER the apply that admitted it committed. A
 		// record written ahead of its apply survives a FAILED attempt, and the next
 		// attempt's own `toSchemaChangeWithLocalRecord` lookup then returns the

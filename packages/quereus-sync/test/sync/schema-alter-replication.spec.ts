@@ -601,16 +601,25 @@ describe('alter table replication', () => {
 			expect(hasTable(receiver, 'orders2')).to.equal(false);
 		});
 
-		it('an undecidable rename still admits the same batch\'s rows for the OLD name', async () => {
-			// The other half of the case above: an undecidable `rename_table` mentions no old
-			// name, so the simulation records no fate for it at all and the row-admission gate
-			// falls back to the basis. `orders` is still there, so its rows must land — only
-			// the rows for the name the rename failed to bring into being are diverted.
+		it('an undecidable rename diverts the pre-rename rows too: every fact ships under the CURRENT name', async () => {
+			// The other half of the case above. Sync bookkeeping follows the table across
+			// the rename (`metadata/table-identity.ts`), so the origin addresses a row
+			// written BEFORE the rename by the name the table has NOW — `orders2` — exactly
+			// like one written after it. A receiver that cannot decide the rename keeps
+			// `orders`, has no `orders2`, and so diverts both rows; its own `orders` stays
+			// empty rather than receiving a row the origin no longer files there. (A row
+			// for the OLD name can still arrive from a peer that has not seen the rename;
+			// the simulation records no fate for an unmentioned name, so the admission
+			// gate falls back to the basis and lands it — the ordinary data-only path.)
 			await localWrite(origin, "insert into orders (id, note) values (4, 'before')");
 			await localWrite(origin, 'alter table orders rename to orders2');
 			await localWrite(origin, "insert into orders2 (id, note) values (5, 'after')");
 
 			const sets = await origin.manager.getChangesSince(receiver.manager.getSiteId());
+			expect(
+				sets.flatMap(cs => [...cs.changes]).map(c => c.table),
+				'both rows ship under the current name',
+			).to.deep.equal(Array(2 * COLUMNS_PER_FRESH_INSERT).fill('orders2'));
 			const stripped = sets.map(cs => ({
 				...cs,
 				schemaMigrations: cs.schemaMigrations.map(m =>
@@ -620,13 +629,13 @@ describe('alter table replication', () => {
 			const result = await receiver.manager.applyChanges(stripped);
 			await settle();
 
-			expect(result.applied, 'the rename migration plus the pre-rename row\'s columns')
-				.to.equal(1 + COLUMNS_PER_FRESH_INSERT);
-			expect(result.unknownTable, 'only the post-rename row is diverted')
-				.to.equal(COLUMNS_PER_FRESH_INSERT);
-			expect(await collect(receiver.db, 'select id, note from orders order by id'))
-				.to.deep.equal([{ id: 4, note: 'before' }]);
+			expect(result.applied, 'only the rename migration is recorded').to.equal(1);
+			expect(result.unknownTable, 'both rows are diverted').to.equal(2 * COLUMNS_PER_FRESH_INSERT);
+			expect(await collect(receiver.db, 'select id, note from orders order by id'), 'orders stays empty')
+				.to.deep.equal([]);
 			expect(hasTable(receiver, 'orders2')).to.equal(false);
+			expect(await receiver.manager.quarantine.list('main', 'orders2'))
+				.to.have.lengthOf(2 * COLUMNS_PER_FRESH_INSERT);
 		});
 	});
 

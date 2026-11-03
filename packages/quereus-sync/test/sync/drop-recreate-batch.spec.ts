@@ -20,10 +20,11 @@
  * undone locally must not resurrect the table in the prediction.
  *
  * The `freshLocalTable` half of the verdict tracks table IDENTITY, not the name: read-free
- * resolution skips the LWW comparison, so it is reserved for a name whose stranded
- * bookkeeping belongs to some other table. A re-delivered batch changes no local schema,
- * and a name renamed away and back gets its own table returned to it; both resolve
- * normally.
+ * resolution skips the LWW comparison, so it is reserved for a name whose CURRENT
+ * generation (the one Phase 1 can still read it by, before Phase 2 retires or moves it —
+ * `metadata/table-identity.ts`) belongs to a table the batch destroys. A re-delivered
+ * batch changes no local schema, and a name renamed away and back gets its own table
+ * returned to it; both resolve normally.
  *
  * Every spec here runs on real `Database` peers (`_peer-harness.ts`), so it asserts what
  * `select` returns, not what the metadata believes.
@@ -137,9 +138,13 @@ describe('drop + re-create in one batch', () => {
 		}
 	});
 
-	// The other half of the same rule: a TRAILING drop_table still hides the table, so
-	// its rows divert exactly as before.
-	it('a trailing drop_table still hides the table and diverts its rows', async () => {
+	// The other half of the same rule: a TRAILING drop_table still hides the table. The
+	// receiver-side half — rows that DO arrive for such a name divert — is pinned over a
+	// synthesized batch in `unknown-table-disposition.spec.ts` ('diverts changes to a
+	// table the batch drops'). Over real peers none arrive: the drop retired the table's
+	// generation on the origin (`metadata/table-identity.ts`), so the dropped
+	// incarnation's facts are orphans that no delta pull carries.
+	it('a trailing drop_table ships none of the dropped table\'s rows and leaves it absent', async () => {
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver', { disposition: 'quarantine' });
 		try {
@@ -147,13 +152,19 @@ describe('drop + re-create in one batch', () => {
 			await localWrite(origin, "insert into widgets (id, w) values (1, 'doomed')");
 			await localWrite(origin, 'drop table widgets');
 
-			const result = await receiver.manager.applyChanges(
-				await origin.manager.getChangesSince(receiver.manager.getSiteId()),
-			);
+			const sets = await origin.manager.getChangesSince(receiver.manager.getSiteId());
+			expect(
+				sets.flatMap(cs => [...cs.changes]).filter(c => c.table === 'widgets'),
+				'the origin retired the dropped incarnation\'s generation, so none of its facts ship',
+			).to.have.lengthOf(0);
+			expect(sets.flatMap(cs => [...cs.schemaMigrations]).map(m => m.type), 'the DDL still ships')
+				.to.include('drop_table');
 
-			expect(result.unknownTable, 'rows for the dropped table are diverted').to.be.greaterThan(0);
+			const result = await receiver.manager.applyChanges(sets);
+
+			expect(result.unknownTable, 'nothing arrives to divert').to.equal(undefined);
 			expect(receiver.db.schemaManager.getTable('main', 'widgets')).to.equal(undefined);
-			expect(await receiver.manager.quarantine.list('main', 'widgets')).to.have.lengthOf(result.unknownTable!);
+			expect(await receiver.manager.quarantine.list('main', 'widgets')).to.have.lengthOf(0);
 		} finally {
 			await closePeer(origin);
 			await closePeer(receiver);
@@ -328,9 +339,10 @@ describe('drop + re-create in one batch', () => {
 	it('a name RENAMED away and re-created in one batch resolves read-free too', async () => {
 		// The rename arm of the same verdict: a `rename_table` VACATES the old name, so a
 		// table CREATED under that name in the same batch is a fresh incarnation exactly
-		// as after a `drop_table`. The metadata stranded under the name belongs to the
-		// table that was renamed AWAY, so consulting it would let its tombstone discard
-		// the new incarnation's row. (`computeBatchTableFates` in `change-applicator.ts`.)
+		// as after a `drop_table`. At Phase 1 the name still resolves to the generation
+		// of the table being renamed AWAY (Phase 2 moves it), so consulting it would let
+		// that table's tombstone discard the new incarnation's row.
+		// (`computeBatchTableFates` in `change-applicator.ts`.)
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver');
 		try {
@@ -366,10 +378,10 @@ describe('drop + re-create in one batch', () => {
 	it('a table swapped INTO a vacated name is fresh: the vacated name\'s tombstone does not block it', async () => {
 		// The table-swap migration shape — build the replacement under a scratch name, drop
 		// the old table, rename the replacement into its place — all in one batch. What ends
-		// up at `widgets` is the freshly created `staging`, so the metadata stranded at
-		// `widgets` describes a table that no longer exists and must not be consulted.
-		// Contrast the spec below, where the name is vacated by a rename AWAY and the SAME
-		// table comes back to it: there the stranded metadata is that table's own.
+		// up at `widgets` is the freshly created `staging`, so the generation `widgets`
+		// resolves to at Phase 1 describes a table the batch destroys and must not be
+		// consulted. Contrast the spec below, where the name is vacated by a rename AWAY
+		// and the SAME table comes back to it: there that generation is the table's own.
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver');
 		try {
@@ -401,8 +413,8 @@ describe('drop + re-create in one batch', () => {
 	});
 
 	// The CONTRAST to the spec above: the name is vacated by a rename AWAY, and the table
-	// that comes back to it is the SAME one, still described by the bookkeeping filed
-	// there — so its changes must resolve against the receiver's stored
+	// that comes back to it is the SAME one, with the same generation and so the same
+	// bookkeeping — so its changes must resolve against the receiver's stored
 	// metadata like any other. Judging `widgets` fresh here let the origin's update
 	// resolve READ-FREE, straight past the receiver's own tombstone for the row, and a
 	// row the receiver had deleted came back under the default `allowResurrection: false`.

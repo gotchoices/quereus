@@ -1671,12 +1671,16 @@ describe('SyncManager', () => {
     /**
      * Whether any `cv:` record was filed for `(schema, table)`. Parses each key
      * rather than matching a literal prefix — every component of a metadata key
-     * is length-prefixed, so the literal spelling is an implementation detail.
+     * is length-prefixed, so the literal spelling is an implementation detail —
+     * and resolves the key's table generation back to its name, since a name
+     * never appears in a `cv:` key.
      */
-    const hasColumnVersionFor = async (schema: string, table: string): Promise<boolean> => {
+    const hasColumnVersionFor = async (manager: SyncManagerImpl, schema: string, table: string): Promise<boolean> => {
       for await (const entry of kv.iterate()) {
         const parsed = parseColumnVersionKey(entry.key);
-        if (parsed?.schema === schema && parsed.table === table) return true;
+        if (!parsed) continue;
+        const name = manager.tableIdentity.nameOf(parsed.generation);
+        if (name?.schema === schema && name.table === table) return true;
       }
       return false;
     };
@@ -1932,7 +1936,7 @@ describe('SyncManager', () => {
 
         // No oracle ⇒ every table reports in-basis ⇒ nothing is skipped.
         expect(warnings.filter(w => w.includes('Skipped'))).to.have.lengthOf(0);
-        expect(await hasColumnVersionFor('main', 'test')).to.be.true;
+        expect(await hasColumnVersionFor(manager, 'main', 'test')).to.be.true;
       } finally {
         console.warn = origWarn;
       }
@@ -1965,7 +1969,7 @@ describe('SyncManager', () => {
         expect(skips[0]).to.include('unresolvable');
 
         // Nothing recorded: no `cv:` column-version record for the skipped table.
-        expect(await hasColumnVersionFor('main', 'test')).to.be.false;
+        expect(await hasColumnVersionFor(manager, 'main', 'test')).to.be.false;
       } finally {
         console.warn = origWarn;
       }

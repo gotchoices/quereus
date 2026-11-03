@@ -15,6 +15,7 @@ import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import type { QuarantineStore } from '../metadata/quarantine.js';
 import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
+import type { TableIdentityStore } from '../metadata/table-identity.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
 import type { StagedRowState } from './staged-transaction-metadata.js';
@@ -36,11 +37,27 @@ export interface SyncContext {
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
 	readonly basisLifecycle: BasisLifecycleStore;
+	/**
+	 * The name ↔ generation map every `cv:`/`tb:`/`cl:` record is keyed through
+	 * (see `metadata/table-identity.ts`). The record stores resolve it themselves;
+	 * sub-modules use it to apply DDL transitions and to resolve a parsed key's
+	 * generation back to the table's current name.
+	 */
+	readonly tableIdentity: TableIdentityStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;
+
+	/**
+	 * Resolves once every local commit enqueued so far has been recorded. Local
+	 * capture runs on an async chain behind the engine commit, so an inbound apply
+	 * must drain it before reading or writing identity-keyed metadata — otherwise a
+	 * local rename whose `move` has not landed yet lets the apply mint a second
+	 * generation for the new name (see `applyChanges`).
+	 */
+	whenCommitsSettled(): Promise<void>;
 
 	/**
 	 * Per-table pk-identity keying (key collation normalizers + semantic key

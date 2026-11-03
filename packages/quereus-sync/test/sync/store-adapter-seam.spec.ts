@@ -798,7 +798,10 @@ describe('store-adapter seam integration', () => {
 				'completed-table tombstone preserved on resume',
 			).to.exist;
 			const clTables = new Set<string>();
-			for await (const e of syncManager.changeLog.getAllChanges()) clTables.add(e.table);
+			for await (const e of syncManager.changeLog.getAllChanges()) {
+				const name = syncManager.tableIdentity.nameOf(e.generation);
+				if (name) clTables.add(name.table);
+			}
 			void expect(clTables.has('tableA'), 'completed-table change-log entry preserved on resume').to.be.true;
 
 			// ...while the non-completed tableC's tb:/cl: state was cleared.

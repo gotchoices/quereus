@@ -32,17 +32,20 @@ import {
   type SchemaMigration,
   type UnknownTableDisposition,
 } from '../../src/sync/protocol.js';
-import { InMemoryKVStore, type KVStore } from '@quereus/store';
-import { buildTableColumnVersionScanBounds, buildTombstoneScanBounds } from '../../src/metadata/keys.js';
+import { InMemoryKVStore } from '@quereus/store';
 import { generateSiteId, siteIdEquals, type SiteId } from '../../src/clock/site.js';
 import { compareHLC, createHLC } from '../../src/clock/hlc.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
-/** Count keys in a KV range — schema-free probe for "no metadata written". */
-async function countKeys(kv: KVStore, bounds: { gte: Uint8Array; lt: Uint8Array }): Promise<number> {
-  let n = 0;
-  for await (const _entry of kv.iterate(bounds)) n++;
-  return n;
+/**
+ * Schema-free probe for "no metadata written": every `cv:`/`tb:`/`cl:` record is
+ * keyed by the table's generation, and a generation is minted into the same batch
+ * as the first record filed for a name — so a name with NO generation has no
+ * record of any kind.
+ */
+function expectNoRecordsFor(manager: SyncManagerImpl, schema: string, table: string): void {
+  expect(manager.tableIdentity.generationOf(schema, table), `no generation minted for ${schema}.${table}`)
+    .to.be.undefined;
 }
 
 interface ApplyCall {
@@ -245,8 +248,7 @@ describe('unknown-table disposition', () => {
       // No column version, no tombstone for the retired table. Probed by keyspace
       // scan: the retired table has no schema, so pk-based lookups (which resolve
       // the pk identity through the schema oracle) would throw by design.
-      expect(await countKeys(h.manager.kv, buildTableColumnVersionScanBounds('main', RETIRED))).to.equal(0);
-      expect(await countKeys(h.manager.kv, buildTombstoneScanBounds('main', RETIRED))).to.equal(0);
+      expectNoRecordsFor(h.manager, 'main', RETIRED);
 
       // getChangesSince surfaces nothing for the retired table.
       const sets = await h.manager.getChangesSince(generateSiteId());
@@ -344,8 +346,7 @@ describe('unknown-table disposition', () => {
         del(h.remoteSite, 1001, RETIRED, 2),
       ])]);
 
-      expect(await countKeys(h.manager.kv, buildTableColumnVersionScanBounds('main', RETIRED))).to.equal(0);
-      expect(await countKeys(h.manager.kv, buildTombstoneScanBounds('main', RETIRED))).to.equal(0);
+      expectNoRecordsFor(h.manager, 'main', RETIRED);
     });
 
     it('idempotent re-apply keeps exactly one forwardable entry per change', async () => {

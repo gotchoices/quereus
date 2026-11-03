@@ -232,6 +232,15 @@ export {
   createPkKeyingResolver,
   makePkIdentityEncoder,
   SYNC_METADATA_FORMAT_VERSION,
+  // Table identity (the per-peer generation every per-row record is keyed by)
+  type TableGeneration,
+  type TableIdentityResolver,
+  TableIdentityStore,
+  applySchemaChangeTransitions,
+  buildTableGenerationKey,
+  parseTableGenerationKey,
+  buildAllTableGenerationScanBounds,
+  mintTableGeneration,
   // Column versions
   type ColumnVersion,
   type ColumnVersionData,

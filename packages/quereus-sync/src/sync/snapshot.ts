@@ -15,6 +15,7 @@ import {
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	encodePkIdentity,
+	joinKeyParts,
 } from '../metadata/keys.js';
 import {
 	SNAPSHOT_WIRE_FORMAT_VERSION,
@@ -38,12 +39,17 @@ import {
 	type ReconciledRow,
 } from './snapshot-identity.js';
 import { admitGroup } from './admission.js';
+import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
 
 /**
  * Get a full snapshot of all data and schema state.
+ *
+ * Records are keyed by table GENERATION and grouped by it; each group ships under
+ * the generation's CURRENT name, and a retired generation (a dropped table's
+ * leftovers) is skipped — same as the streaming producer.
  */
 export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
-	// Collect all column versions, grouped by table and row
+	// Collect all column versions, grouped by table generation and row
 	type RowVersions = Map<string, ColumnVersion>;
 	type TableRows = Map<string, RowVersions>;
 	type TableEntry = { schema: string; table: string; rows: TableRows };
@@ -53,17 +59,18 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	for await (const entry of ctx.kv.iterate(cvBounds)) {
 		const parsed = parseColumnVersionKey(entry.key);
 		if (!parsed) continue;
+		const name = ctx.tableIdentity.nameOf(parsed.generation);
+		if (!name) continue;
 
 		const cv = deserializeColumnVersion(entry.value);
-		const tableKey = `${parsed.schema}.${parsed.table}`;
 		// The parsed pk IDENTITY groups one row's cells; the raw pk (needed to
 		// address the row on the receiver) rides in each cell's record value.
 		const rowKey = parsed.identity;
 
-		if (!tableData.has(tableKey)) {
-			tableData.set(tableKey, { schema: parsed.schema, table: parsed.table, rows: new Map() });
+		if (!tableData.has(parsed.generation)) {
+			tableData.set(parsed.generation, { schema: name.schema, table: name.table, rows: new Map() });
 		}
-		const tableRows = tableData.get(tableKey)!.rows;
+		const tableRows = tableData.get(parsed.generation)!.rows;
 
 		if (!tableRows.has(rowKey)) {
 			tableRows.set(rowKey, new Map());
@@ -72,9 +79,12 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		rowVersions.set(parsed.column, cv);
 	}
 
-	// Build table snapshots
+	// Build table snapshots, in name order (the scan's generation order is random
+	// per peer; see the streaming producer for why a deterministic order matters).
 	const tables: TableSnapshot[] = [];
-	for (const { schema, table, rows } of tableData.values()) {
+	const ordered = [...tableData.values()]
+		.sort((a, b) => joinKeyParts(a.schema, a.table).localeCompare(joinKeyParts(b.schema, b.table)));
+	for (const { schema, table, rows } of ordered) {
 		const columnVersions: ColumnVersionEntry[] = [];
 
 		for (const rowVersionsMap of rows.values()) {
@@ -99,11 +109,13 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
 		const parsed = parseTombstoneKey(entry.key);
 		if (!parsed) continue;
+		const name = ctx.tableIdentity.nameOf(parsed.generation);
+		if (!name) continue;
 
 		const ts = deserializeTombstone(entry.value);
 		tombstones.push({
-			schema: parsed.schema,
-			table: parsed.table,
+			schema: name.schema,
+			table: name.table,
 			pk: ts.pk,
 			hlc: ts.hlc,
 			createdAt: ts.createdAt,
@@ -209,11 +221,20 @@ export async function applySnapshot(
 		dataChanges: dataChangesToApply,
 		schemaChanges: schemaChangesToApply,
 		applyOptions: { remote: true, bootstrap: true },
-		commitMetadata: async () => {
+		commitMetadata: async (executed) => {
 			// Runs AFTER the data apply, so every snapshot table (including ones the
 			// snapshot's own `create table` migration installed) has a resolvable
 			// schema — local keying is derivable here.
 			const resolveKeying = createSnapshotKeyingResolver(ctx);
+
+			// Table-identity transitions for the DDL that RAN (a replicated drop
+			// retires the name's generation, a rename moves it), before the rewrite
+			// below files anything — see the same step in change-applicator.ts.
+			if (executed.length > 0) {
+				const identityBatch = ctx.kv.batch();
+				applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
+				await identityBatch.write();
+			}
 
 			// Clear existing CRDT metadata and apply new
 			const clearBatch = ctx.kv.batch();

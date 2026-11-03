@@ -13,6 +13,7 @@ import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
+import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
 import type {
 	ChangeSet,
 	Change,
@@ -55,8 +56,11 @@ export interface ResolvedChange {
 	 */
 	priorErasedByInBatchDelete?: boolean;
 	/**
-	 * Table exists only via this same batch's create_table — no local schema (and so
-	 * no resolvable pk-identity keying) until Phase 2's DDL runs.
+	 * The table this change is for has no history to resolve against at Phase 1:
+	 * it exists only via this same batch's DDL (no local schema, and so no
+	 * resolvable pk-identity keying, until Phase 2 runs), or the batch's DDL
+	 * replaces the generation its name currently resolves to (see
+	 * {@link BatchTableFate.historyName}).
 	 */
 	freshLocalTable?: boolean;
 }
@@ -84,14 +88,19 @@ interface BatchTableFate {
 	/** The table exists after this batch's schema steps replay in timestamp order. */
 	present: boolean;
 	/**
-	 * The name this name's surviving table has its sync bookkeeping (`cv:`/`tb:`/`cl:`)
-	 * filed under, or `undefined` when it has none — the name ends up empty, or its table
-	 * was CREATED by this batch. The bookkeeping is keyed by table name and nothing
-	 * re-files it on a rename (`bug-sync-rename-and-pk-change-strand-crdt-metadata`), so
-	 * this is the name's own key for a table that stays put and the OLD name for one that
-	 * arrives by rename. `historyName !== key` on a PRESENT name therefore means the
-	 * bookkeeping stranded there describes a table that is no longer there — exactly the
-	 * read-free (`freshLocalTable`) condition at the resolve site.
+	 * The name whose CURRENT generation (`metadata/table-identity.ts`) is the one
+	 * this name's surviving table will carry once the batch's DDL has run, or
+	 * `undefined` when it will carry none the receiver has yet — the name ends up
+	 * empty, or its table was CREATED by this batch (a fresh generation). Phase 1
+	 * resolves BEFORE Phase 2 moves or retires anything, so the only generation it
+	 * can read for a name is the one the name resolves to NOW: that is the name's own
+	 * key for a table that stays put, and the OLD name for a table that arrives by
+	 * rename (its generation still answers to the old name until the move lands).
+	 * `historyName !== key` on a PRESENT name therefore means "the generation this
+	 * name resolves to now is replaced by this batch" — its records belong to the
+	 * incarnation the batch is about to destroy, and resolving against them would
+	 * let a stale tombstone discard the arriving rows: exactly the read-free
+	 * (`freshLocalTable`) condition at the resolve site.
 	 */
 	historyName: string | undefined;
 }
@@ -123,11 +132,13 @@ interface BatchTableFate {
  *   resurrect a state the receiver has since moved past.
  *
  * The simulation tracks WHICH table ends up at each name, not merely whether one does:
- * {@link BatchTableFate.historyName} follows the table, the sync bookkeeping does not.
- * That is what separates the two ways a name is vacated and refilled — a `drop_table`
- * destroys its occupant, so anything arriving afterwards is a stranger to the
- * bookkeeping left behind, while a rename-away followed by a rename BACK returns the
- * very table the bookkeeping describes.
+ * {@link BatchTableFate.historyName} follows the table, as the generation-keyed
+ * bookkeeping will once Phase 2 has run — but Phase 1 reads it by the name it answers
+ * to NOW. That is what separates the two ways a name is vacated and refilled — a
+ * `drop_table` destroys its occupant (the generation is retired and the re-create mints
+ * a fresh one, so the rows must not consult the records the name resolves to today),
+ * while a rename-away followed by a rename BACK returns the very table, and the very
+ * generation, those records describe.
  */
 function computeBatchTableFates(
 	migrations: readonly SchemaMigration[],
@@ -138,7 +149,7 @@ function computeBatchTableFates(
 		const key = tableKey(schema, table);
 		let fate = fates.get(key);
 		if (!fate) {
-			// A table the receiver already holds has its bookkeeping under its own name.
+			// A table the receiver already holds resolves to its own generation by its own name.
 			//
 			// NOTE: the seed reads the `getTableSchema` basis oracle while Phase 2 decides
 			// the DDL against `db.schemaManager` directly. The shipped wiring makes them the
@@ -184,7 +195,8 @@ function computeBatchTableFates(
 				// collision and the whole admission unit aborts; predict no movement.
 				if (!from.present || to.present) break;
 				to.present = true;
-				// The table moves; its bookkeeping stays where it was filed.
+				// The table moves, and Phase 2 will move its generation with it; until
+				// then that generation still answers to the OLD name.
 				to.historyName = from.historyName;
 				from.present = false;
 				from.historyName = undefined;
@@ -267,6 +279,14 @@ export async function applyChanges(
 			throw error;
 		}
 	}
+
+	// NOTE: orders this apply AFTER every local commit already enqueued. Local capture
+	// runs on the async commit chain behind the engine commit, so a local `rename to`
+	// can have committed in the engine while its identity `move` has not landed yet;
+	// resolving against the NEW name here would read nothing, and the metadata commit
+	// below would then mint a second generation for a name whose table already has one
+	// (the chain's later `move` then collides). The chain tail is cheap when idle.
+	await ctx.whenCommitsSettled();
 
 	// PHASE 1a: Schema migrations, batch-wide and HLC-ordered (DDL before DML — the
 	// whole batch's schema changes run before any of its data, see admitGroup). Two
@@ -358,28 +378,30 @@ export async function applyChanges(
 			// Resolve it read-free rather than throwing from the keying resolver;
 			// Phase 3's metadata commit runs after the DDL, when the keying resolves.
 			//
-			// A table this batch leaves under a name whose stranded bookkeeping describes
-			// some OTHER table counts as fresh too, even when the receiver already has the
-			// name: dropping or renaming a table does not move its cell versions and
-			// tombstones, so resolving these rows against them would let a stale tombstone
-			// silently discard them under the default `allowResurrection: false`. That is
-			// `fate.historyName !== key` — a drop-then-re-create, or a swap that renames a
-			// different table into the vacated name. A RE-DELIVERED drop/re-create batch —
-			// every schema step dominated, no local schema changed, the local table already
-			// the post-re-create incarnation — keeps `historyName === key` and resolves
-			// normally against that incarnation's own metadata, and so does a name renamed
-			// AWAY and BACK in one batch: the same table returns to its own bookkeeping.
-			// (The broader question of a re-created table INHERITING that bookkeeping —
-			// purge policy, relays, retention horizon — is tracked separately; this only
-			// stops the in-batch recreate consulting it.)
+			// A table this batch leaves under a name whose CURRENT generation the batch
+			// replaces counts as fresh too, even when the receiver already has the name.
+			// Phase 1 resolves before Phase 2 retires or moves anything, so a read by this
+			// name today reaches the records of the incarnation the batch is about to
+			// destroy, and a stale tombstone there would silently discard the arriving rows
+			// under the default `allowResurrection: false`. That is `fate.historyName !==
+			// key` — a drop-then-re-create, or a swap that renames a different table into
+			// the vacated name. A RE-DELIVERED drop/re-create batch — every schema step
+			// dominated, no local schema changed, the local table already the post-re-create
+			// incarnation under its own fresh generation — keeps `historyName === key` and
+			// resolves normally against that incarnation's own metadata, and so does a name
+			// renamed AWAY and BACK in one batch: the same generation returns to its own
+			// name. (Across SEPARATE batches no simulation is needed: the drop retired the
+			// old generation and the re-create minted a fresh one, so the name's reads
+			// already find nothing of the old incarnation's.)
 			//
 			// NOTE: `!inBasis` still resolves read-free for a table that arrives under a
-			// name the receiver does NOT currently have, including by rename. That name may
-			// carry metadata stranded by an earlier incarnation, which the arriving table's
-			// rows then skip. Unavoidable today — an out-of-basis name has no schema and so
-			// no resolvable pk keying — and the same for `create_table`; if the stranded
-			// bookkeeping is ever purged or re-keyed on drop/rename
-			// (`bug-sync-recreated-table-inherits-dropped-table-metadata`), narrow this.
+			// name the receiver does NOT currently have, including by rename. An
+			// out-of-basis name has no schema and so no resolvable pk keying, and the
+			// renamed table's generation still answers to its OLD name at this point. The
+			// bookkeeping now follows the table, so `fate.historyName` names where that
+			// history can be read (the old name, in basis, with a resolvable keying); if an
+			// arriving rename ever needs its rows resolved against the moved table's own
+			// tombstones and cell versions rather than read-free, resolve by that name here.
 			const freshLocalTable = !inBasis || (fate !== undefined && fate.historyName !== key);
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
@@ -424,7 +446,23 @@ export async function applyChanges(
 		dataChanges: dataChangesToApply,
 		schemaChanges: schemaChangesToApply,
 		applyOptions: { remote: true },
-		commitMetadata: async () => {
+		commitMetadata: async (executed) => {
+			// Table-identity transitions for the DDL Phase 2 actually RAN — a drop retires
+			// the name's generation, a rename moves it, a create ensures one — committed
+			// BEFORE any row record is filed, so the batch's rows for a re-created name
+			// land under the fresh generation and a renamed table's land under its moved
+			// one. `already-applied` DDL is absent from `executed`: its table, and so its
+			// bookkeeping, survived untouched (a local rename already moved it).
+			// NOTE: drains the commit chain again first — Phase 2 ran engine statements,
+			// and a local commit that slipped in between must have its own transition
+			// recorded before this one files anything under the same names.
+			await ctx.whenCommitsSettled();
+			if (executed.length > 0) {
+				const identityBatch = ctx.kv.batch();
+				applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
+				await identityBatch.write();
+			}
+
 			await commitChangeMetadata(ctx, resolvedDataChanges);
 
 			// Commit schema migration metadata
@@ -618,7 +656,7 @@ function emitRemoteChanges(
 	}
 }
 
-// NOTE: this file is 1204 lines (`wc -l`), second-largest in the package. The drain
+// NOTE: this file is ~1250 lines (`wc -l`), second-largest in the package. The drain
 // block below (`drainHeldChanges` → `drainReappearedTables`) shares only `resolveChange`,
 // `reconcileInBatchDeletes`, `commitChangeMetadata`, and `admitGroup` with the wire-apply
 // half above, so it is the natural seam if the file keeps growing.
@@ -690,6 +728,10 @@ async function drainTableGroup(
 	const columns = ctx.getTableColumnNames(group.schema, group.table);
 	if (columns === undefined) return 0;
 	const columnSet = new Set(columns);
+
+	// Same ordering need as `applyChanges`: a drain reads and files identity-keyed
+	// metadata, so a local rename still on the commit chain must land first.
+	await ctx.whenCommitsSettled();
 
 	const resolvedDataChanges: ResolvedChange[] = [];
 	const appliedEntries: Array<{ change: Change; siteId: SiteId }> = [];

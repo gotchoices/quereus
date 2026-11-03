@@ -144,11 +144,15 @@ describe('dotted table name (quoted identifier containing a dot)', () => {
 				// Raw-key seed via the key builder directly: "a.b" does not exist locally
 				// in this test (only its metadata survives via the checkpoint), so a
 				// store-level pk-based write — which resolves the identity through the
-				// schema oracle — would throw by design.
-				await kv.put(
-					buildColumnVersionKey('main', 'a.b', encodeRawPkIdentity(['a1']), 'v'),
+				// schema oracle — would throw by design. The record files under the
+				// name's generation, minted into the same batch.
+				const seedBatch = kv.batch();
+				const generation = syncManager.tableIdentity.ensure('main', 'a.b', seedBatch);
+				seedBatch.put(
+					buildColumnVersionKey(generation, encodeRawPkIdentity(['a1']), 'v'),
 					serializeColumnVersion({ hlc: remoteHLC.tick(), value: 'survives', pk: ['a1'] }),
 				);
+				await seedBatch.write();
 				const checkpoint = {
 					snapshotId,
 					siteId: remoteSiteId,

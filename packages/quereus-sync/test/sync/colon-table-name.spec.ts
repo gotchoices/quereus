@@ -189,11 +189,15 @@ describe('colon table name (quoted identifier containing a colon)', () => {
 
 			// Seed via the key builder directly: "a:b" does not exist locally in this
 			// test, so a store-level pk write (which resolves identity through the
-			// schema oracle) would throw by design.
-			await kv.put(
-				buildColumnVersionKey('main', 'a:b', encodeRawPkIdentity(['a1']), 'v'),
+			// schema oracle) would throw by design. The record files under the name's
+			// generation, minted into the same batch.
+			const seedBatch = kv.batch();
+			const generation = syncManager.tableIdentity.ensure('main', 'a:b', seedBatch);
+			seedBatch.put(
+				buildColumnVersionKey(generation, encodeRawPkIdentity(['a1']), 'v'),
 				serializeColumnVersion({ hlc: remoteHLC.tick(), value: 'survives', pk: ['a1'] }),
 			);
+			await seedBatch.write();
 
 			const checkpoint = {
 				snapshotId,
@@ -237,7 +241,7 @@ describe('colon table name (quoted identifier containing a colon)', () => {
 			const survivors: string[] = [];
 			for await (const entry of kv.iterate()) {
 				const parsed = parseColumnVersionKey(entry.key);
-				if (parsed?.table === 'a:b') survivors.push(parsed.column);
+				if (parsed && syncManager.tableIdentity.nameOf(parsed.generation)?.table === 'a:b') survivors.push(parsed.column);
 			}
 			expect(survivors, 'the preserved table\'s cells were not wiped').to.deep.equal(['v']);
 		} finally {

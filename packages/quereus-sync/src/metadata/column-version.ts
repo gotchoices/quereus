@@ -10,6 +10,7 @@ import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
 import { buildColumnVersionKey, buildColumnVersionScanBounds, encodePkIdentity, parseColumnVersionKey } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
+import type { TableIdentityResolver } from './table-identity.js';
 
 /**
  * Column version record stored in the KV store.
@@ -160,12 +161,18 @@ export function decodeSqlValue(v: unknown): SqlValue {
  *
  * Every pk-taking method derives the record key's pk IDENTITY through the
  * per-table {@link PkKeyingResolver} passed at construction, so callers keep
- * addressing rows by raw pk while the storage keys collapse spellings.
+ * addressing rows by raw pk while the storage keys collapse spellings. The
+ * table component of the key is the table's GENERATION, resolved through the
+ * {@link TableIdentityResolver}: a read for a name that has never filed anything
+ * finds nothing, and a batch write mints the name's generation into the SAME
+ * batch, so the record and the mapping that makes it reachable commit together
+ * (see `metadata/table-identity.ts`).
  */
 export class ColumnVersionStore {
   constructor(
     private readonly kv: KVStore,
     private readonly keying: PkKeyingResolver,
+    private readonly tables: TableIdentityResolver,
   ) {}
 
   private identity(schemaName: string, tableName: string, pk: SqlValue[]): string {
@@ -181,27 +188,32 @@ export class ColumnVersionStore {
     pk: SqlValue[],
     column: string
   ): Promise<ColumnVersion | undefined> {
-    return this.getColumnVersionByIdentity(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
+    // Keying first: an unknown-to-the-oracle table still throws there (by design,
+    // see pk-identity.ts) before the generation lookup can report "nothing filed".
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return undefined;
+    return this.getColumnVersionByIdentity(generation, identity, column);
   }
 
   /**
-   * Get the version of a specific column by pk IDENTITY (as recovered from a
-   * parsed `cv:`/`cl:` key — no raw pk needed).
+   * Get the version of a specific column by table generation and pk IDENTITY
+   * (as recovered from a parsed `cv:`/`cl:` key — no name and no raw pk needed).
    */
   async getColumnVersionByIdentity(
-    schemaName: string,
-    tableName: string,
+    generation: string,
     identity: string,
     column: string
   ): Promise<ColumnVersion | undefined> {
-    const key = buildColumnVersionKey(schemaName, tableName, identity, column);
+    const key = buildColumnVersionKey(generation, identity, column);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeColumnVersion(data);
   }
 
   /**
-   * Set the version of a specific column.
+   * Set the version of a specific column (standalone write — one batch, so the
+   * generation mint, when needed, lands with the record).
    */
   async setColumnVersion(
     schemaName: string,
@@ -210,8 +222,9 @@ export class ColumnVersionStore {
     column: string,
     version: ColumnVersionData
   ): Promise<void> {
-    const key = buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
-    await this.kv.put(key, serializeColumnVersion({ ...version, pk }));
+    const batch = this.kv.batch();
+    this.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
+    await batch.write();
   }
 
   /**
@@ -219,7 +232,8 @@ export class ColumnVersionStore {
    * locally through this store's keying resolver — there is deliberately no
    * caller-supplied-identity variant (a snapshot receiver trusting a sender's
    * identity was the bug fixed by deriving on ingress; see docs/sync.md
-   * § Row identity vs. address).
+   * § Row identity vs. address). The table generation is ensured into the same
+   * batch.
    */
   setColumnVersionBatch(
     batch: WriteBatch,
@@ -229,8 +243,9 @@ export class ColumnVersionStore {
     column: string,
     version: ColumnVersionData
   ): void {
-    const key = buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
-    batch.put(key, serializeColumnVersion({ ...version, pk }));
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.ensure(schemaName, tableName, batch);
+    batch.put(buildColumnVersionKey(generation, identity, column), serializeColumnVersion({ ...version, pk }));
   }
 
   /**
@@ -242,8 +257,10 @@ export class ColumnVersionStore {
     pk: SqlValue[]
   ): Promise<Map<string, ColumnVersion>> {
     const identity = this.identity(schemaName, tableName, pk);
-    const bounds = buildColumnVersionScanBounds(schemaName, tableName, identity);
     const versions = new Map<string, ColumnVersion>();
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return versions;
+    const bounds = buildColumnVersionScanBounds(generation, identity);
 
     for await (const entry of this.kv.iterate(bounds)) {
       // Every key component is length-prefixed, so the column name comes back
@@ -271,7 +288,12 @@ export class ColumnVersionStore {
     pk: SqlValue[],
     column: string
   ): void {
-    batch.delete(buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column));
+    const identity = this.identity(schemaName, tableName, pk);
+    // A staged-only cell was written through `setColumnVersionBatch`, which ensured
+    // the generation, so a name with none has nothing staged or committed to delete.
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return;
+    batch.delete(buildColumnVersionKey(generation, identity, column));
   }
 
   /**
@@ -299,12 +321,14 @@ export class ColumnVersionStore {
   ): Promise<Map<string, ColumnVersion>> {
     const identity = this.identity(schemaName, tableName, pk);
     const versions = await this.getRowVersions(schemaName, tableName, pk);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return versions; // nothing filed ⇒ `versions` is empty
     for (const column of [...versions.keys()]) {
       if (keepColumns?.has(column)) {
         versions.delete(column);
         continue;
       }
-      batch.delete(buildColumnVersionKey(schemaName, tableName, identity, column));
+      batch.delete(buildColumnVersionKey(generation, identity, column));
     }
     return versions;
   }
