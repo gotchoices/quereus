@@ -95,7 +95,10 @@ import {
 	listSnapshotCheckpoints as listSnapshotCheckpointsImpl,
 	clearSnapshotCheckpoint as clearSnapshotCheckpointImpl,
 } from './snapshot-checkpoint.js';
-import { findTablesWithUnrecordedRows as findTablesWithUnrecordedRowsImpl } from './unrecorded-rows.js';
+import {
+	adoptUnrecordedRows as adoptUnrecordedRowsImpl,
+	findTablesWithUnrecordedRows as findTablesWithUnrecordedRowsImpl,
+} from './unrecorded-rows.js';
 
 /**
  * Guard a transaction's running `opSeq` against the uint32 bound. `opSeq` is
@@ -221,6 +224,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	// Settles when every apply started so far has. See whenAppliesSettled.
 	private appliesInFlight: Promise<void> = Promise.resolve();
+
+	// Settles when every adoption started so far has. A snapshot apply waits on it: see applySnapshot.
+	private adoptionsInFlight: Promise<void> = Promise.resolve();
 
 	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
 	// basis-drift warning in recordLensDeployment — a warning, not durable state.
@@ -803,84 +809,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Record CRDT metadata for one committed local transaction.
-	 *
-	 * Driven by the engine's `onTransactionCommit` group — the authoritative
-	 * "one transaction = one HLC" boundary. The clock is ticked exactly **once**;
-	 * every fact of the transaction shares that base `(wallTime, counter, siteId)`
-	 * and differs only in `opSeq` (a contiguous, 0-based sub-order). DDL is recorded
-	 * before DML so migrations sort below the same transaction's data facts
-	 * (docs/sync-schema.md § DDL Application Order). All metadata for the transaction —
-	 * schema migrations, column versions, tombstones, change-log entries, and the
-	 * HLC clock state — lands in a single KV batch.
+	 * Record one committed local transaction, telling listeners rather than the caller
+	 * if that fails: nobody awaits this but the commit chain, which must stay usable.
 	 */
 	private async handleTransactionCommit(batch: TransactionCommitBatch): Promise<void> {
 		try {
-			// Capture only LOCAL facts. An all-remote group is a pure sync-apply echo:
-			// its metadata was already recorded by the apply path. A mixed group
-			// (local + remote in one transaction — unusual) records only its local
-			// facts; opSeq is assigned only to recorded facts so they stay contiguous.
-			const localSchema = batch.schemaEvents.filter(e => !e.remote);
-			const localData = this.filterCapturableDataEvents(
-				batch.dataEvents.filter(e => !e.remote),
-				localSchema,
-			);
-			if (localSchema.length === 0 && localData.length === 0) return;
-
-			// ONE tick per committed transaction. tick() returns opSeq 0; the closure
-			// below stamps each successive fact with the next opSeq off the same base.
-			const base = this.hlcManager.tick();
-			const transactionId = deterministicTxnId(base);
-
-			let opSeq = 0;
-			const nextHlc = (): HLC => {
-				// Throw (telemetered via the catch below) rather than wrap the uint32.
-				assertOpSeqInRange(opSeq);
-				return createHLC(base.wallTime, base.counter, base.siteId, opSeq++);
-			};
-
-			const kvBatch = this.kv.batch();
-			const changes: Change[] = [];
-			// Read-your-own-writes overlay: everything staged into kvBatch is noted
-			// here so a later event of the SAME transaction reads its own staged
-			// metadata instead of pre-transaction storage (see
-			// staged-transaction-metadata.ts). Lives for this one commit.
-			const staged = new StagedTransactionMetadata((schema, table) => this.getPkKeying(schema, table));
-
-			// Table-identity transitions FIRST, ahead of the data records: `drop t;
-			// create t; insert into t` must file its rows under the NEW generation, and
-			// a rename's rows (relabelled to the new name by the engine) under the moved
-			// one. Same batch as everything else, so the mapping and the records that
-			// depend on it commit together.
-			await this.applyLocalTableTransitions(kvBatch, localSchema);
-
-			// DDL before DML: migrations take the lowest opSeqs. A primary-key change also
-			// re-files the table's existing records here, BEFORE the data events below — the
-			// engine already re-keyed those, so they must overwrite re-filed records, not the
-			// reverse — and is reported only once the batch has committed.
-			const versionCounters = new Map<string, number>();
-			const rekeyed: Array<{ schema: string; table: string; counts: RekeyCounts }> = [];
-			for (const event of localSchema) {
-				await this.recordSchemaMigration(kvBatch, event, nextHlc, versionCounters);
-				const counts = await this.rekeyOnLocalKeyChange(kvBatch, event, staged);
-				if (counts) rekeyed.push({ schema: event.schemaName, table: event.objectName, counts });
-			}
-
-			for (const event of localData) {
-				await this.recordDataEvent(kvBatch, event, nextHlc, changes, staged);
-			}
-
-			// Persist HLC clock state (wallTime/counter only — opSeq is never persisted).
-			persistHLCStateBatch(this, kvBatch);
-
-			await kvBatch.write();
-
-			for (const { schema, table, counts } of rekeyed) reportRekeyOutcome(this, schema, table, counts);
-			this.syncEvents.emitLocalChange({
-				transactionId,
-				changes,
-				pendingSync: true,
-			});
+			await this.recordCommitBatch(batch);
 		} catch (error) {
 			console.error('[Sync] Error handling transaction commit:', error);
 			this.syncEvents.emitSyncStateChange({
@@ -896,6 +830,86 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				console.error('[Sync] Table identity index could not be re-read after the failed capture:', reloadError);
 			}
 		}
+	}
+
+	/**
+	 * Record CRDT metadata for one local transaction, throwing on failure.
+	 *
+	 * Driven by the engine's `onTransactionCommit` group — the authoritative
+	 * "one transaction = one HLC" boundary — or by a synthetic group from adoption. The
+	 * clock is ticked exactly **once**; every fact of the transaction shares that base
+	 * `(wallTime, counter, siteId)` and differs only in `opSeq` (a contiguous, 0-based
+	 * sub-order). DDL is recorded before DML so migrations sort below the same
+	 * transaction's data facts (docs/sync-schema.md § DDL Application Order). All metadata
+	 * for the transaction — schema migrations, column versions, tombstones, change-log
+	 * entries, and the HLC clock state — lands in a single KV batch.
+	 */
+	private async recordCommitBatch(batch: TransactionCommitBatch): Promise<void> {
+		// Capture only LOCAL facts. An all-remote group is a pure sync-apply echo:
+		// its metadata was already recorded by the apply path. A mixed group
+		// (local + remote in one transaction — unusual) records only its local
+		// facts; opSeq is assigned only to recorded facts so they stay contiguous.
+		const localSchema = batch.schemaEvents.filter(e => !e.remote);
+		const localData = this.filterCapturableDataEvents(
+			batch.dataEvents.filter(e => !e.remote),
+			localSchema,
+		);
+		if (localSchema.length === 0 && localData.length === 0) return;
+
+		// ONE tick per committed transaction. tick() returns opSeq 0; the closure
+		// below stamps each successive fact with the next opSeq off the same base.
+		const base = this.hlcManager.tick();
+		const transactionId = deterministicTxnId(base);
+
+		let opSeq = 0;
+		const nextHlc = (): HLC => {
+			// Throw rather than wrap the uint32.
+			assertOpSeqInRange(opSeq);
+			return createHLC(base.wallTime, base.counter, base.siteId, opSeq++);
+		};
+
+		const kvBatch = this.kv.batch();
+		const changes: Change[] = [];
+		// Read-your-own-writes overlay: everything staged into kvBatch is noted
+		// here so a later event of the SAME transaction reads its own staged
+		// metadata instead of pre-transaction storage (see
+		// staged-transaction-metadata.ts). Lives for this one commit.
+		const staged = new StagedTransactionMetadata((schema, table) => this.getPkKeying(schema, table));
+
+		// Table-identity transitions FIRST, ahead of the data records: `drop t;
+		// create t; insert into t` must file its rows under the NEW generation, and
+		// a rename's rows (relabelled to the new name by the engine) under the moved
+		// one. Same batch as everything else, so the mapping and the records that
+		// depend on it commit together.
+		await this.applyLocalTableTransitions(kvBatch, localSchema);
+
+		// DDL before DML: migrations take the lowest opSeqs. A primary-key change also
+		// re-files the table's existing records here, BEFORE the data events below — the
+		// engine already re-keyed those, so they must overwrite re-filed records, not the
+		// reverse — and is reported only once the batch has committed.
+		const versionCounters = new Map<string, number>();
+		const rekeyed: Array<{ schema: string; table: string; counts: RekeyCounts }> = [];
+		for (const event of localSchema) {
+			await this.recordSchemaMigration(kvBatch, event, nextHlc, versionCounters);
+			const counts = await this.rekeyOnLocalKeyChange(kvBatch, event, staged);
+			if (counts) rekeyed.push({ schema: event.schemaName, table: event.objectName, counts });
+		}
+
+		for (const event of localData) {
+			await this.recordDataEvent(kvBatch, event, nextHlc, changes, staged);
+		}
+
+		// Persist HLC clock state (wallTime/counter only — opSeq is never persisted).
+		persistHLCStateBatch(this, kvBatch);
+
+		await kvBatch.write();
+
+		for (const { schema, table, counts } of rekeyed) reportRekeyOutcome(this, schema, table, counts);
+		this.syncEvents.emitLocalChange({
+			transactionId,
+			changes,
+			pendingSync: true,
+		});
 	}
 
 	/**
@@ -1606,6 +1620,49 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return findTablesWithUnrecordedRowsImpl(this);
 	}
 
+	adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+		const adopting = this.adoptOnCommitChain();
+		this.adoptionsInFlight = Promise.allSettled([this.adoptionsInFlight, adopting]).then(() => undefined);
+		return adopting;
+	}
+
+	/**
+	 * Run one adoption as one entry on the commit chain, ordering it with local capture.
+	 *
+	 * Applies in flight must finish BEFORE the entry joins the chain, not inside it: an
+	 * apply writes rows before their records, so adoption would stamp a remote row as a
+	 * local one, and an apply waits on the chain again before filing its metadata, so
+	 * waiting for it from inside would deadlock. From the append on, a new apply queues
+	 * behind this entry, because `applyChanges` waits on the chain first thing. No `await`
+	 * may separate the wait below from the append.
+	 *
+	 * The caller receives a failure; the chain itself carries on.
+	 */
+	private async adoptOnCommitChain(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+		await this.appliesDrained();
+		const adopting = this.commitChain.then(() => withIdentityRecovery(
+			this.tableIdentity,
+			() => adoptUnrecordedRowsImpl(this, batch => this.recordCommitBatch(batch)),
+		));
+		this.commitChain = adopting.then(() => undefined, () => undefined);
+		return adopting;
+	}
+
+	/**
+	 * Resolves at a moment when no apply is in flight, rechecking for any that started during the wait.
+	 *
+	 * NOTE: an unbroken run of overlapping applies keeps this waiting. A client's broadcasts
+	 * come in bursts, so it ends; if a busy server ever starves a first attach, stop admitting
+	 * new applies here instead of rechecking.
+	 */
+	private async appliesDrained(): Promise<void> {
+		let applies: Promise<void>;
+		do {
+			applies = this.appliesInFlight;
+			await applies;
+		} while (applies !== this.appliesInFlight);
+	}
+
 	async canDeltaSync(sinceHLC: HLC): Promise<boolean> {
 		return this.deltaFloor.admits(sinceHLC);
 	}
@@ -1622,7 +1679,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return getSnapshotImpl(this);
 	}
 
+	/**
+	 * Waits for adoptions under way, as the streaming apply does. Clearing metadata under
+	 * one would make every remaining row look unrecorded, and the records it then wrote
+	 * would stand as this snapshot's own, keeping rows the snapshot should delete.
+	 */
 	async applySnapshot(snapshot: Snapshot): Promise<void> {
+		await this.adoptionsInFlight;
 		return applySnapshotImpl(this, snapshot);
 	}
 
@@ -1783,6 +1846,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		chunks: AsyncIterable<SnapshotChunk>,
 		onProgress?: (progress: SnapshotProgress) => void
 	): Promise<void> {
+		await this.adoptionsInFlight; // See applySnapshot.
 		// Every flush stages identity transitions and lazy mints; a mid-stream throw
 		// must not leave the index ahead of what committed.
 		return withIdentityRecovery(this.tableIdentity, () => applySnapshotStreamImpl(this, chunks, onProgress));

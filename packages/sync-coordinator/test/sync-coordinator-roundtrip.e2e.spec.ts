@@ -13,7 +13,7 @@
  */
 
 import { expect } from 'chai';
-import { SyncClient } from '@quereus/sync-client';
+import { SyncClient, type SyncClientOptions } from '@quereus/sync-client';
 import {
   bootCoordinator,
   makeClientPeer,
@@ -155,5 +155,71 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
       async () => (await collect(peerB.db, 'select id from orders where id = 30')).length === 0,
       { label: 'delete on A to propagate to B' },
     );
+  });
+});
+
+describe('adopting rows written before sync attached (e2e)', () => {
+  // More than one of adoption's internal batches.
+  const ROWS = 150;
+
+  let coordinator: BootedCoordinator;
+  let holder: ClientPeer;
+  let newcomer: ClientPeer;
+  let clients: SyncClient[] = [];
+
+  const connected = async (peer: ClientPeer, options: Partial<SyncClientOptions> = {}): Promise<SyncClient> => {
+    const client = new SyncClient({
+      syncManager: peer.syncManager,
+      syncEvents: peer.syncEvents,
+      autoReconnect: false,
+      localChangeDebounceMs: 10,
+      ...options,
+    });
+    clients.push(client);
+    await client.connect(coordinator.url, DB_ID);
+    return client;
+  };
+
+  const countRows = async (peer: ClientPeer): Promise<number> =>
+    Number((await collect(peer.db, 'select count(*) as n from orders'))[0].n);
+
+  beforeEach(async () => {
+    coordinator = await bootCoordinator();
+    const values = Array.from({ length: ROWS }, (_, i) => `(${i + 1}, 'note-${i + 1}', ${i})`).join(', ');
+    holder = await makeClientPeer(
+      `${DDL}; create index orders_note on orders (note); insert into orders (id, note, qty) values ${values}`,
+    );
+    newcomer = await makeClientPeer('');
+  });
+
+  afterEach(async () => {
+    for (const client of clients) {
+      try { await client.disconnect(); } catch { /* ignore teardown races */ }
+    }
+    clients = [];
+    for (const p of [holder, newcomer]) {
+      try { await p?.close(); } catch { /* ignore teardown races */ }
+    }
+    await coordinator?.stop();
+  });
+
+  it('a brand-new device with no schema bootstraps the table, its index and its rows', async () => {
+    let acknowledged = false;
+    const holderClient = await connected(holder, {
+      unrecordedRows: 'adopt',
+      onSyncEvent: event => { acknowledged ||= event.message.startsWith('Server applied'); },
+    });
+    await waitFor(async () => acknowledged, { label: 'the adopted rows to reach the server' });
+    expect(holderClient.status.status).to.not.equal('error');
+    expect(await countRows(holder), 'the holder keeps its rows').to.equal(ROWS);
+
+    const newcomerClient = await connected(newcomer);
+    await waitForSynced(newcomerClient);
+
+    expect(await countRows(newcomer)).to.equal(ROWS);
+    const [row] = await collect(newcomer.db, 'select note, qty from orders where id = 150');
+    expect(row.note).to.equal('note-150');
+    expect(Number(row.qty)).to.equal(149);
+    expect(newcomer.db.schemaManager.getTable('main', 'orders')?.indexes?.map(index => index.name)).to.deep.equal(['orders_note']);
   });
 });

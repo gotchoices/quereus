@@ -10,6 +10,9 @@ import { collect, closePeer, createInMemoryProvider, localWrite, makePeer, relay
 import { createSyncModule } from '../../src/create-sync-module.js';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
+import { DATA_FLUSH_SIZE } from '../../src/sync/snapshot-coverage.js';
+import { saveSnapshotCheckpoint } from '../../src/sync/snapshot-checkpoint.js';
+import { generateSiteId } from '../../src/clock/site.js';
 
 async function dump(kv: KVStore): Promise<Array<[string, string]>> {
 	const entries: Array<[string, string]> = [];
@@ -170,5 +173,137 @@ describe('findTablesWithUnrecordedRows', () => {
 
 		await closePeer(sender);
 		await closePeer(receiver);
+	});
+});
+
+describe('adoptUnrecordedRows', () => {
+	const ORDERS = 'create table orders (id integer primary key, note text) using store';
+	let peer: Peer | undefined;
+
+	afterEach(async () => {
+		if (peer) await closePeer(peer);
+		peer = undefined;
+	});
+
+	/** Every migration a peer's first push would carry, as `type object`. */
+	async function migrationsOf(from: Peer): Promise<string[]> {
+		const sets = await from.manager.getChangesSince(generateSiteId());
+		return sets.flatMap(set => set.schemaMigrations.map(m => `${m.type} ${m.table}`));
+	}
+
+	async function adoptionFailure(from: Peer): Promise<unknown> {
+		return from.manager.adoptUnrecordedRows().then(() => undefined, (error: unknown) => error);
+	}
+
+	it('records rows once, and a second call finds nothing and writes nothing', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (1, 'one'), (2, 'two')` });
+
+		expect(await peer.manager.adoptUnrecordedRows()).to.deep.equal({ tables: [{ schema: 'main', table: 'orders' }], rows: 2 });
+		expect(await peer.manager.findTablesWithUnrecordedRows()).to.deep.equal([]);
+
+		const before = await dump(peer.manager.kv);
+		expect(await peer.manager.adoptUnrecordedRows()).to.deep.equal({ tables: [], rows: 0 });
+		expect(await dump(peer.manager.kv)).to.deep.equal(before);
+	});
+
+	it('announces only what a table with unrecorded rows lacks', async () => {
+		peer = await makePeer('a', {
+			beforeSync: `${ORDERS}; create index orders_note on orders (note); insert into orders values (1, 'one');
+				create table empty_one (id integer primary key) using store;
+				create table altered (id integer primary key) using store; insert into altered values (1)`,
+		});
+		await peer.db.exec('create table announced (id integer primary key) using store');
+		await localWrite(peer, `alter table altered add column note text default 'none'`);
+
+		await peer.manager.adoptUnrecordedRows();
+
+		expect((await migrationsOf(peer)).sort()).to.deep.equal([
+			'add_index orders_note',
+			'alter_column altered',
+			'create_table altered',
+			'create_table announced',
+			'create_table orders',
+		]);
+	});
+
+	it('announces a table its migrations leave dropped', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (1, 'one')` });
+		const migrations = peer.manager.schemaMigrations;
+		const stored = { ddl: ORDERS, hlc: peer.manager.getCurrentHLC() };
+		await migrations.recordMigration('main', 'table', 'orders', { ...stored, type: 'create_table', schemaVersion: 1 });
+		await migrations.recordMigration('main', 'table', 'orders', { ...stored, type: 'drop_table', schemaVersion: 2 });
+
+		await peer.manager.adoptUnrecordedRows();
+
+		const types: string[] = [];
+		for await (const { type } of migrations.getAllMigrations('main', 'table', 'orders')) types.push(type);
+		expect(types).to.deep.equal(['create_table', 'drop_table', 'create_table']);
+	});
+
+	it('refuses while an explicit transaction is open, and the commit chain carries on', async () => {
+		peer = await makePeer('a', { beforeSync: ORDERS });
+		await peer.db.exec('begin');
+		await peer.db.exec(`insert into orders values (1, 'may roll back')`);
+
+		const failure = await adoptionFailure(peer);
+		await peer.db.exec('rollback');
+
+		expect(failure).to.be.instanceOf(Error);
+		expect((failure as Error).message).to.include('transaction');
+		expect(await peer.manager.getChangesSince(generateSiteId())).to.deep.equal([]);
+
+		await localWrite(peer, `insert into orders values (2, 'two')`);
+		expect((await peer.manager.columnVersions.getRowVersions('main', 'orders', [2])).size).to.equal(2);
+	});
+
+	it('refuses while a snapshot is partly applied, when every row would look unrecorded', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (1, 'one')` });
+		await saveSnapshotCheckpoint(peer.manager, {
+			snapshotId: 'snap', siteId: peer.manager.getSiteId(), hlc: peer.manager.getCurrentHLC(),
+			lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 1,
+		});
+
+		expect(await adoptionFailure(peer)).to.be.instanceOf(Error);
+		expect(await peer.manager.getChangesSince(generateSiteId())).to.deep.equal([]);
+	});
+
+	it('a snapshot applied during a run waits for it, and still replaces the rows', async () => {
+		const sender = await makePeer('sender', { createOrders: true });
+		await localWrite(sender, `insert into orders values (1, 'one')`);
+		const chunks = await chunksOf(sender);
+		// More than one batch: a batch written after the snapshot's clear would pass for
+		// the snapshot's own records, and its rows would survive the replace.
+		const local = Array.from({ length: DATA_FLUSH_SIZE + 1 }, (_, i) => `(${i + 2}, 'local')`).join(', ');
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values ${local}` });
+
+		const release = holdBatchWrites(peer.manager.kv);
+		const adopting = peer.manager.adoptUnrecordedRows();
+		await settle();
+		const applying = peer.manager.applySnapshotStream(toStream(chunks));
+		await settle();
+		release();
+		await adopting;
+		await applying;
+
+		expect(await collect(peer.db, 'select id from orders')).to.deep.equal([{ id: 1 }]);
+		await closePeer(sender);
+	});
+
+	it('a remote apply under way finishes first, so its row is not stamped as local', async () => {
+		const sender = await makePeer('sender', { createOrders: true });
+		peer = await makePeer('a', { createOrders: true });
+		await localWrite(sender, `insert into orders values (1, 'remote')`);
+		const changes = await sender.manager.getChangesSince(peer.manager.getSiteId());
+
+		const release = holdBatchWrites(peer.manager.kv);
+		const applying = peer.manager.applyChanges(changes);
+		await settle();
+		const adopting = peer.manager.adoptUnrecordedRows();
+		await settle();
+		release();
+		await applying;
+
+		expect((await adopting).rows).to.equal(0);
+		await closePeer(sender);
 	});
 });

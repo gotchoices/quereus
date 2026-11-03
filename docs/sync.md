@@ -175,6 +175,7 @@ Sync keeps a `cv:` cell record for each cell it knows about. A row written befor
 |---|---|
 | `'refuse'` (default) | An automatic snapshot stops before deleting anything. The error names the affected tables and this option. |
 | `'replace'` | The snapshot deletes them. |
+| `'adopt'` | The rows are recorded as local changes on first attach, then pushed and merged by last-writer-wins. Scans each table once. |
 
 - **Which snapshots are checked.** The automatic ones: the `bootstrapOnEmpty` bootstrap and `snapshot_required` recovery. On `snapshot_required` the check runs before the recovery's push, so a refused device does not drain its work to the server first; the handshake's ordinary first push has already gone by then. An explicit `requestSnapshot()` is a full replace with no check, because the caller asked for it. One started while a check is scanning wins too: the check's answer is dropped and the automatic path joins that transfer.
 - **Resuming is not checked.** The header's clear already wiped the metadata, so every row would look unrecorded, and a false refusal would strand a partial database. The decision was made when the transfer started. The header saves its checkpoint *before* that clear, so a crash between the two leaves a checkpoint over intact metadata (the resume clears again), never rows that merely look unrecorded.
@@ -183,6 +184,24 @@ Sync keeps a `cv:` cell record for each cell it knows about. A row written befor
 - **Rows that only look unrecorded.** A local commit is recorded just after it lands, and a remote apply writes rows before their records. So the check waits for commits and applies under way, and reports a table only when two scans with that wait between them name the same row.
 - **Broader than what the snapshot would delete.** A table the server does not have is left alone by a snapshot, but the client cannot know the server's tables until the stream starts, and by then the header has cleared the metadata the check needs. So a table only this device has, with unrecorded rows, also refuses.
 - **Only never-recorded rows count.** A row with any cell record counts as recorded. An update made while sync was detached, to a row that has records, is still a silent divergence and is not detected.
+
+##### Adopting rows
+
+Under `'adopt'`, `SyncManager.adoptUnrecordedRows()` records every such row as an ordinary local change, using the tables `findTablesWithUnrecordedRows()` reads. Each batch of up to `DATA_FLUSH_SIZE` rows goes through local capture as one transaction, so it gets its own HLC, change-log entries and local-change event. It is idempotent: a row that has a record is skipped, so an interrupted run is finished by running it again.
+
+- **When it runs.** On first contact with a server, meaning no received or sent state for it, whatever `bootstrapOnEmpty` says. The sent state is written on the first ack, so a reconnect before that rescans and finds nothing new. A device that adopted rows does not bootstrap, because a snapshot would delete them before they were pushed. It also runs on every `snapshot_required`, whatever the peer state, ahead of the recovery's push, so the rows are on the server when the snapshot is taken and come back in it.
+- **The schema goes too.** The coordinator keeps no table definitions, so cells alone would be quarantined by other devices and would abort any new device's snapshot. A table with unrecorded rows therefore also gets a `create_table` migration, and each of its indexes an `add_index`, unless its migrations already bring it into existence and leave it there. So a table with no migrations gets one, and so does one with only an `alter_column` (created before sync attached, altered since) or one whose last migration is a `drop_table`. A table with no unrecorded rows sends nothing. A foreign key may name a table that was not sent: `create table` accepts a parent that does not exist yet. Views and assertions created before sync attached are not adopted.
+- **Ordering.** Applies in flight finish first, because an apply writes rows before their records and adoption would otherwise stamp a remote row as local. The run is then one entry on the commit chain, so local commits and new applies queue behind it and overwrite it by the usual rules. A snapshot apply started during a run waits for it. Under `SyncClient`, a transfer that has already started, or a pending checkpoint, skips adoption: its header cleared the metadata, so every row would be stamped as new.
+- **When it stops.** It rejects while a checkpoint exists or an explicit transaction is open, because an uncommitted row looks unrecorded and recording one that then rolls back would send other devices a row this one does not have. `SyncClient` treats any failure as a failed check: no snapshot, an error through `onError`, and a retry through the reconnect. Rows already recorded stay recorded.
+- **`readOnly` cannot adopt.** The client constructor throws on the combination: nothing could ever be pushed, so the next snapshot would delete the rows.
+
+What adoption costs, none of which can be undone once the rows are pushed:
+
+- **Adopted rows win against older server edits.** They have no real timestamp, so they get the time of adoption. A row with the same key on the server, edited before that moment, loses.
+- **Two devices adopting the same seeded data** both push every row. They converge, at the cost of the duplicate traffic.
+- **Two devices adopting tables with the same name and different shapes conflict.** The receiver cannot apply the second `create_table`, as with any two devices that created divergent tables offline (`assertDefinitionMatches` in `store-adapter.ts`).
+- **A row the server deleted and pruned comes back** if a device still holds it unrecorded. Nothing on the device can tell it was ever deleted. A row whose tombstone still exists behaves as a local reinsert does: the device keeps it, and under the default `allowResurrection: false` a peer holding the tombstone stays deleted.
+- **Rows a server hook rejects** stay recorded locally and are reported through the `rejected` event, like any local write. A later `snapshot_required` deletes them, as it does any local write the server refused.
 
 ### Unknown-Table Disposition
 

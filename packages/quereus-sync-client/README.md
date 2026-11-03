@@ -96,8 +96,8 @@ interface SyncClientOptions {
   /** Auto-download a full snapshot on first connect to a replica with no sync history (default: true). Rows written before sync attached have no history; `unrecordedRows` decides what happens to them */
   bootstrapOnEmpty?: boolean;
 
-  /** What an automatic snapshot does about rows sync has never recorded: 'refuse' stops before deleting anything, 'replace' deletes them (default: 'refuse') */
-  unrecordedRows?: 'refuse' | 'replace';
+  /** What an automatic snapshot does about rows sync has never recorded: 'refuse' stops before deleting anything, 'replace' deletes them, 'adopt' records and pushes them instead (default: 'refuse') */
+  unrecordedRows?: 'refuse' | 'replace' | 'adopt';
 
   /** Snapshot stall watchdog: abort if no chunk arrives within this window in ms (default: 60000) */
   snapshotChunkTimeoutMs?: number;
@@ -135,6 +135,8 @@ const client = new SyncClient({
 ```
 
 The client then has status `error`, has closed the socket and will not reconnect. `connect()` has already resolved by that point, so use `onError` or the status rather than its promise. To let the snapshot delete those rows, create a new `SyncClient` with `unrecordedRows: 'replace'` and connect; the `SyncManager` and its data carry over. An explicit `requestSnapshot()` is never checked. See [Rows sync has never recorded](../../docs/sync.md#rows-sync-has-never-recorded).
+
+To keep those rows instead, use `unrecordedRows: 'adopt'`. On first attach the client records them as local changes and pushes them, along with `create table` and `create index` for any table no migration announces, so other devices and new devices receive them. This cannot be undone once pushed: the rows have no real timestamp, so they get the time of adoption and beat any older edit of the same key on the server. It cannot be combined with `readOnly`. See [Adopting rows](../../docs/sync.md#adopting-rows).
 
 ### Serialization Helpers
 

@@ -883,6 +883,8 @@ class QuereusWorker implements QuereusWorkerAPI {
       syncManager: this.syncManager,
       syncEvents: this.syncEvents,
       autoReconnect: true,
+      // Someone switching from "store" to "sync" almost certainly wants to keep their data.
+      unrecordedRows: 'adopt',
       onStatusChange: (status: SyncClientStatus) => {
         // Convert SyncClient status to our SyncStatus type
         this.syncStatus = status as SyncStatus;

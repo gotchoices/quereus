@@ -1,16 +1,31 @@
 /**
- * Finding rows sync has never recorded: live rows with no `cv:` cell record, usually
- * written before sync attached. No sync path can see them, and a snapshot covering
- * their table deletes them, so a client looks here before taking a snapshot nobody
- * explicitly asked for (docs/sync.md § Rows sync has never recorded).
+ * Rows sync has never recorded: live rows with no `cv:` cell record, usually written
+ * before sync attached. No sync path can see them, and a snapshot covering their table
+ * deletes them, so a client looks here before taking a snapshot nobody explicitly asked
+ * for, and can record them as local changes instead (docs/sync.md § Rows sync has never
+ * recorded).
  *
- * Strictly read-only. In particular `getRowVersions` resolves a table's generation
- * without minting one, so a table with no `tg:` record simply reads as unrecorded.
+ * Finding them is strictly read-only. In particular `getRowVersions` resolves a table's
+ * generation without minting one, so a table with no `tg:` record simply reads as
+ * unrecorded.
  */
 
-import type { Database, SqlValue } from '@quereus/quereus';
+import {
+	generateIndexDDL,
+	generateTableDDL,
+	isHiddenImplicitIndex,
+	type Database,
+	type DatabaseDataChangeEvent,
+	type DatabaseSchemaChangeEvent,
+	type Row,
+	type SqlValue,
+	type TableSchema,
+	type TransactionCommitBatch,
+} from '@quereus/quereus';
 import { encodePkIdentity } from '../metadata/keys.js';
-import { scanLiveKeys } from './snapshot-coverage.js';
+import type { SchemaObjectKind } from './protocol.js';
+import { DATA_FLUSH_SIZE, scanLiveColumns } from './snapshot-coverage.js';
+import { listSnapshotCheckpoints } from './snapshot-checkpoint.js';
 import type { SyncContext } from './sync-context.js';
 
 /**
@@ -42,14 +57,18 @@ export async function findTablesWithUnrecordedRows(ctx: SyncContext): Promise<Ar
  * tables (`quereus.engine_managed`) included. If a local-only module becomes common, let
  * tables opt out rather than widening this name check.
  */
-function tablesToCheck(ctx: SyncContext, db: Database): Array<{ schema: string; table: string; keyColumns: readonly string[] }> {
-	const tables: Array<{ schema: string; table: string; keyColumns: readonly string[] }> = [];
+function tablesToCheck(
+	ctx: SyncContext,
+	db: Database,
+): Array<{ schema: string; table: string; keyColumns: readonly string[]; definition: TableSchema }> {
+	const tables: Array<{ schema: string; table: string; keyColumns: readonly string[]; definition: TableSchema }> = [];
 	for (const schema of db.schemaManager._getAllSchemas()) {
-		for (const { schemaName, name, vtabModuleName } of schema.getAllTables()) {
+		for (const definition of schema.getAllTables()) {
+			const { schemaName, name, vtabModuleName } = definition;
 			if (!ctx.isTableInBasis(schemaName, name) || ctx.isMaterializedView(schemaName, name)) continue;
 			if (vtabModuleName.toLowerCase() === 'memory') continue;
 			const keyColumns = ctx.getTableKeyColumns(schemaName, name);
-			if (keyColumns) tables.push({ schema: schemaName, table: name, keyColumns });
+			if (keyColumns) tables.push({ schema: schemaName, table: name, keyColumns, definition });
 		}
 	}
 	return tables;
@@ -106,7 +125,7 @@ async function firstUnrecordedKey(
 	table: string,
 	keyColumns: readonly string[],
 ): Promise<SqlValue[] | undefined> {
-	for await (const pk of scanLiveKeys(db, schema, table, keyColumns)) {
+	for await (const pk of scanLiveColumns(db, schema, table, keyColumns)) {
 		const versions = await ctx.columnVersions.getRowVersions(schema, table, pk);
 		if (versions.size === 0) return pk;
 	}
@@ -116,4 +135,142 @@ async function firstUnrecordedKey(
 async function writesSettled(ctx: SyncContext): Promise<void> {
 	await ctx.whenCommitsSettled();
 	await ctx.whenAppliesSettled();
+}
+
+/**
+ * Record every unrecorded row through `record`, the local commit capture, so adopted rows
+ * get the same HLCs, change-log entries and events as any other local write.
+ *
+ * Runs on the commit chain, so it must not wait for commits or applies from in here (see
+ * `SyncManagerImpl.adoptUnrecordedRows`). A local commit queued meanwhile lands afterwards
+ * and overwrites with a newer HLC, as it would any earlier write.
+ */
+export async function adoptUnrecordedRows(
+	ctx: SyncContext,
+	record: (batch: TransactionCommitBatch) => Promise<void>,
+): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+	const adopted = { tables: [] as Array<{ schema: string; table: string }>, rows: 0 };
+	const db = ctx.db;
+	if (!db || !ctx.applyToStore) {
+		console.warn('[Sync] adoptUnrecordedRows did nothing: this peer has no engine to read rows through');
+		return adopted;
+	}
+	if ((await listSnapshotCheckpoints(ctx)).length > 0) {
+		throw new Error('Cannot adopt unrecorded rows while a snapshot is partly applied: its cleared metadata makes every row look unrecorded');
+	}
+
+	for (const { schema, table, definition } of tablesToCheck(ctx, db)) {
+		const rows = await adoptTable(ctx, db, definition, record);
+		if (rows > 0) {
+			adopted.tables.push({ schema, table });
+			adopted.rows += rows;
+		}
+	}
+	return adopted;
+}
+
+/**
+ * Adopt one table's unrecorded rows, `DATA_FLUSH_SIZE` to a synthetic transaction, so no
+ * table has to fit in memory and a crash loses only the unfinished batch. Writing under
+ * the open scan is safe: `record` writes to the sync KV store, not to the table.
+ *
+ * NOTE: a table with more columns than `batchSize / DATA_FLUSH_SIZE` (10 by default) makes
+ * each batch an oversized transaction, which is sent whole and logs a warning per read. If
+ * that noise matters, size the batches by cells instead of rows.
+ *
+ * NOTE: on the store module the open scan holds the execution mutex, so the app's writes
+ * wait for each table to finish, as under `firstUnrecordedKey` but with the recording added.
+ * Not measured. If a large first attach shows it, read the rows in key-ordered pages and
+ * release the mutex between them.
+ */
+async function adoptTable(
+	ctx: SyncContext,
+	db: Database,
+	table: TableSchema,
+	record: (batch: TransactionCommitBatch) => Promise<void>,
+): Promise<number> {
+	const columns = table.columns.map(column => column.name);
+	let adopted = 0;
+	let pending: DatabaseDataChangeEvent[] = [];
+	const flush = async (): Promise<void> => {
+		// With the first row, so a table with nothing to send sends no schema either.
+		const schemaEvents = adopted === 0 ? await missingCreateEvents(ctx, table) : [];
+		await record({ schemaEvents, dataEvents: pending });
+		adopted += pending.length;
+		pending = [];
+	};
+
+	for await (const row of scanLiveColumns(db, table.schemaName, table.name, columns)) {
+		assertNoExplicitTransaction(db);
+		const pk = table.primaryKeyDefinition.map(({ index }) => row[index]);
+		const versions = await ctx.columnVersions.getRowVersions(table.schemaName, table.name, pk);
+		if (versions.size > 0) continue;
+		pending.push(insertEvent(table, pk, row));
+		if (pending.length >= DATA_FLUSH_SIZE) await flush();
+	}
+	if (pending.length > 0) await flush();
+	return adopted;
+}
+
+/**
+ * Checked with the scan open: on the store module that scan holds the execution mutex, so
+ * no transaction can begin between this check and the row it guards. An uncommitted row
+ * looks unrecorded, and recording one that then rolls back would send every other device
+ * a row this one does not have. The client retries through its reconnect.
+ */
+function assertNoExplicitTransaction(db: Database): void {
+	if (!db.getAutocommit() && !db._isImplicitTransaction()) {
+		throw new Error('Cannot adopt unrecorded rows while a transaction is open: its uncommitted rows look unrecorded');
+	}
+}
+
+function insertEvent(table: TableSchema, pk: SqlValue[], row: Row): DatabaseDataChangeEvent {
+	return {
+		type: 'insert',
+		moduleName: table.vtabModuleName,
+		schemaName: table.schemaName,
+		tableName: table.name,
+		key: pk,
+		newRow: row,
+		remote: false,
+	};
+}
+
+/**
+ * The `create` events a table and its indexes lack. The coordinator keeps no table
+ * definitions, so a cell for a table nobody announced is quarantined by another device
+ * and aborts a new device's snapshot (docs/sync.md § Unknown-Table Disposition).
+ * The DDL is what the store module puts on its own create events: no `db` argument, so
+ * fully qualified, and byte-identical across devices adopting the same table.
+ */
+async function missingCreateEvents(ctx: SyncContext, table: TableSchema): Promise<DatabaseSchemaChangeEvent[]> {
+	const { schemaName, name, vtabModuleName: moduleName } = table;
+	const events: DatabaseSchemaChangeEvent[] = [];
+	if (!await hasLiveCreate(ctx, schemaName, 'table', name)) {
+		events.push({ type: 'create', objectType: 'table', moduleName, schemaName, objectName: name, ddl: generateTableDDL(table), remote: false });
+	}
+	for (const index of table.indexes ?? []) {
+		if (isHiddenImplicitIndex(table, index.name) || await hasLiveCreate(ctx, schemaName, 'index', index.name)) continue;
+		events.push({ type: 'create', objectType: 'index', moduleName, schemaName, objectName: index.name, ddl: generateIndexDDL(index, table), remote: false });
+	}
+	return events;
+}
+
+/**
+ * Whether the object's migrations bring it into existence and leave it there. A version
+ * count would not do: a table created before sync attached and altered since has only an
+ * `alter_column`, and one dropped under sync and re-created while detached ends on its
+ * `drop_table`. Either way a receiver replaying them ends with no table.
+ *
+ * NOTE: a rename counts as a create, on the assumption that the old name's stream holds
+ * one. A table created before sync attached and renamed since breaks that: a receiver has
+ * neither name, so it converges without a table. If that shows up, follow `fromTable`.
+ */
+async function hasLiveCreate(ctx: SyncContext, schema: string, kind: SchemaObjectKind, name: string): Promise<boolean> {
+	let live = false;
+	for await (const { type } of ctx.schemaMigrations.getAllMigrations(schema, kind, name)) {
+		if (type === 'create_table' || type === 'add_index' || type === 'rename_table') live = true;
+		else if (type === 'drop_table' || type === 'drop_index') live = false;
+	}
+	return live;
 }

@@ -920,8 +920,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * Checks if we're currently in an implicit transaction.
-	 * @internal
+	 * Checks if we're currently in an implicit transaction. Kept on the consumable type
+	 * surface, like {@link _isExecuting}: `getAutocommit()` alone also reads false while
+	 * another caller's autocommit statement runs, so a host in another package needs this
+	 * to tell an explicit transaction apart.
 	 */
 	_isImplicitTransaction(): boolean {
 		return this.transactionManager.isImplicitTransaction();

@@ -98,7 +98,8 @@ export interface Peer {
  * Build a real-engine peer. `createOrders` creates the `orders` base table with
  * `ordersDdl` (defaults to DEFAULT_ORDERS_DDL). `disposition` overrides
  * `unknownTableDisposition` in the SyncConfig; `config` overrides any other
- * SyncConfig fields (e.g. `allowResurrection`).
+ * SyncConfig fields (e.g. `allowResurrection`). `beforeSync` runs before the sync module
+ * attaches, so its tables and rows have no sync records at all.
  */
 export async function makePeer(
 	name: string,
@@ -107,6 +108,7 @@ export async function makePeer(
 		disposition?: UnknownTableDisposition;
 		ordersDdl?: string;
 		config?: Partial<SyncConfig>;
+		beforeSync?: string;
 	},
 ): Promise<Peer> {
 	const { provider } = createInMemoryProvider();
@@ -114,6 +116,7 @@ export async function makePeer(
 	const db = new Database();
 	const storeModule = new StoreModule(provider, events);
 	db.registerModule('store', storeModule);
+	if (opts?.beforeSync) await db.exec(opts.beforeSync);
 	const applyToStore = createStoreAdapter({ db, storeModule, events });
 
 	const config: SyncConfig = {

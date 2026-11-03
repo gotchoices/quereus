@@ -54,7 +54,7 @@ export interface SyncEvent {
  * What an automatic snapshot does about rows sync has never recorded. See
  * {@link SyncClientOptions.unrecordedRows}.
  */
-export type UnrecordedRowsPolicy = 'refuse' | 'replace';
+export type UnrecordedRowsPolicy = 'refuse' | 'replace' | 'adopt';
 
 /**
  * An automatic snapshot was stopped because it would delete rows sync has never
@@ -170,6 +170,12 @@ export interface SyncClientOptions {
    *   the socket and does not reconnect. `connect()` has already resolved by then,
    *   so watch `onError` or the status rather than its promise.
    * - `'replace'`: let the snapshot delete them.
+   * - `'adopt'`: keep them, by recording them as local changes on first attach and
+   *   pushing them, along with `create table` and `create index` for any table no
+   *   migration announces. This cannot be undone once pushed: the rows have no real
+   *   timestamp, so they get the time of adoption and BEAT any older edit of the same
+   *   key on the server. Cannot be combined with {@link readOnly}, which could never
+   *   push them. See docs/sync.md § Rows sync has never recorded.
    *
    * To choose after a refusal, create a new `SyncClient` with a different value and
    * connect. The `SyncManager` and its data carry over.

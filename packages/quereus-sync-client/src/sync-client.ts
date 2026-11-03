@@ -57,6 +57,13 @@ type PushOutcome =
   | { status: 'held' };
 
 /**
+ * Where rows sync has never recorded leave an automatic snapshot. `clear` means it may
+ * go ahead. `adopted` means rows were just recorded, so a snapshot may follow only once
+ * they are pushed. `stopped` means no snapshot: the socket is closed or already replaced.
+ */
+type UnrecordedRowsVerdict = 'clear' | 'adopted' | 'stopped';
+
+/**
  * WebSocket sync client for Quereus.
  *
  * Connects to a sync server and handles bidirectional synchronization
@@ -163,6 +170,11 @@ export class SyncClient {
   private _connectReject: ((error: Error) => void) | null = null;
 
   constructor(options: SyncClientOptions) {
+    // A read-only client can never push, so adopted rows would never leave the device
+    // and the next snapshot would delete them.
+    if (options.readOnly && options.unrecordedRows === 'adopt') {
+      throw new Error(`The unrecordedRows option 'adopt' cannot be combined with readOnly: adopted rows have to be pushed`);
+    }
     this.syncManager = options.syncManager;
     this.syncEvents = options.syncEvents;
     this.options = {
@@ -814,8 +826,9 @@ export class SyncClient {
     }
 
     // Ahead of the push, so a device that is about to stop does not first drain its
-    // work to the server. (The handshake's own first push has already gone by now.)
-    if (!await this.unrecordedRowsAllowSnapshot()) return;
+    // work to the server, and rows being adopted go out with that work and so come
+    // back in the snapshot. (The handshake's own first push has already gone by now.)
+    if (await this.settleUnrecordedRows() === 'stopped') return;
 
     this.emitSyncEvent(
       'state-change',
@@ -880,8 +893,11 @@ export class SyncClient {
 
   /**
    * Decide, on handshake, whether to run a snapshot transfer before the
-   * incremental path: resume a pending checkpoint, bootstrap an empty replica,
-   * or neither.
+   * incremental path: resume a pending checkpoint, adopt unrecorded rows on first
+   * contact, bootstrap an empty replica, or none of these.
+   *
+   * Rows just adopted rule out a bootstrap: they have not been pushed, so a snapshot
+   * would delete them. The incremental path that follows pushes them.
    *
    * @returns false when a transfer failed or unrecorded rows stopped it — the
    *          socket has been closed and the caller must stop the handshake flow.
@@ -921,8 +937,18 @@ export class SyncClient {
       return error === null;
     }
 
+    // Independent of bootstrapOnEmpty: this is about these rows, not about bootstrapping.
+    // NOTE: the first push after this reads every local change into memory
+    // (`collectAllChanges`, for a push with no watermark), which adoption makes reachable
+    // on a populated device. If that shows up, make that unbounded scan bounded.
+    if (this.options.unrecordedRows === 'adopt' && await this.isFirstContact()) {
+      const verdict = await this.settleUnrecordedRows();
+      if (verdict !== 'clear') return verdict === 'adopted';
+    }
+
     if (this.options.bootstrapOnEmpty && await this.isReplicaEmpty()) {
-      if (!await this.unrecordedRowsAllowSnapshot()) return false;
+      const verdict = await this.settleUnrecordedRows();
+      if (verdict !== 'clear') return verdict === 'adopted';
       this.emitSyncEvent('state-change', 'Empty replica: requesting full snapshot from server');
       const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
       return error === null;
@@ -947,8 +973,8 @@ export class SyncClient {
    * records are not consulted, and replicated DDL applies idempotently.
    *
    * A device whose rows were written BEFORE sync attached also passes: those
-   * rows have no change facts. {@link unrecordedRowsAllowSnapshot} stands between
-   * that device and a bootstrap that would delete them.
+   * rows have no change facts. {@link settleUnrecordedRows} stands between that
+   * device and a bootstrap that would delete them.
    */
   private async isReplicaEmpty(): Promise<boolean> {
     if (!this.serverSiteId) return false;
@@ -956,36 +982,49 @@ export class SyncClient {
     const peerState = await this.syncManager.getPeerSyncState(this.serverSiteId);
     if (peerState !== undefined) return false;
 
-    // NOTE: this arm materializes every local change set when it runs. It runs
-    // only when no peer sync state exists — in practice once, on a device with
-    // nothing to materialize. If some future caller runs the probe on a
-    // populated replica, replace it with a cheap existence scan over the `cv:`
-    // prefix.
+    // NOTE: this arm materializes every local change set when it runs. It runs only
+    // when no peer sync state exists. That is usually once, on a device with nothing to
+    // materialize, but a device that adopted rows and reconnects before its first
+    // `changes` reply holds them all. If that shows up, replace this with a cheap
+    // existence scan over the `cv:` prefix.
     const localChanges = await this.syncManager.getChangesSince(this.serverSiteId);
     return localChanges.length === 0;
   }
 
   /**
-   * Whether an automatic snapshot may go ahead, given rows sync has never recorded.
-   * When this returns false the socket is closed or already replaced, and the caller
-   * must take no snapshot.
-   *
-   * A pending checkpoint skips the scan: that transfer's header already cleared the
-   * metadata, so every row would look unrecorded, and a false refusal would strand a
-   * partial database. The decision was made when that transfer started.
-   *
-   * A scan that fails is not a verdict, so it retries through the reconnect rather
-   * than stopping for good. Either way no snapshot follows.
-   *
-   * A transfer already running settles it the other way, whether it was there first or
-   * started during the scan: in practice an explicit {@link requestSnapshot} starts one
-   * meanwhile (`await connect(); await requestSnapshot()` does), the caller asked for
-   * that full replace, its header makes the scan's answer meaningless, and the caller
-   * here simply joins it.
+   * Whether this device has exchanged nothing with this server yet. Peer sent state is
+   * written on the first ack, so this is what makes handshake adoption run once: until
+   * that ack a reconnect rescans, skipping the rows already adopted.
    */
-  private async unrecordedRowsAllowSnapshot(): Promise<boolean> {
-    if (this.options.unrecordedRows === 'replace' || this.snapshotTransferPromise) return true;
+  private async isFirstContact(): Promise<boolean> {
+    if (!this.serverSiteId) return false;
+    return await this.syncManager.getPeerSyncState(this.serverSiteId) === undefined
+      && await this.syncManager.getPeerSentState(this.serverSiteId) === undefined;
+  }
 
+  /**
+   * Deal with rows sync has never recorded, as the `unrecordedRows` option says, ahead
+   * of an automatic snapshot that would delete them.
+   *
+   * A transfer already running settles it, whether it was there first or started
+   * meanwhile: in practice an explicit {@link requestSnapshot} starts one
+   * (`await connect(); await requestSnapshot()` does), the caller asked for that full
+   * replace, its header clears the metadata both options below read, and the caller
+   * here simply joins it. So does a pending checkpoint: that transfer's header already
+   * cleared the metadata, every row would look unrecorded, and the decision was made
+   * when it started.
+   *
+   * A scan or adoption that fails is not a verdict, so it retries through the reconnect
+   * rather than stopping for good. Either way no snapshot follows.
+   */
+  private settleUnrecordedRows(): Promise<UnrecordedRowsVerdict> {
+    const policy = this.options.unrecordedRows;
+    if (policy === 'replace' || this.snapshotTransferPromise) return Promise.resolve('clear');
+    return policy === 'adopt' ? this.adoptUnrecordedRows() : this.refuseOverUnrecordedRows();
+  }
+
+  /** The `refuse` arm of {@link settleUnrecordedRows}. */
+  private async refuseOverUnrecordedRows(): Promise<UnrecordedRowsVerdict> {
     // A reconnect or disconnect can replace `this.ws` during the scan. The verdict
     // then belongs to nobody: the new socket's handshake decides for itself.
     const socket = this.ws;
@@ -995,13 +1034,42 @@ export class SyncClient {
       if (!resuming) tables = await this.syncManager.findTablesWithUnrecordedRows();
     } catch (err) {
       this.failAndRetry(socket, 'Could not check for rows sync has never recorded', err);
-      return false;
+      return 'stopped';
     }
-    if (this.ws !== socket) return false;
-    if (tables.length === 0 || this.snapshotTransferPromise) return true;
+    if (this.ws !== socket) return 'stopped';
+    if (tables.length === 0 || this.snapshotTransferPromise) return 'clear';
 
     this.stopWithError(new UnrecordedRowsError(tables));
-    return false;
+    return 'stopped';
+  }
+
+  /**
+   * The `adopt` arm of {@link settleUnrecordedRows}. The transfer check sits right against
+   * the call with no `await` between: a transfer started after that call waits inside the
+   * manager for the adoption to finish, and one started before it must not be adopted
+   * under, since its header clears the metadata and every row would be stamped as new.
+   */
+  private async adoptUnrecordedRows(): Promise<UnrecordedRowsVerdict> {
+    const socket = this.ws;
+    let adopted: Awaited<ReturnType<SyncManager['adoptUnrecordedRows']>>;
+    try {
+      const resuming = (await this.syncManager.listSnapshotCheckpoints()).length > 0;
+      if (resuming || this.snapshotTransferPromise) return this.ws === socket ? 'clear' : 'stopped';
+      adopted = await this.syncManager.adoptUnrecordedRows();
+    } catch (err) {
+      this.failAndRetry(socket, 'Could not record rows sync has never recorded', err);
+      return 'stopped';
+    }
+    if (adopted.rows > 0) {
+      this.emitSyncEvent(
+        'state-change',
+        `Recorded ${adopted.rows} existing row(s) in ${adopted.tables.length} table(s) as local changes`,
+        { changeCount: adopted.rows },
+      );
+    }
+    if (this.ws !== socket) return 'stopped';
+    if (adopted.rows === 0 || this.snapshotTransferPromise) return 'clear';
+    return 'adopted';
   }
 
   /**

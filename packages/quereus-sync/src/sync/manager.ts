@@ -112,6 +112,21 @@ export interface SyncManager {
   findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>>;
 
   /**
+   * Record every unrecorded row as a local change, along with any schema migration
+   * its table lacks, so the rows reach the server and every other device. The rows get
+   * the time of adoption, so they beat older edits of the same key elsewhere.
+   * Idempotent: a row that has a record is skipped, so an interrupted run is finished
+   * by calling this again. Returns what was recorded. On a peer with no engine it does
+   * nothing and logs a warning.
+   *
+   * Rejects, recording nothing further, while a snapshot checkpoint exists (the apply
+   * cleared the metadata, so every row would be stamped as new) or while an explicit
+   * transaction is open (its uncommitted rows look unrecorded, and may yet roll back).
+   * A snapshot apply started during a run waits for it to finish.
+   */
+  adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }>;
+
+  /**
    * Update the last sync state for a peer.
    *
    * Called after successfully syncing with a peer.

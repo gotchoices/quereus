@@ -147,6 +147,25 @@ class MockSyncManager implements SyncManager {
   unrecordedScanGate: Promise<void> | null = null;
   /** When set, applyChanges stays in flight until this settles. */
   applyChangesGate: Promise<void> | null = null;
+  /** What the next adoptUnrecordedRows reports. A later call finds nothing, as the real one does. */
+  adoptResult: { tables: Array<{ schema: string; table: string }>; rows: number } = { tables: [], rows: 0 };
+  /** What adoption records, so a push reads these only once it has run. */
+  adoptedChanges: ChangeSet[] = [];
+  /** When set, adoptUnrecordedRows throws this. */
+  adoptError: Error | null = null;
+  adoptCalls = 0;
+  /** When set, getPeerSentState stays pending until this settles. */
+  peerSentStateGate: Promise<void> | null = null;
+
+  async adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
+    this.adoptCalls++;
+    if (this.adoptError) throw this.adoptError;
+    this.getChangesSinceResult = [...this.getChangesSinceResult, ...this.adoptedChanges];
+    this.adoptedChanges = [];
+    const result = this.adoptResult;
+    this.adoptResult = { tables: [], rows: 0 };
+    return result;
+  }
 
   async findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>> {
     this.unrecordedScanCalls++;
@@ -217,6 +236,7 @@ class MockSyncManager implements SyncManager {
   }
 
   async getPeerSentState(_peerSiteId: SiteId): Promise<HLC | undefined> {
+    await this.peerSentStateGate;
     return this.peerSentState;
   }
 
@@ -2309,6 +2329,127 @@ describe('SyncClient', () => {
         await requested;
 
         expect(syncManager.unrecordedScanCalls).to.equal(0);
+      });
+
+      describe("'adopt'", () => {
+        const ADOPTED = { tables: [{ schema: 'main', table: 'notes' }], rows: 2 };
+
+        it('is refused with readOnly, which could never push what it adopts', () => {
+          expect(() => createClient({ unrecordedRows: 'adopt', readOnly: true })).to.throw(/readOnly/);
+        });
+
+        it('on first contact: records the rows and pushes them instead of bootstrapping', async () => {
+          const syncManager = new MockSyncManager();
+          const site = syncManager.getSiteId();
+          syncManager.adoptResult = ADOPTED;
+          syncManager.adoptedChanges = [changeSet(site, 'tx-adopted', hlcAt(6000n, site))];
+          const syncEventsLog: SyncEvent[] = [];
+          const { client } = createClient({ syncManager, bootstrapOnEmpty: true, unrecordedRows: 'adopt', syncEventsLog });
+
+          const ws = await connectAndHandshake(client);
+
+          const types = ws.getSentMessages().map(m => m.type);
+          expect(types).to.include('apply_changes');
+          expect(types).to.not.include('get_snapshot');
+          expect(syncManager.getChangesSinceCalls, 'the emptiness probe is skipped: only the push reads').to.have.length(1);
+          expect(syncEventsLog.filter(e => e.details?.changeCount === 2 && e.type === 'state-change')).to.have.length(1);
+        });
+
+        it('runs even with bootstrapOnEmpty off, but only until this server has acknowledged a push', async () => {
+          const adoptedOnConnect = async (peerSentState?: HLC): Promise<number> => {
+            const syncManager = new MockSyncManager();
+            syncManager.peerSentState = peerSentState;
+            const { client } = createClient({ syncManager, unrecordedRows: 'adopt' });
+            await connectAndHandshake(client);
+            return syncManager.adoptCalls;
+          };
+
+          expect(await adoptedOnConnect()).to.equal(1);
+          expect(await adoptedOnConnect(hlcAt(5000n, generateSiteId()))).to.equal(0);
+        });
+
+        it('with nothing to adopt, an empty replica still bootstraps', async () => {
+          const syncManager = new MockSyncManager();
+          const { client } = createClient({ syncManager, bootstrapOnEmpty: true, unrecordedRows: 'adopt' });
+
+          const ws = await connectAndHandshake(client);
+
+          expect(ws.getSentMessages().map(m => m.type)).to.include('get_snapshot');
+        });
+
+        it('on snapshot_required: adopts before the first push, whatever the peer state, and snapshots only after the ack', async () => {
+          const syncManager = new MockSyncManager();
+          const site = syncManager.getSiteId();
+          const serverSite = generateSiteId();
+          syncManager.peerSyncState = hlcAt(5000n, serverSite);
+          syncManager.peerSentState = hlcAt(5000n, site);
+          const { client } = createClient({ syncManager, unrecordedRows: 'adopt' });
+          const ws = await connectAndHandshake(client, serverSite);
+          expect(syncManager.adoptCalls).to.equal(0);
+
+          syncManager.adoptResult = ADOPTED;
+          syncManager.adoptedChanges = [changeSet(site, 'tx-adopted', hlcAt(6000n, site))];
+          sendSnapshotRequired(ws, serverSite);
+          await new Promise(r => setTimeout(r, 10));
+
+          expect(syncManager.adoptCalls).to.equal(1);
+          let types = ws.getSentMessages().map(m => m.type);
+          expect(types, 'the push carries what adoption recorded').to.include('apply_changes');
+          expect(types).to.not.include('get_snapshot');
+
+          const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId: string };
+          ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 2 });
+          await new Promise(r => setTimeout(r, 10));
+
+          types = ws.getSentMessages().map(m => m.type);
+          expect(types.indexOf('get_snapshot')).to.be.greaterThan(types.indexOf('apply_changes'));
+        });
+
+        it('an adoption that fails takes no snapshot and retries through the reconnect', async () => {
+          const syncManager = new MockSyncManager();
+          const adoptError = new Error('disk full');
+          syncManager.adoptError = adoptError;
+          const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true, unrecordedRows: 'adopt', autoReconnect: true });
+
+          const ws = await connectAndHandshake(client);
+          await new Promise(r => setTimeout(r, RECONNECT_WINDOW_MS));
+
+          expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
+          expect(errors).to.deep.equal([adoptError]);
+          expect(MockWebSocket.instances).to.have.length(2);
+        });
+
+        it('never adopts over a pending checkpoint, when every row would be stamped as new', async () => {
+          const syncManager = new MockSyncManager();
+          const serverSite = generateSiteId();
+          syncManager.checkpoints.set('snap-A', {
+            snapshotId: 'snap-A', siteId: serverSite, hlc: hlcAt(7000n, serverSite),
+            lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 1000,
+          });
+          const { client } = createClient({ syncManager, unrecordedRows: 'adopt' });
+
+          const ws = await connectAndHandshake(client, serverSite);
+
+          expect(ws.getSentMessages().map(m => m.type)).to.include('resume_snapshot');
+          expect(syncManager.adoptCalls).to.equal(0);
+        });
+
+        it('never adopts under a transfer an explicit requestSnapshot() has started', async () => {
+          const syncManager = new MockSyncManager();
+          let finishRead!: () => void;
+          syncManager.peerSentStateGate = new Promise(resolve => { finishRead = resolve; });
+          const serverSite = generateSiteId();
+          const { client } = createClient({ syncManager, unrecordedRows: 'adopt' });
+          const ws = await connectAndHandshake(client, serverSite);
+
+          const requested = client.requestSnapshot();
+          finishRead();
+          await new Promise(r => setTimeout(r, 10));
+          streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+          await requested;
+
+          expect(syncManager.adoptCalls).to.equal(0);
+        });
       });
     });
   });

@@ -146,6 +146,13 @@ interface SyncManager {
    * empty on a peer with no engine.
    */
   findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>>;
+
+  /**
+   * Record every unrecorded row as a local change, along with any schema migration its
+   * table lacks. Idempotent. Rejects while a snapshot checkpoint exists or an explicit
+   * transaction is open; does nothing on a peer with no engine.
+   */
+  adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }>;
 }
 
 interface ApplyResult {
@@ -549,6 +556,16 @@ sync has never recorded. `'replace'` skips the check. So does a pending checkpoi
 a transfer already under way has cleared the metadata the check reads. `requestSnapshot()`
 is never checked. See
 [sync.md § Rows sync has never recorded](sync.md#rows-sync-has-never-recorded).
+
+**`'adopt'` records them instead.** The client calls `adoptUnrecordedRows()` at handshake
+when it has no received or sent state for this server, before the empty check and whatever
+`bootstrapOnEmpty` says, and before the `snapshot_required` push whatever its state. A device
+that adopted rows at handshake skips the bootstrap and goes on to the incremental path, whose
+push carries them. On `snapshot_required` the push-first rule above carries them to the
+server, so they come back in the snapshot. A failed adoption takes no snapshot and retries
+through the reconnect. The constructor rejects `'adopt'` with `readOnly`. Adopted rows get
+the time of adoption, so they beat older edits of the same key; see
+[sync.md § Adopting rows](sync.md#adopting-rows).
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received
