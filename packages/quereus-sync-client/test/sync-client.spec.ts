@@ -121,7 +121,8 @@ function uninstallMockWebSocket(): void {
 
 class MockSyncManager implements SyncManager {
   siteId = generateSiteId();
-  getChangesSinceResult: ChangeSet[] = [];
+  /** What every change read returns: the mock has one change log and no origin filter. */
+  changeSets: ChangeSet[] = [];
   /** Transactions returned per call, standing in for `batchSize`. Unset means no bound. */
   changesPerCall: number | undefined = undefined;
   applyChangesResult: ApplyResult = { applied: 0, skipped: 0, conflicts: 0, transactions: 0 };
@@ -131,6 +132,7 @@ class MockSyncManager implements SyncManager {
   updatePeerSyncStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
   updatePeerSentStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
   getChangesSinceCalls: { peerSiteId: SiteId; sinceHLC?: HLC }[] = [];
+  getChangesToPushCalls: { peerSiteId: SiteId; sinceHLC?: HLC }[] = [];
   /**
    * Stands in for the durable `sc:` records. A real map rather than a fixed
    * `[]` / `undefined`: a test can seed a checkpoint here to make this mock look
@@ -160,7 +162,7 @@ class MockSyncManager implements SyncManager {
   async adoptUnrecordedRows(): Promise<{ tables: Array<{ schema: string; table: string }>; rows: number }> {
     this.adoptCalls++;
     if (this.adoptError) throw this.adoptError;
-    this.getChangesSinceResult = [...this.getChangesSinceResult, ...this.adoptedChanges];
+    this.changeSets = [...this.changeSets, ...this.adoptedChanges];
     this.adoptedChanges = [];
     const result = this.adoptResult;
     this.adoptResult = { tables: [], rows: 0 };
@@ -184,11 +186,19 @@ class MockSyncManager implements SyncManager {
 
   async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
     this.getChangesSinceCalls.push({ peerSiteId, sinceHLC });
-    // Strictly after the watermark, like the real manager, so an ack ends the
-    // client's push chain once nothing is left past it.
+    return this.changeSetsPast(sinceHLC);
+  }
+
+  async getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
+    this.getChangesToPushCalls.push({ peerSiteId, sinceHLC });
+    return this.changeSetsPast(sinceHLC);
+  }
+
+  /** Strictly after the watermark, like the real manager, so an ack ends the client's push chain once nothing is left past it. */
+  private changeSetsPast(sinceHLC?: HLC): ChangeSet[] {
     const unsent = sinceHLC
-      ? this.getChangesSinceResult.filter(cs => compareHLC(cs.hlc, sinceHLC) > 0)
-      : this.getChangesSinceResult;
+      ? this.changeSets.filter(cs => compareHLC(cs.hlc, sinceHLC) > 0)
+      : this.changeSets;
     return unsent.slice(0, this.changesPerCall);
   }
 
@@ -889,7 +899,7 @@ describe('SyncClient', () => {
 
       // Trigger a local change
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 };
-      syncManager.getChangesSinceResult = [{
+      syncManager.changeSets = [{
         siteId: syncManager.getSiteId(),
         transactionId: 'tx-local',
         hlc,
@@ -918,7 +928,7 @@ describe('SyncClient', () => {
       await client.disconnect();
 
       // Trigger a local change after disconnect
-      syncManager.getChangesSinceResult = [{
+      syncManager.changeSets = [{
         siteId: syncManager.getSiteId(),
         transactionId: 'tx-offline',
         hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 },
@@ -933,7 +943,7 @@ describe('SyncClient', () => {
     it('should not send when there are no changes', async () => {
       const syncEvents = new SyncEventEmitterImpl();
       const syncManager = new MockSyncManager();
-      syncManager.getChangesSinceResult = []; // No changes
+      syncManager.changeSets = []; // No changes
       const { client } = createClient({ syncManager, syncEvents });
       const ws = await connectAndHandshake(client);
 
@@ -1164,7 +1174,7 @@ describe('SyncClient', () => {
 
       // Queue a local change to push.
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 };
-      syncManager.getChangesSinceResult = [{
+      syncManager.changeSets = [{
         siteId: syncManager.getSiteId(),
         transactionId: 'tx-local',
         hlc,
@@ -1210,9 +1220,9 @@ describe('SyncClient', () => {
       ws.sentMessages.length = 0;
 
       const site = syncManager.getSiteId();
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 })];
+      syncManager.changeSets = [changeSet(site, 'tx1', { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 })];
       await (client as any).pushLocalChanges();
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx2', { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 })];
+      syncManager.changeSets = [changeSet(site, 'tx2', { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 })];
       await (client as any).pushLocalChanges();
 
       const pushes = ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId?: string }>;
@@ -1227,7 +1237,7 @@ describe('SyncClient', () => {
 
       const site = syncManager.getSiteId();
       const hlc: HLC = { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 };
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      syncManager.changeSets = [changeSet(site, 'tx1', hlc)];
       await (client as any).pushLocalChanges();
 
       const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
@@ -1261,9 +1271,9 @@ describe('SyncClient', () => {
 
       // Two pushes in flight (second re-sends a superset, as delta sync does
       // when the first has not yet been acked).
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc1)];
+      syncManager.changeSets = [changeSet(site, 'tx1', hlc1)];
       await (client as any).pushLocalChanges();
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc1), changeSet(site, 'tx2', hlc2)];
+      syncManager.changeSets = [changeSet(site, 'tx1', hlc1), changeSet(site, 'tx2', hlc2)];
       await (client as any).pushLocalChanges();
 
       const pushes = ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId?: string }>;
@@ -1294,7 +1304,7 @@ describe('SyncClient', () => {
 
       const site = syncManager.getSiteId();
       syncManager.changesPerCall = 1;
-      syncManager.getChangesSinceResult = [
+      syncManager.changeSets = [
         changeSet(site, 'tx1', { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 }),
         changeSet(site, 'tx2', { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 }),
       ];
@@ -1324,7 +1334,7 @@ describe('SyncClient', () => {
       // must never move our watermark, so it goes out with no requestId.
       const peerSite = generateSiteId();
       const hlc: HLC = { wallTime: 5000n, counter: 1, siteId: peerSite, opSeq: 0 };
-      syncManager.getChangesSinceResult = [changeSet(peerSite, 'tx-relay', hlc)];
+      syncManager.changeSets = [changeSet(peerSite, 'tx-relay', hlc)];
 
       ws.simulateMessage({ type: 'request_changes', siteId: siteIdToBase64(peerSite) });
       await new Promise(r => setTimeout(r, 5));
@@ -1369,10 +1379,10 @@ describe('SyncClient', () => {
       const { client } = createClient({ syncManager });
       await connectAndHandshake(client);
 
-      // The post-handshake delta push must query getChangesSince with the
-      // persisted watermark, NOT undefined (undefined re-sends everything).
-      const delta = syncManager.getChangesSinceCalls.find(c => c.sinceHLC !== undefined);
-      expect(delta, 'delta-push should query getChangesSince with a watermark').to.exist;
+      // The post-handshake delta push must read with the persisted watermark,
+      // NOT undefined (undefined re-sends everything).
+      const delta = syncManager.getChangesToPushCalls.find(c => c.sinceHLC !== undefined);
+      expect(delta, 'delta-push should read with a watermark').to.exist;
       expect(delta!.sinceHLC).to.deep.equal(persisted);
       expect((client as any).lastSentHLC).to.deep.equal(persisted);
     });
@@ -1386,7 +1396,7 @@ describe('SyncClient', () => {
 
       const site = syncManager.getSiteId();
       const hlc: HLC = { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 };
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      syncManager.changeSets = [changeSet(site, 'tx1', hlc)];
       await (client as any).pushLocalChanges();
 
       const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
@@ -1420,7 +1430,7 @@ describe('SyncClient', () => {
 
       const site = syncManager.getSiteId();
       const hlc: HLC = { wallTime: 4000n, counter: 2, siteId: site, opSeq: 0 };
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      syncManager.changeSets = [changeSet(site, 'tx1', hlc)];
       await (client as any).pushLocalChanges();
       const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
       ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
@@ -1434,10 +1444,10 @@ describe('SyncClient', () => {
       expect(syncManager.peerSentState).to.deep.equal(hlc);
 
       // Reconnect re-seeds from the durable watermark and resumes from there.
-      syncManager.getChangesSinceCalls.length = 0;
+      syncManager.getChangesToPushCalls.length = 0;
       await connectAndHandshake(client);
       expect((client as any).lastSentHLC).to.deep.equal(hlc);
-      const delta = syncManager.getChangesSinceCalls.find(c => c.sinceHLC !== undefined);
+      const delta = syncManager.getChangesToPushCalls.find(c => c.sinceHLC !== undefined);
       expect(delta!.sinceHLC).to.deep.equal(hlc);
     });
 
@@ -1615,7 +1625,7 @@ describe('SyncClient', () => {
 
       // Offline work appears, then the server refuses our watermark.
       const localHlc = hlcAt(6000n, site);
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', localHlc)];
+      syncManager.changeSets = [changeSet(site, 'tx-offline', localHlc)];
       ws.simulateMessage({
         type: 'snapshot_required',
         sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
@@ -1631,7 +1641,7 @@ describe('SyncClient', () => {
 
       // The ack lands: the sent watermark is confirmed, nothing is left to push,
       // and only now does get_snapshot leave.
-      syncManager.getChangesSinceResult = [];
+      syncManager.changeSets = [];
       ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
       await new Promise(r => setTimeout(r, 10));
       expect(syncManager.updatePeerSentStateCalls.map(c => c.hlc)).to.deep.equal([localHlc]);
@@ -1659,7 +1669,7 @@ describe('SyncClient', () => {
       const ws = await connectAndHandshake(client, serverSite);
 
       syncManager.changesPerCall = 1;
-      syncManager.getChangesSinceResult = [
+      syncManager.changeSets = [
         changeSet(site, 'tx-batch-1', hlcAt(6000n, site)),
         changeSet(site, 'tx-batch-2', hlcAt(6100n, site)),
       ];
@@ -1703,7 +1713,7 @@ describe('SyncClient', () => {
         if (data.includes('"apply_changes"')) throw new Error('socket write failed');
         realSend(data);
       };
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
+      syncManager.changeSets = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
 
       ws.simulateMessage({
         type: 'snapshot_required',
@@ -1720,7 +1730,7 @@ describe('SyncClient', () => {
       const syncManager = new MockSyncManager();
       const serverSite = generateSiteId();
       syncManager.peerSyncState = hlcAt(5000n, serverSite);
-      syncManager.getChangesSinceResult = [changeSet(syncManager.getSiteId(), 'tx-offline', hlcAt(6000n, syncManager.getSiteId()))];
+      syncManager.changeSets = [changeSet(syncManager.getSiteId(), 'tx-offline', hlcAt(6000n, syncManager.getSiteId()))];
       const { client } = createClient({ syncManager, bootstrapOnEmpty: true, readOnly: true });
       const ws = await connectAndHandshake(client, serverSite);
 
@@ -1757,7 +1767,7 @@ describe('SyncClient', () => {
       const syncManager = new MockSyncManager();
       const site = syncManager.getSiteId();
       // Never synced with this server (no peer state), but holds local facts.
-      syncManager.getChangesSinceResult = [changeSet(site, 'tx-local', hlcAt(1000n, site))];
+      syncManager.changeSets = [changeSet(site, 'tx-local', hlcAt(1000n, site))];
       const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
       const ws = await connectAndHandshake(client);
 
@@ -2220,7 +2230,7 @@ describe('SyncClient', () => {
         const { client, errors } = createClient({ syncManager });
         const ws = await connectAndHandshake(client, serverSite);
 
-        syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
+        syncManager.changeSets = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
         syncManager.unrecordedTables = TABLES;
         sendSnapshotRequired(ws, serverSite);
         await new Promise(r => setTimeout(r, 10));
@@ -2351,7 +2361,7 @@ describe('SyncClient', () => {
           const types = ws.getSentMessages().map(m => m.type);
           expect(types).to.include('apply_changes');
           expect(types).to.not.include('get_snapshot');
-          expect(syncManager.getChangesSinceCalls, 'the emptiness probe is skipped: only the push reads').to.have.length(1);
+          expect(syncManager.getChangesSinceCalls, 'the emptiness probe is skipped').to.have.length(0);
           expect(syncEventsLog.filter(e => e.details?.changeCount === 2 && e.type === 'state-change')).to.have.length(1);
         });
 

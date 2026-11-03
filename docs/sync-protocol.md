@@ -117,6 +117,12 @@ interface SyncManager {
   /** All changes since a peer's last known state; omit sinceHLC for initial sync. */
   getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
 
+  /**
+   * What to push upstream to a peer: facts and migrations this replica wrote, plus held
+   * store-and-forward changes not written by that peer. Same bound as getChangesSince.
+   */
+  getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
+
   /** Apply changes received from a peer; returns statistics about what was applied. */
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
 
@@ -473,13 +479,23 @@ batch-slice boundary — so advancing it can only land *between* whole transacti
 4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity — **unless** `sinceHLC` is below its delta floor ([sync.md § Read side → The delta floor](sync.md#read-side-one-changeset-per-transaction)): a delete the client needs has been pruned, so it answers `snapshot_required` and the client recovers as described under *Client snapshot bootstrap* below. A `get_changes` with no `sinceHLC` is a from-nothing load and is never refused
 
 The push loop, end to end: a local change triggers the debounced send (50 ms window);
-the client calls `getChangesSince(serverSiteId, lastSentHLC)` for per-transaction
+the client calls `getChangesToPush(serverSiteId, lastSentHLC)` for per-transaction
 ChangeSets, sends `apply_changes { requestId: apply-N, changes }`, and records
 `pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns`; the server replies
 `apply_result { requestId, ... }` with the id echoed verbatim; on a matching id the
 client sets `lastSentHLC` to that HLC (forward-only) and persists it per peer. One read
 returns at most one `batchSize` batch, so when an ack moves the watermark the client reads
 and pushes again, ending when nothing is left past it.
+
+A device pushes only what it wrote (`hlc.siteId` is its own), never what it received. It
+assumes one coordinator per database: everything it received came through that server, so
+the server has it. So a device that only receives never pushes, and has no sent watermark.
+
+Pushes therefore do not refill a server restored from an older copy (the coordinator's S3
+restore). Such a server gets back only what devices write afterwards and what they have not
+yet had acknowledged. Devices once re-uploaded what they had received since their last push,
+which refilled part of a restored server by accident; it never covered their own
+acknowledged writes, and nothing relied on it.
 
 ### Reconnection with Exponential Backoff
 
@@ -511,8 +527,8 @@ known-fatal set (the three codes above); every other code is treated as transien
 ### Local Change Debouncing
 
 Rapid local changes are batched to reduce network overhead: each local change event
-starts or resets a 50 ms debounce timer, and when it fires the client collects every
-change since `lastSentHLC` and sends them in one `apply_changes` message — N messages
+starts or resets a 50 ms debounce timer, and when it fires the client collects its own
+changes since `lastSentHLC` and sends them in one `apply_changes` message — N messages
 per edit become 1 per burst.
 
 ### Client snapshot bootstrap
@@ -525,8 +541,8 @@ local-change subscription, push) starts:
 - `requestSnapshot()`, explicit. Idempotent while a transfer is in flight: a second call
   joins it, and exactly one `get_snapshot` goes on the wire.
 - An empty replica on first connect (`bootstrapOnEmpty`, default `true`). "Empty"
-  requires **both** no peer sync state for this server and no local change facts of our
-  own — the first alone also matches a device holding real local data that merely never
+  requires **both** no peer sync state for this server and no change facts, whichever
+  device wrote them — the first alone also matches a device holding real local data that merely never
   met this server, and bootstrapping that deletes every row the server's copy lacks. A
   locally pre-created schema still counts as empty; replicated DDL applies idempotently.
   So does a device whose rows were written before sync attached, since they have no
@@ -545,9 +561,10 @@ local-change subscription, push) starts:
   again, and retries — pushes are idempotent, so this converges. Local writes made
   *during* the transfer remain the gap noted below. The rows such a device holds that the
   server deleted long ago are what the apply removes: nothing else in the sync protocol
-  can reach them. Known exception: a row the device pulled but has not pushed past its
-  watermark is pushed back first and returns to the server, so the snapshot keeps it
-  (`fix/sync-client-pushes-back-server-changes`).
+  can reach them. One limit: the device's own older write can still bring such a row back
+  (it edited the row offline, or a push of it lost its acknowledgement and is re-sent),
+  because offline work has to go out and the server cannot tell it from a new write once
+  the tombstone is gone.
 
 **The two automatic triggers check first.** Under `unrecordedRows: 'refuse'`, the default,
 the client asks `findTablesWithUnrecordedRows()` before the bootstrap and before the

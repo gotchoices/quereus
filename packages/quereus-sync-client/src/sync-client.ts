@@ -876,7 +876,7 @@ export class SyncClient {
     this.recoveryOwnsPush = true;
     try {
       // NOTE: progress relies on every read's max hlc exceeding the watermark, which
-      // getChangesSince guarantees today. Unlike the ack chain this loop has no
+      // getChangesToPush guarantees today. Unlike the ack chain this loop has no
       // "did it advance" check; if a read could ever return facts at or below the
       // watermark, stop here on a non-advancing ack or it re-sends them forever.
       let push = await this.pushLocalChanges();
@@ -939,9 +939,6 @@ export class SyncClient {
     }
 
     // Independent of bootstrapOnEmpty: this is about these rows, not about bootstrapping.
-    // NOTE: the first push after this reads every local change into memory
-    // (`collectAllChanges`, for a push with no watermark), which adoption makes reachable
-    // on a populated device. If that shows up, make that unbounded scan bounded.
     if (this.options.unrecordedRows === 'adopt' && await this.isFirstContact()) {
       const verdict = await this.settleUnrecordedRows();
       if (verdict !== 'clear') return verdict === 'adopted';
@@ -963,13 +960,16 @@ export class SyncClient {
    * against the server learned at handshake:
    *
    * - no peer sync state (never synced with this server), and
-   * - no local change facts of our own.
+   * - no change facts, whichever device wrote them. That is why this reads with
+   *   getChangesSince rather than getChangesToPush: a device holding changes learned
+   *   over another route must not be bootstrapped over them.
    *
    * The first alone would also match a device holding real local data that is
    * merely meeting this server for the first time — bootstrapping it would
    * delete every row the server's copy lacks, from each table that copy covers.
-   * The second alone would match a device whose entire contents came from this
-   * server. Requiring both admits only the genuinely new device. A device that
+   * The second alone would match a device already following this server that
+   * simply holds nothing yet, which needs no snapshot. Requiring both admits only
+   * the genuinely new device. A device that
    * pre-created its schema locally still counts as empty: schema migration
    * records are not consulted, and replicated DDL applies idempotently.
    *
@@ -1385,7 +1385,7 @@ export class SyncClient {
   }
 
   /**
-   * Push the next batch of local changes past `lastSentHLC`. `getChangesSince`
+   * Push the next batch of local changes past `lastSentHLC`. `getChangesToPush`
    * bounds what one read returns, so this is not everything: the ack continues
    * from here (handleApplyResult, or {@link pushUntilDrained} during recovery).
    *
@@ -1399,10 +1399,9 @@ export class SyncClient {
     // No pushes while a snapshot is landing — local data is partial.
     if (this.isBootstrapping) return { status: 'held' };
 
-    // Get changes since lastSentHLC (delta sync)
-    // Use serverSiteId to filter out changes that originated from the server
-    // (which we already have), keeping our local changes to send
-    const changes = await this.syncManager.getChangesSince(
+    // What this device wrote past lastSentHLC. Changes it received from other devices
+    // are left out: they came through this server, so it already has them.
+    const changes = await this.syncManager.getChangesToPush(
       this.serverSiteId,
       this.lastSentHLC ?? undefined
     );

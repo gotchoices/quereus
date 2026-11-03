@@ -174,6 +174,18 @@ describe('store-and-forward relay', () => {
     });
   });
 
+  describe('pushing upstream', () => {
+    it('getChangesToPush offers a held forwardable change, except to its origin', async () => {
+      const S = generateSiteId();
+      const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users'] });
+      const C = col(S, 1500, RETIRED, 1, 'note', 'hi');
+      await R.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+
+      expect(flatten(await R.manager.getChangesToPush(generateSiteId()))).to.deep.equal([C]);
+      expect(await R.manager.getChangesToPush(S)).to.deep.equal([]);
+    });
+  });
+
   describe('ping-pong loop-freedom between two non-holders', () => {
     it('two relay peers exchange a forwarded change exactly once and quiesce (no unbounded growth, no infinite re-send)', async () => {
       const S = generateSiteId();

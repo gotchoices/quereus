@@ -14,6 +14,7 @@
 
 import { expect } from 'chai';
 import { SyncClient, type SyncClientOptions } from '@quereus/sync-client';
+import { siteIdEquals, type ChangeSet, type SyncConfig, type SyncManager } from '@quereus/sync';
 import {
   bootCoordinator,
   makeClientPeer,
@@ -156,7 +157,76 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
       { label: 'delete on A to propagate to B' },
     );
   });
+
+  it('a device returning past a pruned delete pushes only its own writes, and the delete holds everywhere', async () => {
+    const service = coordinator.server.service;
+    const pushedByB: ChangeSet[] = [];
+    const applyChanges = service.applyChanges.bind(service);
+    service.applyChanges = (databaseId, client, changes) => {
+      if (siteIdEquals(client.siteId, peerB.syncManager.getSiteId())) pushedByB.push(...changes);
+      return applyChanges(databaseId, client, changes);
+    };
+    const serverEntry = await service.storeManager.acquire(DB_ID);
+
+    await peerA.db.exec(`insert into orders (id, note, qty) values (1, 'one', 1), (2, 'two', 2)`);
+    await waitFor(
+      async () => (await notesOn(peerB)).length === 2,
+      { label: 'A\'s rows to reach B by broadcast' },
+    );
+
+    await clientB.disconnect();
+    await peerB.db.exec(`insert into orders (id, note, qty) values (3, 'offline', 3)`);
+    await peerB.db.exec(`update orders set note = 'edited offline' where id = 2`);
+
+    await peerA.db.exec('delete from orders where id = 1');
+    await waitFor(
+      async () => !(await notesOnServer(serverEntry.syncManager)).some(([id]) => id === 1),
+      { label: 'A\'s delete to reach the server' },
+    );
+    await pruneEveryTombstone(serverEntry.syncManager);
+
+    await clientB.connect(coordinator.url, DB_ID);
+
+    const expected = [[2, 'edited offline'], [3, 'offline']];
+    const onEveryReplica = async () => ({
+      a: await notesOn(peerA),
+      b: await notesOn(peerB),
+      server: await notesOnServer(serverEntry.syncManager),
+    });
+    await waitFor(
+      async () => JSON.stringify(await onEveryReplica()) === JSON.stringify({ a: expected, b: expected, server: expected }),
+      { label: 'A, B and the server to hold rows 2 and 3 only, including B\'s offline edit' },
+    );
+    service.storeManager.release(DB_ID);
+
+    expect(pushedByB, 'B pushes its offline work').to.not.be.empty;
+    expect(
+      pushedByB.every(changeSet => siteIdEquals(changeSet.siteId, peerB.syncManager.getSiteId())),
+      'B pushes nothing another device wrote',
+    ).to.equal(true);
+  });
 });
+
+/** Each row's id and note, by id. */
+async function notesOn(peer: ClientPeer): Promise<Array<[number, unknown]>> {
+  const rows = await collect(peer.db, 'select id, note from orders order by id');
+  return rows.map(row => [Number(row.id), row.note]);
+}
+
+/** The server has no engine to query, so this reads its rows out of a snapshot: each row's id and note, by id. */
+async function notesOnServer(syncManager: SyncManager): Promise<Array<[number, unknown]>> {
+  const { tables } = await syncManager.getSnapshot();
+  const cells = tables.flatMap(table => table.columnVersions).filter(cell => cell.column === 'note');
+  return cells
+    .map((cell): [number, unknown] => [Number(cell.pk[0]), cell.value])
+    .sort(([a], [b]) => a - b);
+}
+
+/** Prune every tombstone now, as the retention horizon eventually would. The horizon is otherwise fixed at startup. */
+async function pruneEveryTombstone(syncManager: SyncManager): Promise<void> {
+  (syncManager as unknown as { config: SyncConfig }).config.retentionHorizonMs = -1;
+  await syncManager.pruneTombstones();
+}
 
 describe('adopting rows written before sync attached (e2e)', () => {
   // More than one of adoption's internal batches.

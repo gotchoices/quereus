@@ -219,19 +219,20 @@ Diverted changes are **never resolved, applied, or recorded as CRDT metadata** �
 **Telemetry fires either way**, because the failure mode the disposition guards against is otherwise silent write loss the straggler never learns about:
 
 - `onUnknownTable(listener)` — one `UnknownTableEvent` per distinct unknown table per apply (see § Reactive Hooks).
-- `getUnknownTableStats()` — cumulative, observe-only: `{ ignored, quarantined, forwarded, relayed, byTable }` (diverted-change counts by disposition and by `schema.table`). `forwarded` counts changes held forwardable at apply time (held once); `relayed` counts forwardable changes re-offered through `getChangesSince` — one held entry may relay many times until it GCs.
+- `getUnknownTableStats()` — cumulative, observe-only: `{ ignored, quarantined, forwarded, relayed, byTable }` (diverted-change counts by disposition and by `schema.table`). `forwarded` counts changes held forwardable at apply time (held once); `relayed` counts forwardable changes re-offered through `getChangesSince` or `getChangesToPush` — one held entry may relay many times until it GCs.
 - `ApplyResult.unknownTable` — count of changes diverted this apply, for callers that don't subscribe.
 
 When `getTableSchema` is absent (e.g. a relay-only coordinator with no basis oracle) detection is **inert**, and the store adapter's defensive `Table not found for external write` throw remains the fallback. Snapshot bootstrap paths (`applySnapshot` / `applySnapshotStream`) are out of scope — they transfer a whole basis, not a straggler delta, so a section with cells for an unknown table still hits that defensive throw (one with no cells is skipped; see [Snapshots replace rows](#snapshots-replace-rows)).
 
 #### Store-and-forward relay
 
-This peer re-offers its forwardable holds to peers that still have the table, riding the existing outbound delta path: `getChangesSince` folds `QuarantineStore.listForwardable()` into its merged `ChangeSet[]` return — **no new transport surface**, so `quereus-sync-client` / `sync-coordinator` need no change. Each forwarded change keeps its **original `hlc` + `siteId`** (the straggler's fact), which makes the relay convergent and loop-free with **no per-table peer-membership oracle** (none exists):
+This peer re-offers its forwardable holds to peers that still have the table, riding the existing outbound delta paths: `getChangesSince` (answering a peer) and `getChangesToPush` (a device's push upstream) both fold `QuarantineStore.listForwardable()` into their merged `ChangeSet[]` return — **no new transport surface**, so `quereus-sync-client` / `sync-coordinator` hold no relay logic of their own. Each forwarded change keeps its **original `hlc` + `siteId`** (the straggler's fact), which makes the relay convergent and loop-free with **no per-table peer-membership oracle** (none exists):
 
 - **Watermark-safe.** Forwardable changes are filtered `HLC > sinceHLC` before merge, like change-log changes. A consumer advances its per-peer `lastSyncHLC` to `max(ChangeSet.hlc)`; without the filter, a forwarded-only round carrying an old HLC would regress that watermark and trigger a re-scan/re-deliver flood.
 - **Loop-free.** A receiver that still lacks the table re-disposes the forwarded change per its own config (re-quarantine / re-forward). Because HLC + siteId are preserved, a peer that already holds it re-holds it idempotently (one HLC-keyed entry), and the per-peer watermark stops re-send after one exchange — so two non-holders ping-ponging a change quiesce instead of looping.
 - **Bound + ordering.** The change-log scan early-exits at a transaction cut `C`; the forwardable scan is full (all `> sinceHLC`); `buildTransactionChangeSets` re-bounds the union at `batchSize` at a transaction boundary `M ≤ C`. Everything `≤ M` from both sources is present, so the returned prefix stays contiguous and a forwarded change interleaves with change-log changes in global HLC order; entries beyond `M` are re-collected next round. A forwarded change re-forms the straggler's original transaction by `deterministicTxnId`, so a straggler transaction touching both a live and a now-retired-here table rejoins into one ChangeSet.
 - **Accepted limitation.** A straggler change causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`) is not relayed via this delta path — the same scalar-watermark limitation the base delta layer has (such a change arrives by direct sync / snapshot instead). store-and-forward targets the transitional uneven-retirement window where the straggler's writes are recent enough to exceed holder watermarks; quarantine prevents write loss outside it.
+- **One echo on a push.** Nothing records which peer a held change came from, so a device that received one from the server pushes it back once, until its sent watermark passes it. This takes a device that has retired a table the server still has, under the non-default `store-and-forward` disposition.
 - **Snapshot carve-out.** Forwardable entries are **delta-only**: a snapshot transfers the offering peer's own basis, and a forwarded change is for a table that peer does not have. The snapshot collectors scan only `cv:` / `tb:` / `sm:`, never `qt:`.
 - **GC vs in-flight relay.** A forwardable entry pruned at the horizon while a slow peer still needed it is acceptable — that peer was already past the delivery guarantee. After `pruneQuarantine` removes it, `getChangesSince` no longer relays it.
 
@@ -439,6 +440,18 @@ early-exit (a large initial range is served by a snapshot instead); and the `sm:
 schema-migration scan is not HLC-ordered, so it is drained in full (migrations are few,
 and grouping drops any that sort past the bounded fact watermark — over-scan costs work,
 never correctness).
+
+**Pushing upstream.** `getChangesToPush(peerSiteId, sinceHLC?)` answers a different
+question with the same machinery: what should this replica send to the server it follows?
+It keeps only facts and migrations whose `hlc.siteId` is this replica's own. That identifies
+the writer for good, because relays, applies and snapshots all keep the original HLC. Held
+store-and-forward changes are still offered (§ Store-and-forward relay). The origin check
+runs before the batch counter, so a run of other devices' entries spends no budget and an
+empty read means nothing is left. With no watermark it scans the change log rather than
+`cv:`/`tb:`, so the same early exit applies and a device that writes nothing is not
+reading every record per handshake. It makes no delta-floor check: the floor says what a
+receiver may be missing, which has no bearing on what this replica has to send. See
+[sync-protocol.md § Delta Sync Optimization](sync-protocol.md#delta-sync-optimization) for the push loop.
 
 Scan-time boundary detection keys off the *log entry's* HLC while grouping keys off the
 *resolved version's* HLC; the two agree because **at most one change-log entry survives
@@ -1063,7 +1076,7 @@ syncEvents.onConflictResolved((event) => { /* event.table/column/winner */ });
 async function syncWithServer(ws: WebSocket) {
   // One batch of at most `batchSize`: read again from this batch's max hlc until
   // the result is empty, or the rest is never sent.
-  const localChanges = await syncManager.getChangesSince(serverSiteId, lastServerHLC);
+  const localChanges = await syncManager.getChangesToPush(serverSiteId, lastSentHLC);
   ws.send(JSON.stringify({ type: 'changes', data: localChanges }));
 
   ws.onmessage = async (msg) => {

@@ -179,7 +179,7 @@ The client implements the Quereus sync WebSocket protocol:
 | `get_changes` | Client→Server | Request changes since HLC |
 | `changes` | Server→Client | Initial/requested changes |
 | `snapshot_required` | Server→Client | Our watermark predates pruned deletes; the client pushes all its unsent local changes, batch by batch, takes a full snapshot, then catches up |
-| `apply_changes` | Client→Server | Send local changes |
+| `apply_changes` | Client→Server | Send changes this device wrote |
 | `apply_result` | Server→Client | Confirm changes applied |
 | `push_changes` | Server→Client | Real-time changes from other clients |
 | `get_snapshot` | Client→Server | Request a full snapshot stream |

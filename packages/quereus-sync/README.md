@@ -51,8 +51,11 @@ syncEvents.onRemoteChange((event) => {
   console.log('Remote changes applied:', event.changes.length);
 });
 
-// Get changes to send to another replica
+// Get changes to send to a replica that asked for them
 const changes = await syncManager.getChangesSince(peerSiteId);
+
+// Or, pushing upstream to the server this replica follows: only what it wrote
+const toPush = await syncManager.getChangesToPush(serverSiteId, sentWatermark);
 
 // Apply received changes from a remote replica
 const result = await syncManager.applyChanges(changeSets);

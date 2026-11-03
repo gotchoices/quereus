@@ -48,6 +48,23 @@ export interface SyncManager {
   getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
 
   /**
+   * What this replica should push upstream to `peerSiteId`: facts and schema migrations
+   * this replica wrote, plus held store-and-forward changes not written by that peer, all
+   * after `sinceHLC`. Same shape and transaction-grained bound as {@link getChangesSince}.
+   * Omitting `sinceHLC` starts from the beginning of the change log; the result is still
+   * one bounded batch. An empty result means nothing is left to push.
+   *
+   * Other devices' changes are left out on the assumption that the peer is the one route
+   * they travel by: this replica received them from it, so it has them. A replica also
+   * learning them over a second transport must forward them with {@link getChangesSince}.
+   *
+   * @param peerSiteId - The peer being pushed to
+   * @param sinceHLC - The sent watermark for that peer (see {@link getPeerSentState})
+   * @returns Array of change sets to send to the peer
+   */
+  getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
+
+  /**
    * Apply changes received from a peer.
    *
    * Changes are applied atomically per transaction.
@@ -236,7 +253,7 @@ export interface SyncManager {
    * across all dispositions — the per-disposition counters partition it).
    * `forwarded` counts changes **held as forwardable at apply time** under the
    * `store-and-forward` disposition (held once). `relayed` counts forwardable
-   * changes **re-offered through `getChangesSince`** — relay activity, distinct
+   * changes **re-offered through `getChangesSince` or `getChangesToPush`** — relay activity, distinct
    * from `forwarded`: one held entry is relayed possibly many times until it GCs,
    * so `relayed` grows with outbound relay traffic rather than with distinct
    * stragglers. Mirrors the engine's `getMaterializedViewCollisionStats()` pattern

@@ -237,8 +237,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	private unknownTableIgnored = 0;
 	private unknownTableQuarantined = 0;
 	private unknownTableForwarded = 0;
-	// Cumulative forwardable changes re-offered through getChangesSince (the
-	// store-and-forward relay's outbound activity). Distinct from
+	// Cumulative forwardable changes re-offered through getChangesSince or
+	// getChangesToPush (the store-and-forward relay's outbound activity). Distinct from
 	// unknownTableForwarded, which counts apply-time holds: a held entry is held
 	// ONCE but relayed possibly MANY times until GC, so this counter grows with
 	// relay activity, not with distinct stragglers. Bumped in collectForwardableChanges.
@@ -1262,25 +1262,52 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
 		// A watermark below the delta floor cannot be served in full: a delete
 		// whose tombstone was pruned is missing from the reply, and nothing in it
-		// says so. Warn rather than throw — the coordinator checks `canDeltaSync`
-		// BEFORE calling (so a server never reaches this), and a client's own
-		// outbound push runs below its local floor legitimately (it prunes its own
-		// tombstones too); a throw there would wedge the push path.
-		// NOTE: a client that inherited the server's floor via a snapshot recovery
-		// and has pushed nothing since (its sent watermark predates that floor)
-		// logs this on every reconnect's handshake push until it next writes; the
-		// warning is about inbound completeness and is a false positive there. If
-		// the noise matters, let the push path pass a flag that skips this check.
+		// says so. Warn rather than throw: the coordinator checks `canDeltaSync`
+		// BEFORE calling, so only a transport that skips that check reaches this.
 		if (sinceHLC && !(await this.deltaFloor.admits(sinceHLC))) {
 			console.warn(
 				'[Sync] getChangesSince below the delta floor: tombstones the peer needs were pruned, so this delta is incomplete — the peer should take a snapshot',
 			);
 		}
 
+		const notFromPeer = (origin: SiteId): boolean => !siteIdEquals(origin, peerSiteId);
 		const dataChanges: Change[] = sinceHLC
-			? await this.collectChangesSince(peerSiteId, sinceHLC, this.config.batchSize)
+			? await this.collectChangesSince(this.changeLog.getChangesSince(sinceHLC), notFromPeer)
 			: await this.collectAllChanges(peerSiteId);
+		const migrations = await this.collectSchemaMigrations(notFromPeer, sinceHLC);
 
+		return this.buildChangeSetsForPeer(peerSiteId, sinceHLC, dataChanges, migrations);
+	}
+
+	async getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
+		const writtenHere = (origin: SiteId): boolean => siteIdEquals(origin, this.getSiteId());
+		// NOTE: walks every change-log key past the watermark, and a device's sent
+		// watermark does not move while it only receives: a quiet device walks the whole
+		// log per handshake (keys only, no record reads), a rarely-writing one re-walks
+		// what it received since its last write. If this shows up, persist a "scanned
+		// through" position per peer.
+		const log = sinceHLC ? this.changeLog.getChangesSince(sinceHLC) : this.changeLog.getAllChanges();
+		const ownChanges = await this.collectChangesSince(log, writtenHere);
+		const ownMigrations = await this.collectSchemaMigrations(writtenHere, sinceHLC);
+
+		// NOTE: nothing records which peer a held change came from, so a change held from
+		// this same peer goes back to it once, until the sent watermark passes it. That
+		// takes a device that retired a table the server still has, under the non-default
+		// `store-and-forward` disposition. If it matters, record the source peer on the
+		// quarantine entry.
+		return this.buildChangeSetsForPeer(peerSiteId, sinceHLC, ownChanges, ownMigrations);
+	}
+
+	/**
+	 * The shared tail of {@link getChangesSince} and {@link getChangesToPush}: add the
+	 * held changes to forward, then group by transaction and bound the result.
+	 */
+	private async buildChangeSetsForPeer(
+		peerSiteId: SiteId,
+		sinceHLC: HLC | undefined,
+		dataChanges: Change[],
+		migrations: SchemaMigration[],
+	): Promise<ChangeSet[]> {
 		// Fold forwardable held changes (the `store-and-forward` relay's outbound
 		// half) into the SAME ChangeSet[] return — no new transport surface. Each
 		// keeps its ORIGINAL hlc + siteId, so buildTransactionChangeSets re-forms the
@@ -1300,11 +1327,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC);
 		const changes = forwardable.length > 0 ? [...dataChanges, ...forwardable] : dataChanges;
 
-		const schemaMigrations = await this.collectSchemaMigrations(peerSiteId, sinceHLC);
-
 		return buildTransactionChangeSets(
 			changes,
-			schemaMigrations,
+			migrations,
 			this.config.batchSize,
 			(transactionId, changeCount) => {
 				// Oversized transactions are returned whole (never split); telemeter
@@ -1317,9 +1342,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Delta extraction: facts after `sinceHLC`, in change-log (HLC) order, bounded
-	 * at **scan time** to whole transactions whose cumulative data-change count
-	 * reaches `batchSize`.
+	 * Delta extraction: the facts in `logEntries` (an HLC-ordered change-log scan)
+	 * from a wanted origin, bounded at **scan time** to whole transactions whose
+	 * cumulative data-change count reaches `batchSize`.
+	 *
+	 * The origin check comes before the batch counter, so a run of unwanted entries
+	 * spends no budget and cannot produce an empty result while wanted facts remain:
+	 * an empty result always means nothing wanted is left.
 	 *
 	 * The change-log scan is keyed by `(wallTime, counter, siteId, opSeq)`, so a
 	 * transaction's facts arrive contiguously and transactions arrive in commit
@@ -1360,10 +1389,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * step drops any that sort past the bounded fact watermark.)
 	 */
 	private async collectChangesSince(
-		peerSiteId: SiteId,
-		sinceHLC: HLC,
-		batchSize: number,
+		logEntries: AsyncIterable<ChangeLogEntry>,
+		isWantedOrigin: (origin: SiteId) => boolean,
 	): Promise<Change[]> {
+		const batchSize = this.config.batchSize;
 		const changes: Change[] = [];
 		// Data-change count over fully-scanned (whole) transactions. The in-flight
 		// transaction's own count is held separately until its boundary is crossed,
@@ -1372,10 +1401,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		let currentTxnId: string | null = null;
 		let currentTxnChangeCount = 0;
 
-		for await (const logEntry of this.changeLog.getChangesSince(sinceHLC)) {
-			// A transaction is wholly one site's, so skipping the peer's own facts
-			// filters whole transactions cleanly (no half-empty ChangeSet).
-			if (siteIdEquals(logEntry.hlc.siteId, peerSiteId)) continue;
+		for await (const logEntry of logEntries) {
+			// A transaction is wholly one site's, so filtering by origin drops whole
+			// transactions cleanly (no half-empty ChangeSet).
+			if (!isWantedOrigin(logEntry.hlc.siteId)) continue;
 
 			// deterministicTxnId excludes opSeq, so it is exactly the transaction
 			// identity. Facts of one transaction are contiguous in the HLC-ordered
@@ -1463,9 +1492,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Unlike {@link collectChangesSince}, this path cannot early-exit at scan time:
 	 * the `cv:`/`tb:` scans are keyed by table/pk, NOT by HLC, so transactions are
 	 * interleaved arbitrarily and no transaction boundary is reachable without a
-	 * full scan + sort. It is left unbounded because it is the from-zero path: a
-	 * large initial range is expected to be served by a snapshot rather than this
-	 * delta path (docs/sync.md).
+	 * full scan + sort. It is left unbounded because it is the from-zero path of a
+	 * read serving a peer: a large initial range is expected to be served by a
+	 * snapshot rather than this delta path (docs/sync.md). {@link getChangesToPush}
+	 * has no such alternative and reads from zero through the change log instead.
 	 *
 	 * Records of a RETIRED generation (a dropped table's leftovers) are skipped:
 	 * they describe an incarnation no peer should receive, and shipping a dropped
@@ -1571,8 +1601,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			if (sinceHLC && compareHLC(change.hlc, sinceHLC) <= 0) continue;
 			changes.push(change);
 		}
-		// Relay-activity telemetry: a held entry is counted on EVERY getChangesSince
-		// that re-offers it (repeatedly until GC), and the batch bound may defer some to
+		// Relay-activity telemetry: a held entry is counted on EVERY read that re-offers it
+		// (repeatedly until GC), and the batch bound may defer some to
 		// a later round (re-counted then) — so this measures relay ACTIVITY, not distinct
 		// deliveries (distinct from the apply-time `forwarded` hold count).
 		this.unknownTableRelayed += changes.length;
@@ -1580,7 +1610,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Collect schema migrations after `sinceHLC` not originating from the peer.
+	 * Collect schema migrations after `sinceHLC` from a wanted origin.
 	 * Each migration shares its transaction's base HLC, so the grouping step
 	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
 	 *
@@ -1594,13 +1624,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * unbounded; see the bounded-extraction ticket's handoff.
 	 */
 	private async collectSchemaMigrations(
-		peerSiteId: SiteId,
+		isWantedOrigin: (origin: SiteId) => boolean,
 		sinceHLC?: HLC,
 	): Promise<SchemaMigration[]> {
 		const all = await this.schemaMigrations.listAllMigrations();
 		return all.filter(migration => {
 			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) return false;
-			return !siteIdEquals(migration.hlc.siteId, peerSiteId);  // echo filter
+			return isWantedOrigin(migration.hlc.siteId);
 		});
 	}
 
