@@ -8,6 +8,13 @@ severity: wrong-result
 likelihood: unusual
 tradeoffs: Apps that create tables after attaching sync, or that ship the same schema to every device, never hit this, and checking on the local write path adds a read of the table's migrations unless the answer is remembered per table.
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-11-03T17:53:18.186Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\1-bug-sync-write-to-unannounced-table-strands-new-devices.fix.2026-11-03T17-53-18-184Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 ## What happens
 
