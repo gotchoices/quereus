@@ -490,6 +490,8 @@ and pushes again, ending when nothing is left past it.
 A device pushes only what it wrote (`hlc.siteId` is its own), never what it received. It
 assumes one coordinator per database: everything it received came through that server, so
 the server has it. So a device that only receives never pushes, and has no sent watermark.
+A [schema seed](sync-schema.md#seeds-and-the-server) is the exception to that assumption: a
+device applies it locally, and it never reaches the server.
 
 Pushes therefore do not refill a server restored from an older copy (the coordinator's S3
 restore). Such a server gets back only what devices write afterwards and what they have not
@@ -542,8 +544,9 @@ local-change subscription, push) starts:
   joins it, and exactly one `get_snapshot` goes on the wire.
 - An empty replica on first connect (`bootstrapOnEmpty`, default `true`). "Empty"
   requires **both** no peer sync state for this server and no change facts, whichever
-  device wrote them — the first alone also matches a device holding real local data that merely never
-  met this server, and bootstrapping that deletes every row the server's copy lacks. A
+  device wrote them — the first alone also matches a device holding real local data that
+  merely never met this server, and bootstrapping that deletes every row the server's copy
+  lacks. A
   locally pre-created schema still counts as empty; replicated DDL applies idempotently.
   So does a device whose rows were written before sync attached, since they have no
   change facts. The `unrecordedRows` check below stands between that device and the
@@ -561,10 +564,13 @@ local-change subscription, push) starts:
   again, and retries — pushes are idempotent, so this converges. Local writes made
   *during* the transfer remain the gap noted below. The rows such a device holds that the
   server deleted long ago are what the apply removes: nothing else in the sync protocol
-  can reach them. One limit: the device's own older write can still bring such a row back
-  (it edited the row offline, or a push of it lost its acknowledgement and is re-sent),
-  because offline work has to go out and the server cannot tell it from a new write once
-  the tombstone is gone.
+  can reach them. One limit: the device's own older write can still bring part of such a
+  row back (it edited the row offline, or a push of it lost its acknowledgement and is
+  re-sent), because offline work has to go out and the server cannot tell it from a new
+  write once the tombstone is gone. Only the cells that device wrote return, so replicas
+  then disagree: one holding the tombstone has no row, the writer keeps its whole row, and
+  one bootstrapping from the server gets the row with its other columns null, even a
+  `not null` one (`fix/sync-offline-edit-of-pruned-row-splits-replicas`).
 
 **The two automatic triggers check first.** Under `unrecordedRows: 'refuse'`, the default,
 the client asks `findTablesWithUnrecordedRows()` before the bootstrap and before the

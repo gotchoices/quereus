@@ -479,6 +479,12 @@ Standard CRDT semantics handle user customizations: app schema is the baseline, 
 2. **App adds the same column in an update**: LWW resolves (later HLC wins, or the user's if concurrent)
 3. **User drops a table**: "most destructive wins" — the drop persists even if the app's seed has the table
 
+### Seeds and the server
+
+Seed facts keep the provider's site ID, so a device never pushes them: `getChangesToPush` sends only what that device wrote. The server never receives the seed, and each device applies its own copy.
+
+NOTE: that is enough for schema, but seed *rows* are not in the server's copy. A snapshot makes each table that copy covers hold exactly its rows ([Snapshots replace rows](sync.md#snapshots-replace-rows)), so `snapshot_required` recovery or `requestSnapshot()` deletes seed rows from any table the server has rows for, and `lastSeedHLC` does not rewind to restore them. Nothing in this repository ships a seed, so this has not been run. If an app's seed carries rows, it has to apply them again after a snapshot, or have a device write them as ordinary changes.
+
 ### What's Provided by Quereus
 
 Every primitive a schema seed needs already ships: from `@quereus/sync`,

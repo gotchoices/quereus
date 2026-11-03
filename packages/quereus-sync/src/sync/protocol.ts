@@ -728,8 +728,8 @@ export type ConflictResolver = (ctx: ConflictContext) => ConflictResolution;
  *   `quarantine`) **and** mark them forwardable, so peers that still have the
  *   table receive them via outbound delta sync. The hold + forwardable mark is
  *   implemented in `sync-store-and-forward-hold`; the outbound relay wiring (the
- *   actual re-offer through `getChangesSince`) lands in the sibling ticket
- *   `sync-store-and-forward-relay`. A forwarded change keeps its **original
+ *   actual re-offer through `getChangesSince`, and now `getChangesToPush`) lands
+ *   in the sibling ticket `sync-store-and-forward-relay`. A forwarded change keeps its **original
  *   `hlc` + `siteId`**, which is what makes the relay loop-free and convergent.
  */
 export type UnknownTableDisposition = 'ignore' | 'quarantine' | 'store-and-forward';

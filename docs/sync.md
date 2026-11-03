@@ -234,7 +234,7 @@ This peer re-offers its forwardable holds to peers that still have the table, ri
 - **Accepted limitation.** A straggler change causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`) is not relayed via this delta path — the same scalar-watermark limitation the base delta layer has (such a change arrives by direct sync / snapshot instead). store-and-forward targets the transitional uneven-retirement window where the straggler's writes are recent enough to exceed holder watermarks; quarantine prevents write loss outside it.
 - **One echo on a push.** Nothing records which peer a held change came from, so a device that received one from the server pushes it back once, until its sent watermark passes it. This takes a device that has retired a table the server still has, under the non-default `store-and-forward` disposition.
 - **Snapshot carve-out.** Forwardable entries are **delta-only**: a snapshot transfers the offering peer's own basis, and a forwarded change is for a table that peer does not have. The snapshot collectors scan only `cv:` / `tb:` / `sm:`, never `qt:`.
-- **GC vs in-flight relay.** A forwardable entry pruned at the horizon while a slow peer still needed it is acceptable — that peer was already past the delivery guarantee. After `pruneQuarantine` removes it, `getChangesSince` no longer relays it.
+- **GC vs in-flight relay.** A forwardable entry pruned at the horizon while a slow peer still needed it is acceptable — that peer was already past the delivery guarantee. After `pruneQuarantine` removes it, neither `getChangesSince` nor `getChangesToPush` relays it.
 
 #### Revival / drain
 

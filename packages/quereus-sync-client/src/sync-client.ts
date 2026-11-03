@@ -969,9 +969,9 @@ export class SyncClient {
    * delete every row the server's copy lacks, from each table that copy covers.
    * The second alone would match a device already following this server that
    * simply holds nothing yet, which needs no snapshot. Requiring both admits only
-   * the genuinely new device. A device that
-   * pre-created its schema locally still counts as empty: schema migration
-   * records are not consulted, and replicated DDL applies idempotently.
+   * the genuinely new device. A device that pre-created its schema locally still
+   * counts as empty: schema migration records are not consulted, and replicated DDL
+   * applies idempotently.
    *
    * A device whose rows were written BEFORE sync attached also passes: those
    * rows have no change facts. {@link settleUnrecordedRows} stands between that
