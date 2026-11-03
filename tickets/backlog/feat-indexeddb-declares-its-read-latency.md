@@ -26,3 +26,7 @@ With the cost-unit conversion those translate to roughly 300–2,300 cost units 
 ## The separate decision: the 25 ms gates
 
 `batchedOuterThresholdMs`, `gatherThresholdMs` and `prefetchProbeThresholdMs` all default to 25 ms (`optimizer-tuning.ts`) — chosen against a synthetic high-latency test fixture. IndexedDB's honest first-row latency clears none of them, so batched index-nested-loop seeks, parallel gathers and prefetch probes never fire on it, even though overlapping its requests is exactly what they are for (the #30 reporter expected batching to engage). Options: keep fixed gates and let a host lower them; make the gates cost-based (fire when the modelled latency saving exceeds the modelled overhead, both in cost units); or derive a per-backend threshold. This is a design decision in its own right — a fixed gate also keeps the parallel machinery away from in-process backends whose latency is noise — and should be stated explicitly, not folded into the declaration.
+
+## Evidence from GitHub issue #35 (reported on 4.24.0, Chromium)
+
+The reporter measures the `browserIdb` preset charging about 1 ms for a nested-loop seek that really costs about 0.22 ms. That moves the hash-versus-nested-loop crossover from about 650 driving rows to about 115, so joins driven by 115 to 650 rows take a hash join and full scan when a nested loop is several times faster. The store-side half of that issue is `feat-indexeddb-batch-secondary-index-multi-seek`, which should be measured first because it changes these numbers.

@@ -164,3 +164,5 @@ stored-identity change for anyone doing this.
 The variadic family also has a third spelling the table in Arm B omits: `select datetime('now')` returns `2026-11-03T17:26:47.630Z`, with the `Z` that a DATETIME column never stores. Whatever fixes this should cover comparing a column against `datetime('now')` and storing that value.
 
 **Decided by the maintainer 2026-11-03:** DATETIME is a fixed instant and the stored spelling stays bare UTC, so no persisted value or downstream content digest changes. Comparisons against text normalize that text the way a write does, and an unparseable text compares as it does today. Arm B takes option 3 (leave and document). Arm C gets a documented note that a shape check on a `datetime` column sees the canonical spelling.
+
+GitHub issue #28 (the source of Arm C) stays rejected under this decision: re-verified on v4.25.0, `check (ts like '%Z')` on a `datetime` column fails every insert. The reporter carries a local patch for it, so the docs note should say plainly what to use instead, and the handoff should flag that the issue needs an answer.

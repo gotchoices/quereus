@@ -64,3 +64,7 @@ cost-profile-parameterized cases added for the parent rather than writing plain 
   and the GitHub #31 evidence.
 - GitHub issue #31 — the reporter's `MIN` case is covered by the parent. Their broader
   `order by … limit` shapes on the IndexedDB backend are covered by this one.
+
+## Evidence from GitHub issue #36 (reported on 4.24.0, IndexedDB)
+
+An ordered `limit` through an `(owner, date)` index is priced as walking and fetching every row, so it loses to a full scan and sort: about 200 ms for 20 rows that a bounded walk would return in a few milliseconds. The reporter calls "latest N through an owner and timestamp index" the canonical paginated-list query.
