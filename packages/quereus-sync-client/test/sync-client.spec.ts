@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { SyncClient } from '../src/sync-client.js';
-import type { SyncStatus, SyncEvent } from '../src/types.js';
+import { UnrecordedRowsError, type SyncStatus, type SyncEvent, type UnrecordedRowsPolicy } from '../src/types.js';
 import {
   generateSiteId,
   siteIdToBase64,
@@ -138,6 +138,17 @@ class MockSyncManager implements SyncManager {
    * below then agree with each other the way the real manager's do.
    */
   checkpoints = new Map<string, SnapshotCheckpoint>();
+  /** What findTablesWithUnrecordedRows reports. */
+  unrecordedTables: Array<{ schema: string; table: string }> = [];
+  /** When set, findTablesWithUnrecordedRows throws this, as a scan that failed would. */
+  unrecordedScanError: Error | null = null;
+  unrecordedScanCalls = 0;
+
+  async findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>> {
+    this.unrecordedScanCalls++;
+    if (this.unrecordedScanError) throw this.unrecordedScanError;
+    return this.unrecordedTables;
+  }
 
   getSiteId(): SiteId {
     return this.siteId;
@@ -358,6 +369,7 @@ function createClient(opts?: {
   syncEvents?: SyncEventEmitterImpl;
   autoReconnect?: boolean;
   bootstrapOnEmpty?: boolean;
+  unrecordedRows?: UnrecordedRowsPolicy;
   snapshotChunkTimeoutMs?: number;
   readOnly?: boolean;
   onSnapshotProgress?: (progress: SnapshotProgress) => void;
@@ -380,6 +392,7 @@ function createClient(opts?: {
     // would otherwise auto-bootstrap on every connect. The bootstrap suite
     // opts in explicitly (and one test covers the default via a raw client).
     bootstrapOnEmpty: opts?.bootstrapOnEmpty ?? false,
+    unrecordedRows: opts?.unrecordedRows,
     snapshotChunkTimeoutMs: opts?.snapshotChunkTimeoutMs,
     readOnly: opts?.readOnly,
     onSnapshotProgress: opts?.onSnapshotProgress,
@@ -2141,6 +2154,116 @@ describe('SyncClient', () => {
       expect(statusChanges.some(s => s.status === 'bootstrapping')).to.be.true;
       // Human-readable event at the table boundary.
       expect(syncEventsLog.some(e => e.type === 'info' && /1 of 1 tables/.test(e.message))).to.be.true;
+    });
+
+    describe('rows sync has never recorded', () => {
+      const TABLES = [{ schema: 'main', table: 'notes' }, { schema: 'main', table: 'tags' }];
+      /** Longer than the harness's reconnectDelayMs, so a scheduled reconnect would have fired. */
+      const RECONNECT_WINDOW_MS = 150;
+
+      function refuseSnapshot(ws: MockWebSocket, serverSite: SiteId): void {
+        ws.simulateMessage({
+          type: 'snapshot_required',
+          sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
+          deltaFloor: serializeHLCForTransport(hlcAt(7000n, serverSite)),
+        });
+      }
+
+      it('bootstrap stops before any snapshot, names the tables and the option, and does not reconnect', async () => {
+        const syncManager = new MockSyncManager();
+        syncManager.unrecordedTables = TABLES;
+        const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+
+        const ws = await connectAndHandshake(client);
+        await new Promise(r => setTimeout(r, RECONNECT_WINDOW_MS));
+
+        expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
+        expect(errors).to.have.length(1);
+        expect(errors[0]).to.be.instanceOf(UnrecordedRowsError);
+        expect((errors[0] as UnrecordedRowsError).tables).to.deep.equal(TABLES);
+        expect(errors[0].message).to.include('main.notes, main.tags').and.to.include('unrecordedRows');
+        expect(client.status.status).to.equal('error');
+        expect(MockWebSocket.instances).to.have.length(1);
+      });
+
+      it('snapshot_required stops before pushing anything or taking a snapshot', async () => {
+        const syncManager = new MockSyncManager();
+        const site = syncManager.getSiteId();
+        const serverSite = generateSiteId();
+        syncManager.peerSyncState = hlcAt(5000n, serverSite);
+        const { client, errors } = createClient({ syncManager });
+        const ws = await connectAndHandshake(client, serverSite);
+
+        syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
+        syncManager.unrecordedTables = TABLES;
+        refuseSnapshot(ws, serverSite);
+        await new Promise(r => setTimeout(r, 10));
+
+        const types = ws.getSentMessages().map(m => m.type);
+        expect(types).to.not.include('apply_changes');
+        expect(types).to.not.include('get_snapshot');
+        expect(errors[0]).to.be.instanceOf(UnrecordedRowsError);
+      });
+
+      it('snapshot_required skips the scan while a checkpoint is pending, when every row would look unrecorded', async () => {
+        const syncManager = new MockSyncManager();
+        const serverSite = generateSiteId();
+        syncManager.peerSyncState = hlcAt(5000n, serverSite);
+        const { client, errors } = createClient({ syncManager });
+        const ws = await connectAndHandshake(client, serverSite);
+
+        syncManager.unrecordedTables = TABLES;
+        syncManager.checkpoints.set('snap-A', {
+          snapshotId: 'snap-A', siteId: serverSite, hlc: hlcAt(7000n, serverSite),
+          lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 1000,
+        });
+        refuseSnapshot(ws, serverSite);
+        await new Promise(r => setTimeout(r, 10));
+
+        expect(syncManager.unrecordedScanCalls).to.equal(0);
+        expect(errors).to.have.length(0);
+        expect(ws.getSentMessages().map(m => m.type)).to.include('get_snapshot');
+      });
+
+      it('a scan that fails takes no snapshot and retries through the reconnect', async () => {
+        const syncManager = new MockSyncManager();
+        const scanError = new Error('unknown collation');
+        syncManager.unrecordedScanError = scanError;
+        const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+
+        const ws = await connectAndHandshake(client);
+        await new Promise(r => setTimeout(r, RECONNECT_WINDOW_MS));
+
+        expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
+        expect(errors).to.deep.equal([scanError]);
+        expect(MockWebSocket.instances).to.have.length(2);
+      });
+
+      it("'replace' takes the snapshot without scanning", async () => {
+        const syncManager = new MockSyncManager();
+        syncManager.unrecordedTables = TABLES;
+        const { client } = createClient({ syncManager, bootstrapOnEmpty: true, unrecordedRows: 'replace' });
+
+        const ws = await connectAndHandshake(client);
+
+        expect(ws.getSentMessages().map(m => m.type)).to.include('get_snapshot');
+        expect(syncManager.unrecordedScanCalls).to.equal(0);
+      });
+
+      it('an explicit requestSnapshot() takes the snapshot without scanning', async () => {
+        const syncManager = new MockSyncManager();
+        const serverSite = generateSiteId();
+        syncManager.unrecordedTables = TABLES;
+        const { client } = createClient({ syncManager });
+        const ws = await connectAndHandshake(client, serverSite);
+
+        const requested = client.requestSnapshot();
+        expect(ws.getSentMessages().map(m => m.type)).to.include('get_snapshot');
+        streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+        await requested;
+
+        expect(syncManager.unrecordedScanCalls).to.equal(0);
+      });
     });
   });
 });

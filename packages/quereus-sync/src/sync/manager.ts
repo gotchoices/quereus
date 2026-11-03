@@ -98,6 +98,20 @@ export interface SyncManager {
   applySnapshot(snapshot: Snapshot): Promise<void>;
 
   /**
+   * The tables holding at least one live row with no sync record, usually written
+   * before sync attached. A snapshot covering such a table would delete those rows
+   * (docs/sync.md § Rows sync has never recorded). Materialized views and `memory`
+   * tables are not reported: a snapshot cannot delete from them.
+   *
+   * Read-only. Waits for local commits and remote applies already under way, so a row
+   * that is merely about to be recorded is not reported. Empty on a peer with no engine.
+   *
+   * Meaningless while a snapshot checkpoint exists: the apply cleared the metadata, so
+   * every row would look unrecorded. Check {@link listSnapshotCheckpoints} first.
+   */
+  findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>>;
+
+  /**
    * Update the last sync state for a peer.
    *
    * Called after successfully syncing with a peer.

@@ -479,7 +479,9 @@ export class SchemaManager {
 	}
 
 	/**
-	 * @internal Returns iterator over all managed schemas
+	 * Returns iterator over all managed schemas. Deliberately part of the consumable
+	 * type surface (kept out of the internal-only set) so a host in another package can
+	 * walk every table, as sync does to find rows it has never recorded.
 	 */
 	_getAllSchemas(): IterableIterator<Schema> {
 		return this.schemas.values();

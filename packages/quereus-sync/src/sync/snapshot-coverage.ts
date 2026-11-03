@@ -87,13 +87,7 @@ export async function removeRowsAbsentFromSnapshot(
 	}
 }
 
-/**
- * The key of every live row whose identity is not in `keep`. Key columns are selected
- * under positional aliases, as `scanLiveRows` in `rekey-on-pk-change.ts` does, so the
- * projection never depends on how the engine spells a column. A singleton table
- * (`primary key ()`) has no key column to select, so a constant stands in and its one
- * row's pk is `[]`.
- */
+/** The key of every live row whose identity is not in `keep`. */
 async function collectAbsentKeys(
 	db: Database,
 	schema: string,
@@ -102,15 +96,31 @@ async function collectAbsentKeys(
 	keying: PkKeying,
 	keep: { has(identity: string): boolean },
 ): Promise<SqlValue[][]> {
+	const absent: SqlValue[][] = [];
+	for await (const pk of scanLiveKeys(db, schema, table, keyColumns)) {
+		if (!keep.has(encodePkIdentity(pk, keying))) absent.push(pk);
+	}
+	return absent;
+}
+
+/**
+ * The key of every live row. Key columns are selected under positional aliases, as
+ * `scanLiveRows` in `rekey-on-pk-change.ts` does, so the projection never depends on how
+ * the engine spells a column. A singleton table (`primary key ()`) has no key column to
+ * select, so a constant stands in and its one row's pk is `[]`.
+ */
+export async function* scanLiveKeys(
+	db: Database,
+	schema: string,
+	table: string,
+	keyColumns: readonly string[],
+): AsyncGenerator<SqlValue[]> {
 	const projection = keyColumns.length > 0
 		? keyColumns.map((name, i) => `${quoteIdentifier(name)} as k${i}`).join(', ')
 		: '1 as k0';
 	const sql = `select ${projection} from ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
 
-	const absent: SqlValue[][] = [];
 	for await (const row of db.eval(sql, undefined, { readConcurrency: 'committed' })) {
-		const pk = keyColumns.map((_, i) => row[`k${i}`]);
-		if (!keep.has(encodePkIdentity(pk, keying))) absent.push(pk);
+		yield keyColumns.map((_, i) => row[`k${i}`]);
 	}
-	return absent;
 }

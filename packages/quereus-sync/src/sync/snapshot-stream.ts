@@ -675,6 +675,17 @@ export async function applySnapshotStream(
 					tablesProcessed = checkpoint.completedTables.length;
 					entriesProcessed = checkpoint.entriesProcessed;
 				}
+
+				// Open the resumable window BEFORE local metadata goes. Both gates above reject
+				// WITHOUT touching local state, so a refused snapshot leaves no checkpoint
+				// behind; from here on `listSnapshotCheckpoints` says the replica's data may be
+				// partial, until the footer clears this record. Saved ahead of the clear because
+				// a crash between the two then leaves a checkpoint over intact metadata, and the
+				// resume clears again. The other order leaves every row with no records and
+				// nothing to say why, so each would look like a row sync never recorded. On a
+				// resumed apply this re-saves substantively the same record — harmless.
+				await saveSnapshotCheckpoint(ctx, buildCheckpointRecord(chunk.snapshotId, chunk.hlc));
+
 				await clearExistingMetadata(ctx, new Set(completedTables), chunk.deltaFloor);
 
 				// That clear just wiped the CRDT metadata of every table this apply did not
@@ -685,16 +696,6 @@ export async function applySnapshotStream(
 				// a faithful answer to "is this replica's data partial?", since the footer
 				// clears this apply's own record and leaves nothing behind it.
 				await clearOtherSnapshotCheckpoints(ctx, chunk.snapshotId);
-
-				// Open the resumable window the instant local metadata is gone. Both gates
-				// above reject WITHOUT touching local state, so a refused snapshot leaves no
-				// checkpoint behind; from here on the replica's data is partial until the
-				// footer clears this record, and `listSnapshotCheckpoints` is what says so.
-				// Without this save, an interruption before the first `flushMetadataBatch`
-				// (every 1000 metadata entries) would leave a cleared, half-written replica
-				// with nothing recording that a transfer was underway. On a resumed apply
-				// this re-saves substantively the same record — harmless.
-				await saveSnapshotCheckpoint(ctx, buildCheckpointRecord(chunk.snapshotId, chunk.hlc));
 				break;
 			}
 

@@ -28,6 +28,7 @@
 
 export { SyncClient } from './sync-client.js';
 export { SnapshotStreamReader } from './snapshot-reader.js';
+export { UnrecordedRowsError } from './types.js';
 
 // The wire codec and message/Serialized types now live in @quereus/sync (the
 // single source of truth shared with the coordinator). Re-export them here so the
@@ -64,5 +65,6 @@ export type {
   SyncEvent,
   SyncEventType,
   SyncClientOptions,
+  UnrecordedRowsPolicy,
 } from './types.js';
 

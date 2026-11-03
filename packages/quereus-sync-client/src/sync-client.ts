@@ -32,10 +32,11 @@ import {
   type SnapshotProgress,
 } from '@quereus/sync';
 
-import type {
-  SyncClientOptions,
-  SyncStatus,
-  SyncEvent,
+import {
+  UnrecordedRowsError,
+  type SyncClientOptions,
+  type SyncStatus,
+  type SyncEvent,
 } from './types.js';
 import { SnapshotStreamReader } from './snapshot-reader.js';
 
@@ -66,7 +67,7 @@ export class SyncClient {
   private readonly syncEvents: SyncEventEmitter;
   private readonly options: Required<Pick<SyncClientOptions,
     'autoReconnect' | 'reconnectDelayMs' | 'maxReconnectDelayMs' | 'localChangeDebounceMs'
-    | 'bootstrapOnEmpty' | 'snapshotChunkTimeoutMs'
+    | 'bootstrapOnEmpty' | 'unrecordedRows' | 'snapshotChunkTimeoutMs'
   >> & SyncClientOptions;
 
   // WebSocket state
@@ -171,6 +172,7 @@ export class SyncClient {
       maxReconnectDelayMs: options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS,
       localChangeDebounceMs: options.localChangeDebounceMs ?? DEFAULT_LOCAL_CHANGE_DEBOUNCE_MS,
       bootstrapOnEmpty: options.bootstrapOnEmpty ?? true,
+      unrecordedRows: options.unrecordedRows ?? 'refuse',
       snapshotChunkTimeoutMs: options.snapshotChunkTimeoutMs ?? DEFAULT_SNAPSHOT_CHUNK_TIMEOUT_MS,
     };
   }
@@ -482,26 +484,12 @@ export class SyncClient {
     // predating versioning, so the ack carries none — would silently
     // misinterpret us. Treat any mismatch (strict equality; absent counts as
     // mismatch) as fatal: stop reconnecting, surface a lasting error, and reject
-    // the pending connect(). Reuses the same stop-reconnect path as a fatal
-    // server error, so auto-reconnect does not resume.
+    // the pending connect().
     if (message.protocolVersion !== PROTOCOL_VERSION) {
       const serverPart = message.protocolVersion === undefined
         ? 'server sent none (pre-versioning coordinator)'
         : `server speaks v${message.protocolVersion}`;
-      const errMsg = `Sync protocol version mismatch: client speaks v${PROTOCOL_VERSION}, ${serverPart}`;
-      this.stopReconnect = true;
-      this.setStatus({ status: 'error', message: errMsg });
-      this.emitSyncEvent('error', errMsg);
-      this.options.onError?.(new Error(errMsg));
-      this.settleConnect(new Error(errMsg));
-      // Drop the incompatible socket. Detach first so its deferred onclose can't
-      // fire back into the client (scheduleReconnect is already guarded by
-      // stopReconnect, but we don't want the disconnected-status churn either).
-      if (this.ws) {
-        this.detachSocketHandlers(this.ws);
-        this.ws.close();
-        this.ws = null;
-      }
+      this.stopWithError(new Error(`Sync protocol version mismatch: client speaks v${PROTOCOL_VERSION}, ${serverPart}`));
       return;
     }
 
@@ -544,6 +532,32 @@ export class SyncClient {
       // This sends the first batch; each ack sends the next (handleApplyResult).
       await this.pushLocalChanges();
     }
+  }
+
+  /**
+   * Stop for good, until the next explicit connect(): a lasting `error` status, no
+   * reconnect, and the pending connect() (if any) rejected. For a condition a bare
+   * reconnect cannot fix. A pending reconnect timer is cancelled too, since the
+   * connect() it fires would clear stopReconnect.
+   */
+  private stopWithError(error: Error): void {
+    this.stopReconnect = true;
+    this.clearReconnectTimer();
+    this.setStatus({ status: 'error', message: error.message });
+    this.emitSyncEvent('error', error.message);
+    this.options.onError?.(error);
+    this.settleConnect(error);
+    // Detach first so the socket's deferred onclose can't fire back into the client
+    // (scheduleReconnect is already guarded by stopReconnect, but we don't want the
+    // disconnected-status churn either). onclose would have released these two, so
+    // they are released here.
+    if (this.ws) {
+      this.detachSocketHandlers(this.ws);
+      this.ws.close();
+      this.ws = null;
+    }
+    this.abortSnapshotTransfer(error);
+    this.rejectAckWaiters(error);
   }
 
   /**
@@ -752,7 +766,8 @@ export class SyncClient {
    * and an unpushed row is DELETED if the server's copy covers its table and
    * lacks the row. The `snapshot_required` recovery pushes first for that reason
    * — this explicit path does not, so call it only on a replica with nothing
-   * pending.
+   * pending. It also skips the `unrecordedRows` check: the caller asked for a full
+   * replace, so rows sync has never recorded are deleted the same way.
    *
    * Idempotent while a transfer is in flight: a second call joins the same
    * transfer instead of starting another stream. Rejects when not connected /
@@ -798,6 +813,9 @@ export class SyncClient {
       // carries the new one).
       return;
     }
+
+    // Ahead of the push, so a device that is about to stop has sent nothing.
+    if (!await this.unrecordedRowsAllowSnapshot()) return;
 
     this.emitSyncEvent(
       'state-change',
@@ -865,8 +883,8 @@ export class SyncClient {
    * incremental path: resume a pending checkpoint, bootstrap an empty replica,
    * or neither.
    *
-   * @returns false when a transfer failed — the socket has been closed and the
-   *          caller must stop the handshake flow (reconnect resumes it).
+   * @returns false when a transfer failed or unrecorded rows stopped it — the
+   *          socket has been closed and the caller must stop the handshake flow.
    */
   private async maybeBootstrap(): Promise<boolean> {
     // A transfer from the PREVIOUS socket can still be unwinding (its abort has
@@ -904,6 +922,7 @@ export class SyncClient {
     }
 
     if (this.options.bootstrapOnEmpty && await this.isReplicaEmpty()) {
+      if (!await this.unrecordedRowsAllowSnapshot()) return false;
       this.emitSyncEvent('state-change', 'Empty replica: requesting full snapshot from server');
       const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
       return error === null;
@@ -928,9 +947,8 @@ export class SyncClient {
    * records are not consulted, and replicated DDL applies idempotently.
    *
    * A device whose rows were written BEFORE sync attached also passes: those
-   * rows have no change facts. The bootstrap deletes them if the server's copy
-   * covers their table and lacks them (they used to survive as rows no sync path
-   * could see).
+   * rows have no change facts. {@link unrecordedRowsAllowSnapshot} stands between
+   * that device and a bootstrap that would delete them.
    */
   private async isReplicaEmpty(): Promise<boolean> {
     if (!this.serverSiteId) return false;
@@ -945,6 +963,39 @@ export class SyncClient {
     // prefix.
     const localChanges = await this.syncManager.getChangesSince(this.serverSiteId);
     return localChanges.length === 0;
+  }
+
+  /**
+   * Whether an automatic snapshot may go ahead, given rows sync has never recorded.
+   * When this returns false the socket is closed or already replaced, and the caller
+   * must take no snapshot.
+   *
+   * A pending checkpoint skips the scan: that transfer's header already cleared the
+   * metadata, so every row would look unrecorded, and a false refusal would strand a
+   * partial database. The decision was made when that transfer started.
+   *
+   * A scan that fails is not a verdict, so it retries through the reconnect rather
+   * than stopping for good. Either way no snapshot follows.
+   */
+  private async unrecordedRowsAllowSnapshot(): Promise<boolean> {
+    if (this.options.unrecordedRows === 'replace') return true;
+
+    // A reconnect or disconnect can replace `this.ws` during the scan. The verdict
+    // then belongs to nobody: the new socket's handshake decides for itself.
+    const socket = this.ws;
+    let tables: ReadonlyArray<{ schema: string; table: string }> = [];
+    try {
+      const resuming = (await this.syncManager.listSnapshotCheckpoints()).length > 0;
+      if (!resuming) tables = await this.syncManager.findTablesWithUnrecordedRows();
+    } catch (err) {
+      this.failAndRetry(socket, 'Could not check for rows sync has never recorded', err);
+      return false;
+    }
+    if (this.ws !== socket) return false;
+    if (tables.length === 0) return true;
+
+    this.stopWithError(new UnrecordedRowsError(tables));
+    return false;
   }
 
   /**
@@ -1035,24 +1086,34 @@ export class SyncClient {
       this.setStatus({ status: 'syncing', progress: 0 });
       return null;
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      // A transfer torn down by our own disconnect() is not a failure to
-      // report — the caller asked for it, and onError means "needs attention".
-      if (!this.intentionalDisconnect) {
-        this.emitSyncEvent('error', `Snapshot transfer failed: ${error.message}`);
-        this.options.onError?.(error);
-      }
-      // Close (handlers attached — see doc comment) unless the socket is
-      // already closed, in which case onclose has fired or is in flight.
-      // `socket.OPEN`, not the global `WebSocket.OPEN`: this runs long after
-      // the transfer started, and a teardown that has since removed the global
-      // (an environment shim, a test harness) would turn this cleanup into a
-      // ReferenceError and break the "never rejects" contract above.
-      if (socket && socket.readyState === socket.OPEN) {
-        socket.close();
-      }
-      return error;
+      return this.failAndRetry(socket, 'Snapshot transfer failed', err);
     }
+  }
+
+  /**
+   * Report a transient failure and close `socket` with its handlers attached, so
+   * onclose firing is what retries (status → disconnected, scheduleReconnect, and
+   * the next handshake decides afresh).
+   *
+   * @returns the failure as an Error.
+   */
+  private failAndRetry(socket: WebSocket | null, description: string, err: unknown): Error {
+    const error = err instanceof Error ? err : new Error(String(err));
+    // Work torn down by our own disconnect() is not a failure to report — the
+    // caller asked for it, and onError means "needs attention".
+    if (!this.intentionalDisconnect) {
+      this.emitSyncEvent('error', `${description}: ${error.message}`);
+      this.options.onError?.(error);
+    }
+    // Close unless the socket is already closed, in which case onclose has fired
+    // or is in flight. `socket.OPEN`, not the global `WebSocket.OPEN`: this can run
+    // long after the work started, and a teardown that has since removed the global
+    // (an environment shim, a test harness) would turn this cleanup into a
+    // ReferenceError.
+    if (socket && socket.readyState === socket.OPEN) {
+      socket.close();
+    }
+    return error;
   }
 
   /** Route one snapshot_chunk to the active transfer. Synchronous — see the dispatch comment. */

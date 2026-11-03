@@ -70,6 +70,13 @@ export interface SyncContext {
 	whenCommitsSettled(): Promise<void>;
 
 	/**
+	 * Resolves once every remote apply started so far has finished, failed ones
+	 * included. An apply writes rows before their metadata, so until then a row it
+	 * wrote can have no records. Never await this from inside an apply.
+	 */
+	whenAppliesSettled(): Promise<void>;
+
+	/**
 	 * Per-table pk-identity keying (key collation normalizers + semantic key
 	 * transforms) for building in-memory row-grouping keys that agree with the
 	 * `cv:`/`tb:`/`cl:` storage keys. Throws when the table's schema is

@@ -51,6 +51,31 @@ export interface SyncEvent {
 // ============================================================================
 
 /**
+ * What an automatic snapshot does about rows sync has never recorded. See
+ * {@link SyncClientOptions.unrecordedRows}.
+ */
+export type UnrecordedRowsPolicy = 'refuse' | 'replace';
+
+/**
+ * An automatic snapshot was stopped because it would delete rows sync has never
+ * recorded. Reaches the app through `onError`.
+ */
+export class UnrecordedRowsError extends Error {
+  /** The tables holding such rows, including any the server's copy turns out not to cover. */
+  readonly tables: ReadonlyArray<{ schema: string; table: string }>;
+
+  constructor(tables: ReadonlyArray<{ schema: string; table: string }>) {
+    const names = tables.map(({ schema, table }) => `${schema}.${table}`).join(', ');
+    super(
+      `Sync stopped to protect local data: ${names} ${tables.length === 1 ? 'holds' : 'hold'} rows sync has never recorded, `
+        + 'and a snapshot from the server would delete them. Set the unrecordedRows client option to choose what happens to them.',
+    );
+    this.name = 'UnrecordedRowsError';
+    this.tables = tables;
+  }
+}
+
+/**
  * Options for configuring the SyncClient.
  */
 export interface SyncClientOptions {
@@ -127,12 +152,30 @@ export interface SyncClientOptions {
    * Automatically request a full snapshot on the first connect to an EMPTY
    * replica — one that has never synced with this server and holds no local
    * change facts of its own. Rows written before sync attached have no change
-   * facts, so they do not stop this, and the snapshot deletes them if it covers
-   * their table and lacks them. Disable to keep bootstrap purely explicit via
+   * facts, so a device holding only those counts as empty; {@link unrecordedRows}
+   * decides what happens to them. Disable to keep bootstrap purely explicit via
    * {@link SyncClient.requestSnapshot}.
    * @default true
    */
   bootstrapOnEmpty?: boolean;
+
+  /**
+   * What happens to rows sync has never recorded, usually rows written before sync
+   * attached, when an AUTOMATIC snapshot would delete them. Automatic means the
+   * {@link bootstrapOnEmpty} bootstrap and recovery from `snapshot_required`. An
+   * explicit {@link SyncClient.requestSnapshot} is always a full replace.
+   *
+   * - `'refuse'`: stop before deleting anything. The client calls `onError` with an
+   *   {@link UnrecordedRowsError} naming the tables, moves to status `error`, closes
+   *   the socket and does not reconnect. `connect()` has already resolved by then,
+   *   so watch `onError` or the status rather than its promise.
+   * - `'replace'`: let the snapshot delete them.
+   *
+   * To choose after a refusal, create a new `SyncClient` with a different value and
+   * connect. The `SyncManager` and its data carry over.
+   * @default 'refuse'
+   */
+  unrecordedRows?: UnrecordedRowsPolicy;
 
   /**
    * Stall watchdog for a snapshot transfer: if no `snapshot_chunk` arrives

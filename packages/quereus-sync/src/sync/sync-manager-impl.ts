@@ -95,6 +95,7 @@ import {
 	listSnapshotCheckpoints as listSnapshotCheckpointsImpl,
 	clearSnapshotCheckpoint as clearSnapshotCheckpointImpl,
 } from './snapshot-checkpoint.js';
+import { findTablesWithUnrecordedRows as findTablesWithUnrecordedRowsImpl } from './unrecorded-rows.js';
 
 /**
  * Guard a transaction's running `opSeq` against the uint32 bound. `opSeq` is
@@ -217,6 +218,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// Change Grouping). Without this, two rapid commits interleave at the first
 	// `await` and a stale change-log entry survives.
 	private commitChain: Promise<void> = Promise.resolve();
+
+	// Settles when every apply started so far has. See whenAppliesSettled.
+	private appliesInFlight: Promise<void> = Promise.resolve();
 
 	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
 	// basis-drift warning in recordLensDeployment — a warning, not durable state.
@@ -694,9 +698,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// touches the engine mutex), await inline so the drain completes before returning.
 		if (reappeared.length > 0) {
 			if (db._isExecuting?.()) {
-				void drainReappearedTables(this, reappeared);
+				void this.trackApply(drainReappearedTables(this, reappeared));
 			} else {
-				await drainReappearedTables(this, reappeared);
+				await this.trackApply(drainReappearedTables(this, reappeared));
 			}
 		}
 	}
@@ -785,6 +789,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	whenCommitsSettled(): Promise<void> {
 		return this.commitChain;
+	}
+
+	/** See {@link SyncContext.whenAppliesSettled}. */
+	whenAppliesSettled(): Promise<void> {
+		return this.appliesInFlight;
+	}
+
+	/** The `then` drops the results: keeping them would link every past apply into one growing chain. */
+	private trackApply<T>(applying: Promise<T>): Promise<T> {
+		this.appliesInFlight = Promise.allSettled([this.appliesInFlight, applying]).then(() => undefined);
+		return applying;
 	}
 
 	/**
@@ -1580,11 +1595,15 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// ============================================================================
 
 	async applyChanges(changes: ChangeSet[]): Promise<ApplyResult> {
-		return applyChangesImpl(this, changes);
+		return this.trackApply(applyChangesImpl(this, changes));
 	}
 
 	async drainHeldChanges(schema?: string, table?: string): Promise<number> {
-		return drainHeldChangesImpl(this, schema, table);
+		return this.trackApply(drainHeldChangesImpl(this, schema, table));
+	}
+
+	async findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>> {
+		return findTablesWithUnrecordedRowsImpl(this);
 	}
 
 	async canDeltaSync(sinceHLC: HLC): Promise<boolean> {

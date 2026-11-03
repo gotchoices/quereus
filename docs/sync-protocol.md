@@ -139,6 +139,13 @@ interface SyncManager {
    * table with no section is left alone (docs/sync.md § Snapshots replace rows).
    */
   applySnapshot(snapshot: Snapshot): Promise<void>;
+
+  /**
+   * The tables holding a live row with no sync record, which a snapshot covering
+   * them would delete (docs/sync.md § Rows sync has never recorded). Read-only;
+   * empty on a peer with no engine.
+   */
+  findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>>;
 }
 
 interface ApplyResult {
@@ -204,7 +211,7 @@ interface SyncManager {
    * metadata is touched.
    *
    * A checkpoint exists for the WHOLE duration of an apply: one is saved at header
-   * time, immediately after the clear, and the footer clears it on success. So
+   * time, immediately before the clear, and the footer clears it on success. So
    * "a checkpoint is present" is the durable answer to "is this replica's data
    * partial?" — see § Checkpoint presence means partial data below.
    */
@@ -307,11 +314,14 @@ interface SnapshotCheckpoint {
 Checkpoints live under `sc:{snapshotId}` (`SYNC_KEY_PREFIX.SNAPSHOT_CHECKPOINT`).
 A checkpoint is present for the *entire* duration of a streaming apply:
 
-- **Saved at the header**, immediately after `clearExistingMetadata`. Both header
-  gates — wire format and clock drift — reject *before* that clear and touch no
-  local state, so a refused snapshot leaves no checkpoint behind. Everything after
-  the clear is covered, including the window before the first metadata-batch flush
-  (every 1000 entries) that used to be the earliest save.
+- **Saved at the header**, immediately before `clearExistingMetadata`. Both header
+  gates — wire format and clock drift — reject *before* that save and touch no
+  local state, so a refused snapshot leaves no checkpoint behind. The clear and
+  everything after it are covered, including the window before the first
+  metadata-batch flush (every 1000 entries) that used to be the earliest save. A
+  crash between the save and the clear leaves a checkpoint over intact metadata,
+  which the resume clears again; the other order would leave rows with no records
+  and nothing to say why.
 - **Re-saved at every metadata flush**, advancing `completedTables`.
 - **Cleared by the footer**, after `bootstrapFinalize` — deliberately in that order,
   so a failed finalize leaves the checkpoint in place and the transfer retries.
@@ -513,8 +523,8 @@ local-change subscription, push) starts:
   met this server, and bootstrapping that deletes every row the server's copy lacks. A
   locally pre-created schema still counts as empty; replicated DDL applies idempotently.
   So does a device whose rows were written before sync attached, since they have no
-  change facts: the bootstrap deletes them if the server's copy covers their table and
-  lacks them ([sync.md § Snapshots replace rows](sync.md#snapshots-replace-rows)).
+  change facts. The `unrecordedRows` check below stands between that device and the
+  bootstrap.
 - A `snapshot_required` reply to `get_changes`: the device has been away longer than the
   server kept its deletion history, so no delta can be complete. This one runs on a
   device that may hold **unpushed offline work**, and the snapshot apply would destroy it
@@ -531,6 +541,14 @@ local-change subscription, push) starts:
   can reach them. Known exception: a row the device pulled but has not pushed past its
   watermark is pushed back first and returns to the server, so the snapshot keeps it
   (`fix/sync-client-pushes-back-server-changes`).
+
+**The two automatic triggers check first.** Under `unrecordedRows: 'refuse'`, the default,
+the client asks `findTablesWithUnrecordedRows()` before the bootstrap and before the
+`snapshot_required` push, and stops with an `UnrecordedRowsError` if any table holds rows
+sync has never recorded. `'replace'` skips the check. So does a pending checkpoint, because
+a transfer already under way has cleared the metadata the check reads. `requestSnapshot()`
+is never checked. See
+[sync.md § Rows sync has never recorded](sync.md#rows-sync-has-never-recorded).
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received

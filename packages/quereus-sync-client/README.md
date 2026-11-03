@@ -93,8 +93,11 @@ interface SyncClientOptions {
   /** Debounce window for local changes in ms (default: 50) */
   localChangeDebounceMs?: number;
 
-  /** Auto-download a full snapshot on first connect to a replica with no sync history (default: true). Rows written before sync attached have no history, and are deleted if the snapshot covers their table and lacks them */
+  /** Auto-download a full snapshot on first connect to a replica with no sync history (default: true). Rows written before sync attached have no history; `unrecordedRows` decides what happens to them */
   bootstrapOnEmpty?: boolean;
+
+  /** What an automatic snapshot does about rows sync has never recorded: 'refuse' stops before deleting anything, 'replace' deletes them (default: 'refuse') */
+  unrecordedRows?: 'refuse' | 'replace';
 
   /** Snapshot stall watchdog: abort if no chunk arrives within this window in ms (default: 60000) */
   snapshotChunkTimeoutMs?: number;
@@ -108,12 +111,30 @@ interface SyncClientOptions {
 
 - `connect(url: string, databaseId: string, token?: string): Promise<void>` - Connect to sync server
 - `disconnect(): Promise<void>` - Disconnect and stop reconnection attempts
-- `requestSnapshot(): Promise<void>` - Explicitly download a full snapshot. **Do not write to the database while it is landing** — a concurrent local write is overwritten by the snapshot and never pushed. Each table the snapshot covers ends up holding exactly the snapshot's rows, so local rows it lacks are deleted, unpushed ones included
+- `requestSnapshot(): Promise<void>` - Explicitly download a full snapshot. **Do not write to the database while it is landing** — a concurrent local write is overwritten by the snapshot and never pushed. Each table the snapshot covers ends up holding exactly the snapshot's rows, so local rows it lacks are deleted, unpushed ones and rows sync has never recorded included
 - `hasPendingSnapshot(): Promise<boolean>` - Whether an interrupted snapshot left the local database partial (usable before connecting; the next connect resumes the transfer)
 - `status: SyncStatus` - Current connection status (getter property)
 - `isConnected: boolean` - Whether the WebSocket is open (getter property)
 - `isSynced: boolean` - Whether the client is fully synced (getter property)
 - `isBootstrapping: boolean` - Whether a snapshot transfer is in flight (getter property)
+
+### Data written before sync was turned on
+
+Rows written before sync attached have no sync records, so a snapshot from the server would delete them. By default the client stops first:
+
+```typescript
+const client = new SyncClient({
+  syncManager,
+  syncEvents,
+  onError: (error) => {
+    if (error instanceof UnrecordedRowsError) {
+      console.warn('Sync stopped. Tables with local-only rows:', error.tables);
+    }
+  },
+});
+```
+
+The client then has status `error`, has closed the socket and will not reconnect. `connect()` has already resolved by that point, so use `onError` or the status rather than its promise. To let the snapshot delete those rows, create a new `SyncClient` with `unrecordedRows: 'replace'` and connect; the `SyncManager` and its data carry over. An explicit `requestSnapshot()` is never checked. See [Rows sync has never recorded](../../docs/sync.md#rows-sync-has-never-recorded).
 
 ### Serialization Helpers
 
@@ -143,7 +164,7 @@ DISCONNECTED → CONNECTING → SYNCING → SYNCED
 - `bootstrapping`: A full snapshot is streaming in — the local database is partial; hold writes until it finishes
 - `syncing`: Connected, exchanging initial changes
 - `synced`: Fully synchronized, real-time updates active
-- `error`: Connection error (will auto-reconnect if enabled)
+- `error`: Connection error (will auto-reconnect if enabled, except after a fatal server error, a protocol version mismatch, or a refusal over unrecorded rows, which last until the next `connect()`)
 
 ## Protocol
 
