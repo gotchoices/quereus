@@ -44,10 +44,11 @@ export function isExplicitTransactionOpen(db: Database): boolean {
 export function rebuildNotOnlyEffectError(table: TableSchema): QuereusError {
 	const schemaPrefix = table.schemaName.toLowerCase() === 'main' ? '' : `${quoteIdentifier(table.schemaName)}.`;
 	return new QuereusError(
-		`apply schema cannot change the primary key of table '${table.name}' alongside other work: `
+		`apply schema cannot change the primary key of table '${table.name}': `
 			+ `module '${table.vtabModuleName ?? '<unknown>'}' cannot re-key in place, so the change needs a `
 			+ `shadow-table rebuild whose DROP + RENAME survives a rollback while its row copy does not, and `
-			+ `anything failing after it in this apply would leave the table empty. Run `
+			+ `this apply has other steps, seed rows or a module able to refuse the commit, any of which `
+			+ `failing afterwards would leave the table empty. Run `
 			+ `\`alter table ${schemaPrefix}${quoteIdentifier(table.name)} alter primary key (...)\` on its own in `
 			+ `autocommit mode, then re-apply.`,
 		StatusCode.ERROR,

@@ -29,8 +29,10 @@ select * from t;                       -- no rows
 
 Observed: the error and the empty table. Inferred, not traced: the failure comes from the commit. The rows being gone means the failure came after the drop, and a deferred constraint is checked at commit. Not tried: a module whose own commit throws, which should end the same way.
 
+The same loss is reachable through `apply schema`, in the one-step plan that apply still allows to rebuild. With the tables and row above, declare `t` with `primary key (c)` and run `apply schema main`: the plan is the single step `ALTER TABLE t ALTER PRIMARY KEY (c)`, the apply fails with `CHECK constraint failed: fk`, and `t` has no rows (ran this during the review of `bug-apply-schema-loses-rows-after-rebuild-when-later-step-fails`). A fix at the rebuild should cover both; check this shape too.
+
 ## Expected behavior
 
 A failed re-key keeps the table's rows. A re-key changes no row, so a violation that was already there should not be able to fail it. A commit that fails for any other reason must not lose the rows either, or must say that it did.
 
-Refusing is not available here, because this is the one rebuild shape the engine still allows.
+Refusing is not available here, because a lone statement and a one-step apply are the rebuild shapes the engine still allows.

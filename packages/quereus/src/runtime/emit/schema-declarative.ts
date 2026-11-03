@@ -528,10 +528,16 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
  * commit. Any registered module counts, whichever one owns the table, because the batch spans them
  * all. The answer costs a plan with no rebuild nothing: the flag it sets is only read on the way
  * into a rebuild. See docs/schema-undo-plan.md § A primary-key rebuild.
+ *
+ * NOTE: the implicit commit still follows an allowed rebuild and can fail, so this does not close
+ * the loss for that one shape: backlog `bug-rebuild-loses-rows-when-implicit-commit-fails`.
  */
 function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: number, withSeed: boolean | undefined): boolean {
 	if (stepCount !== 1) return false;
 	if (withSeed && [...db.declaredSchemaManager.getAllSeedData(schemaName).values()].some(rows => rows.length > 0)) return false;
+	// NOTE: also counts a module defining `endSchemaBatch` without `beginSchemaBatch`, which
+	// `beginSchemaBatchAll` never starts and so can never refuse. Errs toward refusing; test
+	// both hooks if such a module ever needs to rebuild through an apply.
 	for (const { module } of db.schemaManager.allModules()) {
 		if (typeof module.endSchemaBatch === 'function') return false;
 	}
