@@ -5,7 +5,7 @@ import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAss
 
 /**
  * Canonical text rendering of a {@link SchemaCatalog}, for the `apply schema`
- * applied-state snapshot (see `docs/schema.md` § Applied-state snapshot).
+ * applied-state snapshot (see `docs/schema-declarative.md` § Applied-state snapshot).
  *
  * The rendering exists to answer exactly one question: *is this catalog, field
  * for field, the one that was in place at the end of the last successful,

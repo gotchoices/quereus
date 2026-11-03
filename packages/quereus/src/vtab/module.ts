@@ -626,7 +626,7 @@ export interface VirtualTableModule<
 	 * module that discards its overlay here therefore discards the forward and
 	 * the undo DDL together and rewinds to the pre-apply substrate; a module that
 	 * has no overlay has had both applied for real. Either way the substrate
-	 * agrees with the catalog. See docs/schema.md § Failure and restoration.
+	 * agrees with the catalog. See docs/schema-declarative.md § Failure and restoration.
 	 *
 	 * NOTE: the exception is an UNRESTORABLE failure (a data-destroying step ran,
 	 * so no unwind happened and the catalog keeps the steps that landed). A module

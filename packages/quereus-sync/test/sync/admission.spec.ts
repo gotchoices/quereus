@@ -3,7 +3,7 @@
  * `applyDataToStore`, src/sync/admission.ts) that backs every sync ingress
  * modality.
  *
- * These pin the ordering invariant directly (docs/sync.md § Transactional
+ * These pin the ordering invariant directly (docs/sync-transactions.md § Transactional
  * Integrity During Sync): data first → metadata second → watermark; a data-apply
  * failure emits `status:'error'` and aborts BEFORE any metadata commit or clock
  * advance. The end-to-end paths are covered in store-adapter-seam.spec.ts and

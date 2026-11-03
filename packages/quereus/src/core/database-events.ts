@@ -121,7 +121,7 @@ export interface MaintenanceCollisionEvent {
  * sync layer anchors an HLC to: it spans **all** tables touched by the
  * transaction (every module's emitter feeds the same engine-level batch), so a
  * cross-table commit is never split — unlike a per-table store coordinator, which
- * commits each table separately. See `docs/sync.md` § Transaction-Based Change
+ * commits each table separately. See `docs/sync-transactions.md` § Transaction-Based Change
  * Grouping.
  *
  * Delivered once from `flushBatch()` (i.e. after a successful commit), never on

@@ -534,7 +534,7 @@ undo journal, so a migration that fails part-way is normally unwound and announc
 all. The one exception is a migration a data-destroying step (`DROP TABLE`, `DROP COLUMN`,
 `SET DATA TYPE`) made unrestorable: the statements before the failure stay **applied** and
 announced, and only the statement that failed retracts its own. See
-[Schema § Failure and restoration](schema.md#failure-and-restoration).
+[Declarative Schema § Failure and restoration](schema-declarative.md#failure-and-restoration).
 
 #### What each `ALTER TABLE` arm reports
 

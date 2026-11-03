@@ -245,7 +245,7 @@ export function toError(error: unknown): Error {
  * sync-state event and throw BEFORE committing any CRDT metadata, so the whole
  * batch re-resolves and re-applies idempotently on the next sync attempt.
  *
- * This upholds the write-ordering invariant (docs/sync.md § Transactional
+ * This upholds the write-ordering invariant (docs/sync-transactions.md § Transactional
  * Integrity): CRDT metadata must not be committed when the corresponding data
  * write did not land — for per-change failures, not just whole-batch throws.
  *

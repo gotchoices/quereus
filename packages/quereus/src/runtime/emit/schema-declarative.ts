@@ -54,7 +54,7 @@ function formatSeedValue(v: SqlValue): string {
  * the ConstraintCheckNode (which sees no statement-level OR clause here, so it
  * resolves to ABORT) and aborts the apply with a clear error, where `OR IGNORE`
  * used to drop it silently. See ticket seed-or-ignore-masks-malformed-rows and
- * docs/schema.md § Seed Data.
+ * docs/schema-declarative.md § Seed Data.
  *
  * A table whose PK is empty (`primary key ()` — a 0-or-1-row singleton) has no
  * columns to name, so it falls back to the untargeted `on conflict do nothing`;
@@ -219,7 +219,7 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
  * marked `irreversible` by the differ): once one has run the apply cannot be taken back, and
  * a later failure reports the schema as partially migrated. A module refusing the final
  * `endSchemaBatch` counts as a failure too, and is unwound the same way. See
- * `runBatchedMigrationLoop` and docs/schema.md § Failure and restoration.
+ * `runBatchedMigrationLoop` and docs/schema-declarative.md § Failure and restoration.
  *
  * Schema events are retracted CONDITIONALLY, which is why this emitter cannot use the plain
  * `withStatementScopedSchemaEvents` helper (see ddl-event-scope.ts) every other DDL emitter
@@ -305,7 +305,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// remaining one, `renamePolicy`, is inert when there are no differences (no
 		// name-change pairs for a policy to police), and `allow_destructive` only
 		// gates a non-empty `diff.maintainedModuleMigrations`. So the skip is
-		// behaviour-preserving. See docs/schema.md § Applied-state snapshot.
+		// behaviour-preserving. See docs/schema-declarative.md § Applied-state snapshot.
 		const catalogRendering = renderCatalogForComparison(actualCatalog);
 		const declaredRendering = rctx.db.declaredSchemaManager.getDeclaredRendering(schemaName);
 		const snapshot = rctx.db.declaredSchemaManager.getAppliedSnapshot(schemaName);

@@ -2580,7 +2580,7 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 		// rows and refuses with CONSTRAINT. The DROP that preceded it has already run, but
 		// `apply schema` unwinds a failed plan through its undo journal, so the old body is
 		// re-added and the table ends up exactly as the apply found it — old constraint
-		// present AND enforced (docs/schema.md § Failure and restoration;
+		// present AND enforced (docs/schema-declarative.md § Failure and restoration;
 		// docs/sql-alter.md § ADD / DROP / RENAME CONSTRAINT).
 		const db = new Database();
 		try {

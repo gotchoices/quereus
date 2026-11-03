@@ -239,7 +239,7 @@ drift between two same-named, same-typed columns converges silently.
 Silent convergence matters beyond noise reduction: a schema-change throw lands in
 `ApplyToStoreResult.errors`, and any non-empty `errors` aborts the whole admission unit
 *before* its CRDT metadata commits (see
-[sync.md § Transactional Integrity During Sync](sync.md#transactional-integrity-during-sync)), so a
+[sync-transactions.md § Transactional Integrity During Sync](sync-transactions.md#transactional-integrity-during-sync)), so a
 throwing duplicate create would block every other change in the batch from ever
 committing metadata, the peer watermark would never advance, and the receiver would
 re-apply and re-fail the same batch on every sync, permanently.
@@ -438,7 +438,7 @@ An app's initial schema (and optionally seed data) must reach each user's local 
 2. **Runtime**: Sync from the bundled seed into the user's database using `applyChanges()`
 3. **Updates**: On app updates, only new schema changes are applied (delta sync)
 
-This reuses existing sync code paths (no new migration infrastructure), handles user customizations naturally via CRDT semantics, delta-syncs efficiently on app updates, and works offline. Because the seed is applied through `applyChanges()`, it rides the wire path's group-atomic admission core (`admitGroup`, see [Transactional Integrity During Sync](sync.md#transactional-integrity-during-sync)) and inherits the same data-first/metadata-second/abort-with-no-metadata write-ordering guarantees with no seed-specific code.
+This reuses existing sync code paths (no new migration infrastructure), handles user customizations naturally via CRDT semantics, delta-syncs efficiently on app updates, and works offline. Because the seed is applied through `applyChanges()`, it rides the wire path's group-atomic admission core (`admitGroup`, see [Transactional Integrity During Sync](sync-transactions.md#transactional-integrity-during-sync)) and inherits the same data-first/metadata-second/abort-with-no-metadata write-ordering guarantees with no seed-specific code.
 
 ### Architecture
 

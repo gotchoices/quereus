@@ -3,7 +3,7 @@
 -- is the motivating case: the plan is DROP CONSTRAINT + ADD CONSTRAINT, the re-add fails its
 -- existing-row validation, and the undo journal re-adds the OLD constraint — which must not
 -- only be back in the catalog but still be enforced. Runs on both backends
--- (see docs/schema.md § Failure and restoration; the executor is runBatchedMigrationLoop).
+-- (see docs/schema-declarative.md § Failure and restoration; the executor is runBatchedMigrationLoop).
 
 -- ===================================
 -- 1. CHECK tightened against a violating row

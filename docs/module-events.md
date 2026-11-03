@@ -241,8 +241,8 @@ journal. When a step fails, or a module refuses the final commit, and the journa
 nothing — the undo DDL's events included. But once a data-destroying step (`DROP TABLE`,
 `DROP COLUMN`, `SET DATA TYPE`) has run the apply cannot be taken back, and a later failure
 leaves the schema partially migrated: those steps really happened, so their events stay, and
-only the failing statement retracts its own. See [Schema § Failure and
-restoration](schema.md#failure-and-restoration).
+only the failing statement retracts its own. See [Declarative Schema § Failure and
+restoration](schema-declarative.md#failure-and-restoration).
 
 ### For Modules without Native Events
 

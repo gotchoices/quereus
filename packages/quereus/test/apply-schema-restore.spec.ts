@@ -4,7 +4,7 @@
  * verified back at its pre-apply state before the step's own error is rethrown. The stated
  * residual is a data-destroying step (`DROP TABLE`, `DROP COLUMN`, `SET DATA TYPE`): once one
  * has run the apply cannot be taken back, and a later failure reports the schema as partially
- * migrated. See docs/schema.md § Failure and restoration; the executor is
+ * migrated. See docs/schema-declarative.md § Failure and restoration; the executor is
  * `runBatchedMigrationLoop` in `runtime/emit/schema-declarative.ts`.
  *
  * The cross-backend half of this contract — constraint tightening against a violating row on
@@ -480,7 +480,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 	it('an applied-state snapshot an earlier apply recorded survives a restored failure', async () => {
 		// The snapshot is a claim that the catalog matched a declaration; a restore that
 		// returns the catalog to that state leaves the claim true, so it is neither cleared
-		// nor left lying (see docs/schema.md § Applied-state snapshot).
+		// nor left lying (see docs/schema-declarative.md § Applied-state snapshot).
 		const SETTLED = `
 			declare schema main {
 				table t {

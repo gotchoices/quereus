@@ -23,7 +23,7 @@ export interface LensSnapshotPair {
  *
  * On the next apply, both sides are re-rendered; if all three fields still
  * match, `computeSchemaDiff` / `generateMigrationPlan` are skipped. See
- * `docs/schema.md` § Applied-state snapshot.
+ * `docs/schema-declarative.md` § Applied-state snapshot.
  *
  * NOTE: the two renderings are retained per schema for as long as the declaration
  * lives — measured at 309 KB + 109 KB for the 112.7 KB / 54-table declaration of

@@ -379,7 +379,7 @@ A precise per-source row/group scope, mirroring the maintenance projection the m
 
 > **Invariant:** [MV-013](invariants.md#mv-013--bodyhash-is-the-identity-of-the-definition)
 
-Maintained tables participate in the [declarative-schema](schema.md#declarative-schema) pipeline. A `declare schema { ... }` block accepts a `materialized view` item — or the equivalent `create table … maintained as` table form; both normalize to the **same** declared record, so they compare equal against the same live maintained table:
+Maintained tables participate in the [declarative-schema](schema-declarative.md#declarative-schema) pipeline. A `declare schema { ... }` block accepts a `materialized view` item — or the equivalent `create table … maintained as` table form; both normalize to the **same** declared record, so they compare equal against the same live maintained table:
 
 ```sql
 declare schema main {

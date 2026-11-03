@@ -1,6 +1,6 @@
 /**
  * `apply schema` creates indexes AFTER the table-alter block (see `generateMigrationPlan` and
- * docs/schema.md § Migration Order), so one round can add or rename a column and index it.
+ * docs/schema-declarative.md § Migration Order), so one round can add or rename a column and index it.
  * Before, the index create ran ahead of `ADD COLUMN` / `RENAME COLUMN` and failed with
  * "Column ... not found".
  */

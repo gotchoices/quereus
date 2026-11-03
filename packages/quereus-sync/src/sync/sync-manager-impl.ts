@@ -217,7 +217,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	// Tail-promise chain serializing commit recording. Each commit chains onto the
 	// prior handler's completion so N+1's dedup reads see N's durable writes,
-	// preserving the change-log ordering invariant (docs/sync.md § Transaction-Based
+	// preserving the change-log ordering invariant (docs/sync-transactions.md § Transaction-Based
 	// Change Grouping). Without this, two rapid commits interleave at the first
 	// `await` and a stale change-log entry survives.
 	private commitChain: Promise<void> = Promise.resolve();
@@ -377,7 +377,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// Capture local changes at the engine transaction boundary: one grouped
 		// `onTransactionCommit` batch ⇒ one transaction ⇒ one HLC. The store's
 		// per-table emitter is below the transaction boundary and cannot group a
-		// multi-table transaction (docs/sync.md § Transaction-Based Change Grouping),
+		// multi-table transaction (docs/sync-transactions.md § Transaction-Based Change Grouping),
 		// so we subscribe here, not there. Omitted for relay-only deployments.
 		transactionSource?.onTransactionCommit((batch) => {
 			manager.enqueueTransactionCommit(batch);
@@ -776,7 +776,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	/**
 	 * Serialize commit recording: chain each commit onto the prior handler's
 	 * completion so N+1's dedup reads observe N's durable writes (the change-log
-	 * ordering invariant, docs/sync.md § Transaction-Based Change Grouping). The
+	 * ordering invariant, docs/sync-transactions.md § Transaction-Based Change Grouping). The
 	 * defensive `.catch` guards the tail: `handleTransactionCommit` already swallows
 	 * and telemeters its own errors, but any unexpected throw must not poison the
 	 * chain for every subsequent commit. Returns `void` — fire-and-forget from the
@@ -1264,7 +1264,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * bounded at transaction granularity by `config.batchSize`. A transaction is
 	 * never split across ChangeSets and two transactions are never merged, so a
 	 * consumer that advances `lastSyncHLC = ChangeSet.hlc` always lands on a real
-	 * commit boundary (docs/sync.md § Transaction-Based Change Grouping → Read side).
+	 * commit boundary (docs/sync-transactions.md § Transaction-Based Change Grouping → Read side).
 	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
 		// A watermark below the delta floor cannot be served in full: a delete

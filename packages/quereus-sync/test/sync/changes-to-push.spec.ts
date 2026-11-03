@@ -1,6 +1,6 @@
 /**
  * What a replica pushes upstream: what it wrote, however much it has received.
- * See docs/sync.md § Read side → Pushing upstream.
+ * See docs/sync-transactions.md § Read side → Pushing upstream.
  */
 
 import { expect } from 'chai';

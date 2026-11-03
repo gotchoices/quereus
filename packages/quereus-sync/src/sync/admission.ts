@@ -1,7 +1,7 @@
 /**
  * Group-atomic admission core for the sync ingress data-apply seam.
  *
- * Centralizes the docs/sync.md § Transactional Integrity During Sync write
+ * Centralizes the docs/sync-transactions.md § Transactional Integrity During Sync write
  * ordering — **data first → metadata second → abort with no metadata** — that
  * every ingress modality must uphold:
  *   - wire `applyChanges`            (change-applicator.ts)  → `admitGroup`

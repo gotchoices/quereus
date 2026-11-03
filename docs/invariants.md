@@ -1179,7 +1179,7 @@ after the reserved-tag diagnostics so a tag typo still surfaces first. Three nam
 `table` / `view` / `materialized view` share one (the engine enforces that too, so a cross-kind
 clash could only half-apply then fail mid-migration), while `index` (SCH-001) and `assertion`
 each have their own. Seed blocks are keyed by target table and guarded at declare time — the
-differ never sees them. See [Schema § Applied-state snapshot](schema.md#applied-state-snapshot-the-unchanged-schema-fast-path)
+differ never sees them. See [Declarative Schema § Applied-state snapshot](schema-declarative.md#applied-state-snapshot-the-unchanged-schema-fast-path)
 for why the fast path safely skips this check.
 
 ### SCH-004 — A module never silently no-ops an `alterTable` arm
