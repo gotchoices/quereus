@@ -463,7 +463,7 @@ export async function applySnapshotStream(
 		const executed = executedSchemaChanges(schemaChanges, result);
 		if (executed.length > 0) {
 			const identityBatch = ctx.kv.batch();
-			applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
+			await applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
 			await identityBatch.write();
 		}
 		// Record each migration only AFTER the apply that admitted it committed. A

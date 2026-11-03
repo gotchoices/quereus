@@ -472,7 +472,7 @@ export async function applyChanges(
 			await ctx.whenCommitsSettled();
 			if (executed.length > 0) {
 				const identityBatch = ctx.kv.batch();
-				applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
+				await applySchemaChangeTransitions(ctx.tableIdentity, executed, identityBatch);
 				await identityBatch.write();
 			}
 

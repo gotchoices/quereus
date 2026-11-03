@@ -15,6 +15,7 @@
 
 import { expect } from 'chai';
 import type { PrimaryKeyRekeyedEvent } from '../../src/sync/events.js';
+import { buildTableColumnVersionScanBounds, buildTombstoneScanBounds } from '../../src/metadata/keys.js';
 import {
 	changesFor,
 	closePeer,
@@ -173,6 +174,27 @@ describe('sync bookkeeping follows the table across a rename and its rows across
 	});
 });
 
+/**
+ * What one generation holds, counted raw from the KV store: the record readers
+ * resolve by name, so they cannot see a retired generation's records.
+ */
+async function generationFootprint(peer: Peer, generation: string): Promise<{ cv: number; tb: number; cl: number }> {
+	const count = async (entries: AsyncIterable<unknown>): Promise<number> => {
+		let n = 0;
+		for await (const _entry of entries) n++;
+		return n;
+	};
+	let cl = 0;
+	for await (const entry of peer.manager.changeLog.getAllChanges()) {
+		if (entry.generation === generation) cl++;
+	}
+	return {
+		cv: await count(peer.manager.kv.iterate(buildTableColumnVersionScanBounds(generation))),
+		tb: await count(peer.manager.kv.iterate(buildTombstoneScanBounds(generation))),
+		cl,
+	};
+}
+
 describe('sync bookkeeping does not outlive a dropped table', () => {
 	let a: Peer;
 	let b: Peer;
@@ -207,5 +229,35 @@ describe('sync bookkeeping does not outlive a dropped table', () => {
 
 		expect(await collect(a.db, 'select id, note from orders'), 'a holds b\'s row').to.deep.equal([{ id: 1, note: 'reborn' }]);
 		expect(await collect(b.db, 'select id, note from orders'), 'b keeps its row').to.deep.equal([{ id: 1, note: 'reborn' }]);
+	});
+
+	// a runs the local drop and b the replicated one, so both retire callers are covered.
+	it('a drop deletes the table\'s cell versions and tombstones, and the next repair sweep its change-log entries', async () => {
+		await localWrite(a, "insert into orders (id, note, extra) values (1, 'kept', 'x')");
+		await localWrite(a, "insert into orders (id, note, extra) values (2, 'gone', 'y')");
+		await localWrite(a, 'delete from orders where id = 2');
+		await relayAll(a, b);
+
+		const peers = [a, b].map(peer => ({ peer, generation: peer.manager.tableIdentity.generationOf('main', 'orders')! }));
+		const logged: number[] = [];
+		for (const { peer, generation } of peers) {
+			const before = await generationFootprint(peer, generation);
+			expect(before.cv, `${peer.name} holds cell versions`).to.be.greaterThan(0);
+			expect(before.tb, `${peer.name} holds the tombstone`).to.equal(1);
+			expect(before.cl, `${peer.name} indexes both`).to.equal(before.cv + before.tb);
+			logged.push(before.cl);
+		}
+
+		await localWrite(a, 'drop table orders');
+		await relayAll(a, b);
+
+		for (const [i, { peer, generation }] of peers.entries()) {
+			expect(peer.manager.tableIdentity.generationOf('main', 'orders'), `the drop reached ${peer.name}`).to.equal(undefined);
+			expect(await generationFootprint(peer, generation), `${peer.name} after the drop`)
+				.to.deep.equal({ cv: 0, tb: 0, cl: logged[i] });
+
+			expect(await peer.manager.repairChangeLog(), `${peer.name} repair count`).to.equal(logged[i]);
+			expect((await generationFootprint(peer, generation)).cl, `${peer.name} after repair`).to.equal(0);
+		}
 	});
 });

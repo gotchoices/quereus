@@ -430,7 +430,8 @@ reaches those instead: a full scan of the change log that deletes every entry
 maintenance pass (`SyncMaintenanceTarget`, `src/sync/maintenance.ts`) — safe to run at any
 time, on any replica, with no peer coordination, since a `null`-resolving entry already
 produced no output. Cheap once caught up: a replica with nothing to repair resolves every
-entry and deletes none, paying only the scan.
+entry and deletes none, paying only the scan. A dropped table's entries are also left to
+this sweep (see *Table identity*).
 
 **Oversized transaction.** A transaction whose fact count exceeds `batchSize` is returned
 **whole** as one ChangeSet and telemetered (a `console.warn`), never silently chunked —
@@ -634,12 +635,15 @@ the name (`metadata/table-identity.ts`):
   generation with its first cell version or tombstone. The mapping is the `tg:` record;
   the whole set (bounded by the table count) is held in memory and loaded at open.
 - A **rename moves the mapping** to the new name and touches no record. A **drop retires**
-  the generation: its records become unreachable orphans that every scan skips (the delta
-  extractors, the snapshot producers, the change-log resolver), and that a later repair
-  sweep removes from the change log; reclaiming the `cv:`/`tb:` records themselves is
-  `sync-retire-dropped-table-bookkeeping`. A **same-name re-create mints a fresh
-  generation** and so inherits nothing — the dropped incarnation's tombstones cannot block
-  the new table's rows.
+  the generation and reclaims its bookkeeping in two steps. The `cv:` and `tb:` records go
+  with the drop, in the same batch as the `tg:` removal; that is an exact prefix scan,
+  bounded by the dropped table's size. The `cl:` entries go with the next `repairChangeLog`
+  sweep, because the change log is HLC-first and finding one generation's entries takes a
+  full scan. Until then a retired generation resolves to no name, so every scan (the delta
+  extractors, the snapshot producers, the change-log resolver) skips what it still has on
+  disk. A relay-only peer retires on the admitted `drop_table` migration, so it reclaims
+  the same way. A **same-name re-create mints a fresh generation** and so inherits nothing:
+  the dropped incarnation's tombstones cannot block the new table's rows.
 - Who drives the three transitions: local DDL through the transaction-commit capture
   (`create`/`drop`/`alter`-with-`oldObjectName` table events, staged ahead of the same
   transaction's data records so `drop t; create t; insert into t` files its rows under the
@@ -684,8 +688,8 @@ create inherits (its migration is lost the same way).
 The `fv:` record stores the sync-metadata storage format version
 (`SYNC_METADATA_FORMAT_VERSION`, currently **6**: the per-row records `cv:`/`tb:`/`cl:`
 are keyed by the table's *generation* through the new `tg:` record (see *Table identity*)
-instead of by the table name, so a rename moves one record and a drop retires one
-generation without touching a row record. Version 5 keyed those records by `(schema,
+instead of by the table name, so a rename moves one record without touching a row record
+and a drop retires one generation. Version 5 keyed those records by `(schema,
 table)`, which a rename stranded and a same-name re-create inherited; it also introduced
 pk-identity keying, raw pk in record values, every variable-length key component
 length-prefixed, `sm:` keyed by object kind, and each `sm:` VALUE carrying a

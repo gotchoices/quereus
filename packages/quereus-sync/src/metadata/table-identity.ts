@@ -12,8 +12,8 @@
  *
  *   - a rename MOVES the mapping to the new name — the generation, and so every
  *     record, is untouched;
- *   - a drop RETIRES the generation — its records become unreachable orphans (the
- *     sibling ticket `sync-retire-dropped-table-bookkeeping` reclaims them);
+ *   - a drop RETIRES the generation — its `cv:`/`tb:` records are deleted with the
+ *     drop, and its `cl:` entries with the next `repairChangeLog` sweep;
  *   - a same-name re-create mints a FRESH generation and so can inherit nothing.
  *
  * The generation is LOCAL to each peer and never travels. On the wire a change is
@@ -45,7 +45,9 @@
 import type { KVStore, WriteBatch } from '@quereus/store';
 import {
 	buildAllTableGenerationScanBounds,
+	buildTableColumnVersionScanBounds,
 	buildTableGenerationKey,
+	buildTombstoneScanBounds,
 	joinKeyParts,
 	mintTableGeneration,
 	parseTableGenerationKey,
@@ -137,7 +139,9 @@ export class TableIdentityStore implements TableIdentityResolver {
 
 	/**
 	 * The name a generation currently carries, or `undefined` for a retired
-	 * generation — whose records are leftovers every scan skips.
+	 * generation. Every scan skips what such a generation still has on disk: its
+	 * `cl:` entries until the next repair sweep, and its `cv:`/`tb:` records while
+	 * the retiring batch has not committed.
 	 */
 	nameOf(generation: string): { schema: string; table: string } | undefined {
 		return this.byGeneration.get(generation);
@@ -166,17 +170,42 @@ export class TableIdentityStore implements TableIdentityResolver {
 
 	/**
 	 * Retire the generation `(schema, table)` resolves to: the name forgets it and
-	 * its records become unreachable. No-op for a name that never filed anything.
-	 * The records themselves are left in place — reclaiming them is the sibling
-	 * ticket `sync-retire-dropped-table-bookkeeping`.
+	 * the deletion of its `cv:`/`tb:` records is staged into `batch`, so they go
+	 * with the drop that orphaned them. No-op for a name that never filed anything.
+	 *
+	 * The `cl:` entries stay: the change log is HLC-first, so finding one generation's
+	 * entries takes a full scan, which `repairChangeLog` already runs and which removes
+	 * them because a retired generation resolves to no name.
+	 *
+	 * The name forgets the generation BEFORE the first await, so nothing that runs
+	 * during the scan can resolve the name to it and file a new record under it. A
+	 * failed scan is the same recovery as a failed commit ({@link withIdentityRecovery}).
 	 */
-	retire(schema: string, table: string, batch: WriteBatch): void {
+	async retire(schema: string, table: string, batch: WriteBatch): Promise<void> {
 		const generation = this.generationOf(schema, table);
 		if (generation === undefined) return;
 
 		batch.delete(buildTableGenerationKey(schema, table));
 		this.byName.delete(joinKeyParts(schema, table));
 		this.byGeneration.delete(generation);
+		await this.stageRecordDeletions(generation, batch);
+	}
+
+	/**
+	 * NOTE: one delete per record in one batch, so the drop holds the table's whole
+	 * record count in memory until the commit. If that shows up on very large tables,
+	 * commit the `tg:` removal first and purge in chunks; the purge needs no atomicity
+	 * with it, only a way to resume after a crash.
+	 *
+	 * NOTE: an inbound batch already staged under this generation can commit after this
+	 * scan (the commit chain does not exclude the apply path), leaving records nothing
+	 * purges. They are inert, since every scan skips a nameless generation. If they ever
+	 * accumulate, sweep `cv:`/`tb:` for nameless generations alongside `repairChangeLog`.
+	 */
+	private async stageRecordDeletions(generation: string, batch: WriteBatch): Promise<void> {
+		for (const bounds of [buildTableColumnVersionScanBounds(generation), buildTombstoneScanBounds(generation)]) {
+			for await (const entry of this.kv.iterate(bounds)) batch.delete(entry.key);
+		}
 	}
 
 	/**
@@ -263,18 +292,18 @@ export interface TableLifecycleChange {
  * Order matters and is the caller's: `drop t; create t` must retire before it
  * ensures, or the re-create keeps the dropped incarnation's generation.
  */
-export function applySchemaChangeTransitions(
+export async function applySchemaChangeTransitions(
 	identity: TableIdentityStore,
 	changes: ReadonlyArray<TableLifecycleChange>,
 	batch: WriteBatch,
-): void {
+): Promise<void> {
 	for (const change of changes) {
 		switch (change.type) {
 			case 'create_table':
 				identity.ensure(change.schema, change.table, batch);
 				break;
 			case 'drop_table':
-				identity.retire(change.schema, change.table, batch);
+				await identity.retire(change.schema, change.table, batch);
 				break;
 			case 'rename_table':
 				// No `fromTable` (an omitting peer) is undecidable for the catalog too —

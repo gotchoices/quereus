@@ -827,7 +827,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// a rename's rows (relabelled to the new name by the engine) under the moved
 			// one. Same batch as everything else, so the mapping and the records that
 			// depend on it commit together.
-			this.applyLocalTableTransitions(kvBatch, localSchema);
+			await this.applyLocalTableTransitions(kvBatch, localSchema);
 
 			// DDL before DML: migrations take the lowest opSeqs. A primary-key change also
 			// re-files the table's existing records here, BEFORE the data events below — the
@@ -884,13 +884,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * table, not which table it is, and are skipped. Events are walked in emit
 	 * order, so a `drop t; create t` retires before it ensures.
 	 */
-	private applyLocalTableTransitions(batch: WriteBatch, localSchema: DatabaseSchemaChangeEvent[]): void {
+	private async applyLocalTableTransitions(batch: WriteBatch, localSchema: DatabaseSchemaChangeEvent[]): Promise<void> {
 		for (const event of localSchema) {
 			if (event.objectType !== 'table') continue;
 			if (event.type === 'create') {
 				this.tableIdentity.ensure(event.schemaName, event.objectName, batch);
 			} else if (event.type === 'drop') {
-				this.tableIdentity.retire(event.schemaName, event.objectName, batch);
+				await this.tableIdentity.retire(event.schemaName, event.objectName, batch);
 			} else if (event.type === 'alter' && event.oldObjectName !== undefined) {
 				this.tableIdentity.move(event.schemaName, event.oldObjectName, event.objectName, batch);
 			}
@@ -1349,9 +1349,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * `null` when the underlying column version / tombstone is gone — a stale log
 	 * entry (e.g. a column overwritten, or a row deleted after the entry was
 	 * written) — or when the entry's table generation has been RETIRED (the table
-	 * was dropped; its leftover records are unreachable orphans, so the entry is
-	 * one too). The authoritative HLC, value AND pk come from the current version
-	 * record, not the log key — the key carries only the lossy pk identity — and
+	 * was dropped, and its records with it, so the entry waits for
+	 * {@link repairChangeLog}). The authoritative HLC, value AND pk come from the
+	 * current version record, not the log key — the key carries only the lossy pk
+	 * identity — and
 	 * the change is addressed by the table's CURRENT name, which is how a fact
 	 * recorded before a rename ships under the name the peer will know it by.
 	 */
@@ -1669,9 +1670,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * entry that resolves to `null` already produced no output for
 	 * {@link collectChangesSince} (`resolveLogEntry` returning `null` is exactly
 	 * what makes it an orphan), so deleting it changes nothing observable. That
-	 * includes every entry of a RETIRED table generation — a dropped table's index
-	 * entries, which nothing can resolve by name any more. Full scan, same shape as
-	 * {@link pruneTombstones} — a replica with no pre-fix orphans (or one already
+	 * includes every entry of a RETIRED table generation: a drop deletes the table's
+	 * `cv:`/`tb:` records ({@link TableIdentityStore.retire}) but leaves their index
+	 * entries, which only a scan of the HLC-first log can find, to this sweep. Full
+	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix orphans (or one already
 	 * repaired) resolves every entry and deletes nothing, so a caught-up replica
 	 * pays only the scan.
 	 *
