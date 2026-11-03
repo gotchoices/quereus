@@ -9,9 +9,9 @@
  * sqllogic harness has no reopen primitive).
  *
  * Both declaration spellings are covered: table-level `primary key (a) on conflict replace`
- * and column-level `a integer primary key on conflict replace`. They land on different
- * emission branches (table-level clause vs. inline column clause) and both re-parse onto
- * the column, so each has to survive on its own.
+ * and column-level `a integer primary key on conflict replace`. They are separate records
+ * on different emission branches (table-level clause vs. inline column clause), so each has
+ * to survive on its own.
  *
  * Two more shapes cover the **all-columns key** (the key a table gets when its declared key
  * spans every column, and the one it gets when it declares none — they are the same key).

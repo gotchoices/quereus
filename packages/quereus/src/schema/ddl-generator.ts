@@ -14,12 +14,13 @@
  * are elided for readability:
  *   - schema name qualification (db.schemaManager current schema)
  *   - USING module / args (db.options.default_vtab_module / default_vtab_args)
- *   - per-column NULL / NOT NULL annotation (db.options.default_column_nullability)
+ *   - per-column NULL / NOT NULL annotation (db.options.default_column_nullability),
+ *     except on a column whose own `ON CONFLICT` action needs the annotation to ride on
  */
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
-import { maskToOps, resolvePkDefaultConflict } from './table.js';
+import { maskToOps } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
@@ -27,7 +28,7 @@ import type { MaintainedTableSchema } from './derivation.js';
 import type { SqlValue } from '../common/types.js';
 import { ConflictResolution } from '../common/constants.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, maintainedClauseToString, alterIndexToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, maintainedClauseToString, alterIndexToString, contextClauseToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -99,7 +100,7 @@ export function generateMaintainedTableDDL(table: MaintainedTableSchema): string
  * (session-elided for {@link generateTableDDL}, backing-normalized for
  * {@link generateMaintainedTableDDL}); `maintainedClause` is the rendered
  * `maintained as …` clause or null. Clause order matches the parser grammar:
- * `(columns) → using → maintained as … [insert defaults] → with tags`.
+ * `(columns) → using → maintained as … [insert defaults] → with context → with tags`.
  */
 function generateTableDDLInternal(
 	tableSchema: TableSchema,
@@ -117,40 +118,36 @@ function generateTableDDLInternal(
 	// explicitly. It is also what gives a column-declared `ON CONFLICT` on an all-columns
 	// key somewhere to ride; the old omission dropped it on every round-trip.
 
-	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when there is
-	// none to emit (the empty-key singleton, or a composite key — rendered table-level
-	// below). Resolved from `primaryKeyDefinition`, the authoritative key record, NOT from
+	// A table holds two independent `ON CONFLICT` records and each rides its own clause, so
+	// a re-parse reproduces both: the table-level action on the table-level key clause, a
+	// column's action on that column's clause. Consumers read them differently (a NOT NULL
+	// violation reads only the column's record; a duplicate key reads the table's first),
+	// so folding one into the other changes what the table does.
+	const tableAction = emittedTableKeyAction(tableSchema);
+
+	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when the key renders
+	// table-level below: the empty-key singleton, a composite key, or any key with a
+	// table-level action, which an inline clause would re-parse onto the column instead.
+	// Resolved from `primaryKeyDefinition`, the authoritative key record, NOT from
 	// the per-column `primaryKey` flag: the flag is a CREATE-time mirror that
 	// `ALTER TABLE … ALTER PRIMARY KEY` producers may leave pointing at the retired key,
 	// and rendering from it emitted DDL that re-parsed to the OLD key (and, on a
 	// composite→single move, two inline clauses).
-	const inlinePkIndex = tableSchema.primaryKeyDefinition.length === 1
+	const inlinePkIndex = tableSchema.primaryKeyDefinition.length === 1 && tableAction === undefined
 		? tableSchema.primaryKeyDefinition[0].index
 		: -1;
 
-	// The declared `ON CONFLICT` action rides whichever clause ends up carrying the key
-	// (see pkConflictClause) — without it a `primary key (...) on conflict replace`
-	// re-parses as ABORT and stops replacing after a persistence reopen. Resolved through
-	// resolvePkDefaultConflict, not the raw `primaryKeyDefaultConflict` field, so a
-	// column-declared action (`a integer not null on conflict replace, … primary key (a, b)`)
-	// reaches the table-level clause too — reading the field alone dropped it there, and
-	// dropped it stably enough that the fixed-point assertion could not see it.
-	const pkConflict = pkConflictClause(resolvePkDefaultConflict(tableSchema));
-
 	const columnDefs: string[] = tableSchema.columns.map((col, columnIndex) =>
-		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex, pkConflict));
+		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex));
 
-	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
-	// Single-column PK is emitted inline on the column above. Per-column DESC is emitted
-	// so a descending key component (e.g. an ordering-seeded maintained-table backing key)
-	// survives the round-trip instead of silently re-keying ascending on re-parse.
-	if (tableSchema.primaryKeyDefinition.length === 0) {
-		columnDefs.push(`PRIMARY KEY ()${pkConflict}`);
-	} else if (tableSchema.primaryKeyDefinition.length > 1) {
+	// Per-column DESC is emitted so a descending key component (e.g. an ordering-seeded
+	// maintained-table backing key) survives the round-trip instead of silently re-keying
+	// ascending on re-parse. An empty key lists no columns, which is the singleton's `()`.
+	if (inlinePkIndex === -1) {
 		const pkCols = tableSchema.primaryKeyDefinition
 			.map(pk => quoteName(tableSchema.columns[pk.index].name) + (pk.desc ? ' DESC' : ''))
 			.join(', ');
-		columnDefs.push(`PRIMARY KEY (${pkCols})${pkConflict}`);
+		columnDefs.push(`PRIMARY KEY (${pkCols})${onConflictClause(tableAction)}`);
 	}
 
 	// Table-level CHECK / UNIQUE / FOREIGN KEY constraints. Emitting these is what
@@ -169,6 +166,9 @@ function generateTableDDLInternal(
 	if (usingClause) parts.push(usingClause);
 
 	if (maintainedClause) parts.push(maintainedClause);
+
+	const contextClause = emitContextClause(tableSchema);
+	if (contextClause) parts.push(contextClause);
 
 	// Table-level WITH TAGS
 	if (hasTags(tableSchema.tags)) {
@@ -462,6 +462,19 @@ function emitTableConstraints(tableSchema: TableSchema): string {
 	return constraints.length > 0 ? tableConstraintsToString(constraints) : '';
 }
 
+/**
+ * Renders the `with context (...)` clause over the schema→AST lift, so this path and the
+ * declarative AST→SQL path cannot drift. Its text is session-independent: a bare variable
+ * is NOT NULL under any `default_column_nullability`, because the parser always decides.
+ */
+function emitContextClause(tableSchema: TableSchema): string {
+	return contextClauseToString(tableSchema.mutationContext?.map(contextVar => ({
+		name: contextVar.name,
+		dataType: contextVar.logicalType.name,
+		notNull: contextVar.notNull,
+	})));
+}
+
 // --- Internals ---
 
 interface EmitContext {
@@ -504,32 +517,35 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 }
 
 /**
- * Renders the ` ON CONFLICT <action>` tail of a table's primary-key declaration, or ''
- * when none was declared or it is the ABORT default (which re-parses identically).
- *
- * Emitted on whichever clause carries the key — inline on the column for a
- * single-column key, table-level otherwise — because the action is a property of the
- * key, not of the clause's spelling. Dropping it silently downgrades a
- * `primary key (...) on conflict replace` table to ABORT on any DDL round-trip, so a
- * store-backed table stops replacing on duplicate-key writes after a reopen.
+ * The table-level key action as it must appear in the text. A declared ABORT equals an
+ * absent one (every consumer resolves `statement OR ?? declared ?? ABORT`), so it is elided
+ * unless a key column declares an action of its own, which the table's ABORT outranks.
+ */
+function emittedTableKeyAction(tableSchema: TableSchema): ConflictResolution | undefined {
+	const action = tableSchema.primaryKeyDefaultConflict;
+	if (action !== ConflictResolution.ABORT) return action;
+	const keyColumnDeclares = tableSchema.primaryKeyDefinition.some(pk => tableSchema.columns[pk.index].defaultConflict !== undefined);
+	return keyColumnDeclares ? action : undefined;
+}
+
+/**
+ * Renders the ` ON CONFLICT <action>` tail of a clause, or '' when there is no action.
  *
  * Uppercase to match the surrounding CREATE TABLE keywords; the parser is
  * case-insensitive, and the constraint fragment emitted below (lowercase, via
  * `tableConstraintsToString`) already mixes the two.
  */
-function pkConflictClause(defaultConflict: ConflictResolution | undefined): string {
-	if (defaultConflict === undefined || defaultConflict === ConflictResolution.ABORT) return '';
-	return ` ON CONFLICT ${ConflictResolution[defaultConflict]}`;
+function onConflictClause(action: ConflictResolution | undefined): string {
+	return action === undefined ? '' : ` ON CONFLICT ${ConflictResolution[action]}`;
 }
 
 /**
  * Renders one column definition. `isInlinePk` is decided by the caller from
  * `primaryKeyDefinition` (see `generateTableDDLInternal`) — this function never
  * consults the per-column `primaryKey` flag, so flag drift from any ALTER producer
- * cannot reach the emitted DDL. `pkConflict` is the rendered `ON CONFLICT` tail for the
- * table's key, appended only when this column carries the inline clause.
+ * cannot reach the emitted DDL.
  */
-function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, isInlinePk: boolean, pkConflict: string): string {
+function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, isInlinePk: boolean): string {
 	let colDef = quoteName(col.name);
 	// NOTE: emits the flattened col.logicalType.name (e.g. 'INTEGER'), not col.declaredType
 	// (e.g. 'BIGINT'). That's intentional today — declaredType is informational-only, read
@@ -538,16 +554,13 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 	// isn't silently dropped again.
 	if (col.logicalType) colDef += ` ${col.logicalType.name}`;
 
-	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull);
+	// A column's `primary key` / `not null` / `null` clauses share one conflict slot and the
+	// last one wins on re-parse, so exactly one clause carries it: the inline PRIMARY KEY
+	// clause when there is one, otherwise the nullability annotation.
+	const annotationCarriesAction = !isInlinePk && col.defaultConflict !== undefined;
+	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull, annotationCarriesAction);
 	if (nullAnnotation) colDef += ` ${nullAnnotation}`;
-	// NOTE: a column's own `ON CONFLICT` action (`ColumnSchema.defaultConflict`, which a
-	// `not null` / `null` / `primary key` column clause all collapse onto) is emitted ONLY
-	// on the inline PRIMARY KEY clause below. On a non-key column — `x integer not null on
-	// conflict rollback` — it is still dropped, so the column falls back to ABORT after a
-	// persistence round-trip. Emitting it on the nullability annotation would fix that, but
-	// the annotation elides in the with-`db` form (see nullabilityAnnotation), so the action
-	// would need a forced annotation to ride on. Worth doing when a non-key `on conflict`
-	// declaration actually has to survive a reopen.
+	if (annotationCarriesAction) colDef += onConflictClause(col.defaultConflict);
 
 	// Column COLLATE: emit only a non-default collation (BINARY / '' are elided),
 	// mirroring the index column path (generateIndexDDL). Without this, a re-parse
@@ -566,11 +579,7 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 	// would otherwise silently re-key ascending).
 	if (isInlinePk) {
 		colDef += tableSchema.primaryKeyDefinition[0].desc ? ' PRIMARY KEY DESC' : ' PRIMARY KEY';
-		// `pkConflict` already folds in this column's own action (resolvePkDefaultConflict
-		// reads the column-level record when no table-level one is set), which is what makes
-		// the emission a fixed point — a table-level action re-parses ONTO the column, so the
-		// second emission has only the column-level record to read.
-		colDef += pkConflict;
+		colDef += onConflictClause(col.defaultConflict);
 	}
 
 	if (col.defaultValue !== null && col.defaultValue !== undefined) {
@@ -596,11 +605,12 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 /**
  * Decides what nullability annotation (if any) to emit.
  *
- * - With a known session default: emit only the annotation that differs from the default.
+ * - With a known session default: emit only the annotation that differs from the default,
+ *   unless `force`d because the annotation is what carries the column's `ON CONFLICT`.
  * - Without a session default: always emit explicitly (safe for persistence under any reader).
  */
-function nullabilityAnnotation(notNull: boolean, defaultNotNull: boolean | undefined): string | null {
-	if (defaultNotNull === undefined) {
+function nullabilityAnnotation(notNull: boolean, defaultNotNull: boolean | undefined, force: boolean): string | null {
+	if (defaultNotNull === undefined || force) {
 		return notNull ? 'NOT NULL' : 'NULL';
 	}
 	if (defaultNotNull && !notNull) return 'NULL';

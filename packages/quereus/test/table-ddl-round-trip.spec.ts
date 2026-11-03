@@ -28,6 +28,13 @@
  * the action decayed to `ABORT` on every round-trip — two shapes below pin that it now
  * survives.
  *
+ * ## The rule: each conflict record rides its own clause
+ *
+ * A table has two `ON CONFLICT` records: the table-level one and each column's own. The
+ * emitter maps them one-to-one onto clauses, so every shape also asserts that both raw
+ * records survive the re-parse. Comparing only the resolved key action would miss a record
+ * that migrates to the other slot or vanishes behind the one that outranks it.
+ *
  * `expectedNullability` pins the absolute answer for the shapes that need it: the ones
  * running under `pragma default_column_nullability = 'nullable'`, where naming the key is
  * the thing that used to tighten the column. Shapes without it run under the shipped
@@ -49,10 +56,8 @@ function keySpelling(schema: TableSchema): string[] {
 }
 
 /**
- * The key's effective conflict action, named, or `'(none)'`. Read through
- * `resolvePkDefaultConflict` rather than `primaryKeyDefaultConflict` because a
- * table-level action re-parses onto the column — comparing the raw field would report a
- * difference where the resolved behaviour is identical.
+ * The key's effective conflict action, named, or `'(none)'` — what a duplicate-key write
+ * resolves to, read through `resolvePkDefaultConflict`.
  *
  * A declared ABORT reads as `'(none)'`: every consumer resolves the action as
  * `statementOnConflict ?? perConstraint ?? ABORT` (memory `layer/manager.ts`, store
@@ -61,6 +66,23 @@ function keySpelling(schema: TableSchema): string[] {
  */
 function conflictSpelling(schema: TableSchema): string {
 	const action = resolvePkDefaultConflict(schema);
+	return action === undefined || action === ConflictResolution.ABORT ? '(none)' : ConflictResolution[action];
+}
+
+/**
+ * `name: ACTION` (or `name: -`) for every column, read from the raw per-column record. A
+ * table has two independent conflict records and consumers read them differently (a NOT
+ * NULL violation reads only the column's), so `conflictSpelling`, which resolves them into
+ * one answer, cannot see an action migrate between them or vanish behind another.
+ */
+function columnActionSpelling(schema: TableSchema): string[] {
+	return schema.columns.map(col =>
+		`${col.name}: ${col.defaultConflict === undefined ? '-' : ConflictResolution[col.defaultConflict]}`);
+}
+
+/** The raw table-level action, with a declared ABORT reading as absent (see `conflictSpelling`). */
+function tableActionSpelling(schema: TableSchema): string {
+	const action = schema.primaryKeyDefaultConflict;
 	return action === undefined || action === ConflictResolution.ABORT ? '(none)' : ConflictResolution[action];
 }
 
@@ -96,6 +118,11 @@ interface Shape {
 	expectedKey: string[];
 	/** Expected live conflict action, as `conflictSpelling` renders it. Default `'(none)'`. */
 	expectedConflict?: string;
+	/**
+	 * Expected per-column actions, as `columnActionSpelling` renders them, for shapes whose
+	 * text legitimately carries an `ON CONFLICT` the key does not resolve to.
+	 */
+	expectedColumnActions?: string[];
 	/**
 	 * Expected per-column nullability, as `nullabilitySpelling` renders it. Set it for the
 	 * shapes where the absolute answer is the point (a nullable key emitted, re-parsed
@@ -181,9 +208,8 @@ const SHAPES: Shape[] = [
 		expectedKey: ['a collate binary', 'b collate binary'],
 	},
 	{
-		// The empty-key singleton has its own emission path (`PRIMARY KEY ()`) and must stay
-		// on it — folding it into the composite branch (`length > 1`) would render an empty
-		// column list, and dropping it entirely would re-parse as the all-columns key.
+		// The empty-key singleton must emit `PRIMARY KEY ()`: dropping the clause entirely
+		// would re-parse as the all-columns key.
 		label: 'empty-key singleton `primary key ()`',
 		statements: [`create table t (a integer, b text, primary key ())`],
 		expectedKey: [],
@@ -197,25 +223,23 @@ const SHAPES: Shape[] = [
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
 	},
 	{
-		// The action declared on a PK COLUMN rather than on the table-level clause. It is
-		// still the key's action (resolvePkDefaultConflict reads either), so the table-level
-		// clause has to carry it — emitting from `primaryKeyDefaultConflict` alone dropped it
-		// here while the inline branch kept it.
+		// The action declared on a PK COLUMN rather than on the table-level clause. It stays
+		// on the column: folding it into the key clause minted a table-level action nobody
+		// declared and took away the column's own NOT NULL action.
 		label: 'narrow composite PK, action declared on a key column',
 		statements: [`create table t (a integer not null on conflict replace, b text, c text, primary key (a, b))`],
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
-		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
+		expectedText: '"a" INTEGER NOT NULL ON CONFLICT REPLACE',
 	},
 	{
-		// An all-columns key whose action is declared on a key COLUMN. This used to emit no
-		// clause, so the action had nowhere to ride and decayed to ABORT on reopen — stably,
-		// so the fixed-point assertion could not see it. The clause now carries it.
-		label: 'all-columns PK, action declared on a key column (clause carries the action)',
+		// An all-columns key whose action is declared on a key COLUMN. The column's clause
+		// carries it, the same as on a narrower key.
+		label: 'all-columns PK, action declared on a key column (column clause carries the action)',
 		statements: [`create table t (a integer not null on conflict replace, b text, primary key (a, b))`],
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
-		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
+		expectedText: '"a" INTEGER NOT NULL ON CONFLICT REPLACE',
 	},
 	{
 		// Same, single-column spelling: the lone column IS the whole key, so the inline
@@ -235,19 +259,18 @@ const SHAPES: Shape[] = [
 		expectedText: 'PRIMARY KEY () ON CONFLICT REPLACE',
 	},
 	{
-		// A narrow table-level key with a conflict action lands on the INLINE branch, so
-		// the action has to ride the column clause. Dropping it there downgraded the table
-		// to ABORT on reopen just as silently as on the table-level branch.
-		label: 'narrow table-level PK with ON CONFLICT (inline branch carries the action)',
+		// A single-column key with a table-level action must stay table-level: an inline
+		// clause would re-parse the action onto the column, where it also starts governing
+		// that column's NOT NULL violations.
+		label: 'narrow table-level PK with ON CONFLICT (stays table-level)',
 		statements: [`create table t (a integer, b text, v integer, primary key (a) on conflict replace)`],
 		expectedKey: ['a collate binary'],
 		expectedConflict: 'REPLACE',
-		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
+		expectedText: 'PRIMARY KEY ("a") ON CONFLICT REPLACE',
 	},
 	{
-		// The column-declared spelling — and the shape a table-level action re-parses INTO,
-		// so this is what makes the emission a fixed point rather than losing the action on
-		// the second write.
+		// The column-declared spelling: the action lives on the column's one conflict slot,
+		// so the inline clause carries it.
 		label: 'column-declared PK with ON CONFLICT',
 		statements: [`create table t (a integer primary key on conflict replace, b text)`],
 		expectedKey: ['a collate binary'],
@@ -286,6 +309,80 @@ const SHAPES: Shape[] = [
 		statements: [`create table t (a text collate nocase, b integer)`],
 		expectedKey: ['a collate nocase', 'b collate binary'],
 	},
+	{
+		label: 'non-key columns with their own action, NOT NULL and NULL',
+		statements: [`create table t (id integer primary key, x integer not null on conflict ignore, y integer null on conflict ignore)`],
+		expectedKey: ['id collate binary'],
+		expectedColumnActions: ['id: -', 'x: IGNORE', 'y: IGNORE'],
+		expectedText: '"x" INTEGER NOT NULL ON CONFLICT IGNORE, "y" INTEGER NULL ON CONFLICT IGNORE',
+	},
+	{
+		label: 'composite key whose members declare different actions',
+		statements: [`create table t (a integer not null on conflict rollback, b integer not null on conflict ignore, primary key (a, b))`],
+		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedConflict: 'ROLLBACK',
+		expectedColumnActions: ['a: ROLLBACK', 'b: IGNORE'],
+		expectedText: 'PRIMARY KEY ("a", "b")',
+	},
+	{
+		// A column's ABORT is not elidable: the key resolves to the first key column that
+		// declares anything, so without it this key would flip to REPLACE.
+		label: 'composite key, ABORT on the first member and REPLACE on the second',
+		statements: [`create table t (a integer not null on conflict abort, b integer not null on conflict replace, primary key (a, b))`],
+		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedColumnActions: ['a: ABORT', 'b: REPLACE'],
+		expectedText: '"a" INTEGER NOT NULL ON CONFLICT ABORT',
+	},
+	{
+		label: 'single-column key, table action and column action differ',
+		statements: [`create table t (a integer not null on conflict rollback, v integer, primary key (a) on conflict replace)`],
+		expectedKey: ['a collate binary'],
+		expectedConflict: 'REPLACE',
+		expectedColumnActions: ['a: ROLLBACK', 'v: -'],
+		expectedText: '"a" INTEGER NOT NULL ON CONFLICT ROLLBACK, "v" INTEGER NOT NULL, PRIMARY KEY ("a") ON CONFLICT REPLACE',
+	},
+	{
+		// The table's ABORT outranks the column's REPLACE here, so unlike a lone table-level
+		// ABORT it cannot be elided without the key flipping to REPLACE.
+		label: 'single-column key, table-level ABORT outranking a column action',
+		statements: [`create table t (a integer not null on conflict replace, v integer, primary key (a) on conflict abort)`],
+		expectedKey: ['a collate binary'],
+		expectedColumnActions: ['a: REPLACE', 'v: -'],
+		expectedText: 'PRIMARY KEY ("a") ON CONFLICT ABORT',
+	},
+	{
+		// The table-level branch is the only one that can carry a single-column key's table
+		// action, so a descending component has to survive there too.
+		label: 'descending single-column key with a table-level action',
+		statements: [`create table t (a integer, v integer, primary key (a desc) on conflict replace)`],
+		expectedKey: ['a desc collate binary'],
+		expectedConflict: 'REPLACE',
+		expectedText: 'PRIMARY KEY ("a" DESC) ON CONFLICT REPLACE',
+	},
+	{
+		// No reload involved: RENAME COLUMN rebuilds the column from a synthesized definition.
+		label: 'column action survives RENAME COLUMN',
+		statements: [
+			`create table t (id integer primary key, x integer not null on conflict ignore)`,
+			`alter table t rename column x to z`,
+		],
+		expectedKey: ['id collate binary'],
+		expectedColumnActions: ['id: -', 'z: IGNORE'],
+		expectedText: '"z" INTEGER NOT NULL ON CONFLICT IGNORE',
+	},
+	{
+		// Same loss through a different builder: a source rename reshapes the maintained
+		// table's backing column from its own synthesized definition.
+		label: 'column action survives a source rename reaching a maintained table',
+		statements: [
+			`create table s (id integer primary key, v integer)`,
+			`create table t (id integer primary key, v integer not null on conflict ignore) maintained as select id, v from s`,
+			`alter table s rename column v to v2`,
+		],
+		expectedKey: ['id collate binary'],
+		expectedColumnActions: ['id: -', 'v2: IGNORE'],
+		expectedText: '"v2" INTEGER NOT NULL ON CONFLICT IGNORE',
+	},
 ];
 
 describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point', () => {
@@ -295,6 +392,8 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 				ddl: generateTableDDL(schema),
 				key: keySpelling(schema),
 				conflict: conflictSpelling(schema),
+				columnActions: columnActionSpelling(schema),
+				tableAction: tableActionSpelling(schema),
 				nullability: nullabilitySpelling(schema),
 			}));
 
@@ -308,8 +407,11 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 			if (shape.expectedText) {
 				expect(original.ddl, 'emitted DDL carries the declared clause').to.contain(shape.expectedText);
 			}
-			if (shape.expectedConflict === undefined) {
+			if (shape.expectedConflict === undefined && shape.expectedColumnActions === undefined) {
 				expect(original.ddl, 'no ON CONFLICT expected').to.not.contain('ON CONFLICT');
+			}
+			if (shape.expectedColumnActions) {
+				expect(original.columnActions, 'live column actions').to.deep.equal(shape.expectedColumnActions);
 			}
 			if (shape.expectedNullability) {
 				expect(original.nullability, 'live nullability').to.deep.equal(shape.expectedNullability);
@@ -320,12 +422,18 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 				ddl: generateTableDDL(schema),
 				key: keySpelling(schema),
 				conflict: conflictSpelling(schema),
+				columnActions: columnActionSpelling(schema),
+				tableAction: tableActionSpelling(schema),
 				nullability: nullabilitySpelling(schema),
 			}));
 
 			expect(reparsed.key, `re-parsed key from: ${original.ddl}`).to.deep.equal(original.key);
 			expect(reparsed.conflict, `re-parsed conflict action from: ${original.ddl}`)
 				.to.equal(original.conflict);
+			expect(reparsed.columnActions, `re-parsed column actions from: ${original.ddl}`)
+				.to.deep.equal(original.columnActions);
+			expect(reparsed.tableAction, `re-parsed table-level action from: ${original.ddl}`)
+				.to.equal(original.tableAction);
 			expect(reparsed.nullability, `re-parsed nullability from: ${original.ddl}`)
 				.to.deep.equal(original.nullability);
 			// Emit twice: the second emission must be byte-identical, so the persisted text
@@ -402,6 +510,71 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 		} finally {
 			await db.close();
 		}
+	});
+
+	it('the session-elided form keeps a column action by forcing its nullability annotation', async () => {
+		const db = new Database();
+		try {
+			await db.exec(`create table t (id integer primary key on conflict replace, x integer not null on conflict ignore, y integer)`);
+			const schema = db.schemaManager.findTable('t')!;
+			const ddl = generateTableDDL(schema, db);
+			const actions = columnActionSpelling(schema);
+
+			expect(ddl, 'annotated although NOT NULL is the session default').to.contain('"x" INTEGER NOT NULL ON CONFLICT IGNORE');
+			expect(ddl, 'the inline key clause needs no annotation').to.contain('"id" INTEGER PRIMARY KEY ON CONFLICT REPLACE');
+			expect(ddl, 'a column with no action stays elided').to.contain('"y" INTEGER)');
+
+			await db.exec('drop table t');
+			await db.exec(ddl);
+			expect(columnActionSpelling(db.schemaManager.findTable('t')!)).to.deep.equal(actions);
+		} finally {
+			await db.close();
+		}
+	});
+
+	describe('with context', () => {
+		// One table carrying every variable spelling the clause has to reproduce: a typed
+		// NOT NULL variable read by a CHECK, one read by a DEFAULT (without the clause the
+		// emitted DEFAULT is not even valid DDL), a nullable one, a reserved-word name, and
+		// `with tags` following the clause.
+		const CREATE = `create table t (
+			id integer primary key,
+			v integer not null,
+			d integer null default n,
+			constraint under_cap check (new.v <= cap)
+		) with context (cap integer, n integer, "select" text null) with tags (owner = 'ops')`;
+
+		it('is emitted, re-parses to the same variables, and is byte-stable', async () => {
+			const original = await withTable([CREATE], schema => ({ ddl: generateTableDDL(schema), context: schema.mutationContext }));
+			expect(original.ddl).to.contain(`with context (cap INTEGER, n INTEGER, "select" TEXT NULL) WITH TAGS (owner = 'ops')`);
+
+			const reparsed = await withTable([original.ddl], schema => ({ ddl: generateTableDDL(schema), context: schema.mutationContext }));
+			expect(reparsed.context?.map(v => [v.name, v.logicalType.name, v.notNull]))
+				.to.deep.equal(original.context?.map(v => [v.name, v.logicalType.name, v.notNull]));
+			expect(reparsed.ddl, 'emit → parse → emit is byte-stable').to.equal(original.ddl);
+		});
+
+		it('leaves the re-parsed table writable, with the variables still enforced', async () => {
+			const ddl = await withTable([CREATE], generateTableDDL);
+
+			const db = new Database();
+			try {
+				await db.exec(ddl);
+				await db.exec(`insert into t (id, v) with context cap = 10, n = 3 values (1, 5)`);
+				expect(await db.get(`select d from t where id = 1`)).to.deep.equal({ d: 3 });
+
+				let error: unknown;
+				try {
+					await db.exec(`insert into t (id, v) with context cap = 10, n = 3 values (2, 11)`);
+				} catch (e) {
+					error = e;
+				}
+				expect(error, 'the CHECK still reads cap').to.be.instanceOf(Error);
+				expect((error as Error).message).to.match(/constraint/i);
+			} finally {
+				await db.close();
+			}
+		});
 	});
 
 	it('applying a declaration with no PRIMARY KEY twice is a no-op', async () => {

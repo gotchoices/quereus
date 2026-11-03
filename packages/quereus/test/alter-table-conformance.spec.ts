@@ -864,9 +864,10 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 			name text not null collate nocase default 'x',
 			v integer not null default 7,
 			dbl integer null generated always as (v * 2) stored,
+			skip_null integer null on conflict ignore,
 			constraint pos check (v > 0),
 			constraint u_name unique (name)
-		) using noalter with tags (owner = 'ops')`);
+		) using noalter with context (audit integer null) with tags (owner = 'ops')`);
 		await db.exec(`insert into t (id, code, name, v) values (1, 100, 'a', 5)`);
 
 		const before = generateTableDDL(db.schemaManager.findTable('t')!);
@@ -878,7 +879,7 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 		expect(after, 'the two texts are not trivially identical').to.not.equal(before);
 		// Non-vacuity: the comparison below is only worth anything if the captured text
 		// actually carries every feature the rebuild could drop.
-		for (const feature of [/CHECK/i, /UNIQUE/i, /COLLATE/i, /DEFAULT/i, /GENERATED ALWAYS AS/i, /TAGS/i, /USING/i]) {
+		for (const feature of [/CHECK/i, /UNIQUE/i, /COLLATE/i, /DEFAULT/i, /GENERATED ALWAYS AS/i, /TAGS/i, /USING/i, /NULL ON CONFLICT IGNORE/, /with context/i]) {
 			expect(before, `sanity: captured DDL carries ${feature}`).to.match(feature);
 		}
 

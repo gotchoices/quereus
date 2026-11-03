@@ -1454,7 +1454,7 @@ function declaredTableToString(it: AST.DeclaredTable): string {
 
 	parts.push(tableBodyDefsToString(stmt));
 
-	const ctx = contextClauseToString(stmt);
+	const ctx = contextClauseToString(stmt.contextDefinitions);
 	if (ctx) parts.push(ctx);
 
 	const tagStr = tagsClauseToString(stmt.tags);
@@ -1869,9 +1869,9 @@ function moduleClauseToString(stmt: AST.CreateTableStmt): string {
 	return s;
 }
 
-function contextClauseToString(stmt: AST.CreateTableStmt): string {
-	if (!stmt.contextDefinitions || stmt.contextDefinitions.length === 0) return '';
-	const contextVars = stmt.contextDefinitions.map(varDef => {
+export function contextClauseToString(vars: readonly AST.MutationContextVar[] | undefined): string {
+	if (!vars || vars.length === 0) return '';
+	const contextVars = vars.map(varDef => {
 		let def = quoteIdentifier(varDef.name);
 		if (varDef.dataType) def += ` ${varDef.dataType}`;
 		if (varDef.notNull === false) def += ' NULL';
@@ -1897,7 +1897,7 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const maintained = maintainedClauseToString(stmt.maintained);
 	if (maintained) parts.push(maintained);
 
-	const ctx = contextClauseToString(stmt);
+	const ctx = contextClauseToString(stmt.contextDefinitions);
 	if (ctx) parts.push(ctx);
 
 	const tagStr = tagsClauseToString(stmt.tags);

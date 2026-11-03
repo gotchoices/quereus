@@ -2241,6 +2241,10 @@ async function rebuildViaShadowTable(
 			// statement-level clause that outranks every declared default
 			// (see row-constraints.ts: statement OR clause > per-constraint default > ABORT)
 			// and surfaces the collision the way every other re-key path does.
+			//
+			// NOTE: the shadow also declares the table's `with context` variables, and this copy
+			// has no values for them, so a table whose CHECK or DEFAULT reads one is refused
+			// here — see backlog `bug-rebuild-copy-refused-when-table-reads-context`.
 			await rctx.db._execWithinTransaction(
 				`insert or abort into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
 			);
@@ -2701,11 +2705,7 @@ function rewriteOtherTableColumnExpressions(
  */
 function buildConstraintsFromColumn(col: ColumnSchema): ColumnDef['constraints'] {
 	const constraints: ColumnDef['constraints'] = [];
-	if (col.notNull) {
-		constraints.push({ type: 'notNull' });
-	} else {
-		constraints.push({ type: 'null' });
-	}
+	constraints.push({ type: col.notNull ? 'notNull' : 'null', onConflict: col.defaultConflict });
 	if (col.primaryKey) {
 		constraints.push({ type: 'primaryKey', direction: col.pkDirection });
 	}

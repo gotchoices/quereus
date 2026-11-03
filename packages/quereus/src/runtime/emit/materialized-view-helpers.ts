@@ -3439,7 +3439,7 @@ async function renameShiftedBackingColumns(
  *  type / not-null / PK / collation — never defaults or generated expressions
  *  (see {@link buildBackingTableSchema}) — so the lift is total. */
 function backingColumnDef(col: ColumnSchema, newName: string): AST.ColumnDef {
-	const constraints: AST.ColumnDef['constraints'] = [col.notNull ? { type: 'notNull' } : { type: 'null' }];
+	const constraints: AST.ColumnDef['constraints'] = [{ type: col.notNull ? 'notNull' : 'null', onConflict: col.defaultConflict }];
 	if (col.primaryKey) constraints.push({ type: 'primaryKey', direction: col.pkDirection });
 	if (col.collation && col.collation !== 'BINARY') constraints.push({ type: 'collate', collation: col.collation });
 	return { name: newName, dataType: col.logicalType.name, constraints };
