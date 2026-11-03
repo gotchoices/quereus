@@ -158,3 +158,29 @@ the conformance matrix asserts they behave identically.
 
 `docs/memory-table.md` § DDL and transactions needs updating; it currently carries a paragraph
 pointing here.
+
+## Findings from 2026-11-03 (ran against the v4.25.0 build, memory backend)
+
+Arm A reproduces as written, and the hole is wider than deletes. An uncommitted `update` that a rollback undoes does the same thing, so **the "refuse when the transaction has uncommitted deletes" option above would not close this bug**:
+
+```sql
+create table t (id integer primary key, v text null);
+insert into t values (1, null);
+begin;
+update t set v = 'x';
+alter table t alter column v set not null;  -- accepted: no NULL is visible
+rollback;
+select * from t;                            -- 1 | NULL, in a column table_info reports as NOT NULL
+```
+
+```sql
+create table t (id integer primary key, v text);
+insert into t values (1, 'a'), (2, 'a');
+begin;
+update t set v = 'b' where id = 2;
+create unique index ix on t (v);            -- accepted: values are distinct right now
+rollback;
+select * from t where v = 'a';              -- two rows under a unique index
+```
+
+Proposed rule, awaiting the maintainer's decision: a failure can only go to the DDL statement, because that is the last point that can report one. Row-validating DDL inside a transaction validates every state a rollback could return to (the committed rows and each open savepoint from before the DDL) as well as the rows the transaction sees now, each state on its own, and refuses with an error saying to commit first. Later states need no check, since the new rule is enforced on writes after the DDL. This keeps the delete-then-DDL shape legal when the deleted row breaks no rule, and refuses it only when a rollback would actually break the table. It also makes the memory and store legs agree, because the store's convert pre-pass already rejects over committed rows.

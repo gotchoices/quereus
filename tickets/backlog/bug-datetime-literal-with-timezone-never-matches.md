@@ -156,3 +156,11 @@ over the engine's chosen spelling; the canonical form is therefore not just a di
 question but part of a persisted identity downstream. That raises the bar on Arm B's
 option 1 (changing what the variadic `datetime()` prints): a spelling change is a
 stored-identity change for anyone doing this.
+
+## Findings from 2026-11-03 (ran against the v4.25.0 build)
+
+`docs/types.md` § DATETIME already states the semantics: offset and `[zone]` inputs are converted to UTC, stored in the bare form, and "equal instants compare equal regardless of input shape". So the instant reading is documented, and Arm A is the code failing that sentence. Ordering is wrong too, not only equality: `where t >= '2021-06-05T09:00:00+02:00'` misses a row stored as `2021-06-05T08:00:00`.
+
+The variadic family also has a third spelling the table in Arm B omits: `select datetime('now')` returns `2026-11-03T17:26:47.630Z`, with the `Z` that a DATETIME column never stores. Whatever fixes this should cover comparing a column against `datetime('now')` and storing that value.
+
+Proposed rule, awaiting the maintainer's decision: DATETIME is a fixed instant and the stored spelling stays bare UTC, so no persisted value or downstream content digest changes. Comparisons against text normalize that text the way a write does, and an unparseable text compares as it does today. Arm B takes option 3 (leave and document). Arm C gets a documented note that a shape check on a `datetime` column sees the canonical spelling.
