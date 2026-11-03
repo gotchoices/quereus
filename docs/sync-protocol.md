@@ -35,8 +35,7 @@ interface ColumnChange {
 }
 ```
 
-**Per-cell before-image (`priorValue` / `priorHlc`).** An optional, purely additive
-before-image mirroring Lamina's `UpdateCellFact(new_value, prior_value?, prior_hlc?)`.
+**Per-cell before-image (`priorValue` / `priorHlc`).** An optional before-image mirroring Lamina's `UpdateCellFact(new_value, prior_value?, prior_hlc?)`.
 It carries the cell version this write replaced, so a receiver can see *what changed
 from what* (audit trails, undo, conflict debugging) without a separate lookup.
 
@@ -49,7 +48,10 @@ from what* (audit trails, undo, conflict debugging) without a separate lookup.
   the origin's chain (the prior's own origin HLC, never reset to the receiver's clock).
 - **Best-effort.** Both fields are absent on a cell's first write and on
   snapshot-reconstructed cells. Producers may omit them; receivers ignore them when
-  absent; the no-`conflictResolver` HLC fast path is unchanged. Repeated local overwrites
+  absent; the no-`conflictResolver` HLC fast path is unchanged. One default outcome reads
+  `priorHlc`, and only for its presence: an edit of a row the replica has forgotten by
+  pruning is refused ([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)).
+  A producer that omits it gets the outcome from before that rule. Repeated local overwrites
   before a pull keep one change-log entry per cell, whose prior is the *immediately*
   overwritten version — "what the winning write overwrote", not "the value at last sync"
   (intended Lamina semantics).
@@ -564,13 +566,13 @@ local-change subscription, push) starts:
   again, and retries — pushes are idempotent, so this converges. Local writes made
   *during* the transfer remain the gap noted below. The rows such a device holds that the
   server deleted long ago are what the apply removes: nothing else in the sync protocol
-  can reach them. One limit: the device's own older write can still bring part of such a
-  row back (it edited the row offline, or a push of it lost its acknowledgement and is
-  re-sent), because offline work has to go out and the server cannot tell it from a new
-  write once the tombstone is gone. Only the cells that device wrote return, so replicas
-  then disagree: one holding the tombstone has no row, the writer keeps its whole row, and
-  one bootstrapping from the server gets the row with its other columns null, even a
-  `not null` one (`fix/sync-offline-edit-of-pruned-row-splits-replicas`).
+  can reach them. That includes a row the device edited offline: the server refuses the
+  edit, so the delete holds on every replica and the edit is lost with no event, exactly as
+  it is while the tombstone exists
+  ([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)). One limit: a
+  re-sent insert carries no before-image, so a push that lost its acknowledgement brings
+  the whole row back on the server and the writer while a device holding the tombstone
+  stays without it (`bug-sync-resent-insert-returns-pruned-row`).
 
 **The two automatic triggers check first.** Under `unrecordedRows: 'refuse'`, the default,
 the client asks `findTablesWithUnrecordedRows()` before the bootstrap and before the

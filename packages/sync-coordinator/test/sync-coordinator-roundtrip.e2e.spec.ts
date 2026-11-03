@@ -205,6 +205,48 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
       'B pushes nothing another device wrote',
     ).to.equal(true);
   });
+
+  it('an offline edit of a row deleted and pruned elsewhere is refused, so every replica and a new device agree', async () => {
+    const service = coordinator.server.service;
+    const serverEntry = await service.storeManager.acquire(DB_ID);
+
+    await peerA.db.exec(`insert into orders (id, note, qty) values (1, 'one', 1), (2, 'two', 2)`);
+    await waitFor(
+      async () => (await notesOn(peerB)).length === 2,
+      { label: 'A\'s rows to reach B by broadcast' },
+    );
+
+    await clientB.disconnect();
+    await peerB.db.exec(`update orders set note = 'edited offline' where id = 1`);
+
+    await peerA.db.exec('delete from orders where id = 1');
+    await waitFor(
+      async () => !(await notesOnServer(serverEntry.syncManager)).some(([id]) => id === 1),
+      { label: 'A\'s delete to reach the server' },
+    );
+    await pruneEveryTombstone(serverEntry.syncManager);
+
+    await clientB.connect(coordinator.url, DB_ID);
+
+    const expected = JSON.stringify([[2, 'two']]);
+    await waitFor(
+      async () => [await notesOn(peerA), await notesOn(peerB), await notesOnServer(serverEntry.syncManager)]
+        .every(notes => JSON.stringify(notes) === expected),
+      { label: 'A, B and the server to hold row 2 only' },
+    );
+    service.storeManager.release(DB_ID);
+
+    const peerC = await makeClientPeer(DDL);
+    const clientC = new SyncClient({ syncManager: peerC.syncManager, syncEvents: peerC.syncEvents, autoReconnect: false });
+    try {
+      await clientC.connect(coordinator.url, DB_ID);
+      await waitForSynced(clientC);
+      expect(JSON.stringify(await notesOn(peerC)), 'a new device').to.equal(expected);
+    } finally {
+      await clientC.disconnect();
+      await peerC.close();
+    }
+  });
 });
 
 /** Each row's id and note, by id. */

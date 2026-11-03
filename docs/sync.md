@@ -121,7 +121,9 @@ The `ctx` (`ConflictContext`) also carries the incoming change's optional before
 overwrote at its origin (see § Data Structures → per-cell before-image) — so a resolver or
 transition validator can see what the source changed *from* (e.g. accept the remote only if
 it transitioned from the value the receiver still holds). Both are absent when the incoming
-change carried no prior, and neither affects default resolution.
+change carried no prior. Neither affects last-writer-wins resolution. Whether a change carries
+a before-image at all does decide one default outcome: an edit of a row the replica has
+forgotten is refused (§ Tombstones and Deletions).
 
 > **Future Work**: The architecture supports extending to other CRDT types (counters, sets, RGA for text) by tracking different metadata per column type.
 
@@ -132,6 +134,16 @@ Deletions are recorded as "tombstones" with an HLC timestamp, preventing deleted
 **Resurrection Policy** (configurable):
 - **Default: Delete Wins** (`allowResurrection: false`) - once a row is tombstoned, **all** subsequent column writes for it are blocked — regardless of the write's HLC — until the tombstone is pruned at the retention horizon
 - **Optional: Resurrection Allowed** (`allowResurrection: true`) - an insert/update with HLC > the tombstone's T1 resurrects the row; writes with HLC ≤ T1 stay blocked
+
+**A delete still holds against an edit after its tombstone is pruned.** Pruning is a storage limit and does not change who wins. Under the default policy, a replica that has pruned at least one tombstone (its delta floor is set) refuses a column change that carries a before-image when it holds no cell and no tombstone for that row: the writer saw an earlier version, and this replica cannot tell a row it forgot from one it never heard of. The change counts as `skipped` and fires no event, so the writer's edit is lost as it would be while the tombstone exists; its application sees the row leave through the snapshot's ordinary remote delete. Replicas that have never pruned have forgotten nothing and accept the edit, and the before-image is not compared with the floor, because the edit can be concurrent with the pruned delete.
+
+A row with a first write in the same batch, in either order, is accepted: a new row inserted then edited offline pushes its unchanged cells with no before-image. So is a row with cells here from an earlier batch, which a device's timestamp-ordered pushes guarantee. This rule does not cover:
+
+- **A re-sent insert.** It carries no before-image, so a whole row returns on the server and the writer while a replica holding the tombstone stays without it (`bug-sync-resent-insert-returns-pruned-row`).
+- **A row sync never recorded.** Editing one produces a fragment with no before-image (`bug-sync-edit-of-unrecorded-row-sends-partial-row`).
+- **A table whose primary key was redefined.** Edits to it are always accepted, because a relay cannot re-file its records and a row can look unknown under its new key. A fragment can still return on such a table.
+- **`allowResurrection: true`**, whose own fragment bug is `bug-sync-allow-resurrection-update-returns-partial-row`.
+- **Fragments already stored** on a server, which are not repaired.
 
 **The rule applies within one apply batch too**: a delete carried in an `applyChanges` batch blocks that same batch's column changes for its row exactly as an already-stored tombstone would (the row's max-HLC in-batch delete is the blocker; under `allowResurrection` a column change with a later HLC survives it). One batch therefore leaves the same **state** as the same changes applied across separate batches, and re-emits identical changes onward. The *event stream* is not identical: `onConflictResolved` fires before the in-batch reconciliation runs, so a change that ends up blocked can still have emitted one, and a delete + re-creation collapses to a single net store event rather than a delete followed by an insert.
 

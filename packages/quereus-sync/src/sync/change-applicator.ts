@@ -65,6 +65,12 @@ export interface ResolvedChange {
 	 * {@link BatchTableFate.historyName}).
 	 */
 	freshLocalTable?: boolean;
+	/**
+	 * Phase 1 judged this column change an edit of a row this replica has forgotten
+	 * ({@link isEditOfForgottenRow}). Provisional: the same batch can still found the
+	 * row, so {@link refuseEditsOfForgottenRows} makes the decision.
+	 */
+	editOfForgottenRow?: boolean;
 }
 
 /**
@@ -424,7 +430,11 @@ export async function applyChanges(
 	// counters, the store apply list, and the emitted-change list from the
 	// reconciled outcomes — so `ApplyResult` and `onRemoteChange` reflect what is
 	// actually written.
-	const reconciled = reconcileInBatchDeletes(ctx, dataResolutions.map(entry => entry.resolved));
+	const reconciled = await refuseEditsOfForgottenRows(
+		ctx,
+		reconcileInBatchDeletes(ctx, dataResolutions.map(entry => entry.resolved)),
+		schemaChangesToApply,
+	);
 	for (let i = 0; i < reconciled.length; i++) {
 		const resolved = reconciled[i];
 		if (resolved.outcome === 'applied') {
@@ -756,7 +766,7 @@ function emitRemoteChanges(
 	}
 }
 
-// NOTE: this file is ~1250 lines (`wc -l`), second-largest in the package. The drain
+// NOTE: this file is ~1450 lines (`wc -l`), second-largest in the package. The drain
 // block below (`drainHeldChanges` → `drainReappearedTables`) shares only `resolveChange`,
 // `reconcileInBatchDeletes`, `commitChangeMetadata`, and `admitGroup` with the wire-apply
 // half above, so it is the natural seam if the file keeps growing.
@@ -858,7 +868,7 @@ async function drainTableGroup(
 	// Same in-batch delete reconciliation as applyChanges: a held delete and a held
 	// column write for one row drain together and must block each other exactly as
 	// they would arriving in one wire batch.
-	for (const resolved of reconcileInBatchDeletes(ctx, resolutions)) {
+	for (const resolved of await refuseEditsOfForgottenRows(ctx, reconcileInBatchDeletes(ctx, resolutions))) {
 		if (resolved.outcome === 'applied') {
 			applied++;
 			resolvedDataChanges.push(resolved);
@@ -1061,7 +1071,7 @@ export async function resolveChange(
 			});
 		}
 
-		return {
+		const resolved: ResolvedChange = {
 			outcome: 'applied',
 			change,
 			oldColumnVersion: localVersion ?? undefined,
@@ -1073,7 +1083,28 @@ export async function resolveChange(
 				columns: { [change.column]: change.value },
 			},
 		};
+		if (!localVersion && !freshLocalTable && await isEditOfForgottenRow(ctx, change)) {
+			resolved.editOfForgottenRow = true;
+		}
+		return resolved;
 	}
+}
+
+/**
+ * Whether a column change that found no version of its cell and no blocking tombstone
+ * edits a row this replica has forgotten: the writer saw an earlier version of the cell,
+ * yet this replica, which has pruned at least one tombstone, holds nothing of the row.
+ * Accepting it would bring back a fragment of a row whose delete this replica may have
+ * forgotten (docs/sync.md § Tombstones and Deletions).
+ *
+ * The before-image is deliberately not compared with the delta floor: the edit can be
+ * concurrent with the pruned delete, so its before-image can be newer than the floor.
+ */
+async function isEditOfForgottenRow(ctx: SyncContext, change: ColumnChange): Promise<boolean> {
+	if (ctx.config.allowResurrection || change.priorHlc === undefined) return false;
+	if (await ctx.deltaFloor.get() === undefined) return false;
+	const cells = await ctx.columnVersions.getRowVersions(change.schema, change.table, change.pk);
+	return cells.size === 0;
 }
 
 /**
@@ -1129,6 +1160,79 @@ function reconcileInBatchDeletes(
 		}
 		return { outcome: 'skipped', change: entry.change };
 	});
+}
+
+/**
+ * Refuse each edit Phase 1 flagged as an edit of a forgotten row, unless the batch
+ * itself shows the row is not forgotten. Runs after {@link reconcileInBatchDeletes},
+ * because Phase 1 sees only pre-batch state and a batch may arrive in any order.
+ *
+ * A row is founded by an applied column change with no before-image: a new row inserted
+ * then edited offline pushes `id` with none and its rewritten columns with one. Founding
+ * cells that came in an earlier batch left cells here, so Phase 1 never flagged the edit.
+ *
+ * A table whose key was redefined is exempt, because its records can be filed under the
+ * old key while this edit addresses the new one, so "no cells" proves nothing.
+ *
+ * Returns a same-length, same-order list with each refused change flipped to `'skipped'`.
+ *
+ * NOTE: a row never pushed is refused if every one of its cells was rewritten offline,
+ * including the key through a case-only change under a `NOCASE` key, since no founding
+ * cell then remains. Inferred from the code, not run. If it is ever hit, have the
+ * writer keep a marker that the row's first write has not been pushed.
+ */
+async function refuseEditsOfForgottenRows(
+	ctx: SyncContext,
+	resolved: ResolvedChange[],
+	batchSchemaChanges: readonly SchemaChangeToApply[] = [],
+): Promise<ResolvedChange[]> {
+	const flagged = resolved.filter(entry => entry.editOfForgottenRow);
+	if (flagged.length === 0) return resolved;
+
+	const foundedRows = new Set<string>();
+	for (const { outcome, change, freshLocalTable } of resolved) {
+		if (outcome === 'applied' && change.type === 'column' && change.priorHlc === undefined) {
+			foundedRows.add(rowIdentityKey(ctx, change, freshLocalTable));
+		}
+	}
+	const rekeyedTables = await tablesWithRedefinedKey(ctx, flagged, batchSchemaChanges);
+
+	return resolved.map(entry => {
+		if (!entry.editOfForgottenRow) return entry;
+		const { change } = entry;
+		if (foundedRows.has(rowIdentityKey(ctx, change)) || rekeyedTables.has(tableKey(change.schema, change.table))) {
+			return entry;
+		}
+		return { outcome: 'skipped', change };
+	});
+}
+
+/** Those of the flagged changes' tables whose primary key this batch or an earlier one redefined. */
+async function tablesWithRedefinedKey(
+	ctx: SyncContext,
+	flagged: readonly ResolvedChange[],
+	batchSchemaChanges: readonly SchemaChangeToApply[],
+): Promise<Set<string>> {
+	const redefinesKey = (migration: { type: string; ddl?: string }): boolean =>
+		migration.type === 'alter_column' && alterPrimaryKeyColumns(migration.ddl) !== undefined;
+
+	const rekeyed = new Set(
+		batchSchemaChanges.filter(redefinesKey).map(change => tableKey(change.schema, change.table)),
+	);
+	const tables = new Map(flagged.map(({ change }) => [tableKey(change.schema, change.table), change]));
+	for (const [key, { schema, table }] of tables) {
+		if (rekeyed.has(key)) continue;
+		// NOTE: migrations are filed by table name, so a key change followed by a table
+		// rename is missed here and that table loses the exemption. If it is ever hit,
+		// follow `rename_table.fromTable` back through the earlier names.
+		for await (const migration of ctx.schemaMigrations.getAllMigrations(schema, 'table', table)) {
+			if (redefinesKey(migration)) {
+				rekeyed.add(key);
+				break;
+			}
+		}
+	}
+	return rekeyed;
 }
 
 /**

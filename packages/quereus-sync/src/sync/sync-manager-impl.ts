@@ -16,7 +16,7 @@ import type {
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
 } from '@quereus/quereus';
-import { QuereusError, StatusCode, SYNC_EVICT_TAG } from '@quereus/quereus';
+import { QuereusError, StatusCode, SYNC_EVICT_TAG, sqlValueIdentical } from '@quereus/quereus';
 import type { GetTableSchemaCallback, TransactionCommitSource } from '../create-sync-module.js';
 import { HLCManager, type HLC, compareHLC, createHLC, deterministicTxnId, MAX_OPSEQ } from '../clock/hlc.js';
 import {
@@ -1193,10 +1193,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const columnNames = this.getTableSchema?.(schemaName, tableName)?.columns?.map(c => c.name);
 
 		for (let i = 0; i < newRow.length; i++) {
-			const oldValue = oldRow?.[i];
 			const newValue = newRow[i];
 
-			if (!oldRow || oldValue !== newValue) {
+			// By value: a blob or JSON value read back from a row is a new object each
+			// time, and a key cell recorded as rewritten leaves its row no first write
+			// to show a replica that has pruned (`refuseEditsOfForgottenRows`).
+			if (!oldRow || !sqlValueIdentical(oldRow[i], newValue)) {
 				const column = columnNames?.[i] ?? `col_${i}`;
 
 				// Overlay first: a cell this same transaction rewrote reads its staged
