@@ -1085,6 +1085,17 @@ export abstract class StoreTableBase extends VirtualTable {
 		yield* this.iterateEffective(store, bounds, reverse);
 	}
 
+	/**
+	 * COMMITTED-only ordered entry scan within `bounds`: the data store as a whole-transaction
+	 * `rollback` would leave it, this module's buffered ops ignored. The whole-rollback state a
+	 * row-validating DDL judges for `BUSY` (`rollbackStates` in store-module-index-build.ts).
+	 * Opens the data store first, like {@link iterateEffectiveEntries}.
+	 */
+	async *iterateCommittedEntries(bounds: IterateOptions): AsyncIterable<KVEntry> {
+		const store = await this.ensureStore();
+		yield* store.iterate(bounds);
+	}
+
 	/** Buffer a privileged row-count delta, applied at coordinator commit (host writes). */
 	trackPrivilegedMutation(delta: number): void {
 		this.trackMutation(delta, true);

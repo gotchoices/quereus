@@ -17,7 +17,7 @@ export interface OverlayEntry {
 }
 
 /** Resolves the tombstone column's position in an overlay table's schema. */
-function resolveTombstoneIndex(overlayTable: VirtualTable, tombstoneColumn: string): number {
+export function resolveTombstoneIndex(overlayTable: VirtualTable, tombstoneColumn: string): number {
 	const overlaySchema = overlayTable.tableSchema;
 	if (!overlaySchema) {
 		throw new QuereusError('Overlay table has no schema', StatusCode.INTERNAL);
@@ -43,9 +43,22 @@ export async function collectOverlayEntries(
 ): Promise<OverlayEntry[]> {
 	if (!overlayTable.query) return [];
 	const tombstoneIndex = resolveTombstoneIndex(overlayTable, tombstoneColumn);
+	return collectEntriesFromRows(overlayTable.query(makeFullScanFilterInfo()), tombstoneIndex, pkIndices);
+}
 
+/**
+ * Decomposes a stream of overlay-shaped rows (data columns plus the trailing tombstone column)
+ * into {@link OverlayEntry}s. The row-shaped half of {@link collectOverlayEntries}, so the same
+ * decomposition serves the live overlay and a savepoint frame of it
+ * (`VirtualTable.savepointRowSources`).
+ */
+export async function collectEntriesFromRows(
+	rows: AsyncIterable<Row>,
+	tombstoneIndex: number,
+	pkIndices: readonly number[],
+): Promise<OverlayEntry[]> {
 	const entries: OverlayEntry[] = [];
-	for await (const overlayRow of overlayTable.query(makeFullScanFilterInfo())) {
+	for await (const overlayRow of rows) {
 		entries.push({
 			isTombstone: overlayRow[tombstoneIndex] === 1,
 			pk: pkIndices.map(i => overlayRow[i]),
@@ -69,22 +82,23 @@ export function makePkKeySerializer(db: Database, schema: TableSchema): (pk: rea
 }
 
 /**
- * Yields the rows the overlay's owning connection can SEE: the underlying table's committed
- * rows, minus the ones its overlay tombstones, superseded by the ones its overlay rewrote,
- * plus the ones its overlay added.
+ * Yields the rows the overlay's owning connection would SEE with `entries` as its staged set:
+ * the underlying table's committed rows, minus the ones the entries tombstone, superseded by
+ * the ones they rewrote, plus the ones they added. With the live overlay's entries that is the
+ * connection's current view; with a savepoint frame's entries it is the view `rollback to` that
+ * savepoint would restore.
  *
- * This is the stream the isolation layer hands to a row-validating DDL on the underlying
- * module (`EffectiveRowSource`), which cannot reach the overlay itself. Row ORDER is
- * unspecified — every consumer is a set-shaped uniqueness check.
+ * These are the streams the isolation layer hands to a row-validating DDL on the underlying
+ * module (`IssuerRowSources`), which cannot reach the overlay itself. Row ORDER is unspecified
+ * — every consumer is a set-shaped check.
  */
 export async function* iterateEffectiveRows(
 	underlyingTable: VirtualTable,
-	overlayTable: VirtualTable,
-	tombstoneColumn: string,
+	collectEntries: () => Promise<OverlayEntry[]>,
 	pkIndices: readonly number[],
 	pkKeyOf: (pk: readonly SqlValue[]) => string,
 ): AsyncIterable<Row> {
-	const entries = await collectOverlayEntries(overlayTable, tombstoneColumn, pkIndices);
+	const entries = await collectEntries();
 	// Every staged PK shadows its underlying row, tombstone or not: a tombstone drops it,
 	// a rewrite replaces it with the overlay's version (yielded below).
 	const staged = new Set(entries.map(entry => pkKeyOf(entry.pk)));

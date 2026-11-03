@@ -17,7 +17,7 @@
 
 import type {
 	Database,
-	EffectiveRowSource,
+	IssuerRowSources,
 	KeyNormalizerResolver,
 	TableIndexSchema,
 	TableSchema,
@@ -34,7 +34,7 @@ import { findReusableIndexForUnique, implicitUniqueIndexName } from './implicit-
 import { buildFullScanBounds, buildIndexStoreName } from './key-builder.js';
 import { StoreModuleSchemaSync } from './store-module-schema-sync.js';
 import { DEFAULT_MAX_BATCH_BYTES } from './store-module-base.js';
-import { buildIndexEntries, validateUniqueIndexOverRows } from './store-module-index-build.js';
+import { buildIndexEntries, judgeRollbackStates, validateUniqueIndexOverRows } from './store-module-index-build.js';
 
 /**
  * Map of `lowercased implicit index name → actual name` for every NON-DERIVED
@@ -80,21 +80,22 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	/**
 	 * Creates an index on a store-backed table.
 	 *
-	 * `rows` — an {@link EffectiveRowSource} supplied by a wrapper module (the isolation
-	 * layer) — replaces this module's own rows as the set the UNIQUE duplicate check judges.
-	 * When present the check runs UP FRONT, before `getIndexStore` opens the index-store
-	 * directory, so a rejection leaves no directory behind; and `buildIndexEntries` then
-	 * populates the physical index from this module's own (committed) rows with its in-pass
-	 * dup check disabled. Those two row sets legitimately differ — the wrapper's transaction
-	 * may have deleted a committed duplicate — and an index entry with no live row behind it
-	 * is harmless (see the entry-resolution note in `buildIndexEntries`).
+	 * `rows` — {@link IssuerRowSources} supplied by a wrapper module (the isolation layer) —
+	 * replaces this module's own rows as the set the UNIQUE duplicate check judges for
+	 * legality (`rows.effective`, CONSTRAINT); the committed rows and each of
+	 * `rows.savepoints` are then judged on their own, a duplicate refusing as BUSY — a committed
+	 * duplicate the wrapper's transaction deleted would come back under the index on rollback
+	 * (`judgeRollbackStates`). When present the checks run UP FRONT, before `getIndexStore`
+	 * opens the index-store directory, so a rejection leaves no directory behind; and
+	 * `buildIndexEntries` then populates the physical index from this module's own (committed)
+	 * rows with its in-pass dup check disabled — those rows were already judged.
 	 */
 	async createIndex(
 		db: Database,
 		schemaName: string,
 		tableName: string,
 		indexSchema: TableIndexSchema,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<void> {
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
@@ -133,9 +134,16 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 
 		// Wrapper-supplied rows are the judged set. Validate BEFORE `getIndexStore` so a
 		// rejection leaves no index-store directory behind, and disable the in-pass dup
-		// check below (which would judge this module's committed rows instead).
-		if (rows && indexSchema.unique) {
-			await validateUniqueIndexOverRows(rows(), tableSchema, indexSchema, db.getKeyNormalizerResolver());
+		// check below (which would judge this module's committed rows for CONSTRAINT —
+		// they are judged here for BUSY instead, with every savepoint state).
+		if (indexSchema.unique) {
+			const keyNormalizers = db.getKeyNormalizerResolver();
+			if (rows) await validateUniqueIndexOverRows(rows.effective(), tableSchema, indexSchema, keyNormalizers);
+			await judgeRollbackStates(
+				table, rows,
+				state => validateUniqueIndexOverRows(state.rows(), tableSchema, indexSchema, keyNormalizers),
+				`create unique index ${indexSchema.name}`,
+			);
 		}
 
 		// Create the index store

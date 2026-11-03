@@ -658,16 +658,23 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'column retyped').to.contain('date');
 	});
 
-	it('same-class SET DATA TYPE ignores an illegal value only in a row the transaction deleted', async () => {
+	it('same-class SET DATA TYPE refuses (BUSY) an illegal value only in a row the transaction deleted', async () => {
 		await db.exec(`create table t (id integer primary key, v text) using isolated`);
 		await db.exec(`insert into t values (1, '2024-01-01'), (2, 'not-a-date')`);
 		await db.exec('begin');
 		await db.exec(`delete from t where id = 2`); // the only offending value is now invisible to this transaction
 
+		// Not a MISMATCH — the transaction cannot see the value — but a rollback would restore it
+		// under DATE, so the underlying refuses over its committed rows (the whole-rollback state).
 		const err = await attemptAlter(db, `alter table t alter column v set data type date`);
-		expect(err, 'a deleted row must not block the retype').to.equal(null);
+		expect(err, 'a deleted row the rollback would restore must refuse the retype').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.BUSY);
+		expect(err!.message).to.match(/commit the pending writes first/i);
+		expect(err!.message, 'names the user table, not the overlay staging table').to.not.match(/_overlay_/);
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');
 
 		await db.exec('commit');
+		expect(await attemptAlter(db, `alter table t alter column v set data type date`), 'lands once the delete is committed').to.equal(null);
 		expect(await rows(db, `select id, v from t order by id`)).to.deep.equal([{ id: 1, v: '2024-01-01' }]);
 		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'column retyped').to.contain('date');
 	});

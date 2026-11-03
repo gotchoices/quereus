@@ -78,7 +78,10 @@ detail belongs in the backend docs, not the flag. Three tiers, in severity order
 - **`non-transactional`** — the schema change escapes the transaction (it survives
   `rollback`) but buffered DML still rolls back normally. This is the **memory** module,
   and the store's non-committing DDL statements (`create index`, `add constraint`,
-  schema-only arms).
+  schema-only arms). Because the rows a row-validating DDL was judged against do roll
+  back, such a statement also judges every state a rollback could restore and refuses with
+  `BUSY` ("commit the pending writes first") when one of them would violate the new rule —
+  see [memory-table.md § DDL and transactions](memory-table.md#ddl-and-transactions).
 - **`auto-commit`** — executing certain DDL commits the module's buffered transaction at
   DDL time: the schema change **and every buffered write** become durable immediately, and
   a later `rollback` undoes nothing. This is the **store** module (its row-rewriting ALTER

@@ -136,6 +136,16 @@ export interface DatabaseInternal {
 	getConnectionsForTable(tableName: string): VirtualTableConnection[];
 
 	/**
+	 * The number of savepoints currently open on the active transaction (0 outside one).
+	 *
+	 * A wrapper module that stages a connection's writes in a table of another module reads
+	 * this to know whether a row-validating DDL has savepoint states to judge when that
+	 * module cannot report them (`VirtualTable.savepointRowSources` absent) — the isolation
+	 * layer refuses such a DDL rather than leave a rollback state unjudged.
+	 */
+	getActiveSavepointDepth(): number;
+
+	/**
 	 * Removes all active connections for a specific table, bypassing the implicit
 	 * transaction deferral that {@link unregisterConnection} honours.
 	 *

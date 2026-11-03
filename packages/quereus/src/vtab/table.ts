@@ -1,4 +1,4 @@
-import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from './module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, IssuerRowSources, SchemaChangeInfo } from './module.js';
 import type { Database } from '../core/database.js';
 import type { TableSchema } from '../schema/table.js';
 import type { MaybePromise, Row, SqlValue, CompareFn, UpdateResult } from '../common/types.js';
@@ -266,6 +266,18 @@ export abstract class VirtualTable {
 	rollbackTo?(savepointIndex: number): Promise<void>;
 
 	/**
+	 * For each open savepoint, oldest first: the rows this table would show its connection after
+	 * `rollback to` that savepoint. A wrapper module that stages a connection's writes in a table
+	 * of another module (the isolation layer's overlay) reads this off the staging table to build
+	 * {@link IssuerRowSources.savepoints} for a row-validating DDL on the wrapped module.
+	 *
+	 * Optional; a module without it cannot serve as a staging overlay for row-validating DDL under
+	 * open savepoints — the isolation layer refuses such a DDL with `BUSY` rather than leave a
+	 * rollback state unjudged. A released savepoint is not listed (it cannot be rolled back to).
+	 */
+	savepointRowSources?(): readonly EffectiveRowSource[];
+
+	/**
 	 * Modifies the schema of this virtual table
 	 * @param changeInfo Object describing the schema modification
 	 * @param validateOnly When true, run every pre-mutation validation the change would run
@@ -283,11 +295,13 @@ export abstract class VirtualTable {
 	/**
 	 * Creates a secondary index on the virtual table
 	 * @param indexInfo The index definition
-	 * @param rows Optional {@link EffectiveRowSource} — the rows the DDL-issuing connection
-	 *   can see, supplied by a wrapper module that holds pending rows this table cannot
-	 *   reach. When present, the UNIQUE duplicate check MUST judge this stream.
+	 * @param rows Optional {@link IssuerRowSources} — the rows the DDL-issuing connection can
+	 *   see and the rows each of its open savepoints would restore, supplied by a wrapper module
+	 *   that holds pending rows this table cannot reach. When present, the UNIQUE duplicate check
+	 *   MUST judge `rows.effective` for `CONSTRAINT`, and this table's own committed rows plus
+	 *   each of `rows.savepoints` for `BUSY`.
 	 */
-	createIndex?(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void>;
+	createIndex?(indexInfo: IndexSchema, rows?: IssuerRowSources): Promise<void>;
 
 	/**
 	 * Drops a secondary index from the virtual table

@@ -213,8 +213,10 @@ select id, a, v, typeof(v) from rc order by id;
 drop table rc;
 
 -- ===================================
--- 8. EFFECTIVE rows, not committed rows: a collision only among rows the open
---    transaction has DELETED must NOT block the retype.
+-- 8. EFFECTIVE rows decide legality, but every state a rollback could restore is judged too:
+--    a collision only among rows the open transaction has DELETED is not a constraint
+--    violation, yet a rollback would bring the pair back under the retyped UNIQUE — so the
+--    retype is refused as retryable (BUSY), and lands once the delete is committed.
 -- ===================================
 
 create table tx1 (id integer primary key, v text, unique (v));
@@ -226,8 +228,15 @@ begin;
 delete from tx1 where id = 2;
 -- run
 alter table tx1 alter column v set data type integer;
--- run
+-- error: commit the pending writes first
+
+-- the refusal left the column text and the transaction usable
+select id, v, typeof(v) from tx1 order by id;
+→ [{"id":1,"v":"1","typeof(v)":"text"},{"id":3,"v":"5","typeof(v)":"text"}]
+
 commit;
+-- run
+alter table tx1 alter column v set data type integer;
 -- run
 
 select id, v, typeof(v) from tx1 order by id;

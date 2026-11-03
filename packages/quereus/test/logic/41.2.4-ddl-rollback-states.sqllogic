@@ -1,0 +1,255 @@
+-- Row-validating DDL inside a transaction must hold for every state a rollback could
+-- restore. On the bundled backends a schema change survives `rollback` / `rollback to
+-- savepoint` (the `non-transactional` tier, docs/module-capabilities.md) while the rows it
+-- was judged against do not. So besides the rows the transaction can SEE — which decide
+-- whether the statement is LEGAL (CONSTRAINT / MISMATCH) — every state a rollback could
+-- return the table to is judged on its own: the committed rows (a whole-transaction
+-- rollback) and the rows as they stood at each open savepoint (`rollback to`). When one of
+-- them would violate the new rule the statement is refused as retryable (BUSY, "commit the
+-- pending writes first"); a released savepoint is not a restorable state, and a deleted row
+-- that breaks no rule does not block. Each refusal leaves the table and the transaction
+-- untouched, and the same statement lands once the pending writes are committed.
+--
+-- Cross-backend: under the memory module the restorable states are its own base and
+-- savepoint layers; under --store they are the store's committed rows plus the isolation
+-- wrapper's overlay savepoint frames, handed down as `IssuerRowSources.savepoints`.
+-- See docs/memory-table.md § DDL and transactions, rule 1.
+
+-- ===================================
+-- A. `rollback to savepoint` would restore a staged duplicate under the new unique index.
+-- ===================================
+
+create table ra (id integer primary key, v text);
+insert into ra values (1, 'a');
+-- run
+
+begin;
+-- run
+insert into ra values (2, 'a');
+-- run
+savepoint s;
+-- run
+delete from ra where id = 2;
+-- run
+
+-- the effective rows and the committed rows are both clean; only the savepoint state holds the pair
+create unique index ix_ra on ra (v);
+-- error: commit the pending writes first
+
+rollback to savepoint s;
+-- run
+select id, v from ra order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"a"}]
+
+rollback;
+-- run
+select count(*) as c from ra;
+→ [{"c":1}]
+
+-- nothing to restore any more: the index lands
+create unique index ix_ra on ra (v);
+-- run
+insert into ra values (3, 'a');
+-- error: UNIQUE constraint failed
+
+drop table ra;
+
+-- ===================================
+-- B. a committed row the transaction deleted would collide under the new collation.
+-- ===================================
+
+create table rb (id integer primary key, v text, unique (v));
+insert into rb values (1, 'a'), (2, 'A');
+-- run
+
+begin;
+-- run
+delete from rb where id = 2;
+-- run
+alter table rb alter column v set collate nocase;
+-- error: commit the pending writes first
+
+rollback;
+-- run
+select name, collation from table_info('rb') where name = 'v';
+→ [{"name":"v","collation":"BINARY"}]
+select id, v from rb order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"A"}]
+
+delete from rb where id = 2;
+-- run
+alter table rb alter column v set collate nocase;
+-- run
+insert into rb values (3, 'A');
+-- error: UNIQUE constraint failed
+
+drop table rb;
+
+-- ===================================
+-- C. a committed row the transaction deleted holds a value the new type refuses.
+-- ===================================
+
+create table rc (id integer primary key, v text);
+insert into rc values (1, 'abc'), (2, '20');
+-- run
+
+begin;
+-- run
+delete from rc where id = 1;
+-- run
+alter table rc alter column v set data type integer;
+-- error: commit the pending writes first
+
+rollback;
+-- run
+select id, v, typeof(v) from rc order by id;
+→ [{"id":1,"v":"abc","typeof(v)":"text"},{"id":2,"v":"20","typeof(v)":"text"}]
+
+delete from rc where id = 1;
+-- run
+alter table rc alter column v set data type integer;
+-- run
+select id, v, typeof(v) from rc order by id;
+→ [{"id":2,"v":20,"typeof(v)":"integer"}]
+
+drop table rc;
+
+-- ===================================
+-- D. a committed NULL the transaction overwrote, with no DEFAULT to fill it from.
+-- ===================================
+
+create table rd (id integer primary key, v text null);
+insert into rd values (1, null);
+-- run
+
+begin;
+-- run
+update rd set v = 'x' where id = 1;
+-- run
+alter table rd alter column v set not null;
+-- error: commit the pending writes first
+
+rollback;
+-- run
+select id, v from rd order by id;
+→ [{"id":1,"v":null}]
+-- still nullable
+insert into rd values (2, null);
+-- run
+
+delete from rd where id = 2;
+-- run
+update rd set v = 'x' where id = 1;
+-- run
+alter table rd alter column v set not null;
+-- run
+insert into rd values (3, null);
+-- error: NOT NULL
+
+drop table rd;
+
+-- ===================================
+-- D'. the same shape WITH a DEFAULT: the committed NULL is backfilled, not refused — the
+--     rewrite reaches the committed rows, so the restored row satisfies the new rule.
+-- ===================================
+
+create table rdd (id integer primary key, v text null default 'filled');
+insert into rdd values (1, null);
+-- run
+
+begin;
+-- run
+update rdd set v = 'x' where id = 1;
+-- run
+alter table rdd alter column v set not null;
+-- run
+select id, v from rdd order by id;
+→ [{"id":1,"v":"x"}]
+
+rollback;
+-- run
+select id, v from rdd order by id;
+→ [{"id":1,"v":"filled"}]
+insert into rdd values (2, null);
+-- error: NOT NULL
+
+drop table rdd;
+
+-- ===================================
+-- E. a pending UPDATE hides a committed duplicate the new unique index would forbid.
+-- ===================================
+
+create table re (id integer primary key, v text);
+insert into re values (1, 'a'), (2, 'a');
+-- run
+
+begin;
+-- run
+update re set v = 'b' where id = 2;
+-- run
+create unique index ix_re on re (v);
+-- error: commit the pending writes first
+
+commit;
+-- run
+create unique index ix_re on re (v);
+-- run
+select id, v from re order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table re;
+
+-- ===================================
+-- F. (legal) a deleted row that breaks no rule does not block the build, and the rolled-back
+--    table holds no violation.
+-- ===================================
+
+create table rf (id integer primary key, v text);
+insert into rf values (1, 'a'), (2, 'b');
+-- run
+
+begin;
+-- run
+delete from rf where id = 2;
+-- run
+create unique index ix_rf on rf (v);
+-- run
+rollback;
+-- run
+
+select id, v from rf order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+insert into rf values (3, 'a');
+-- error: UNIQUE constraint failed
+
+drop table rf;
+
+-- ===================================
+-- H. (legal) a RELEASED savepoint cannot be rolled back to, so the state it held is not judged.
+-- ===================================
+
+create table rh (id integer primary key, v text);
+insert into rh values (1, 'a');
+-- run
+
+begin;
+-- run
+insert into rh values (2, 'a');
+-- run
+savepoint s;
+-- run
+delete from rh where id = 2;
+-- run
+release savepoint s;
+-- run
+create unique index ix_rh on rh (v);
+-- run
+commit;
+-- run
+
+select id, v from rh order by id;
+→ [{"id":1,"v":"a"}]
+insert into rh values (3, 'a');
+-- error: UNIQUE constraint failed
+
+drop table rh;

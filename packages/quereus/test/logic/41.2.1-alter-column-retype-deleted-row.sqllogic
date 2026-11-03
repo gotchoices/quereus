@@ -1,0 +1,45 @@
+-- ALTER COLUMN SET DATA TYPE: a value only in a row the transaction has DELETED is not
+-- a MISMATCH — the convert pre-pass judges the transaction's EFFECTIVE rows (committed
+-- rows overlaid with its own pending writes) for legality — but it still refuses the
+-- retype: DDL is not undone by a rollback while the delete is, so the rolled-back row
+-- would sit unconverted in a column of the new type. The refusal is retryable (BUSY,
+-- "commit the pending writes first"), and the same statement lands once the delete is
+-- committed. Cross-backend: under --store the delete is an overlay tombstone, and the
+-- wrapper hands the store its effective stream for MISMATCH and the store judges its own
+-- committed rows for BUSY (docs/memory-table.md § DDL and transactions, rule 1).
+
+create table t_del (id integer primary key, v text);
+insert into t_del values (1, '2024-01-01'), (2, 'not-a-date');
+-- run
+
+begin;
+-- run
+delete from t_del where id = 2;
+-- run
+
+-- The only unconvertible value lives in a row this transaction deleted — not illegal,
+-- but a rollback would restore it under DATE, so the retype is refused.
+alter table t_del alter column v set data type date;
+-- error: commit the pending writes first
+
+-- Nothing was mutated: the column is still text and the transaction still usable.
+select id, v, typeof(v) from t_del order by id;
+→ [{"id": 1, "v": "2024-01-01", "typeof(v)": "text"}]
+
+rollback;
+-- run
+
+-- The deleted row is back, under the type it was stored with.
+select id, v from t_del order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 2, "v": "not-a-date"}]
+
+-- Committed, the delete is final and the retype lands.
+delete from t_del where id = 2;
+-- run
+alter table t_del alter column v set data type date;
+-- run
+
+select id, v from t_del order by id;
+→ [{"id": 1, "v": "2024-01-01"}]
+
+drop table t_del;

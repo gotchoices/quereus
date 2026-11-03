@@ -21,8 +21,10 @@ import {
 	QuereusError,
 	StatusCode,
 	formatKeyValue,
+	judgeRestorableStates,
 	rowsValueIdentical,
 	type ColumnSchema,
+	type EffectiveRowSource,
 	type TableSchema,
 	type Row,
 	type SqlValue,
@@ -166,6 +168,12 @@ export class StoreTable extends StoreTableConstraints {
 	 *     so a committed pair collapsing onto one new key cannot be represented even
 	 *     when the transaction has deleted one of them → `BUSY`, with the memory
 	 *     module's "commit/rollback and retry" posture.
+	 *  3. **Would a `rollback to savepoint` restore a collision?** — question 1 again
+	 *     over each of `savepoints`, the states a wrapper module (the isolation layer)
+	 *     reports for the transaction's open savepoints (`IssuerRowSources.savepoints`;
+	 *     empty unwrapped). Their staged rows live in the wrapper and their committed
+	 *     rows here, so neither probe above sees the pair → `BUSY`, "commit the pending
+	 *     writes first" (`judgeRestorableStates`), `ddl` naming the statement.
 	 *
 	 * Probe order is what makes the statuses right, with no backend sniffing: the
 	 * committed probe can only fire once the effective one passed, i.e. only when the
@@ -197,30 +205,14 @@ export class StoreTable extends StoreTableConstraints {
 		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
 		newColumns: ReadonlyArray<ColumnSchema>,
 		effectiveRows: AsyncIterable<Row>,
+		savepoints: readonly EffectiveRowSource[],
+		ddl: string,
 		mapRow?: (row: Row) => Row,
 	): Promise<void> {
 		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
 		const keyOf = mapRow ? (row: Row): Uint8Array => computeNewKey(mapRow(row)) : computeNewKey;
 
-		const seenEffective = new Set<string>();
-		for await (const row of effectiveRows) {
-			const hex = bytesToHex(keyOf(row));
-			if (seenEffective.has(hex)) {
-				// Mirror the memory module's diagnostic, naming the key from the second
-				// (colliding) row's PK values — its POST-rewrite values, which are the key
-				// that collides — including its empty-key wording, since `alter primary
-				// key ()` leaves no components to name and "(key: )" reads as a bug
-				// (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
-				const judged = mapRow ? mapRow(row) : row;
-				const parts = newPkDef.map(pk => formatKeyValue(judged[pk.index]));
-				const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
-				throw new QuereusError(
-					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition ${keyDesc}`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-			seenEffective.add(hex);
-		}
+		await this.assertNoRekeyedCollision(effectiveRows, keyOf, newPkDef, mapRow);
 
 		const store = await this.ensureStore();
 		const seenCommitted = new Set<string>();
@@ -235,6 +227,44 @@ export class StoreTable extends StoreTableConstraints {
 				);
 			}
 			seenCommitted.add(hex);
+		}
+
+		await judgeRestorableStates(
+			savepoints,
+			state => this.assertNoRekeyedCollision(state(), keyOf, newPkDef, mapRow),
+			ddl,
+			this.tableName,
+		);
+	}
+
+	/**
+	 * Question 1 of {@link validateRekeyedPrimaryKey}: `CONSTRAINT`, naming the key, when two of
+	 * `rows` share a primary key under `keyOf`. Also the per-savepoint probe of question 3.
+	 */
+	private async assertNoRekeyedCollision(
+		rows: AsyncIterable<Row>,
+		keyOf: (row: Row) => Uint8Array,
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		mapRow?: (row: Row) => Row,
+	): Promise<void> {
+		const seen = new Set<string>();
+		for await (const row of rows) {
+			const hex = bytesToHex(keyOf(row));
+			if (seen.has(hex)) {
+				// Mirror the memory module's diagnostic, naming the key from the second
+				// (colliding) row's PK values — its POST-rewrite values, which are the key
+				// that collides — including its empty-key wording, since `alter primary
+				// key ()` leaves no components to name and "(key: )" reads as a bug
+				// (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
+				const judged = mapRow ? mapRow(row) : row;
+				const parts = newPkDef.map(pk => formatKeyValue(judged[pk.index]));
+				const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition ${keyDesc}`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			seen.add(hex);
 		}
 	}
 

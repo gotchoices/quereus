@@ -13,7 +13,7 @@
 import type {
 	ColumnSchema,
 	Database,
-	EffectiveRowSource,
+	IssuerRowSources,
 	Row,
 	SchemaChangeInfo,
 	SqlValue,
@@ -23,6 +23,7 @@ import {
 	QuereusError,
 	StatusCode,
 	buildColumnIndexMap,
+	describeAlterColumn,
 	foldDefaultToType,
 	planRetypeConversion,
 	validateCollationForType,
@@ -31,7 +32,7 @@ import { StoreTable } from './store-table.js';
 import { storeSemanticKeyTransform } from './pk-key-resolution.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
 import { StoreModuleIndex } from './store-module-index.js';
-import { effectiveDdlRows, validateUniqueOverExistingRows } from './store-module-index-build.js';
+import { effectiveDdlRows, judgeRollbackStates, validateUniqueOverExistingRows } from './store-module-index-build.js';
 
 /**
  * Result of an {@link alterColumnChange} attribute sub-branch: the rewritten
@@ -66,8 +67,9 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
+		const ddl = describeAlterColumn(change);
 		const colNameLower = change.columnName.toLowerCase();
 		const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
 		if (colIndex === -1) {
@@ -83,9 +85,9 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// already-explicit) that leave the table and any open transaction untouched.
 		let attr: AlterColumnAttrChange | null;
 		if (change.setNotNull !== undefined) {
-			attr = await alterColumnSetNotNull(table, oldCol, colIndex, change, rows);
+			attr = await alterColumnSetNotNull(table, oldCol, colIndex, change, rows, ddl);
 		} else if (change.setDataType !== undefined) {
-			attr = await alterColumnSetDataType(table, oldSchema, oldCol, colIndex, change);
+			attr = await alterColumnSetDataType(table, oldSchema, oldCol, colIndex, change, rows, ddl);
 		} else if (change.setDefault !== undefined) {
 			attr = { newCol: { ...oldCol, defaultValue: change.setDefault }, collationChanged: false };
 		} else if (change.setCollation !== undefined) {
@@ -154,7 +156,8 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// Existing-row UNIQUE re-validation (Option A, non-PK UNIQUE). Two ways an ALTER
 		// COLUMN can make rows that were distinct collide, both judged here BEFORE any
 		// mutation/persist so the first collision throws CONSTRAINT and leaves the table
-		// unchanged and writable (matches the ADD CONSTRAINT rollback shape):
+		// unchanged and writable (matches the ADD CONSTRAINT rollback shape) — then judged
+		// again over every state a rollback could restore (`judgeRollbackStates`, BUSY):
 		//  - SET COLLATE / a key-transform change: the comparators change ('a'/'A' collide
 		//    under NOCASE). Re-scan under the NEW collation (`updatedSchema` carries it).
 		//  - a value-REWRITING change (`valueConvert`: SET DATA TYPE, or a SET NOT NULL
@@ -181,14 +184,15 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		if (collationChanged || keyTransformChanged || rewritesValues) {
 			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 				.filter(uc => uc.columns.includes(colIndex));
+			const keyNormalizers = db.getKeyNormalizerResolver();
+			const judged = (stream: AsyncIterable<Row>): AsyncIterable<Row> => convertRow ? mapRowsAsync(stream, convertRow) : stream;
 			for (const uc of coveringConstraints) {
-				// Fresh generator per constraint — an async generator is single-shot.
-				const effectiveRows = effectiveDdlRows(table, rows);
-				await validateUniqueOverExistingRows(
-					convertRow ? mapRowsAsync(effectiveRows, convertRow) : effectiveRows,
-					updatedSchema,
-					uc,
-					db.getKeyNormalizerResolver(),
+				// Fresh generator per constraint and per state — an async generator is single-shot.
+				await validateUniqueOverExistingRows(judged(effectiveDdlRows(table, rows)), updatedSchema, uc, keyNormalizers);
+				await judgeRollbackStates(
+					table, rows,
+					state => validateUniqueOverExistingRows(judged(state.rows()), updatedSchema, uc, keyNormalizers),
+					ddl,
 				);
 			}
 		}
@@ -226,6 +230,8 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 				oldSchema.primaryKeyDefinition,
 				updatedSchema.columns,
 				effectiveDdlRows(table, rows),
+				rows?.savepoints ?? [],
+				ddl,
 				convertRow,
 			);
 		}
@@ -330,19 +336,24 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
  * `valueConvert` (null → DEFAULT) the caller applies only after every throw-only
  * check — including the UNIQUE re-validation over the backfilled values — has passed.
  *
- * `rows` is the wrapper-supplied effective row source (the isolation overlay). When present,
- * the reject-vs-backfill decision scans it instead of `table.rowsWithNullAtIndex`: behind the
- * isolation layer the issuer's pending inserts live in the wrapper's overlay, not this store,
- * so the store's own count would miss them and wrongly accept the ALTER. The committed-store
- * `mapRowsAtIndex` backfill is unchanged — the overlay-resident pending rows are the isolation
- * layer's job (its overlay migration), this store only owns its committed rows.
+ * `rows` is the wrapper-supplied row bundle (the isolation overlay). When present, the
+ * reject-vs-backfill decision scans its effective stream instead of this store's own effective
+ * rows: behind the isolation layer the issuer's pending inserts live in the wrapper's overlay,
+ * not this store, so the store's own count would miss them and wrongly accept the ALTER. The
+ * states a rollback could restore are then judged the same way (`judgeRollbackStates`): a
+ * committed NULL is backfilled too when a DEFAULT exists (the `mapRowsAtIndex` rewrite reaches
+ * the committed rows, so the restored row satisfies the new rule) and refuses as BUSY without
+ * one; a NULL in a wrapper savepoint frame refuses as BUSY either way, since no rewrite of this
+ * store reaches it. The overlay-resident pending rows are the isolation layer's job (its
+ * overlay migration); this store only owns its committed rows.
  */
 async function alterColumnSetNotNull(
 	table: StoreTable,
 	oldCol: ColumnSchema,
 	colIndex: number,
 	change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
-	rows?: EffectiveRowSource,
+	rows: IssuerRowSources | undefined,
+	ddl: string,
 ): Promise<AlterColumnAttrChange | null> {
 	let newCol: ColumnSchema;
 	let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
@@ -353,28 +364,28 @@ async function alterColumnSetNotNull(
 		// literal is converted to the column's declared type, so a backfilled cell matches
 		// what an INSERT under the same DEFAULT would store.
 		const defaultLiteral = foldDefaultToType(oldCol.defaultValue, oldCol.logicalType, change.columnName);
-		// Decide reject-vs-backfill over the DDL transaction's EFFECTIVE rows. `rows()` (the
-		// isolation overlay) sees the issuer's pending inserts; `rowsWithNullAtIndex` (run
-		// directly, no wrapper) sees the store's own effective rows. Either way a NULL the
-		// transaction can see is backfilled, or rejects the ALTER, like any other row.
-		let anyNull: boolean;
-		if (rows) {
-			anyNull = false;
-			for await (const row of rows()) {
-				if (row[colIndex] === null) { anyNull = true; break; }
-			}
-		} else {
-			anyNull = (await table.rowsWithNullAtIndex(colIndex)) > 0;
+		const hasDefault = defaultLiteral !== undefined && defaultLiteral !== null;
+		// Throw-only, and before the DDL-commit below: the transaction survives.
+		const containsNull = (): QuereusError =>
+			new QuereusError(`column ${change.columnName} contains NULL values`, StatusCode.CONSTRAINT);
+
+		// Decide reject-vs-backfill over the DDL transaction's EFFECTIVE rows (the wrapper's
+		// stream, or run directly this store's own effective rows — `rowsWithNullAtIndex`),
+		// then over every state a rollback could restore.
+		let backfill = false;
+		const visibleNull = rows ? await anyNullAt(rows.effective(), colIndex) : (await table.rowsWithNullAtIndex(colIndex)) > 0;
+		if (visibleNull) {
+			if (!hasDefault) throw containsNull();
+			backfill = true;
 		}
-		if (anyNull) {
-			if (defaultLiteral === undefined || defaultLiteral === null) {
-				// Throw-only, and before the DDL-commit below: the transaction survives.
-				throw new QuereusError(
-					`column ${change.columnName} contains NULL values`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-			const fill = defaultLiteral;
+		await judgeRollbackStates(table, rows, async state => {
+			if (!await anyNullAt(state.rows(), colIndex)) return;
+			if (!hasDefault || !state.backfilled) throw containsNull(); // rewrapped as BUSY
+			backfill = true;
+		}, ddl);
+
+		if (backfill) {
+			const fill = defaultLiteral as SqlValue;
 			// Backfill DEFERRED: the caller flushes + `mapRowsAtIndex`es this closure only
 			// after its throw-only checks pass. Run directly, that fills the transaction's
 			// rows too (the probe saw them). Behind isolation the issuer's overlay-resident
@@ -421,6 +432,8 @@ async function alterColumnSetDataType(
 	oldCol: ColumnSchema,
 	colIndex: number,
 	change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+	rows: IssuerRowSources | undefined,
+	ddl: string,
 ): Promise<AlterColumnAttrChange> {
 	const { newLogicalType, convert } = planRetypeConversion(change.setDataType!, oldCol.logicalType, change.columnName);
 	let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
@@ -431,20 +444,32 @@ async function alterColumnSetDataType(
 				StatusCode.CONSTRAINT,
 			);
 		}
-		// Throw-only pass over the LIVE rows, so an unconvertible value this
-		// transaction inserted rejects the ALTER with the transaction still intact.
-		// The rewrite itself is DEFERRED: the caller flushes + `mapRowsAtIndex`es
-		// this closure only after its remaining throw-only checks pass.
-		// NOTE: pre-existing gap — this scan reads the store's own effective rows and
-		// ignores a wrapper-supplied `rows` stream (unlike the memory module's arm). No
-		// hole under isolation: the wrapper's `validateOverlayMigration` converts every
-		// staged overlay value itself before the underlying mutates.
-		for await (const value of table.iterateEffectiveValuesAtIndex(colIndex)) {
-			if (value !== null) convert(value);
-		}
+		// Throw-only pass over the rows this transaction can SEE (the wrapper's stream behind
+		// isolation, else this store's own effective rows), so an unconvertible value it
+		// inserted rejects the ALTER (MISMATCH) with the transaction still intact — then over
+		// every state a rollback could restore (BUSY): the rewrite below reaches the committed
+		// rows, and a rolled-back row would otherwise sit unconverted under the new type. The
+		// rewrite itself is DEFERRED: the caller flushes + `mapRowsAtIndex`es this closure only
+		// after its remaining throw-only checks pass.
+		const everyValueConverts = async (stream: AsyncIterable<Row>): Promise<void> => {
+			for await (const row of stream) {
+				const value = row[colIndex];
+				if (value !== null) convert(value);
+			}
+		};
+		await everyValueConverts(effectiveDdlRows(table, rows));
+		await judgeRollbackStates(table, rows, state => everyValueConverts(state.rows()), ddl);
 		valueConvert = (v) => v === null ? v : convert(v);
 	}
 	return { newCol: { ...oldCol, logicalType: newLogicalType }, collationChanged: false, valueConvert };
+}
+
+/** True when any row of `stream` holds NULL at `colIndex`. Stops at the first. */
+async function anyNullAt(stream: AsyncIterable<Row>, colIndex: number): Promise<boolean> {
+	for await (const row of stream) {
+		if (row[colIndex] === null) return true;
+	}
+	return false;
 }
 
 /**

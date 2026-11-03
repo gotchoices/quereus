@@ -1,9 +1,9 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
+import { rolledBackRowsWouldViolate, MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
-import { iterateEffectiveRows, makePkKeySerializer } from './overlay-rows.js';
+import { collectEntriesFromRows, collectOverlayEntries, iterateEffectiveRows, makePkKeySerializer, resolveTombstoneIndex, type OverlayEntry } from './overlay-rows.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
 import type { AlterMigrationHost } from './alter-migration.js';
 import {
@@ -82,6 +82,23 @@ export function clampToReentrantReads(mode: VtabConcurrencyMode): VtabConcurrenc
  *   detection). A stable snapshot, if needed, is the underlying module's job.
  * - Savepoint support via overlay module's transaction support
  */
+/**
+ * The statement a row-validating ALTER arm would name in its `BUSY` refusal
+ * (`rolledBackRowsWouldViolate`), or undefined for an arm that judges no rows and so needs no
+ * rollback states. Gates the one refusal {@link IsolationModule.effectiveRowsFor} raises itself.
+ */
+function describeRowValidatingAlter(change: SchemaChangeInfo): string | undefined {
+	if (change.type === 'addConstraint') {
+		const constraint = change.constraint;
+		return constraint.type === 'unique' ? `add ${constraint.name ? `constraint ${constraint.name} ` : ''}unique` : undefined;
+	}
+	if (change.type !== 'alterColumn') return undefined;
+	if (change.setCollation !== undefined) return `alter column ${change.columnName} set collate ${change.setCollation}`;
+	if (change.setDataType !== undefined) return `alter column ${change.columnName} set data type ${change.setDataType}`;
+	if (change.setNotNull === true) return `alter column ${change.columnName} set not null`;
+	return undefined;
+}
+
 export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseModuleConfig>, AlterMigrationHost {
 	readonly underlying: VirtualTableModule<any, any>;
 	readonly overlayModule: VirtualTableModule<any, any>;
@@ -1097,24 +1114,39 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * The rows the connection owning `overlayState` can SEE — the underlying's committed rows
-	 * merged with that overlay's staged writes. Re-callable, as `EffectiveRowSource` requires.
+	 * The rows a row-validating DDL must judge for the connection owning `overlayState`
+	 * (`IssuerRowSources`): what it can SEE — the underlying's committed rows merged with that
+	 * overlay's staged writes — and what each of its open savepoints would restore — the same
+	 * merge over the overlay's rows as they stood at that savepoint. Every stream is
+	 * re-callable, as `EffectiveRowSource` requires.
 	 *
 	 * This is the seam the whole fix turns on: the underlying module validates row-content DDL
-	 * (UNIQUE duplicate detection, collation-rekey collisions) against its OWN rows, which under
-	 * isolation are the committed rows only. The transaction's pending rows live here, in the
-	 * overlay, where the underlying cannot reach them — so we hand them down.
+	 * (UNIQUE duplicate detection, collation-rekey collisions, convertibility, NULLs) against
+	 * its OWN rows, which under isolation are the committed rows only. The transaction's pending
+	 * rows live here, in the overlay, where the underlying cannot reach them — so we hand them
+	 * down, and with them the frames a `rollback to savepoint` could reinstate, which the
+	 * underlying judges for `BUSY` (its own committed rows are the whole-rollback state and it
+	 * judges those itself). Savepoints taken before the overlay existed restore "no staged
+	 * rows" — exactly the committed state — and contribute nothing here.
 	 *
-	 * NOTE: each call re-materializes the overlay and re-scans the underlying. `alter column …
-	 * set collate` calls once per UNIQUE constraint covering the altered column, so a table with
-	 * many such constraints pays that many scans. If it ever shows up as slow, materialize the
-	 * overlay's PK map once per DDL and share it across the calls.
+	 * `ddl` names the statement when it is row-validating, for the one refusal raised here: an
+	 * overlay module without `VirtualTable.savepointRowSources` cannot report its frames, so a
+	 * row-validating DDL under open savepoints is refused (BUSY) rather than judged over a
+	 * state the wrapper cannot see. Undefined for a DDL that judges no rows.
+	 *
+	 * NOTE: each call re-materializes the overlay (or a frame of it) and re-scans the underlying.
+	 * `alter column … set collate` calls once per UNIQUE constraint covering the altered column,
+	 * per state, so a table with many such constraints under deep savepoints pays that many
+	 * scans. If it ever shows up as slow, materialize each state's PK map once per DDL and share
+	 * it across the calls.
 	 */
 	private effectiveRowsFor(
 		db: Database,
 		underlyingTable: VirtualTable,
 		overlayState: ConnectionOverlayState,
-	): EffectiveRowSource {
+		ddl: string | undefined,
+		tableName: string,
+	): IssuerRowSources {
 		const schema = underlyingTable.tableSchema;
 		if (!schema) {
 			throw new QuereusError('Isolation layer: underlying table has no schema', StatusCode.INTERNAL);
@@ -1122,29 +1154,46 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const pkIndices = schema.primaryKeyDefinition.map(pkDef => pkDef.index);
 		const pkKeyOf = makePkKeySerializer(db, schema);
 		const overlayTable = overlayState.overlayTable;
-		return () => iterateEffectiveRows(underlyingTable, overlayTable, this.tombstoneColumn, pkIndices, pkKeyOf);
+		const tombstoneColumn = this.tombstoneColumn;
+		const mergedWith = (collect: () => Promise<OverlayEntry[]>): EffectiveRowSource =>
+			() => iterateEffectiveRows(underlyingTable, collect, pkIndices, pkKeyOf);
+
+		const effective = mergedWith(() => collectOverlayEntries(overlayTable, tombstoneColumn, pkIndices));
+		if (!overlayTable.savepointRowSources) {
+			if (ddl !== undefined && (db as DatabaseInternal).getActiveSavepointDepth() > 0) {
+				throw rolledBackRowsWouldViolate(ddl, tableName);
+			}
+			return { effective, savepoints: [] };
+		}
+		const tombstoneIndex = resolveTombstoneIndex(overlayTable, tombstoneColumn);
+		const savepoints = overlayTable.savepointRowSources()
+			.map(frame => mergedWith(() => collectEntriesFromRows(frame(), tombstoneIndex, pkIndices)));
+		return { effective, savepoints };
 	}
 
 	/**
-	 * The row source to hand a row-validating DDL on behalf of the connection issuing it, or
+	 * The row sources to hand a row-validating DDL on behalf of the connection issuing it, or
 	 * undefined when that connection has nothing staged and the underlying's own rows already
-	 * ARE its effective rows.
+	 * ARE its effective rows (and its own committed rows every state a rollback could restore).
 	 *
 	 * **Only the issuing connection's overlay feeds validation.** A foreign connection's
 	 * overlay may hold rows that collide with the new constraint; that is its problem when it
 	 * commits, exactly as an ordinary concurrent duplicate insert would be. A poisoned issuer
 	 * overlay is likewise skipped — its rows are structurally stale, and the connection can
 	 * only recover by rolling back.
+	 *
+	 * `ddl` — see {@link effectiveRowsFor}.
 	 */
 	private issuerEffectiveRows(
 		db: Database,
 		schemaName: string,
 		tableName: string,
 		underlyingTable: VirtualTable,
-	): EffectiveRowSource | undefined {
+		ddl: string | undefined,
+	): IssuerRowSources | undefined {
 		const overlayState = this.getConnectionOverlay(db, schemaName, tableName);
 		if (!overlayState || overlayState.poison || !overlayState.hasChanges) return undefined;
-		return this.effectiveRowsFor(db, underlyingTable, overlayState);
+		return this.effectiveRowsFor(db, underlyingTable, overlayState, ddl, tableName);
 	}
 
 	/**
@@ -1190,12 +1239,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		schemaName: string,
 		tableName: string,
 		indexSchema: IndexSchema,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<void> {
 		const state = this.getUnderlyingState(schemaName, tableName);
-		// An outer wrapper's row source, if any, already names the effective rows; otherwise
-		// build our own from the issuing connection's overlay.
-		const rowSource = rows ?? (state ? this.issuerEffectiveRows(db, schemaName, tableName, state.underlyingTable) : undefined);
+		// An outer wrapper's row sources, if any, already name the rows; otherwise build our
+		// own from the issuing connection's overlay. Only a UNIQUE index judges rows.
+		const ddl = indexSchema.unique ? `create unique index ${indexSchema.name}` : undefined;
+		const rowSource = rows ?? (state ? this.issuerEffectiveRows(db, schemaName, tableName, state.underlyingTable, ddl) : undefined);
 
 		if (state?.underlyingTable.createIndex) {
 			// Instance-level createIndex keeps MemoryTable.tableSchema fresh
@@ -1470,7 +1520,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
 		if (!this.underlying.alterTable) {
 			throw new QuereusError(
@@ -1541,13 +1591,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		const underlyingState = this.getUnderlyingState(schemaName, tableName);
 
-		// Hand the underlying the issuer's effective rows so its own row-content checks
-		// (`add constraint … unique`, `alter column … set collate` / `set not null`) see the
-		// transaction's pending rows and skip the ones it has deleted. An outer wrapper's source
-		// wins if one was supplied. Built before the migration plan, which reads the same stream
-		// to learn whether a `set not null` backfill will actually move the committed keys.
+		// Hand the underlying the issuer's effective rows and savepoint states so its own
+		// row-content checks (`add constraint … unique`, `alter column … set collate` / `set data
+		// type` / `set not null`) see the transaction's pending rows, skip the ones it has deleted
+		// for legality, and refuse (BUSY) when a rollback would restore a violation. An outer
+		// wrapper's sources win if supplied. Built before the migration plan, which reads the
+		// effective stream to learn whether a `set not null` backfill will move the committed keys.
 		let rowSource = rows ?? (underlyingState
-			? this.issuerEffectiveRows(db, schemaName, tableName, underlyingState.underlyingTable)
+			? this.issuerEffectiveRows(db, schemaName, tableName, underlyingState.underlyingTable, describeRowValidatingAlter(change))
 			: undefined);
 
 		// Precompute every per-change-type migration constant, from the PRE-alter schema — so the
@@ -1555,9 +1606,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// post-mutation migration. The attribute arms read a to-be-migrated overlay's schema, never
 		// a skipped poisoned overlay's (possibly stale pre-alter) one. The plan is also told which
 		// rows the underlying's own data-dependent decisions will read — the issuer's effective rows
-		// when it has staged work, else the committed set — so the `set not null` re-key arm gates
-		// exactly as the underlying's backfill does.
-		const migration = await deriveAlterMigrationPlan(change, db, tableName, toMigrate, rowSource ?? this.committedRowsOf(underlyingState));
+		// when it has staged work, else the committed set, plus the committed set the underlying
+		// also backfills — so the `set not null` re-key arm gates exactly as the underlying's
+		// backfill does.
+		const committedRows = this.committedRowsOf(underlyingState);
+		const migration = await deriveAlterMigrationPlan(change, db, tableName, toMigrate, rowSource?.effective ?? committedRows, committedRows);
 
 		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
 		// Any throw here (CONSTRAINT backfill, MISMATCH conversion, or INTERNAL tombstone guard)
@@ -1592,10 +1645,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					// NOTE: materializes the issuer's whole effective row set for this one ALTER.
 					// The underlying's own re-key probe already holds every row it sees (see
 					// MemoryTableManager.makePrimaryKeyProbe's NOTE), so this does not change the
-					// peak's order of magnitude.
+					// peak's order of magnitude. The savepoint states need no snapshot: the drops
+					// land in the overlay's current frame, and each state reads an immutable one.
 					const snapshot: Row[] = [];
-					for await (const row of rowSource()) snapshot.push(row);
-					rowSource = () => (async function* () { yield* snapshot; })();
+					for await (const row of rowSource.effective()) snapshot.push(row);
+					rowSource = { effective: () => (async function* () { yield* snapshot; })(), savepoints: rowSource.savepoints };
 				}
 				droppedMarkerRows = plan;
 				await applyPkRekeyMarkerDrops(ownOverlayState, pkRekeyCtx, plan);
@@ -1658,18 +1712,20 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Tier 3: per FOREIGN overlay, validate then migrate — but a per-row NOT NULL
 		// (CONSTRAINT) failure poisons that one overlay instead of aborting the issuer's
 		// ALTER, as does a UNIQUE the migration itself raises (its staged rows may violate a
-		// constraint the issuer just declared) and an unconvertible staged value under a retype
-		// (MISMATCH). Those three are data conditions of ONE connection's uncommitted rows, and
-		// the underlying has already been mutated by this point, so rethrowing any of them would
-		// abort the issuer's ALTER after the fact — exactly the divergence this tiering exists to
-		// prevent. An INTERNAL failure (e.g. missing tombstone column) is a layer-invariant
-		// violation, not a data condition, so it rethrows loud for everyone. Both phases run per
-		// overlay, so one bad foreign overlay poisons only itself; healthy peers still migrate.
+		// constraint the issuer just declared), an unconvertible staged value under a retype
+		// (MISMATCH), and a savepoint frame the migration could not carry (BUSY — the same
+		// routing `applyInPlaceOverlayChange` gives the overlay module's own BUSY). Those are
+		// data conditions of ONE connection's uncommitted rows, and the underlying has already
+		// been mutated by this point, so rethrowing any of them would abort the issuer's ALTER
+		// after the fact — exactly the divergence this tiering exists to prevent. An INTERNAL
+		// failure (e.g. missing tombstone column) is a layer-invariant violation, not a data
+		// condition, so it rethrows loud for everyone. Both phases run per overlay, so one bad
+		// foreign overlay poisons only itself; healthy peers still migrate.
 		for (const [key, oldState] of foreign) {
 			try {
 				await validateOverlayMigration(this, oldState, migration);
 			} catch (e) {
-				if (e instanceof QuereusError && (e.code === StatusCode.CONSTRAINT || e.code === StatusCode.MISMATCH)) {
+				if (e instanceof QuereusError && (e.code === StatusCode.CONSTRAINT || e.code === StatusCode.MISMATCH || e.code === StatusCode.BUSY)) {
 					oldState.poison = { message: buildAlterPoisonMessage(schemaName, tableName, change) };
 					continue; // poisoned — do NOT migrate; leave pre-alter rows in place
 				}

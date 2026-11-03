@@ -2,14 +2,17 @@
  * Row-validating / row-rewriting DDL (`create unique index`, `alter table … add constraint …
  * unique`, `alter table … alter column … set collate`, `… set data type`, `… set not null`) must
  * see the rows the issuing transaction wrote but has not yet committed, and the rule it declares
- * must stay enforced for the rest of that transaction — and after it commits.
+ * must stay enforced for the rest of that transaction — and after it commits. DDL is not undone
+ * by a rollback while the rows it was judged against are, so it must also hold for every state a
+ * rollback could restore — the committed rows and each open savepoint's rows — refusing with
+ * BUSY ("commit the pending writes first") when one of them would violate the new rule.
  *
  * Memory-only: the store backend reaches the same rules by a different route. Its isolation overlay
  * originally did NOT honor them; the UNIQUE analogue is closed by
  * `isolation-ddl-validation-ignores-overlay-rows`, and `set not null` (reject + DEFAULT backfill,
  * issuer + foreign overlay) by `bug-set-not-null-ignores-uncommitted-rows`. The store + isolation
- * paths for those are covered by their own specs (see packages/quereus-isolation/test).
- * `set data type` behind the isolation overlay remains an open gap (deferred).
+ * paths for those are covered by their own specs (see packages/quereus-isolation/test); the
+ * rollback-state refusals are cross-backend in 41.2.4-ddl-rollback-states.sqllogic.
  *
  * See docs/memory-table.md § DDL and transactions.
  */
@@ -155,15 +158,66 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await db.exec(`rollback`);
 		});
 
-		it('sees a pending DELETE — a committed duplicate removed in-transaction does not block the build', async () => {
+		it('refuses when a committed duplicate removed in-transaction would come back on rollback', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);
 			await db.exec(`insert into t values (1, 'a'), (2, 'a')`);
 			await db.exec(`begin`);
 			await db.exec(`delete from t where id = 2`);
-			await db.exec(`create unique index ix on t (v)`);
-			await db.exec(`commit`);
 
-			expect(await rowCount(db, 't')).to.equal(1);
+			// The transaction sees no duplicate, so the index is not ILLEGAL — but a rollback would
+			// restore row 2 under it. Refused as retryable, not as a constraint violation.
+			await expectError(
+				() => db.exec(`create unique index ix on t (v)`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+
+			// The refusal mutated nothing and the transaction is still usable.
+			await db.exec(`insert into t values (3, 'b')`);
+			expect(await rowCount(db, 't')).to.equal(2);
+			await db.exec(`commit`);
+			const manager = getManager(db, 't');
+			expect(manager.tableSchema.indexes?.some(i => i.name === 'ix') ?? false).to.equal(false);
+
+			// With the delete committed there is nothing to restore, and the same statement lands.
+			await db.exec(`create unique index ix on t (v)`);
+			await expectError(
+				() => db.exec(`insert into t values (4, 'a')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
+
+		it('refuses when a pending UPDATE hides a committed duplicate that a rollback would restore (case E)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'b' where id = 2`);
+
+			await expectError(
+				() => db.exec(`create unique index ix on t (v)`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			await db.exec(`commit`);
+			await db.exec(`create unique index ix on t (v)`);
+		});
+
+		it('a pending DELETE of a row that breaks no rule does not block the build (case F)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where id = 2`);
+			await db.exec(`create unique index ix on t (v)`);
+			await db.exec(`rollback`);
+
+			// Both rows are back, the index survived the rollback, and nothing violates it.
+			expect(await rowCount(db, 't')).to.equal(2);
+			await expectError(
+				() => db.exec(`insert into t values (3, 'a')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
 		});
 
 		it('a failed create unique index leaves the schema and the table untouched', async () => {
@@ -399,6 +453,48 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(await rowCount(db, 't')).to.equal(0);
 		});
 
+		it('create unique index refuses when rollback to a savepoint would restore a duplicate (case A)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`delete from t where id = 2`);
+
+			// The effective view and the committed rows are both clean; only the state `rollback
+			// to s` restores holds the pair.
+			await expectError(
+				() => db.exec(`create unique index ix on t (v)`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			await db.exec(`rollback to s`);
+			expect(await rowCount(db, 't'), 'the duplicate is back, under no index').to.equal(2);
+			await db.exec(`rollback`);
+			expect(getManager(db, 't').tableSchema.indexes?.some(i => i.name === 'ix') ?? false).to.equal(false);
+		});
+
+		it('a RELEASED savepoint is not a restorable state — the delete-then-index shape stays legal (case H)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`delete from t where id = 2`);
+			await db.exec(`release s`);
+
+			// The snapshot holding the pair stays in the layer chain, but nothing can roll back
+			// to it, so it is not judged.
+			await db.exec(`create unique index ix on t (v)`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(1);
+			await expectError(
+				() => db.exec(`insert into t values (3, 'a')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
+
 		it('after rollback to savepoint the adopted schema still enforces the new constraint', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);
 			await db.exec(`begin`);
@@ -470,16 +566,23 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(collationOf('t', 'v')).to.equal('BINARY');
 		});
 
-		it('sees a pending DELETE — a committed duplicate removed in-transaction does not block the change', async () => {
+		it('refuses when a committed row removed in-transaction would collide under the new collation on rollback', async () => {
 			await seed([[1, 'a'], [2, 'A']]);
 			await db.exec(`begin`);
 			await db.exec(`delete from t where id = 2`);
-			await db.exec(`alter table t alter column v set collate nocase`);
-			await db.exec(`commit`);
 
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+
+			// Committed, the delete is final and the same statement lands.
+			await db.exec(`commit`);
 			expect(await rowCount(db, 't')).to.equal(1);
+			await db.exec(`alter table t alter column v set collate nocase`);
 			expect(collationOf('t', 'v')).to.equal('NOCASE');
-			// The accepted change survived the commit: 'A' now collides with the surviving 'a'.
 			await expectError(
 				() => db.exec(`insert into t values (3, 'A')`),
 				StatusCode.CONSTRAINT,
@@ -1072,19 +1175,25 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(await values(`select v from t order by id`)).to.deep.equal([42, 7]);
 		});
 
-		it('accepts the change when the only unconvertible value is in a pending-deleted row', async () => {
+		it('refuses when the only unconvertible value is in a pending-deleted row a rollback would restore', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);
 			await db.exec(`insert into t values (1, 'notanumber'), (2, '5')`);
 			await db.exec(`begin`);
 			await db.exec(`delete from t where id = 1`);
-			// Effective view holds only '5'; the deleted 'notanumber' must not block the change.
-			await db.exec(`alter table t alter column v set data type integer`);
 
+			// The effective view holds only '5', so the retype is not a MISMATCH — but a rollback
+			// would put 'notanumber' back under an integer column.
+			await expectError(
+				() => db.exec(`alter table t alter column v set data type integer`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			expect(await scalar(db, `select typeof(v) from t where id = 2`)).to.equal('text');
+
+			await db.exec(`commit`);
+			await db.exec(`alter table t alter column v set data type integer`);
 			expect(await values(`select v from t`)).to.deep.equal([5]);
 			expect(await scalar(db, `select typeof(v) from t where id = 2`)).to.equal('integer');
-			await db.exec(`commit`);
-			expect(await values(`select v from t`)).to.deep.equal([5]);
-			expect(await rowCount(db, 't')).to.equal(1);
 		});
 
 		it('coerces a later insert in the same transaction to the new type', async () => {
@@ -1232,15 +1341,24 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(notNullOf('t', 'v')).to.equal(false);
 		});
 
-		it('accepts the change when the only NULL is in a pending-deleted row', async () => {
+		it('refuses when the only NULL is in a pending-deleted row a rollback would restore', async () => {
 			await db.exec(`create table t (id integer primary key, v text null)`);
 			await db.exec(`insert into t values (1, null), (2, 'a')`);
 			await db.exec(`begin`);
 			await db.exec(`delete from t where id = 1`);
-			// Effective view holds only 'a'; the deleted NULL must not block the change.
-			await db.exec(`alter table t alter column v set not null`);
-			await db.exec(`commit`);
 
+			// The effective view holds only 'a', so the tightening is not a CONSTRAINT violation
+			// — but a rollback would put the NULL back under a NOT NULL column, and with no
+			// DEFAULT nothing can fill it.
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			expect(notNullOf('t', 'v')).to.equal(false);
+
+			await db.exec(`commit`);
+			await db.exec(`alter table t alter column v set not null`);
 			expect(notNullOf('t', 'v')).to.equal(true);
 			expect(await rowCount(db, 't')).to.equal(1);
 		});
@@ -1262,18 +1380,54 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(notNullOf('t', 'v')).to.equal(false);
 		});
 
-		it('accepts when a pending UPDATE clears the only committed NULL', async () => {
+		it('refuses when a pending UPDATE clears the only committed NULL a rollback would restore (case D)', async () => {
 			await db.exec(`create table t (id integer primary key, v text null)`);
 			await db.exec(`insert into t values (1, null)`);
 			await db.exec(`begin`);
-			// The committed NULL is overwritten to a value before the tighten — the effective view
-			// holds no NULL, so the ALTER must be accepted.
+			// The committed NULL is overwritten before the tighten — the effective view holds no
+			// NULL, but a rollback restores it and there is no DEFAULT to fill it from.
 			await db.exec(`update t set v = 'a' where id = 1`);
-			await db.exec(`alter table t alter column v set not null`);
-			await db.exec(`commit`);
 
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.BUSY,
+				/commit the pending writes first/i,
+			);
+			expect(notNullOf('t', 'v')).to.equal(false);
+
+			await db.exec(`commit`);
+			await db.exec(`alter table t alter column v set not null`);
 			expect(notNullOf('t', 'v')).to.equal(true);
 			expect(await values(`select v from t`)).to.deep.equal(['a']);
+		});
+
+		it('backfills a committed NULL a rollback would restore from the DEFAULT instead of refusing', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'a' where id = 1`);
+
+			// The transaction sees no NULL, but the committed row holds one; the rewrite reaches
+			// the base, so it is filled rather than refused — and a rollback restores 'filled'.
+			await db.exec(`alter table t alter column v set not null`);
+			expect(await values(`select v from t`)).to.deep.equal(['a']);
+			await db.exec(`rollback`);
+			expect(notNullOf('t', 'v')).to.equal(true);
+			expect(await values(`select v from t`)).to.deep.equal(['filled']);
+		});
+
+		it('backfills a NULL held only in a savepoint frame, because the rewrite reaches every open layer', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`savepoint s`);
+			await db.exec(`update t set v = 'a' where id = 1`);
+
+			await db.exec(`alter table t alter column v set not null`);
+			await db.exec(`rollback to s`);
+			expect(await values(`select v from t`), 'the frame was converted, not left NULL').to.deep.equal(['filled']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t`)).to.deep.equal(['filled']);
 		});
 
 		it('backfills a pending NULL from a literal DEFAULT, leaving non-null rows untouched', async () => {

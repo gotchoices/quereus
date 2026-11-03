@@ -18,7 +18,7 @@ import { Database } from '../src/index.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { Database as DatabaseType } from '../src/core/database.js';
 import type { TableSchema } from '../src/schema/table.js';
-import type { SchemaChangeInfo, EffectiveRowSource } from '../src/vtab/module.js';
+import type { SchemaChangeInfo, IssuerRowSources } from '../src/vtab/module.js';
 
 async function collect(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const rows: Array<Record<string, unknown>> = [];
@@ -49,7 +49,7 @@ class PositionedMemoryModule extends MemoryTableModule {
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
 		const positioned: SchemaChangeInfo = change.type === 'addColumn' && this.insertAt !== undefined
 			? { ...change, insertAtIndex: this.insertAt }

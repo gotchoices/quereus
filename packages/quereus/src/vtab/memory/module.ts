@@ -4,7 +4,7 @@ import type { Database } from '../../core/database.js';
 import { type TableSchema, type IndexSchema, IndexColumnSchema } from '../../schema/table.js';
 import { generateTableDDL, generateDropTableDDL } from '../../schema/ddl-generator.js';
 import { MemoryTable } from './table.js';
-import type { VirtualTableModule, SchemaChangeInfo, EffectiveRowSource } from '../module.js';
+import type { VirtualTableModule, SchemaChangeInfo, IssuerRowSources } from '../module.js';
 import { MemoryTableManager } from './layer/manager.js';
 import type { BackingHost, BackingScanRequest, MaintenanceOp, BackingRowChange } from '../backing-host.js';
 import type { VirtualTableConnection } from '../connection.js';
@@ -1198,7 +1198,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	/**
 	 * Alters an existing memory table's structure (ADD/DROP/RENAME COLUMN).
 	 */
-	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: EffectiveRowSource): Promise<TableSchema> {
+	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: IssuerRowSources): Promise<TableSchema> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 
@@ -1275,7 +1275,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	/**
 	 * Creates an index on a memory table
 	 */
-	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
+	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema, rows?: IssuerRowSources): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 

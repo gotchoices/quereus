@@ -1,5 +1,5 @@
 import type { Database, TableSchema, SchemaChangeInfo, Row, SqlValue, VirtualTable, UpdateResult, EffectiveRowSource } from '@quereus/quereus';
-import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, planRetypeConversion, validateCollationForType, formatKeyValue } from '@quereus/quereus';
+import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, planRetypeConversion, validateCollationForType, formatKeyValue, rolledBackRowsWouldViolate } from '@quereus/quereus';
 import type { ConnectionOverlayState, Predicate } from './isolation-types.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
 import { makePkKeySerializer } from './overlay-rows.js';
@@ -249,9 +249,11 @@ export function buildAlterPoisonMessage(schemaName: string, tableName: string, c
  *
  * `underlyingRows` is the row stream the underlying's own data-dependent decisions read: the
  * effective rows it is handed when the ISSUING transaction has staged work, else its committed
- * rows (`IsolationModule.committedRowsOf`). The `set not null` re-key arm reads it (see
- * {@link derivePkRekey}) because whether the underlying backfills at all — and so whether the
- * committed keys move — is decided over exactly that stream. Async for that one scan only.
+ * rows (`IsolationModule.committedRowsOf`); `committedRows` is the committed set either way. The
+ * `set not null` re-key arm reads both (see {@link derivePkRekey}) because whether the underlying
+ * backfills at all — and so whether the committed keys move — is decided over exactly those two
+ * sets: a NULL it can see, or a committed NULL a rollback would restore (which it backfills so
+ * the restored row satisfies the new rule). Async for those scans only.
  */
 export async function deriveAlterMigrationPlan(
 	change: SchemaChangeInfo,
@@ -259,13 +261,14 @@ export async function deriveAlterMigrationPlan(
 	tableName: string,
 	toMigrate: readonly [string, ConnectionOverlayState][],
 	underlyingRows: EffectiveRowSource | undefined,
+	committedRows: EffectiveRowSource | undefined,
 ): Promise<AlterMigrationPlan> {
 	const setNotNull = deriveSetNotNullBackfill(change, toMigrate);
 	return {
 		addColumn: deriveAddColumnBackfill(change, db, tableName),
 		setNotNull,
 		setDataType: deriveSetDataTypeConvert(change, toMigrate),
-		pkRekey: await derivePkRekey(change, db, tableName, toMigrate, setNotNull, underlyingRows),
+		pkRekey: await derivePkRekey(change, db, tableName, toMigrate, setNotNull, underlyingRows, committedRows),
 	};
 }
 
@@ -430,6 +433,7 @@ async function derivePkRekey(
 	toMigrate: readonly [string, ConnectionOverlayState][],
 	setNotNull: SetNotNullBackfillContext | undefined,
 	underlyingRows: EffectiveRowSource | undefined,
+	committedRows: EffectiveRowSource | undefined,
 ): Promise<PkRekeyContext | undefined> {
 	if (change.type !== 'alterColumn') return undefined;
 	const overlaySchema = probeOverlaySchema(toMigrate);
@@ -452,11 +456,11 @@ async function derivePkRekey(
 	}
 
 	if (setNotNull?.hasDefault && setNotNull.colIndex === colIndex) {
-		// NOTE: one extra scan of the underlying's rows per key-member `set not null` with open
-		// overlays (the underlying repeats it for its own gate; a stream is single-shot and the
-		// answer is not handed down). Fine for DDL this rare; if it ever shows up, thread the
-		// answer to the underlying instead of re-deriving it here.
-		if (!underlyingRows || !await anyRowNullAt(underlyingRows, colIndex)) return undefined; // metadata-only tightening — keys stay
+		// NOTE: up to two extra scans of the underlying's rows per key-member `set not null` with
+		// open overlays (the underlying repeats them for its own gate; a stream is single-shot
+		// and the answer is not handed down). Fine for DDL this rare; if it ever shows up, thread
+		// the answer to the underlying instead of re-deriving it here.
+		if (!await underlyingBackfills(underlyingRows, committedRows, colIndex)) return undefined; // metadata-only tightening — keys stay
 		const keyPos = pkIndices.indexOf(colIndex);
 		const fill = setNotNull.foldedDefault;
 		const serialize = makePkKeySerializer(db, overlaySchema);
@@ -471,7 +475,22 @@ async function derivePkRekey(
 	return undefined;
 }
 
-/** True when any row of the effective stream holds NULL at `colIndex` — the underlyings' backfill gate. */
+/**
+ * The underlyings' `set not null` backfill gate, mirrored: they rewrite when a NULL is in the
+ * rows the transaction can see OR in the committed rows a rollback would restore (both bundled
+ * backends backfill their own committed rows so the restored row satisfies the new rule).
+ */
+async function underlyingBackfills(
+	underlyingRows: EffectiveRowSource | undefined,
+	committedRows: EffectiveRowSource | undefined,
+	colIndex: number,
+): Promise<boolean> {
+	if (underlyingRows && await anyRowNullAt(underlyingRows, colIndex)) return true;
+	if (committedRows && committedRows !== underlyingRows && await anyRowNullAt(committedRows, colIndex)) return true;
+	return false;
+}
+
+/** True when any row of the stream holds NULL at `colIndex`. */
 async function anyRowNullAt(rows: EffectiveRowSource, colIndex: number): Promise<boolean> {
 	for await (const row of rows()) {
 		if (row[colIndex] === null) return true;
@@ -605,6 +624,17 @@ export async function validateOverlayMigration(
 		return;
 	}
 
+	// SET NOT NULL backfill of a KEY member: a deletion marker at the NULL key in a savepoint
+	// frame taken before this ALTER names a committed row the underlying is about to backfill —
+	// its key moves out from under the marker. The migrate step rewrites markers in the CURRENT
+	// frame only (`backfillStagedNotNull`), so `rollback to` that savepoint would restore a marker
+	// that deletes nothing at flush, and the row the transaction deleted would come back. Refuse
+	// (BUSY) while such a frame exists. A live NULL in a frame is the underlying's to refuse: it
+	// judges each frame's merged rows (`IssuerRowSources.savepoints`).
+	if (plan.setNotNull?.hasDefault && plan.pkRekey && !plan.pkRekey.forwardedViaAlterSchema) {
+		await assertNoMarkerAtNullKeyInSavepointFrames(oldOverlay, oldTombstoneIdx, plan.setNotNull, plan.pkRekey.tableName);
+	}
+
 	// A PRIMARY-KEY re-key (SET COLLATE, or the SET NOT NULL backfill of a key member): two
 	// staged LIVE rows landing on one post-change key are a real duplicate — refuse before the
 	// underlying re-keys (atomic for the issuer, poison for a foreign overlay via the caller).
@@ -621,6 +651,27 @@ export async function validateOverlayMigration(
 				`UNIQUE constraint failed: ${pkRekeyCtx.tableName} primary key collides under the new key definition (key: ${keyDesc})`,
 				StatusCode.CONSTRAINT,
 			);
+		}
+	}
+}
+
+/**
+ * Refuses the key-member `set not null` backfill while any open savepoint frame of `overlay`
+ * holds a deletion marker at the NULL key (see the caller for why). An overlay module without
+ * `savepointRowSources` reports no frames; `IsolationModule.effectiveRowsFor` has already
+ * refused the DDL for such a module when savepoints are open.
+ */
+async function assertNoMarkerAtNullKeyInSavepointFrames(
+	overlay: VirtualTable,
+	tombstoneIdx: number,
+	ctx: SetNotNullBackfillContext,
+	tableName: string,
+): Promise<void> {
+	for (const frame of overlay.savepointRowSources?.() ?? []) {
+		for await (const row of frame()) {
+			if (row[tombstoneIdx] === 1 && row[ctx.colIndex] === null) {
+				throw rolledBackRowsWouldViolate(`alter column ${ctx.colName} set not null`, tableName);
+			}
 		}
 	}
 }
@@ -878,10 +929,12 @@ async function forwardAlterColumnToOverlay(
  * backfill's rewrites), and deletes by each marker's OLD primary key — the overlay is still
  * keyed under the old collation / the pre-backfill values at that moment.
  *
- * NOTE: like {@link backfillStagedNotNull}'s rewrites, the drops land in the overlay's
- * CURRENT savepoint frame. A later `rollback to savepoint` taken BEFORE this ALTER restores
- * the marker while the table stays re-keyed — the same divergence class that method's NOTE
- * documents (`bug-rolled-back-rows-violate-surviving-ddl`), not a new hole opened here.
+ * Like {@link backfillStagedNotNull}'s rewrites, the drops land in the overlay's CURRENT
+ * savepoint frame; a frame taken before this ALTER keeps its marker. No such frame can restore
+ * a state the re-keyed table rejects: the `set collate` arm is pre-flighted against every frame
+ * of the overlay's chain (`alterSchema(change, true)` — the overlay module's representability
+ * pass refuses a frame whose marker and live row collide under the new key), and the backfill
+ * arm refuses while any frame holds a marker at the NULL key ({@link validateOverlayMigration}).
  */
 async function dropCollapsedPkRekeyMarkers(
 	host: AlterMigrationHost,
@@ -1010,12 +1063,14 @@ function requireTombstoneIndex(host: AlterMigrationHost, overlaySchema: TableSch
  * no-DEFAULT case rejects (issuer) or poisons (foreign) in {@link validateOverlayMigration}
  * before any overlay is touched.
  *
- * NOTE: these rewrites land in the overlay's CURRENT savepoint frame — each is a normal
- * staged write. A later `rollback to savepoint` taken BEFORE this ALTER therefore restores
- * the pre-backfill NULL while the column stays NOT NULL (DDL is not transactional here).
- * That is the same class of divergence as any rolled-back row violating surviving DDL — a
- * row un-inserted past an ADD CONSTRAINT, say — tracked by the backlog ticket
- * `bug-rolled-back-rows-violate-surviving-ddl`, not a new hole opened by this forward.
+ * These rewrites land in the overlay's CURRENT savepoint frame — each is a normal staged
+ * write — so a frame taken before this ALTER keeps its pre-backfill NULLs, and `rollback to`
+ * that savepoint would restore them under a column that stays NOT NULL (DDL is not
+ * transactional here). The ALTER is therefore refused (BUSY, "commit the pending writes first")
+ * while any such frame holds a NULL: the underlying judges each frame's merged rows
+ * (`IssuerRowSources.savepoints`, as-is — no backfill reaches a wrapper's frame), and
+ * {@link validateOverlayMigration} refuses a marker at the NULL key for the key-member arm. By
+ * the time this runs, no frame a rollback could restore holds a NULL in the column.
  */
 async function backfillStagedNotNull(
 	host: AlterMigrationHost,

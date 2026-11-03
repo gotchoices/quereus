@@ -2754,6 +2754,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			});
 	}
 
+	/** @internal See `DatabaseInternal.getActiveSavepointDepth`. */
+	getActiveSavepointDepth(): number {
+		return this.transactionManager.getActiveSavepointDepth();
+	}
+
 	/**
 	 * @internal Gets all active connections.
 	 * @returns Array of all active connections

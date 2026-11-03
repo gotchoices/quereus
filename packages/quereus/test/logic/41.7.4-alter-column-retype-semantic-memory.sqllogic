@@ -370,7 +370,10 @@ select id from sem8 where v = 'PT3600S';
 
 drop table sem8;
 
--- 8b. …and a collision only among rows the transaction has DELETED does NOT block it.
+-- 8b. …and a collision only among rows the transaction has DELETED is not a constraint
+--     violation either — but a rollback would restore the pair under the re-sorted UNIQUE, so
+--     the retype refuses as retryable (BUSY) and lands once the delete is committed
+--     (41.2.4-ddl-rollback-states.sqllogic has the full matrix).
 create table sem8b (id integer primary key, v text, unique (v));
 insert into sem8b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
 -- run
@@ -380,8 +383,10 @@ begin;
 delete from sem8b where id = 2;
 -- run
 alter table sem8b alter column v set data type timespan;
--- run
+-- error: commit the pending writes first
 commit;
+-- run
+alter table sem8b alter column v set data type timespan;
 -- run
 
 select id from sem8b where v = 'PT3600S';

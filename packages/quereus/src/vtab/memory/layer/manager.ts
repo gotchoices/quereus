@@ -31,9 +31,10 @@ import { buildObjectRefResolver } from '../../../schema/object-ref-resolver.js';
 import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
-import type { EffectiveRowSource } from '../../module.js';
+import type { EffectiveRowSource, IssuerRowSources } from '../../module.js';
+import { judgeRestorableStates } from '../../rollback-states.js';
 import { convertRowAtIndex, mapRows, mapRowsAsync, type RowMapper } from './row-convert.js';
-import { buildAlterColumnPlan, planColumnAttributeChange, type AlterColumnChange, type AlterColumnPlan, type EffectiveRows } from './alter-column.js';
+import { buildAlterColumnPlan, describeAlterColumn, planColumnAttributeChange, type AlterColumnChange, type AlterColumnPlan, type EffectiveRows, type RestorableState } from './alter-column.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -2357,7 +2358,7 @@ export class MemoryTableManager {
 	 * isolation layer uses it to pre-flight an overlay's migration before the shared
 	 * underlying table mutates irreversibly (see `VirtualTable.alterSchema`).
 	 */
-	async alterColumn(change: AlterColumnChange, rows?: EffectiveRowSource, validateOnly = false): Promise<void> {
+	async alterColumn(change: AlterColumnChange, rows?: IssuerRowSources, validateOnly = false): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2374,21 +2375,26 @@ export class MemoryTableManager {
 
 			// Decide + validate, in that order and both before any mutation: `planColumnAttributeChange`
 			// runs the attribute's own pre-validation (the NULL scan, the convertibility scan, the
-			// primary-key carve-outs) over the effective rows, and `validateAlterColumnPlan` runs the
-			// re-keyed UNIQUE / primary-key probes over the schema it produced. Nothing above
-			// `applyAlterColumnToBase` writes, so a throw from either leaves the table as it was.
+			// primary-key carve-outs) over the effective rows and every restorable state, and
+			// `validateAlterColumnPlan` runs the re-keyed UNIQUE / primary-key probes over the schema
+			// it produced. Nothing above `applyAlterColumnToBase` writes, so a throw from either
+			// leaves the table as it was. The restorable states are read AFTER
+			// `ensureSchemaChangeSafety` above, which is what re-points the lazy savepoint markers.
+			const ddl = describeAlterColumn(change);
 			const attributeChange = await planColumnAttributeChange({
 				schema: this.tableSchema,
 				tableName: this._tableName,
 				columnName: change.columnName,
 				colIndex,
 				effectiveRows: this.effectiveRowSource(rows),
+				restorableStates: this.restorableStates(rows),
+				ddl,
 				isCollationRegistered: (n) => this.db.isCollationRegistered(n),
 			}, change);
 			if (attributeChange === null) return; // already in the requested state — nothing to do
 
 			const plan = buildAlterColumnPlan(this.tableSchema, colIndex, attributeChange);
-			await this.validateAlterColumnPlan(plan, rows);
+			await this.validateAlterColumnPlan(plan, rows, ddl);
 
 			// Dry run ends here: everything above validates without mutating (the one earlier
 			// side effect, ensureSchemaChangeSafety's committed-layer drain, is semantically
@@ -2449,7 +2455,7 @@ export class MemoryTableManager {
 	 */
 	async alterPrimaryKey(
 		newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 		validateOnly = false,
 	): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
@@ -2471,7 +2477,8 @@ export class MemoryTableManager {
 			// is LEGAL (CONSTRAINT on a visible collision), the manager's own layer chain
 			// whether the re-keyed trees can PHYSICALLY carry it (BUSY when only rows a
 			// rollback must restore collide). A throw leaves everything as it was.
-			await this.validateRekeyedPrimaryKey(newSchema, rows);
+			const keyColumns = newPkColumns.map(pk => this.tableSchema.columns[pk.index]?.name ?? String(pk.index)).join(', ');
+			await this.validateRekeyedPrimaryKey(newSchema, rows, `alter primary key (${keyColumns})`);
 
 			// Dry run ends here: everything above validates without mutating, everything
 			// below mutates. See the method doc.
@@ -2593,24 +2600,23 @@ export class MemoryTableManager {
 	 * what would merge two committed rows — decides representability. A retype of a PK column is
 	 * rejected upstream, so `rewrite` + `pkColumnRekeyed` is only ever the backfill.
 	 */
-	private async validateAlterColumnPlan(plan: AlterColumnPlan, rows?: EffectiveRowSource): Promise<void> {
+	private async validateAlterColumnPlan(plan: AlterColumnPlan, rows: IssuerRowSources | undefined, ddl: string): Promise<void> {
 		if (plan.rewrite) {
 			const { convert, convertNulls } = plan.rewrite;
-			// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
-			// the probe sees is visible to the transaction, and the `set data type` pre-pass
-			// already proved each one convertible, so a throw is unreachable; surfacing it as
-			// MISMATCH still beats probing a stale value that could mask a collision.
+			// A conversion failure here is NOT swallowed. The `set data type` pre-pass already
+			// proved every value convertible — in the effective rows and in every restorable
+			// state — so a throw is unreachable; surfacing it (MISMATCH, or BUSY over a
+			// restorable state) still beats probing a stale value that could mask a collision.
 			const mapRow: RowMapper = row => convertRowAtIndex(row, plan.colIndex, convert, convertNulls);
-			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows, mapRow);
-			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows, mapRow);
+			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows, ddl, mapRow);
+			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows, ddl, mapRow);
 		} else if (plan.structuresRekeyed) {
-			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows);
-			// Unlike the secondary-structure pass above — which only ever judges the effective
-			// rows — the PK pass judges TWO row sets: the effective rows (`rows` when a wrapper
-			// supplies them) decide whether the change is LEGAL, and this manager's own layer
-			// chain decides whether the re-keyed trees can PHYSICALLY carry it. See
+			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows, ddl);
+			// The secondary-structure pass above judges the effective rows and each restorable
+			// state with ONE probe. The PK pass asks a second question of this manager's own layer
+			// chain — whether the re-keyed trees can PHYSICALLY carry the change — see
 			// `validateRekeyedPrimaryKey` for why the sets differ and which status each raises.
-			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows);
+			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows, ddl);
 		}
 	}
 
@@ -2641,11 +2647,8 @@ export class MemoryTableManager {
 			// if a wide-index table ever shows this as slow, filter to indexes whose columns
 			// include colIndex. Mirrors the `set collate` path's unconditional rebuild.
 			//
-			// `set data type`: a base value that fails to convert is kept as-is — validation over
-			// the effective view already rejected any unconvertible value the transaction can SEE,
-			// so a surviving one is shadowed by a pending delete/overwrite and is never read back
-			// (a ROLLBACK re-exposes it under the new type — DDL is not undone by rollback, the
-			// known behavior of `feat-ddl-transaction-capability`).
+			// `set data type`: every base value converts — the pre-pass judged the base as a
+			// restorable state and refused the ALTER (BUSY) over any value that would not.
 			// `set not null` (`convertNulls`): null base values are mapped to the DEFAULT literal.
 			const convertedBaseRows = this.convertBaseRows(plan.colIndex, plan.rewrite.convert, plan.rewrite.convertNulls);
 			undo.basePrimaryTree = this.baseLayer.primaryTree;
@@ -2712,11 +2715,67 @@ export class MemoryTableManager {
 	 * view ({@link effectiveDdlRows}) — which stays a SYNC iterable on purpose, so a scan over it
 	 * cannot be interleaved with another connection's write. See `scanEffectiveRows`.
 	 */
-	private effectiveRowSource(rows?: EffectiveRowSource): EffectiveRows {
-		return rows ?? (() => this.effectiveDdlRows());
+	private effectiveRowSource(rows?: IssuerRowSources): EffectiveRows {
+		return rows ? rows.effective : () => this.effectiveDdlRows();
 	}
 
-	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean, rows?: EffectiveRowSource): Promise<void> {
+	/**
+	 * Every state a `rollback` or `rollback to savepoint` could return this table to, each as a
+	 * re-callable row stream a row-validating DDL judges on its own — with the same check the
+	 * effective rows get, a violation rewrapped as `BUSY` (docs/memory-table.md § DDL and
+	 * transactions, rule 1; `judgeRestorableStates`). The base is what a whole-transaction
+	 * rollback restores; unwrapped, each open savepoint restores the layer
+	 * {@link MemoryTableConnection.savepointRestoreLayers} names. A wrapper that stages the
+	 * transaction's rows outside this manager hands the savepoint states down instead
+	 * (`IssuerRowSources.savepoints`): the base is then exactly the committed rows the wrapper
+	 * cannot see, and this manager's own markers (all lazy, re-pointed at the base) add nothing.
+	 *
+	 * Empty when no state differs from the effective rows — no wrapper and no open work — so the
+	 * common autocommit DDL pays no second scan. Must run AFTER `ensureSchemaChangeSafety`, which
+	 * drains the committed chain into the base and re-points the lazy markers.
+	 *
+	 * `backfilled` marks the states this manager's own value rewrite reaches: the base
+	 * (`convertBaseRows`) and every layer in the chain (`TransactionLayer.convertColumn`). A
+	 * wrapper's frame is not reached, so `set not null` judges it as-is (see `RestorableState`).
+	 * Own states are SYNC iterables for the same reason `effectiveDdlRows` is (`scanRows`).
+	 */
+	private restorableStates(rows?: IssuerRowSources): RestorableState[] {
+		const connection = this.ddlConnection();
+		if (!rows && !connection?.hasOpenWork()) return [];
+		const base: RestorableState = { rows: () => iteratePrimaryRows(this.baseLayer.primaryTree), backfilled: true };
+		if (rows) return [base, ...rows.savepoints.map(source => ({ rows: source, backfilled: false }))];
+		return [base, ...this.savepointRestoreLayers(connection).map(layer => ({ rows: () => this.layerRows(layer), backfilled: true }))];
+	}
+
+	/**
+	 * The layers a `rollback to savepoint` on `connection` could reinstate, oldest first, base
+	 * excluded — the base is the whole-rollback state and is judged on its own.
+	 */
+	private savepointRestoreLayers(connection: MemoryTableConnection | undefined): Layer[] {
+		if (!connection) return [];
+		return connection.savepointRestoreLayers().filter(layer => layer !== this.baseLayer);
+	}
+
+	/** The rows `layer`'s merged view holds — what a connection reading through it sees. */
+	private layerRows(layer: Layer): Iterable<Row> {
+		return iteratePrimaryRows(layer.getModificationTree('primary') ?? this.baseLayer.primaryTree);
+	}
+
+	/**
+	 * `VirtualTable.savepointRowSources` for `connection`: the rows each open savepoint would
+	 * restore, oldest first, as re-callable async streams. Read by a wrapper module (the isolation
+	 * layer) off its staging table, so the savepoint states of a transaction it stages can be
+	 * judged by the wrapped module. Resolves each layer's tree per call, not up front — an ALTER on
+	 * this table replaces layer trees, and a stream built before it must not read a stale one.
+	 */
+	public savepointRowSources(connection: MemoryTableConnection): EffectiveRowSource[] {
+		return this.savepointRestoreLayers(connection).map(layer => {
+			const rows = (): Iterable<Row> => this.layerRows(layer);
+			return async function* () { yield* rows(); };
+		});
+	}
+
+	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean, rows?: IssuerRowSources): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2740,11 +2799,14 @@ export class MemoryTableManager {
 			}
 
 			// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows — a
-			// duplicate the transaction inserted but has not committed must reject the build,
-			// and one it has deleted must not. A throw here leaves schema, base layer and
-			// index map exactly as they were.
+			// duplicate the transaction inserted but has not committed must reject the build
+			// (CONSTRAINT) — and then over every state a rollback could restore: a duplicate it
+			// has deleted does not make the index illegal, but it would come back under the
+			// index on rollback, so it refuses as BUSY. A throw here leaves schema, base layer
+			// and index map exactly as they were.
 			if (newIndexSchemaEntry.unique) {
 				await this.validateUniqueOverEffectiveRows(newIndexSchemaEntry, this.tableSchema, rows);
+				await this.assertUniqueOverRestorableStates(newIndexSchemaEntry, this.tableSchema, rows, `create unique index ${indexName}`);
 			}
 
 			const updatedIndexes = Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry]);
@@ -3036,7 +3098,7 @@ export class MemoryTableManager {
 	 *   only for modules that omit `alterTable` — which cannot DROP/RENAME a constraint
 	 *   anyway.)
 	 */
-	async addConstraint(constraint: ASTTableConstraint, rows?: EffectiveRowSource): Promise<void> {
+	async addConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -3102,7 +3164,7 @@ export class MemoryTableManager {
 	 * unless an existing *unique* index already covers the exact columns — in which
 	 * case the data is already validated and we only register the covering structure.
 	 */
-	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: EffectiveRowSource): Promise<void> {
+	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources): Promise<void> {
 		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
 		const columns = this.tableSchema.columns;
 		const existingIndexes = this.tableSchema.indexes ?? [];
@@ -3160,11 +3222,16 @@ export class MemoryTableManager {
 		};
 
 		// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows (throws
-		// CONSTRAINT on the first in-scope duplicate). The covering index carries no
-		// `unique: true` flag, so `addIndexToBase` would not check it anyway — and must
-		// not: it populates from committed rows, which may still hold a duplicate this
-		// transaction has deleted.
+		// CONSTRAINT on the first in-scope duplicate), then over every state a rollback could
+		// restore (BUSY — see `createIndex`). The covering index carries no `unique: true`
+		// flag, so `addIndexToBase` would not check it anyway — and must not: it populates
+		// from committed rows, which the restorable-state pass has already judged.
 		await this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema, rows);
+		const constrainedColumns = uc.columns.map(colIdx => columns[colIdx]?.name ?? String(colIdx)).join(', ');
+		await this.assertUniqueOverRestorableStates(
+			indexSchema, this.tableSchema, rows,
+			`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
+		);
 
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,
@@ -3408,20 +3475,24 @@ export class MemoryTableManager {
 	/**
 	 * The committed base rows for `alter column … set data type` / `set not null` backfill, with the
 	 * value at `colIndex` run through `convert`. NULLs pass through untouched UNLESS `convertNulls` is
-	 * set (the SET NOT NULL backfill maps null → DEFAULT). A value that fails to convert is kept as-is:
-	 * the manager validated every value in the effective VIEW before calling, so a base value that
-	 * fails here is one a pending delete/overwrite shadows and no reader can see. The result is a fresh
-	 * full row list for {@link BaseLayer.rebuildPrimaryTreeFromRows} — the base primary tree is
-	 * REPLACED, never mutated in place (inheritree forbids mutating a tree the open transaction's
-	 * layers derive from).
+	 * set (the SET NOT NULL backfill maps null → DEFAULT). Every value converts: the pre-pass judged
+	 * the base as a restorable state (`restorableStates`) and refused the ALTER over any value that
+	 * would not, so a failure here is a hole in that pass and is raised as INTERNAL rather than left
+	 * in the column under the new type. The result is a fresh full row list for
+	 * {@link BaseLayer.rebuildPrimaryTreeFromRows} — the base primary tree is REPLACED, never mutated
+	 * in place (inheritree forbids mutating a tree the open transaction's layers derive from).
 	 */
 	private convertBaseRows(colIndex: number, convert: (v: SqlValue) => SqlValue, convertNulls = false): Row[] {
 		const out: Row[] = [];
 		for (const row of iteratePrimaryRows(this.baseLayer.primaryTree)) {
 			try {
 				out.push(convertRowAtIndex(row, colIndex, convert, convertNulls));
-			} catch {
-				out.push(row); // shadowed unconvertible value — keep as-is
+			} catch (e) {
+				throw new QuereusError(
+					`Base row of table ${this._tableName} failed to convert after the pre-pass accepted every restorable state`,
+					StatusCode.INTERNAL,
+					e instanceof Error ? e : undefined,
+				);
 			}
 		}
 		return out;
@@ -3429,24 +3500,59 @@ export class MemoryTableManager {
 
 	/**
 	 * Rejects an index/constraint whose uniqueness the DDL transaction's own effective rows
-	 * already violate, BEFORE anything is mutated. Builds a throwaway {@link MemoryIndex} —
-	 * the collation-aware, partial-predicate-aware key comparator — over those rows and lets
-	 * {@link populateIndexFromRows} raise CONSTRAINT on the first duplicate.
+	 * already violate, BEFORE anything is mutated (`CONSTRAINT`).
 	 *
 	 * `rows` overrides {@link effectiveDdlRows}. A wrapper module (the isolation layer) holds
 	 * the transaction's pending rows outside this manager, so only it can name the rows the
 	 * issuing connection actually sees; when it supplies them, they are the judged set and this
-	 * manager's own committed rows are ignored. See `vtab/module.ts` {@link EffectiveRowSource}.
+	 * manager's own committed rows are ignored here — they are judged by
+	 * {@link assertUniqueOverRestorableStates} instead. See `vtab/module.ts` {@link IssuerRowSources}.
+	 */
+	private validateUniqueOverEffectiveRows(
+		indexSchema: IndexSchema,
+		schema: TableSchema,
+		rows?: IssuerRowSources,
+		mapRow?: RowMapper,
+	): Promise<void> {
+		return this.validateUniqueOverRows(indexSchema, schema, this.effectiveRowSource(rows), mapRow);
+	}
+
+	/**
+	 * The same probe over every state a rollback could restore ({@link restorableStates}), each
+	 * on its own, a duplicate rewrapped as `BUSY` (`judgeRestorableStates`). Runs AFTER the
+	 * effective pass, so a duplicate the transaction can see keeps its `CONSTRAINT`.
+	 */
+	private assertUniqueOverRestorableStates(
+		indexSchema: IndexSchema,
+		schema: TableSchema,
+		rows: IssuerRowSources | undefined,
+		ddl: string,
+		mapRow?: RowMapper,
+	): Promise<void> {
+		return judgeRestorableStates(
+			this.restorableStates(rows),
+			state => this.validateUniqueOverRows(indexSchema, schema, state.rows, mapRow),
+			ddl,
+			this._tableName,
+		);
+	}
+
+	/**
+	 * Builds a throwaway {@link MemoryIndex} — the collation-aware, partial-predicate-aware key
+	 * comparator — over `source`'s rows and lets {@link populateIndexFromRows} raise CONSTRAINT on
+	 * the first duplicate. Mutates nothing.
 	 *
 	 * `mapRow` judges the rows in a form they do not yet have on disk: an `alter column` that
 	 * REWRITES values passes the per-row conversion here, so the probe sees the post-ALTER
-	 * values. Applied to whichever stream is used; the mapping is a read-side wrap and mutates
-	 * nothing.
+	 * values. Applied to whichever stream is used; the mapping is a read-side wrap.
+	 *
+	 * Keeps a synchronous source synchronous (the manager's own layered walks) for the reason
+	 * `scanRows` in alter-column.ts gives; a wrapper's stream is genuinely async.
 	 */
-	private async validateUniqueOverEffectiveRows(
+	private async validateUniqueOverRows(
 		indexSchema: IndexSchema,
 		schema: TableSchema,
-		rows?: EffectiveRowSource,
+		source: EffectiveRows,
 		mapRow?: RowMapper,
 	): Promise<void> {
 		const probe = new MemoryIndex(
@@ -3457,10 +3563,10 @@ export class MemoryTableManager {
 			this.primaryKeyFunctions.encode,
 			schema.name,
 		);
-		if (rows) {
-			const stream = mapRow ? mapRowsAsync(rows(), mapRow) : rows();
+		const rows = source();
+		if (Symbol.asyncIterator in rows) {
 			await populateIndexFromRowsAsync(
-				stream,
+				mapRow ? mapRowsAsync(rows, mapRow) : rows,
 				probe,
 				this.primaryKeyFunctions.extractFromRow,
 				true,
@@ -3469,9 +3575,8 @@ export class MemoryTableManager {
 			);
 			return;
 		}
-		const own = this.effectiveDdlRows();
 		populateIndexFromRows(
-			mapRow ? mapRows(own, mapRow) : own,
+			mapRow ? mapRows(rows, mapRow) : rows,
 			probe,
 			this.primaryKeyFunctions.extractFromRow,
 			true,
@@ -3483,8 +3588,9 @@ export class MemoryTableManager {
 	/**
 	 * `ALTER COLUMN` arm of {@link validateUniqueOverEffectiveRows}: rejects the change when it
 	 * makes two of the DDL transaction's effective rows collide under any uniqueness-enforcing
-	 * structure that covers the altered column. Runs before anything is mutated, so a rejection
-	 * leaves the table and schema untouched and the transaction usable.
+	 * structure that covers the altered column (`CONSTRAINT`), or two rows of any state a rollback
+	 * could restore ({@link assertUniqueOverRestorableStates}, `BUSY`). Runs before anything is
+	 * mutated, so a rejection leaves the table and schema untouched and the transaction usable.
 	 *
 	 * Serves both families of change that can collapse two distinct values onto one:
 	 *
@@ -3507,7 +3613,8 @@ export class MemoryTableManager {
 	private async validateRekeyedUniqueStructures(
 		newSchema: TableSchema,
 		alteredColumnIndex: number,
-		rows?: EffectiveRowSource,
+		rows: IssuerRowSources | undefined,
+		ddl: string,
 		mapRow?: RowMapper,
 	): Promise<void> {
 		// NOTE: the probe index carries the manager's PRE-change `primaryKeyFunctions` (the new
@@ -3520,6 +3627,7 @@ export class MemoryTableManager {
 			if (!indexEnforcesUnique(newSchema, indexSchema)) continue;
 			// `rows` is re-callable, so each structure gets a fresh stream.
 			await this.validateUniqueOverEffectiveRows(indexSchema, newSchema, rows, mapRow);
+			await this.assertUniqueOverRestorableStates(indexSchema, newSchema, rows, ddl, mapRow);
 		}
 	}
 
@@ -3559,6 +3667,9 @@ export class MemoryTableManager {
 	 * rows only in the layers. When `rows` is supplied, the view layer holds the COMMITTED
 	 * rows — not a subset of what pass 1 judged — so pass 2 starts AT the view; when `rows`
 	 * is absent, pass 1 judged exactly the view's rows and pass 2 starts at its parent.
+	 * A wrapper's savepoint states (`rows.savepoints`) are in neither set — their staged rows
+	 * live in the wrapper, their committed rows here — so pass 1's legality probe runs once
+	 * more over each of them, a collision rewrapped as `BUSY` like every other restorable state.
 	 *
 	 * Pass 2 is deliberately conservative. The chain holds one immutable layer per statement
 	 * boundary (see `MemoryTableConnection.createSavepoint`'s eager path), so it rejects any
@@ -3573,17 +3684,18 @@ export class MemoryTableManager {
 	 * collisions anywhere in the chain, every primary key resolves to at most one row in
 	 * each layer under the new definition.
 	 */
-	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows?: EffectiveRowSource, mapRow?: RowMapper): Promise<void> {
+	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows: IssuerRowSources | undefined, ddl: string, mapRow?: RowMapper): Promise<void> {
 		const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 		const connection = this.ddlConnection();
 		const view: Layer = connection
 			? (connection.pendingTransactionLayer ?? connection.readLayer)
 			: this.baseLayer;
+		const keyIsTuple = primaryKeyArity(newSchema) !== 1;
 
 		await this.assertNoPrimaryKeyCollisionInRows(
-			rows ? rows() : this.effectiveDdlRows(),
+			rows ? rows.effective() : this.effectiveDdlRows(),
 			newPkFunctions,
-			primaryKeyArity(newSchema) !== 1,
+			keyIsTuple,
 			mapRow,
 		);
 
@@ -3592,6 +3704,15 @@ export class MemoryTableManager {
 		// layers plus the base — every tree a rollback could restore.
 		for (let layer: Layer | null = rows ? view : view.getParent(); layer; layer = layer.getParent()) {
 			this.assertNoPrimaryKeyCollisionInLayer(layer, newPkFunctions, mapRow);
+		}
+
+		if (rows) {
+			await judgeRestorableStates(
+				rows.savepoints,
+				state => this.assertNoPrimaryKeyCollisionInRows(state(), newPkFunctions, keyIsTuple, mapRow),
+				ddl,
+				this._tableName,
+			);
 		}
 	}
 

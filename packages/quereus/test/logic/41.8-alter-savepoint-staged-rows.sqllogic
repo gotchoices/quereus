@@ -395,13 +395,19 @@ drop table t10;
 
 -- ADD CONSTRAINT UNIQUE over a primary-key member with two in-transaction deletions:
 -- the two deletion markers share a = 1, and a naive uniqueness check over them would
--- report a phantom duplicate. Deleted rows are not rows — the ALTER must succeed.
+-- report a phantom duplicate. Deleted rows are not rows — the ALTER must succeed. The
+-- pair is staged in THIS transaction (a delete of a staged row keeps a marker under the
+-- isolation wrapper) so that no committed state holds it: a committed pair deleted
+-- in-transaction is refused instead, since a rollback would restore it under the
+-- constraint (41.2.4-ddl-rollback-states.sqllogic).
 create table t11 (a integer, b integer, primary key (a, b));
 -- run
-insert into t11 values (1, 1), (1, 2), (2, 1);
+insert into t11 values (2, 1);
 -- run
 
 begin;
+-- run
+insert into t11 values (1, 1), (1, 2);
 -- run
 delete from t11 where a = 1;
 -- run

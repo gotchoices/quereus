@@ -589,10 +589,10 @@ export class TransactionLayer implements Layer {
 	 * any later `create index` ({@link reindexOwnWrites}) replay.
 	 *
 	 * NULL own-values pass through untouched UNLESS `convertNulls` is set (the SET NOT NULL backfill
-	 * maps null → DEFAULT). A value that fails to convert is left as-is (not an error): the manager
-	 * validated every value in the effective VIEW before calling, so an unconvertible own value here is
-	 * one a higher layer has shadowed — it is never read through this layer, and re-converting it would
-	 * double-fault a value the transaction cannot see. It matches the base rewrite's same-reasoned skip.
+	 * maps null → DEFAULT). Every own value converts: the manager's pre-pass judged the effective view
+	 * AND every state a rollback could restore (`MemoryTableManager.restorableStates`), refusing the
+	 * ALTER over any value that would not, so a failure here is a hole in that pass and is raised as
+	 * INTERNAL — like the base rewrite (`convertBaseRows`) — rather than left in the column.
 	 */
 	public convertColumn(colIndex: number, convert: (v: SqlValue) => SqlValue, newSchema: TableSchema, convertNulls = false): void {
 		const preTree = this.primaryModifications;
@@ -615,11 +615,15 @@ export class TransactionLayer implements Layer {
 				survivingDeletions.push(convertKey(write.primaryKey));
 				continue;
 			}
-			let newRow = effectiveRow;
+			let newRow: Row;
 			try {
 				newRow = convertRowAtIndex(effectiveRow, colIndex, convert, convertNulls);
-			} catch {
-				// Shadowed unconvertible own value — leave as-is (see method doc).
+			} catch (e) {
+				throw new QuereusError(
+					`Own row of layer ${this.getLayerId()} failed to convert after the pre-pass accepted every restorable state`,
+					StatusCode.INTERNAL,
+					e instanceof Error ? e : undefined,
+				);
 			}
 			upserts.push(newRow);
 		}

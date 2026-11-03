@@ -1,5 +1,5 @@
 import { VirtualTable } from '../table.js';
-import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from '../module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, IssuerRowSources, SchemaChangeInfo } from '../module.js';
 import type { Database } from '../../core/database.js';
 import type { Row, SqlValue, CompareFn, UpdateResult } from '../../common/types.js';
 import { type IndexSchema, type TableSchema } from '../../schema/table.js';
@@ -297,6 +297,18 @@ export class MemoryTable extends VirtualTable {
 		if (!this.connection) return; // No connection, no savepoints to rollback to
 		this.connection.rollbackToSavepoint(savepointIndex);
 	}
+
+	/**
+	 * The rows each open savepoint of this instance's connection would restore, oldest first
+	 * (`VirtualTable.savepointRowSources`). Read by the isolation layer off its overlay staging
+	 * table — whose connection is the one the database replays the transaction's savepoint stack
+	 * onto — to hand the wrapped module the savepoint states it must judge. No connection means
+	 * nothing staged and nothing to restore.
+	 */
+	savepointRowSources(): readonly EffectiveRowSource[] {
+		if (!this.connection) return [];
+		return this.manager.savepointRowSources(this.connection);
+	}
 	// --- End Savepoint operations ---
 
 
@@ -398,7 +410,7 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	// --- Index DDL methods delegate to the manager ---
-	async createIndex(indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
+	async createIndex(indexSchema: IndexSchema, rows?: IssuerRowSources): Promise<void> {
 		logger.operation('Create Index', this.tableName, { indexName: indexSchema.name });
 		await this.manager.createIndex(indexSchema, undefined, rows);
 		this.tableSchema = this.manager.tableSchema; // Refresh local schema ref

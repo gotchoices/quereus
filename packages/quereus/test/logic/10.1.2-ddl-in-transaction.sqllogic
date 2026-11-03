@@ -91,7 +91,9 @@ insert into ddl_tx_c values (4, 'b');
 -- Lives in 10.1.2.1-add-constraint-in-transaction § 2 (it needs no index DDL).
 
 -- ===================================
--- 6. A pending DELETE removes a committed duplicate, so the build is legal
+-- 6. A pending DELETE removes a committed duplicate: the build is not ILLEGAL, but a rollback
+--    would restore the duplicate under the index, so it is refused as retryable and lands once
+--    the delete is committed (41.2.4-ddl-rollback-states.sqllogic has the full matrix).
 -- ===================================
 
 create table ddl_tx_e (id integer primary key, v text);
@@ -105,12 +107,16 @@ begin;
 delete from ddl_tx_e where id = 2;
 -- run
 create unique index ddl_tx_e_ix on ddl_tx_e (v);
--- run
+-- error: commit the pending writes first
 commit;
+-- run
+create unique index ddl_tx_e_ix on ddl_tx_e (v);
 -- run
 
 select id, v from ddl_tx_e order by id;
 → [{ "id": 1, "v": "a" }]
+insert into ddl_tx_e values (3, 'a');
+-- error: UNIQUE constraint failed
 
 -- ===================================
 -- 7. NULLs are distinct: multiple pending NULLs never block the build

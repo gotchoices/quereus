@@ -761,7 +761,7 @@ row before returning or acting on it. See [memory-table.md](memory-table.md) § 
 transactions for the full statement of the boundary and what a fully-cooperating module would
 do instead.
 
-#### When the pending rows live outside your module: `EffectiveRowSource`
+#### When the pending rows live outside your module: `IssuerRowSources`
 
 A module cannot always reach the transaction's uncommitted rows. Under the isolation layer
 (`@quereus/isolation`) each connection's writes are staged in a private in-memory *overlay*;
@@ -775,34 +775,64 @@ The optional last parameter of `createIndex` and `alterTable` closes that gap:
 /** Re-callable; each call returns a fresh stream. */
 export type EffectiveRowSource = () => AsyncIterable<Row>;
 
-createIndex?(db, schemaName, tableName, indexSchema, rows?: EffectiveRowSource): Promise<void>;
-alterTable?(db, schemaName, tableName, change, rows?: EffectiveRowSource): Promise<TableSchema>;
-createIndex?(indexSchema, rows?: EffectiveRowSource): Promise<void>;   // VirtualTable, instance level
+export interface IssuerRowSources {
+	/** The rows the issuing transaction can SEE now. Judged for CONSTRAINT / MISMATCH. */
+	readonly effective: EffectiveRowSource;
+	/** The rows it would see after `rollback to` each open savepoint, oldest first. Each is
+	 *  judged on its own; a violation refuses with BUSY. */
+	readonly savepoints: readonly EffectiveRowSource[];
+}
+
+createIndex?(db, schemaName, tableName, indexSchema, rows?: IssuerRowSources): Promise<void>;
+alterTable?(db, schemaName, tableName, change, rows?: IssuerRowSources): Promise<TableSchema>;
+createIndex?(indexSchema, rows?: IssuerRowSources): Promise<void>;   // VirtualTable, instance level
+savepointRowSources?(): readonly EffectiveRowSource[];             // VirtualTable, the staging table's half
 ```
 
 **Who supplies it.** Only a wrapper module that holds the issuing connection's pending rows
 outside the target module. The engine's own emitters (`CREATE INDEX`, `ALTER TABLE`) pass
-nothing, so an unwrapped module keeps validating its own effective rows exactly as before. The
-isolation layer supplies its issuing connection's merged view: committed rows, minus the ones
-that connection's overlay tombstones, superseded by the ones it rewrote, plus the ones it
-added. A *foreign* connection's overlay never contributes — its staged duplicates are its own
-problem at commit time, exactly as a concurrent duplicate insert would be.
+nothing, so an unwrapped module keeps validating its own effective rows — and its own rollback
+states — exactly as before. The isolation layer supplies its issuing connection's merged view as
+`effective` (committed rows, minus the ones that connection's overlay tombstones, superseded by
+the ones it rewrote, plus the ones it added) and the same merge over the overlay's rows *as they
+stood at each open savepoint* as `savepoints`, read off the staging table through
+`VirtualTable.savepointRowSources` (the memory module implements it; a staging module without it
+cannot serve row-validating DDL under open savepoints, and the isolation layer refuses such a DDL
+with `BUSY` rather than leave a rollback state unjudged). Savepoints taken before the overlay
+existed restore the committed state and are not listed. A *foreign* connection's overlay never
+contributes — its staged duplicates are its own problem at commit time, exactly as a concurrent
+duplicate insert would be. It is one bundle rather than two optional parameters so a wrapper
+cannot hand down the effective rows and forget the rollback states.
 
-**What the receiver must do with it.** When `rows` is present it is the ONLY set the module may
-judge row CONTENT against:
+**What the receiver must do with it.** When `rows` is present:
 
-*   Every row-content check — UNIQUE duplicate detection, collation-rekey collision detection,
-    value-rewrite collapse detection (`SET DATA TYPE` / `SET NOT NULL` backfill, judged with the
-    altered column already converted) — reads this stream.
+*   Every row-content check for the statement's *legality* — UNIQUE duplicate detection,
+    collation-rekey collision detection, value-rewrite collapse detection (`SET DATA TYPE` /
+    `SET NOT NULL` backfill, judged with the altered column already converted), the
+    convertibility scan, the NULL scan — reads `rows.effective`. A violation there keeps the
+    statement's own status: `CONSTRAINT`, or `MISMATCH` for an unconvertible value.
 *   The module MUST NOT reject the DDL as a *constraint violation* over a duplicate that exists
     only in its own committed data. That duplicate may be a row the issuing transaction has
     already deleted; calling it invalid data is a false positive the caller cannot work around.
-    **One narrow exception:** a structure that physically cannot *hold* the duplicate — a re-keyed
-    PRIMARY KEY tree, which is a map, not a multi-map, and whose committed rows must survive a
-    rollback — may still refuse. It must do so as `BUSY` ("commit/rollback and retry"), never
-    `CONSTRAINT`: the data is valid, the storage merely cannot represent it while those rows are
-    still resident. Both bundled backends do exactly this for `ALTER COLUMN … SET COLLATE` on a
-    PK member.
+*   It MUST NOT accept it either. DDL survives a rollback on every bundled backend
+    ([module-capabilities.md](module-capabilities.md#ddl-transactionality-tiers)) while the rows
+    it was judged against do not, so the module then runs the *same* check, on its own, over each
+    state a rollback could restore: its own committed rows (the whole-transaction rollback state,
+    which only it holds) and each of `rows.savepoints`. A violation confined to such a state
+    refuses with `BUSY` and the message `rolledBackRowsWouldViolate` builds — "rows this
+    transaction has deleted or overwritten would violate it if the transaction rolled back. Commit
+    the pending writes first, then retry." `judgeRestorableStates` runs a probe over each state and
+    rewraps its `CONSTRAINT` / `MISMATCH` as that `BUSY`, so the wording lives in one place; run it
+    *after* the effective pass so a visible violation keeps its own status. (A primary-key re-key
+    refuses with the same status when its map-shaped tree physically cannot hold a committed pair
+    — both bundled backends, for `ALTER COLUMN … SET COLLATE` on a PK member.)
+*   Judge each state as the rows it will hold *after your rewrite reaches it*. Your committed
+    rows are rewritten by a `SET DATA TYPE` / `SET NOT NULL` backfill, so a committed NULL under a
+    usable `DEFAULT` is backfilled, not refused — and that forces the backfill even when the
+    transaction itself sees no NULL. A wrapper's savepoint frame is *not* reached by your rewrite:
+    judge it as-is, so a NULL there refuses under `SET NOT NULL` whether or not a `DEFAULT`
+    exists. (`SET DATA TYPE` applies the conversion before judging every state; an unconvertible
+    value refuses either way.)
 *   Physical structures are still built from the module's OWN rows. Building an index over
     committed rows while validating over the merged view is deliberate and sound: an index entry
     with no live row behind it is harmless, because every reader resolves an entry back to its
@@ -810,14 +840,9 @@ judge row CONTENT against:
     site (`BaseLayer.addIndexToBase`, `StoreModule.buildIndexEntries`).
 *   Validate BEFORE creating any physical artifact, so a rejection leaves nothing behind.
 
-`rows` is re-callable because a single `ALTER` may validate more than once (one pass per UNIQUE
-constraint covering the altered column). Row order is unspecified — every consumer is a
-set-shaped check.
-
-Not covered: a PRIMARY KEY collision introduced by `ALTER COLUMN ... SET COLLATE` on a PK
-member. The wrapper's staged rows are re-keyed inside the wrapper's own overlay and the
-module's inside its own store, so a pending row that collides with a committed one under the
-new collation is checked by neither. Both re-key sites carry a `NOTE:` to that effect.
+Every stream is re-callable because a single `ALTER` may validate more than once (one pass per
+UNIQUE constraint covering the altered column, per state). Row order is unspecified — every
+consumer is a set-shaped check.
 
 ### Connection Registration
 

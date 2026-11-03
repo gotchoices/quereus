@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, getModuleReadCommittedSnapshot, installCommitStall, runCommittedReadConformance, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor, EffectiveRowSource } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor, IssuerRowSources } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 import { makeFullScanFilterInfo } from '../src/filter-info.js';
@@ -2507,6 +2507,59 @@ describe('IsolationModule', () => {
 			expect(err, 'NOT NULL enforced after commit').to.be.instanceOf(QuereusError);
 		});
 
+		it('SET NOT NULL … DEFAULT refuses (BUSY) while a savepoint frame holds a staged NULL the backfill cannot reach', async () => {
+			// The backfill rewrites the overlay's CURRENT frame only; a frame taken before the
+			// ALTER keeps its NULL, and `rollback to` it would restore that NULL under a column that
+			// stays NOT NULL. The underlying judges the frame as-is (`IssuerRowSources.savepoints`).
+			await db.exec(`CREATE TABLE csp_bfs (id INTEGER PRIMARY KEY, v TEXT NULL DEFAULT 'filled') USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_bfs VALUES (1, NULL)`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`UPDATE csp_bfs SET v = 'a' WHERE id = 1`);
+
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE csp_bfs ALTER COLUMN v SET NOT NULL`); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+			expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
+			expect((err as QuereusError).message, 'names the user table').to.not.match(/_overlay_/);
+
+			// Nothing was mutated: the transaction is usable and the column still nullable.
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_bfs ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'the frame restores the staged NULL').to.deep.equal([[1, null]]);
+			await db.exec(`COMMIT`);
+
+			// Committed, the same statement lands and backfills the NULL.
+			await db.exec(`ALTER TABLE csp_bfs ALTER COLUMN v SET NOT NULL`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_bfs ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'filled']]);
+		});
+
+		it('CREATE UNIQUE INDEX refuses (BUSY) when rollback to a savepoint would restore a staged duplicate', async () => {
+			// Case A over the wrapper: the staged duplicate lives in the overlay's savepoint frame,
+			// which the wrapper merges with the committed rows and hands down as a rollback state.
+			await db.exec(`CREATE TABLE csp_ua (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO csp_ua VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_ua VALUES (2, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`DELETE FROM csp_ua WHERE id = 2`);
+
+			let err: unknown;
+			try { await db.exec(`CREATE UNIQUE INDEX ix_ua ON csp_ua (v)`); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+			expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
+
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_ua ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'the duplicate is back, under no index').to.deep.equal([[1, 'a'], [2, 'a']]);
+			await db.exec(`ROLLBACK`);
+		});
+
 		it('SET NOT NULL backfills a staged NULL and the fill survives a later savepoint rollback', async () => {
 			await db.exec(`CREATE TABLE csp_bf (id INTEGER PRIMARY KEY, v TEXT NULL DEFAULT 'filled') USING isolated`);
 
@@ -2708,10 +2761,14 @@ describe('IsolationModule', () => {
 			// The spike's failing shape: two staged deletions share a = 1, and a naive UNIQUE
 			// forward to the overlay saw the two tombstones as duplicates of each other
 			// (`UNIQUE constraint failed: _overlay_…`). The tombstone-narrowed index must not.
+			// Both rows are staged in THIS transaction (a delete of a staged row converts it to a
+			// tombstone in place), so no committed state and no savepoint holds the colliding
+			// pair — see the test below for the committed shape, which is refused instead.
 			await db.exec(`CREATE TABLE csp_tb (a INTEGER, b INTEGER, PRIMARY KEY (a, b)) USING isolated`);
-			await db.exec(`INSERT INTO csp_tb VALUES (1, 1), (1, 2), (2, 1)`);
+			await db.exec(`INSERT INTO csp_tb VALUES (2, 1)`);
 
 			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_tb VALUES (1, 1), (1, 2)`);
 			await db.exec(`DELETE FROM csp_tb WHERE a = 1`);
 			await db.exec(`ALTER TABLE csp_tb ADD CONSTRAINT u_a UNIQUE (a)`);
 			await db.exec(`COMMIT`);
@@ -2724,6 +2781,26 @@ describe('IsolationModule', () => {
 			try { await db.exec(`INSERT INTO csp_tb VALUES (3, 2)`); } catch (e) { err = e; }
 			expect(err, 'the new UNIQUE(a) enforces on live rows').to.be.instanceOf(QuereusError);
 			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		});
+
+		it('ADD CONSTRAINT UNIQUE refuses (BUSY) when the deleted committed rows would collide on rollback', async () => {
+			// The committed pair (1,1),(1,2) collides on `a`; deleting both makes the constraint
+			// legal for the transaction, but a rollback restores the pair under it.
+			await db.exec(`CREATE TABLE csp_tbc (a INTEGER, b INTEGER, PRIMARY KEY (a, b)) USING isolated`);
+			await db.exec(`INSERT INTO csp_tbc VALUES (1, 1), (1, 2), (2, 1)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM csp_tbc WHERE a = 1`);
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE csp_tbc ADD CONSTRAINT u_a UNIQUE (a)`); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+			expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
+			expect((err as QuereusError).message).to.not.match(/_overlay_/);
+
+			await db.exec(`ROLLBACK`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM csp_tbc ORDER BY a, b`));
+			expect(rows.map((r: any) => [r.a, r.b]), 'rollback restores the pair; no constraint was added').to.deep.equal([[1, 1], [1, 2], [2, 1]]);
 		});
 	});
 
@@ -2777,6 +2854,31 @@ describe('IsolationModule', () => {
 			await db.exec(`ROLLBACK`);
 			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM ecp_del ORDER BY k`));
 			expect(rows.map((r: any) => r.k), 'rollback restores the colliding pair').to.deep.equal(['A', 'a', 'b']);
+		});
+
+		it('raises BUSY when only a savepoint frame holds the colliding pair (one row staged, then deleted)', async () => {
+			// The staged 'a' lives only in the overlay's savepoint frame — neither the effective
+			// rows (it is tombstoned now) nor the underlying's committed rows hold the pair, so the
+			// wrapper's frame is what the underlying's legality probe has to judge
+			// (`IssuerRowSources.savepoints`). A `rollback to s` would otherwise restore 'a' beside
+			// the committed 'A' under a NOCASE key.
+			await db.exec(`CREATE TABLE ecp_sp (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO ecp_sp VALUES ('A', 'x')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO ecp_sp VALUES ('a', 'y')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`DELETE FROM ecp_sp WHERE k = 'a'`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_sp ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code).to.equal(StatusCode.BUSY);
+			expect(err.message).to.match(/commit the pending writes first/i);
+			expect(underlyingCollation('ecp_sp', 'k'), 'underlying untouched').to.equal('BINARY');
+
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM ecp_sp ORDER BY k`));
+			expect(rows.map((r: any) => r.k), 'the frame restores the pair, still distinct under BINARY').to.deep.equal(['A', 'a']);
+			await db.exec(`ROLLBACK`);
 		});
 
 		it('raises the same BUSY when only one of the two colliders is deleted', async () => {
@@ -3213,20 +3315,46 @@ describe('IsolationModule', () => {
 			expect(rows.map((r: any) => [r.x, r.y])).to.deep.equal([[0, 1]]);
 		});
 
-		it('leaves a marker at its NULL key when the tightening is metadata-only (no visible NULL)', async () => {
-			// The underlyings backfill only when a NULL is visible in the issuer's effective rows;
-			// otherwise the committed keys do not move and the marker must not either.
+		it('re-keys a marker at its NULL key even when no NULL is visible, because the committed NULL is backfilled', async () => {
+			// The underlyings backfill a committed NULL a rollback would restore (rule 1 of
+			// docs/memory-table.md § DDL and transactions) even when the issuer's effective rows
+			// hold none — so the committed key moves, and the marker must follow it or the delete
+			// would land nowhere at commit. The wrapper mirrors that gate (`underlyingBackfills`).
 			await db.exec(`CREATE TABLE nm (x INTEGER NULL DEFAULT 0, y INTEGER NULL) USING isolated`);
 			await db.exec(`INSERT INTO nm (x, y) VALUES (NULL, 1), (2, 2)`);
 
 			await db.exec(`BEGIN`);
 			await db.exec(`DELETE FROM nm WHERE x IS NULL AND y = 1`);
 			await db.exec(`ALTER TABLE nm ALTER COLUMN x SET NOT NULL`);
-			expect((await overlayRows('nm')).map(r => [r[0], r[1], r[2]]), 'marker untouched').to.deep.equal([[null, 1, 1]]);
+			expect((await overlayRows('nm')).map(r => [r[0], r[1], r[2]]), 'marker re-keyed to the backfilled key').to.deep.equal([[0, 1, 1]]);
 
 			await db.exec(`COMMIT`);
 			const rows = await asyncIterableToArray(db.eval(`SELECT x, y FROM nm`));
 			expect(rows.map((r: any) => [r.x, r.y]), 'the delete still landed').to.deep.equal([[2, 2]]);
+		});
+
+		it('refuses (BUSY) a key-member backfill while a savepoint frame holds a marker at the NULL key', async () => {
+			// The migrate step rewrites markers in the CURRENT frame only; a frame taken before the
+			// ALTER would restore a marker naming a key the underlying no longer holds, which deletes
+			// nothing at flush — the deleted row would come back. Refused up front instead.
+			await db.exec(`CREATE TABLE nmf (x INTEGER NULL DEFAULT 0, y INTEGER NULL) USING isolated`);
+			await db.exec(`INSERT INTO nmf (x, y) VALUES (NULL, 1), (2, 2)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM nmf WHERE x IS NULL AND y = 1`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO nmf (x, y) VALUES (3, 3)`);
+
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE nmf ALTER COLUMN x SET NOT NULL`); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+			expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
+			expect((err as QuereusError).message, 'names the user table').to.not.match(/_overlay_/);
+
+			await db.exec(`ROLLBACK`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT x, y FROM nmf ORDER BY y`));
+			expect(rows.map((r: any) => [r.x, r.y]), 'nothing was backfilled or deleted').to.deep.equal([[null, 1], [2, 2]]);
 		});
 
 		describe('foreign overlays under a cross-connection key-column backfill', () => {
@@ -3410,7 +3538,7 @@ describe('IsolationModule', () => {
 				schemaName: string,
 				tableName: string,
 				change: SchemaChangeInfo,
-				rows?: EffectiveRowSource,
+				rows?: IssuerRowSources,
 			): Promise<TableSchema> {
 				const positioned: SchemaChangeInfo = change.type === 'addColumn' && this.insertAt !== undefined
 					? { ...change, insertAtIndex: this.insertAt }
@@ -6588,10 +6716,14 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 
 		it('create unique index inside a transaction over a fully tombstoned table commits empty', async () => {
 			await db.exec(`create table t (a integer, b integer, primary key (a, b)) using isolated`);
-			await db.exec(`insert into t values (1, 1)`);
-			await db.exec(`insert into t values (1, 2)`);
 
 			await db.exec('begin');
+			// Staged in THIS transaction so no committed state holds the colliding pair (a
+			// committed pair deleted in-transaction is refused: a rollback would restore it under
+			// the index — 41.2.4-ddl-rollback-states.sqllogic). A delete of a staged row converts
+			// it to a tombstone in place, so the overlay still holds two tombstones at a = 1.
+			await db.exec(`insert into t values (1, 1)`);
+			await db.exec(`insert into t values (1, 2)`);
 			await db.exec('delete from t');
 			// Pre-fix: rebuilding the overlay for the new index enforced uniqueness over the
 			// two tombstones just staged (both carry a = 1) and raised INTERNAL.

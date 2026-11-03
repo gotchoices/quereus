@@ -141,23 +141,32 @@ describe('ALTER COLUMN SET COLLATE on a store PK member, inside a transaction', 
 		expect(info).to.deep.equal([{ name: 'k', collation: 'NOCASE' }]);
 	});
 
-	it('a unique-index collider deleted in this transaction is accepted, with the index still serving seeks', async () => {
+	it('a unique-index collider deleted in this transaction is refused (BUSY), and lands once committed with the index serving seeks', async () => {
 		// Composite PK so the re-key itself never collides — only the unique index over k
-		// could object, and its collider is gone from this transaction's view.
+		// could object, and its collider is gone from this transaction's view. Not a
+		// constraint violation, then — but a rollback would restore the collider under the
+		// NOCASE unique index, so the store refuses over its committed rows (the whole-rollback
+		// state it judges for BUSY) before anything is re-keyed.
 		await db.exec(`create table t (k text collate binary, j integer, v text, primary key (k, j)) using store`);
 		await db.exec(`create unique index t_k on t (k)`);
 		await db.exec(`insert into t values ('A', 1, 'x'), ('a', 2, 'y')`);
 
 		await db.exec('begin');
 		await db.exec(`delete from t where k = 'a'`);
-		// Pre-fix the post-re-key ENFORCING index rebuild rejected this over the committed
-		// rows (which still hold 'a'), after the data store was already re-keyed — leaving
-		// index-backed seeks and full scans disagreeing.
-		await db.exec(`alter table t alter column k set collate nocase`);
+		await expectRejection(
+			db,
+			`alter table t alter column k set collate nocase`,
+			StatusCode.BUSY,
+			/commit the pending writes first/i,
+		);
+		// Nothing was re-keyed: both access paths still see the surviving row under BINARY.
+		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'A'`)))
+			.to.deep.equal([{ k: 'A', j: 1 }]);
 		await db.exec('commit');
 
-		// Index-backed seek and full scan agree on the surviving row.
-		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'A'`)))
+		// With the delete committed the re-key lands, and index-backed seek and full scan agree.
+		await db.exec(`alter table t alter column k set collate nocase`);
+		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'a'`)))
 			.to.deep.equal([{ k: 'A', j: 1 }]);
 		expect(await asyncIterableToArray(db.eval(`select k, j from t order by j`)))
 			.to.deep.equal([{ k: 'A', j: 1 }]);
@@ -226,28 +235,34 @@ describe('ALTER COLUMN SET COLLATE on a store PK member, inside a transaction', 
 			.to.deep.equal([{ v: 'x' }]);
 	});
 
-	it('an accepted re-key over a deleted unique-index collider survives a ROLLBACK with data and index agreeing', async () => {
-		// The other half of the deleted-collider case: the DDL is not transactional, so the
-		// re-key and the non-enforcing index rebuild stay after the data changes are undone.
-		// Whatever the committed rows then are, the index must describe exactly them —
-		// the disagreement defect 2 left behind.
+	it('a ROLLBACK after the refused re-key restores the collider with data and index agreeing under BINARY', async () => {
+		// The other half of the deleted-collider case: the DDL is not transactional, so had it
+		// been accepted the re-key would have stayed after the data changes were undone and the
+		// restored pair would have sat under a NOCASE unique index it violates. The refusal is
+		// what keeps data and index agreeing: nothing was re-keyed, and the rollback restores
+		// both rows under the collation they were stored with.
 		await db.exec(`create table t (k text collate binary, j integer, v text, primary key (k, j)) using store`);
 		await db.exec(`create unique index t_k on t (k)`);
 		await db.exec(`insert into t values ('A', 1, 'x'), ('a', 2, 'y')`);
 
 		await db.exec('begin');
 		await db.exec(`delete from t where k = 'a'`);
-		await db.exec(`alter table t alter column k set collate nocase`);
+		await expectRejection(
+			db,
+			`alter table t alter column k set collate nocase`,
+			StatusCode.BUSY,
+			/commit the pending writes first/i,
+		);
 		await db.exec('rollback');
 
-		// The rollback restored the deleted row; under the now-NOCASE column an index-backed
-		// seek on either spelling and the full scan must all report the same two rows.
-		const both = [{ k: 'A', j: 1 }, { k: 'a', j: 2 }];
-		expect(await asyncIterableToArray(db.eval(`select k, j from t order by j`))).to.deep.equal(both);
-		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'A' order by j`))).to.deep.equal(both);
-		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'a' order by j`))).to.deep.equal(both);
+		// The rollback restored the deleted row; under the still-BINARY column an index-backed
+		// seek on each spelling finds exactly its own row, and the full scan both.
+		expect(await asyncIterableToArray(db.eval(`select k, j from t order by j`)))
+			.to.deep.equal([{ k: 'A', j: 1 }, { k: 'a', j: 2 }]);
+		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'A' order by j`))).to.deep.equal([{ k: 'A', j: 1 }]);
+		expect(await asyncIterableToArray(db.eval(`select k, j from t where k = 'a' order by j`))).to.deep.equal([{ k: 'a', j: 2 }]);
 		const info = await asyncIterableToArray(db.eval(`select name, collation from table_info('t') where name = 'k'`));
-		expect(info).to.deep.equal([{ name: 'k', collation: 'NOCASE' }]);
+		expect(info).to.deep.equal([{ name: 'k', collation: 'BINARY' }]);
 	});
 });
 

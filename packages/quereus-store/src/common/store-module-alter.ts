@@ -12,7 +12,7 @@
 import type {
 	ColumnSchema,
 	Database,
-	EffectiveRowSource,
+	IssuerRowSources,
 	ResolveColumnInSource,
 	SchemaChangeInfo,
 	SqlValue,
@@ -44,7 +44,7 @@ import {
 import { StoreTable } from './store-table.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
 import { StoreModuleAlterColumn } from './store-module-alter-column.js';
-import { effectiveDdlRows, validateUniqueOverExistingRows } from './store-module-index-build.js';
+import { effectiveDdlRows, judgeRollbackStates, validateUniqueOverExistingRows } from './store-module-index-build.js';
 import { buildColumnRemap, renameColumnInSelfForeignKeys } from './store-module-schema-rewrite.js';
 
 export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
@@ -61,7 +61,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
 		this.ensureSchemaSubscription(db);
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
@@ -500,7 +500,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'alterPrimaryKey' }>,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
 		const newPkColumns = change.newPkColumns;
 		// Shared with the memory module's native arm: rebuilds `primaryKeyDefinition` AND the
@@ -516,10 +516,13 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// so either refusal leaves the store, the catalog AND the enclosing transaction
 		// untouched. Mirrors the memory backend's `MemoryTableManager.validateRekeyedPrimaryKey`
 		// and the SET COLLATE arm's `pkRekeyNeeded` block (store-module-alter-column.ts).
+		const keyColumns = newPkColumns.map(pk => oldSchema.columns[pk.index]?.name ?? String(pk.index)).join(', ');
 		await table.validateRekeyedPrimaryKey(
 			updatedSchema.primaryKeyDefinition,
 			updatedSchema.columns,
 			effectiveDdlRows(table, rows),
+			rows?.savepoints ?? [],
+			`alter primary key (${keyColumns})`,
 		);
 
 		// Physical re-key ahead — flush buffered writes so every live row is re-keyed and
@@ -557,7 +560,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'addConstraint' }>,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema> {
 		const constraint = change.constraint;
 		let updatedSchema: TableSchema;
@@ -572,13 +575,17 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			//
 			// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
 			// writes no rows, and the validation scan already reads effectively, so
-			// the transaction survives a CONSTRAINT rejection.
+			// the transaction survives a CONSTRAINT rejection. Every state a rollback
+			// could restore is judged next (BUSY): a committed duplicate the wrapper's
+			// transaction deleted would come back under the constraint on rollback.
 			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
-			await validateUniqueOverExistingRows(
-				effectiveDdlRows(table, rows),
-				oldSchema,
-				uc,
-				db.getKeyNormalizerResolver(),
+			const keyNormalizers = db.getKeyNormalizerResolver();
+			await validateUniqueOverExistingRows(effectiveDdlRows(table, rows), oldSchema, uc, keyNormalizers);
+			const constrainedColumns = uc.columns.map(i => oldSchema.columns[i]?.name ?? String(i)).join(', ');
+			await judgeRollbackStates(
+				table, rows,
+				state => validateUniqueOverExistingRows(state.rows(), oldSchema, uc, keyNormalizers),
+				`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
 			);
 			updatedSchema = {
 				...oldSchema,

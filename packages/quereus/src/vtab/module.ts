@@ -55,21 +55,50 @@ export interface BaseModuleConfig {
 export type VtabConcurrencyMode = 'serial' | 'reentrant-reads' | 'fully-reentrant';
 
 /**
- * The rows the DDL-issuing connection can currently SEE — committed rows merged with that
- * connection's own uncommitted writes.
- *
- * Supplied only by a wrapper module (today: the isolation layer) that holds those pending rows
- * outside the target module, where the target module cannot reach them. When present, the target
- * module MUST use this stream for every row-CONTENT judgement it makes (UNIQUE duplicate
- * detection, collation-rekey collision detection) and MUST NOT reject the DDL over a duplicate
- * that exists only in its own committed data. Physical structures are still built from the
- * module's own rows — an index entry with no live row behind it is harmless, because every
- * reader resolves an entry back to its live row and drops it if the row is gone.
- *
- * Re-callable: each call returns a fresh stream (a single ALTER may validate more than once).
- * Omitted by the engine's own emitters, which leaves each module on its own effective stream.
+ * A re-callable row stream: each call returns a fresh stream (a single ALTER may validate more
+ * than once). The shape of every stream a wrapper module hands down in {@link IssuerRowSources}.
  */
 export type EffectiveRowSource = () => AsyncIterable<Row>;
+
+/**
+ * The rows a row-validating DDL (`create unique index`, `add constraint … unique`, `alter column
+ * … set collate` / `set data type` / `set not null`) must judge on behalf of the connection
+ * issuing it, supplied by a wrapper module (today: the isolation layer) that stages that
+ * connection's writes outside the target module, where the target module cannot reach them.
+ * See docs/module-authoring.md § When the pending rows live outside your module.
+ *
+ * A bundle rather than two optional parameters so a wrapper cannot hand down the effective rows
+ * and forget the rollback states: the type makes both halves mandatory. Omitted by the engine's
+ * own emitters, which leaves each module on its own effective rows and its own rollback states.
+ */
+export interface IssuerRowSources {
+	/**
+	 * The rows the issuing transaction can SEE now — committed rows merged with its own
+	 * uncommitted writes. The ONLY set the module may judge row CONTENT against for the
+	 * statement's legality: a violation here is `CONSTRAINT` (or `MISMATCH` for an unconvertible
+	 * value). A duplicate that exists only in the module's own committed data is NOT a
+	 * constraint violation — see {@link savepoints} for what it is instead. Physical structures
+	 * are still built from the module's own rows; an index entry with no live row behind it is
+	 * harmless, because every reader resolves an entry back to its live row and drops it if the
+	 * row is gone.
+	 */
+	readonly effective: EffectiveRowSource;
+	/**
+	 * The rows the issuing transaction would see after `rollback to` each open savepoint taken
+	 * before this DDL, oldest first. Each is judged on its own, with the same check the
+	 * effective rows get; a violation refuses with `BUSY` and "commit the pending writes first"
+	 * (`rolledBackRowsWouldViolate`), because DDL survives a rollback while the rows it was judged
+	 * against do not. A released savepoint cannot be rolled back to and is not listed. The
+	 * whole-transaction rollback state is not listed either: it is the receiving module's own
+	 * committed rows, which it holds and must judge the same way itself.
+	 *
+	 * Judged AS-IS for `set not null`: the module's NULL → DEFAULT backfill rewrites its own
+	 * rows, never a wrapper's frames, so a NULL in one of these refuses even when a DEFAULT would
+	 * fill the module's committed NULLs. (A `set data type` conversion is applied to every state
+	 * before judging — an unconvertible value refuses either way.)
+	 */
+	readonly savepoints: readonly EffectiveRowSource[];
+}
 
 /**
  * Assessment result from a module's supports() method indicating
@@ -383,8 +412,9 @@ export interface VirtualTableModule<
 	 * @param schemaName The name of the database schema
 	 * @param tableName The name of the virtual table
 	 * @param indexSchema The schema definition for the index being created
-	 * @param rows Optional {@link EffectiveRowSource}. When supplied, the UNIQUE duplicate
-	 *   check MUST run over this stream instead of the module's own rows.
+	 * @param rows Optional {@link IssuerRowSources}. When supplied, the UNIQUE duplicate check
+	 *   MUST judge `rows.effective` instead of the module's own rows for `CONSTRAINT`, and the
+	 *   module's own committed rows plus each of `rows.savepoints` for `BUSY`.
 	 * @throws QuereusError on failure
 	 */
 	createIndex?(
@@ -392,7 +422,7 @@ export interface VirtualTableModule<
 		schemaName: string,
 		tableName: string,
 		indexSchema: IndexSchema,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<void>;
 
 	/**
@@ -539,16 +569,17 @@ export interface VirtualTableModule<
 	 * If not implemented, the engine rejects data-affecting ALTER operations
 	 * (`renameColumn` degrades to an engine-side schema-only rename instead).
 	 *
-	 * `rows` is an optional {@link EffectiveRowSource}. When supplied, the row-validating
-	 * arms (`addConstraint … unique`, `alterColumn … set collate`) MUST judge that stream
-	 * rather than the module's own rows.
+	 * `rows` is an optional {@link IssuerRowSources}. When supplied, the row-validating arms
+	 * (`addConstraint … unique`, `alterColumn … set collate` / `set data type` / `set not null`)
+	 * MUST judge `rows.effective` rather than the module's own rows for `CONSTRAINT` /
+	 * `MISMATCH`, and the module's own committed rows plus each of `rows.savepoints` for `BUSY`.
 	 */
 	alterTable?(
 		db: Database,
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
-		rows?: EffectiveRowSource,
+		rows?: IssuerRowSources,
 	): Promise<TableSchema>;
 
 	/**

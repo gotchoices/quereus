@@ -1,6 +1,6 @@
 import type { CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
 import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, uniqueColumnsChanged, normalizeCollationName, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering } from '@quereus/quereus';
-import type { EffectiveRowSource } from '@quereus/quereus';
+import type { IssuerRowSources } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -2026,7 +2026,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * `IsolationModule` in turn; routing them through the module keeps that path on the same
 	 * protocol.
 	 */
-	async createIndex(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
+	async createIndex(indexInfo: IndexSchema, rows?: IssuerRowSources): Promise<void> {
 		await this.isolationModule.createIndex(this.db, this.schemaName, this.tableName, indexInfo, rows);
 		this.tableSchema = this.underlyingTable.tableSchema;
 	}

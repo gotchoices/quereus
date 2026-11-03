@@ -6,6 +6,8 @@ import { QuereusError } from '../../../common/errors.js';
 import { foldDefaultToType, planRetypeConversion } from '../../../types/validation.js';
 import { comparisonSemanticsDiffer } from '../../../util/comparison.js';
 import type { Row } from '../../../common/types.js';
+import { judgeRestorableStates, type RestorableRows } from '../../rollback-states.js';
+export { describeAlterColumn } from '../../rollback-states.js';
 
 /**
  * The decide-and-validate half of `MemoryTableManager.alterColumn`.
@@ -94,14 +96,35 @@ export interface AlterColumnPlan {
 
 /**
  * The DDL transaction's EFFECTIVE rows: committed rows overlaid with its own pending writes. A
- * value the transaction can SEE rejects the ALTER; one only in a row it has DELETED does not block
- * it. Re-callable — each scan gets a fresh stream.
+ * value the transaction can SEE rejects the ALTER with the statement's own status (`CONSTRAINT`,
+ * `MISMATCH`); one only in a row it has DELETED or overwritten does not make the ALTER illegal —
+ * but see {@link RestorableState}. Re-callable — each scan gets a fresh stream.
  *
  * Either flavour: the manager's own layered walk is synchronous, a wrapper module's overlay (the
- * isolation layer) is an `EffectiveRowSource` and therefore async. {@link scanEffectiveRows} keeps
- * the sync one sync.
+ * isolation layer) is an `EffectiveRowSource` and therefore async. {@link scanRows} keeps the
+ * sync one sync.
  */
-export type EffectiveRows = () => Iterable<Row> | AsyncIterable<Row>;
+export type EffectiveRows = RestorableRows;
+
+/**
+ * One state a rollback could return the table to — the committed rows (what a whole-transaction
+ * `rollback` restores) or the rows as they stood at an open savepoint (what `rollback to` restores)
+ * — judged on its own by every pre-validation scan, with the same check the effective rows get.
+ * A violation confined to such a state refuses the ALTER with `BUSY` ("commit the pending writes
+ * first"): DDL survives a rollback, the rows it was judged against do not, and the ALTER is the
+ * last point that can report the conflict. See docs/memory-table.md § DDL and transactions, rule 1.
+ */
+export interface RestorableState {
+	readonly rows: RestorableRows;
+	/**
+	 * Whether the `set not null` NULL → DEFAULT backfill rewrites these rows: true for the
+	 * manager's own base and savepoint layers (`convertBaseRows` / `TransactionLayer.convertColumn`
+	 * reach every layer in the chain), false for a savepoint frame a wrapper module supplies
+	 * (`IssuerRowSources.savepoints`), which only the wrapper could fill and does not. A NULL in a
+	 * state the backfill reaches is filled; one it does not reach refuses, DEFAULT or not.
+	 */
+	readonly backfilled: boolean;
+}
 
 /** Everything the attribute handlers read beyond the change itself. */
 export interface AlterColumnContext {
@@ -111,12 +134,16 @@ export interface AlterColumnContext {
 	readonly columnName: string;
 	readonly colIndex: number;
 	readonly effectiveRows: EffectiveRows;
+	/** Every state a rollback could restore; empty when none differs from the effective rows. */
+	readonly restorableStates: readonly RestorableState[];
+	/** The statement as the user wrote it (`alter column v set not null`), for the `BUSY` refusal. */
+	readonly ddl: string;
 	readonly isCollationRegistered: (name: string) => boolean;
 }
 
 /**
- * Visit the effective rows until `visit` returns true — which stops the scan and is the result.
- * `visit` may also THROW to reject the ALTER outright.
+ * Visit `rows` until `visit` returns true — which stops the scan and is the result. `visit` may
+ * also THROW to reject the ALTER outright.
  *
  * Branches on the source's flavour rather than routing everything through `for await`: the
  * manager's own layered walk is synchronous, and awaiting it per row would open a microtask gap
@@ -124,8 +151,8 @@ export interface AlterColumnContext {
  * schema-change latch serializes DDL only. An overlay supplied by a wrapper module is genuinely
  * async and has no such atomicity to lose.
  */
-async function scanEffectiveRows(ctx: AlterColumnContext, visit: (row: Row) => boolean): Promise<boolean> {
-	const source = ctx.effectiveRows();
+async function scanRows(rows: RestorableRows, visit: (row: Row) => boolean): Promise<boolean> {
+	const source = rows();
 	if (Symbol.asyncIterator in source) {
 		for await (const row of source) {
 			if (visit(row)) return true;
@@ -192,7 +219,11 @@ export async function planSetNotNull(ctx: AlterColumnContext, setNotNull: boolea
 
 /**
  * `set not null` on a nullable column: scan the effective rows for NULLs, and when one is
- * visible, either reject or backfill from the column's DEFAULT.
+ * visible, either reject or backfill from the column's DEFAULT. Then scan every state a rollback
+ * could restore the same way: a NULL there is backfilled too when the rewrite reaches that state
+ * and a DEFAULT exists — which is what forces the rewrite even when the transaction itself sees no
+ * NULL — and refuses with `BUSY` otherwise, since the column would be NOT NULL over a NULL the
+ * moment the transaction rolled back.
  *
  * The backfill maps null → the folded DEFAULT literal, routed through the SAME base-replacement
  * + open-layer conversion machinery `set data type` uses — no logical-type change, no in-place
@@ -218,14 +249,24 @@ async function planTightenNotNull(ctx: AlterColumnContext, oldCol: ColumnSchema)
 	// "acceptance must not depend on the rows" rule the ADD COLUMN arm follows, and the
 	// same point the store leg and the isolation overlay fold at.
 	const defaultLiteral = foldDefaultToType(oldCol.defaultValue, oldCol.logicalType, ctx.columnName);
+	const hasDefault = defaultLiteral !== undefined && defaultLiteral !== null;
+	const containsNull = (): QuereusError =>
+		new QuereusError(`column ${ctx.columnName} contains NULL values`, StatusCode.CONSTRAINT);
 
-	if (!await hasNullValue(ctx)) return metadataOnly(newCol);
-
-	if (defaultLiteral === undefined || defaultLiteral === null) {
-		throw new QuereusError(`column ${ctx.columnName} contains NULL values`, StatusCode.CONSTRAINT);
+	let backfill = false;
+	if (await hasNullValue(ctx.effectiveRows, ctx.colIndex)) {
+		if (!hasDefault) throw containsNull();
+		backfill = true;
 	}
+	await judgeRestorableStates(ctx.restorableStates, async state => {
+		if (!await hasNullValue(state.rows, ctx.colIndex)) return;
+		if (!hasDefault || !state.backfilled) throw containsNull(); // rewrapped as BUSY
+		backfill = true;
+	}, ctx.ddl, ctx.tableName);
 
-	const literal = defaultLiteral;
+	if (!backfill) return metadataOnly(newCol);
+
+	const literal = defaultLiteral as SqlValue;
 	return {
 		newCol,
 		collationChanged: false,
@@ -234,9 +275,9 @@ async function planTightenNotNull(ctx: AlterColumnContext, oldCol: ColumnSchema)
 	};
 }
 
-/** True when any effective row holds NULL in the altered column. */
-function hasNullValue(ctx: AlterColumnContext): Promise<boolean> {
-	return scanEffectiveRows(ctx, row => row[ctx.colIndex] === null);
+/** True when any row of `rows` holds NULL in the altered column. */
+function hasNullValue(rows: RestorableRows, colIndex: number): Promise<boolean> {
+	return scanRows(rows, row => row[colIndex] === null);
 }
 
 /**
@@ -290,15 +331,21 @@ export async function planSetDataType(ctx: AlterColumnContext, dataType: string)
 }
 
 /**
- * Rejects the retype when any effective row holds an unconvertible value. Runs before anything is
+ * Rejects the retype when any effective row holds an unconvertible value (`MISMATCH`), or when any
+ * state a rollback could restore does (`BUSY` — the rewrite reaches every layer, so a rolled-back
+ * row would otherwise sit unconverted in a column of the new type). Runs before anything is
  * mutated, so a throw leaves the schema, the base and the transaction untouched.
  */
 async function assertEveryValueConverts(ctx: AlterColumnContext, convert: (v: SqlValue) => SqlValue): Promise<void> {
-	await scanEffectiveRows(ctx, row => {
-		const val = row[ctx.colIndex];
-		if (val !== null) convert(val); // throws MISMATCH to reject the retype
-		return false; // every row must convert — never stop early
-	});
+	const everyValueConverts = async (rows: RestorableRows): Promise<void> => {
+		await scanRows(rows, row => {
+			const val = row[ctx.colIndex];
+			if (val !== null) convert(val); // throws MISMATCH to reject the retype
+			return false; // every row must convert — never stop early
+		});
+	};
+	await everyValueConverts(ctx.effectiveRows);
+	await judgeRestorableStates(ctx.restorableStates, state => everyValueConverts(state.rows), ctx.ddl, ctx.tableName);
 }
 
 /**

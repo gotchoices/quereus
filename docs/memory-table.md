@@ -244,13 +244,42 @@ a full scan that applies the constraint's own predicate and collations — slowe
 `ALTER TABLE ... DROP COLUMN` may run inside an open transaction. Three rules
 define what that means.
 
-**1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
-`MemoryTableManager` validates against the DDL connection's *effective* rows — the committed
-base overlaid with that connection's uncommitted writes, i.e. the layer
-`pendingTransactionLayer ?? readLayer`. A duplicate the transaction inserted but has not
-committed raises `UNIQUE constraint failed`; a duplicate it has *deleted* does not block the
-change. Validation runs before anything is mutated, so a rejection leaves the schema, the base
-layer and the index map untouched, and the transaction stays usable.
+**1. Row-validating DDL is judged over what a `SELECT` in the same transaction sees — and over
+every state a rollback could restore.** `MemoryTableManager` decides *legality* against the DDL
+connection's *effective* rows — the committed base overlaid with that connection's uncommitted
+writes, i.e. the layer `pendingTransactionLayer ?? readLayer`. A duplicate the transaction
+inserted but has not committed raises `UNIQUE constraint failed` (`CONSTRAINT`; an unconvertible
+value raises `MISMATCH`); a duplicate it has *deleted* or overwritten does not make the change
+illegal. But DDL is not undone by `ROLLBACK` or `ROLLBACK TO SAVEPOINT` (rule 2) while the rows it
+was judged against are, and the DDL statement is the last point that can report the conflict. So
+the same check then runs, on its own, over each *restorable state*: the base (what a
+whole-transaction rollback restores) and the layer each **open** savepoint would reinstate (what
+`rollback to` restores — `MemoryTableConnection.savepointRestoreLayers`, which walks the savepoint
+*stack* rather than the layer chain, because a released savepoint cannot be rolled back to and its
+snapshot is not a restorable state even though it stays in the chain). A violation confined to a
+restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rows this
+transaction has deleted or overwritten would violate it if the transaction rolled back. Commit the
+pending writes first, then retry.` (`rolledBackRowsWouldViolate` in `vtab/rollback-states.ts`,
+reached from every site through `judgeRestorableStates`) — the same retryable posture as rule 3,
+because the data the transaction can see is valid, and `commit` followed by the same statement
+lands it. A deleted row that breaks no rule does not block. Validation runs before anything is
+mutated (`restorableStates` is read after `ensureSchemaChangeSafety` has re-pointed the lazy
+savepoint markers), so a rejection leaves the schema, the base layer and the index map untouched,
+and the transaction stays usable; outside a transaction no state differs from the effective rows,
+so autocommit DDL pays no second scan.
+
+Each restorable state is judged *as the rows it will hold after the DDL's rewrite has reached it*.
+The value-rewriting arms convert the base and every layer in the chain, so a state is probed with
+the altered column converted (the same `mapRow` as the effective pass): a NULL under a
+`SET NOT NULL` with a usable `DEFAULT` is backfilled rather than refused — and the rewrite is
+forced even when the transaction itself sees no NULL — while an unconvertible value, a NULL with
+no `DEFAULT`, or a post-conversion UNIQUE collision refuses. Behind a wrapper module that stages
+the transaction's rows outside the manager (the isolation layer), the wrapper hands down the
+effective rows *and* the savepoint states as one bundle (`IssuerRowSources`, see
+[module-authoring.md](module-authoring.md#when-the-pending-rows-live-outside-your-module-issuerrowsources));
+the manager's base is then exactly the committed rows, and a wrapper's frame is judged as-is for
+`SET NOT NULL` because no rewrite of the manager reaches it. The cross-backend cases are pinned
+in `41.2.4-ddl-rollback-states.sqllogic`.
 
 Every `ALTER COLUMN` that can make two previously-distinct rows collide is validated the same
 way, once per uniqueness-enforcing index covering the altered column (`indexEnforcesUnique` —
@@ -348,9 +377,10 @@ policy leaves the behavior above unchanged.
 **identity**, not the physical storage class: a retype between aliases of one type (`TEXT` →
 `VARCHAR(50)`, `INTEGER` → `BIGINT`, where `inferType` returns the same shared object) is
 metadata-only; *every* other retype validates and rewrites. `MemoryTableManager.alterColumn` first
-runs a throw-only conversion pass over the effective rows (rule 1): a value the transaction can see
-that will not convert rejects the `ALTER` with `MISMATCH`, and one only in a row it has deleted does
-not block it. Accepted values are rewritten to the new type's **canonical form** — the value an
+runs a throw-only conversion pass over the effective rows and every restorable state (rule 1): a
+value the transaction can see that will not convert rejects the `ALTER` with `MISMATCH`, and one
+only in a row it has deleted refuses it with `BUSY` (a rollback would restore the value under the
+new type). Accepted values are rewritten to the new type's **canonical form** — the value an
 `INSERT` would have stored (`'2024-06-05T00:00:00Z'` → `'2024-06-05'`, `'1 hour'` → `'PT1H'`) —
 even when the storage class is unchanged, so the column never holds a spelling no write path could
 have produced. The rewrite REPLACES the base primary tree with a fresh one built from the converted
@@ -361,10 +391,10 @@ transaction, hands each layer to `TransactionLayer.convertColumn` oldest-first (
 index; it re-installs the schema and rebuilds the layer's indexes, so it subsumes `adoptSchema`
 when the retype also moved the comparators). Like `rekeyPrimaryKey`, `convertColumn` collapses the
 layer's own-write log to its net effect per key, carrying the *converted* value, so the commit-time
-rebase replays converted rows. A base or own-write value that fails to convert here is left
-untouched: the effective-view pass already accepted every value the transaction can read, so an
-unconvertible one is necessarily shadowed by a delete or a later write and is never read back. The
-result matches the store backend, whose `alterColumnSetDataType` flushes buffered writes before the
+rebase replays converted rows. Every base and own-write value converts: the pre-pass judged the
+effective rows *and* every restorable state, so a value that fails inside the rewrite is a hole in
+that pass and is raised as `INTERNAL` rather than left in the column under the new type. The result
+matches the store backend, whose `alterColumnSetDataType` flushes buffered writes before the
 physical rewrite. Retyping a **primary-key** column is rejected outright (`CONSTRAINT`) — defense in
 depth, since the engine already refuses `SET DATA TYPE` on any PK column: the key bytes, the tree's
 ordering, or at minimum the key values' canonical spelling would move, and neither the base rewrite
@@ -373,9 +403,10 @@ primary-key carve-out.
 
 **`SET NOT NULL` validates over the effective view and backfills through the same machinery.**
 Tightening a column to `NOT NULL` scans the effective rows (rule 1) for a NULL the transaction can
-see: a committed-or-pending NULL rejects the `ALTER` with `CONSTRAINT`, and one only in a row the
-transaction has deleted does not block it. When the column has a usable literal `DEFAULT`, those
-NULLs are *backfilled* instead of rejected — and this runs through the identical seam `SET DATA TYPE`
+see — a committed-or-pending NULL rejects the `ALTER` with `CONSTRAINT` — and then every restorable
+state, where a NULL only in a row the transaction has deleted or overwritten refuses with `BUSY`.
+When the column has a usable literal `DEFAULT`, every such NULL — visible or restorable, since the
+rewrite reaches every layer — is *backfilled* instead of rejected — and this runs through the identical seam `SET DATA TYPE`
 uses (`convertBaseRows` replaces the base primary tree, `convertColumn` rewrites each open layer's
 own-writes oldest-first), with the value map `null → DEFAULT` and the `convertNulls` flag set so NULLs
 flow through the converter instead of passing untouched. Routing backfill through the base-replacement
@@ -621,11 +652,11 @@ two images are tie-broken against the recorded key, mirroring the engine emitter
 schema at delivery. A collation-only re-key deliberately skips that rewrite — no stored value or
 key value moves, so the recorded images stay accurate.
 
-**Rule 1 assumes the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK TO
-SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated
-against *are*. Rolling back therefore restores rows the surviving index or collation forbids —
-a duplicate the transaction had deleted comes back under a unique index built while it was
-absent. Tracked in `tickets/backlog/bug-rolled-back-rows-violate-surviving-ddl.md`.
+**Rule 1 does not assume the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK
+TO SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated
+against *are* — which is why rule 1 judges every restorable state and refuses with `BUSY` when a
+rollback would restore a row the surviving index, collation, type or `NOT NULL` forbids. The one
+rollback a user can still take past an accepted statement restores only rows that satisfy it.
 
 ### Where the boundary sits
 

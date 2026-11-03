@@ -269,7 +269,7 @@ drop table t_alias;
 -- (a pending illegal value the transaction can SEE rejects; the
 -- transaction's own pending rows are normalized along with the
 -- committed ones. The deleted-row half — a value only in a row the
--- transaction DELETED does not block — is memory-only, in 41.2.1)
+-- transaction DELETED is refused, since a rollback would restore it — is in 41.2.1)
 -- ===================================
 
 create table t_tx (id integer primary key, v text);

@@ -11,6 +11,7 @@
 import type {
 	CompiledPredicate,
 	EffectiveRowSource,
+	IssuerRowSources,
 	KeyNormalizer,
 	KeyNormalizerResolver,
 	Row,
@@ -19,7 +20,7 @@ import type {
 	TableSchema,
 	UniqueConstraintSchema,
 } from '@quereus/quereus';
-import { QuereusError, StatusCode, compilePredicate, logicalTypeCanHoldText, serializeKey } from '@quereus/quereus';
+import { QuereusError, StatusCode, compilePredicate, judgeRestorableStates, logicalTypeCanHoldText, serializeKey } from '@quereus/quereus';
 import type { KVEntry, KVStore } from './kv-store.js';
 import {
 	resolveIndexKeyCollations,
@@ -257,16 +258,70 @@ export async function* rowsFromEntries(entries: AsyncIterable<KVEntry>): AsyncIt
 
 /**
  * The rows a DDL-issuing connection can SEE, as every pre-mutation probe in the ALTER
- * path needs them: a wrapper module's `EffectiveRowSource` when the isolation layer
- * holds this transaction's staged rows outside the store, else this table's own
- * effective stream (committed rows merged with the module's buffered puts/deletes).
+ * path needs them: a wrapper module's effective stream (`IssuerRowSources`) when the
+ * isolation layer holds this transaction's staged rows outside the store, else this
+ * table's own effective stream (committed rows merged with the module's buffered
+ * puts/deletes). A violation here is the statement's own status (`CONSTRAINT`, `MISMATCH`).
  *
  * One fresh stream per call — an async generator is single-shot, and an
  * `EffectiveRowSource` is re-callable for exactly that reason, so a probe that needs
  * two walks calls this twice.
  */
-export function effectiveDdlRows(table: StoreTable, rows?: EffectiveRowSource): AsyncIterable<Row> {
-	return rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds()));
+export function effectiveDdlRows(table: StoreTable, rows?: IssuerRowSources): AsyncIterable<Row> {
+	return rows ? rows.effective() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds()));
+}
+
+/**
+ * One state a rollback could return the table to, judged on its own by a row-validating DDL
+ * with the same probe its effective rows get — a violation rewrapped as `BUSY`, "commit the
+ * pending writes first" (`judgeRestorableStates`). See {@link rollbackStates}.
+ */
+export interface RollbackState {
+	readonly rows: EffectiveRowSource;
+	/**
+	 * Whether the `set not null` NULL → DEFAULT backfill (`StoreTable.mapRowsAtIndex`) rewrites
+	 * these rows: true for the committed rows, false for a wrapper's savepoint frame, which no
+	 * rewrite of this module reaches. A NULL in a state the backfill reaches is filled; one it
+	 * does not reach refuses, DEFAULT or not.
+	 */
+	readonly backfilled: boolean;
+}
+
+/**
+ * Every state a rollback could return `table` to (docs/store.md § ALTER TABLE): the committed
+ * rows — what a whole-transaction `rollback` restores — and the rows each open savepoint would
+ * restore.
+ *
+ * Behind the isolation wrapper (`rows` supplied) the store holds only committed rows while the
+ * wrapper stages everything pending, so the committed stream IS the whole-rollback state and
+ * the savepoint states are the wrapper's (`IssuerRowSources.savepoints`). Unwrapped, the
+ * module's own buffered deletes and savepoints live in the coordinator's op log, a different
+ * site: its row-rewriting ALTER arms flush that log before mutating (nothing left to restore),
+ * and its non-committing arms are left to `bug-bare-store-ddl-ignores-buffered-rollback-states`,
+ * which extends this list with the coordinator's savepoint prefixes — until then the bare
+ * module judges no rollback state.
+ */
+export function rollbackStates(table: StoreTable, rows: IssuerRowSources | undefined): RollbackState[] {
+	if (!rows) return [];
+	return [
+		{ rows: () => rowsFromEntries(table.iterateCommittedEntries(buildFullScanBounds())), backfilled: true },
+		...rows.savepoints.map(frame => ({ rows: frame, backfilled: false })),
+	];
+}
+
+/**
+ * Runs `probe` — which throws `CONSTRAINT` / `MISMATCH` over a stream it finds in violation,
+ * exactly as it does over the effective rows — over each of {@link rollbackStates}, rewrapping
+ * such a throw as `BUSY` (`judgeRestorableStates`). `ddl` names the statement as the user wrote
+ * it for the refusal; runs AFTER the effective pass so a visible violation keeps its own status.
+ */
+export function judgeRollbackStates(
+	table: StoreTable,
+	rows: IssuerRowSources | undefined,
+	probe: (state: RollbackState) => Promise<void>,
+	ddl: string,
+): Promise<void> {
+	return judgeRestorableStates(rollbackStates(table, rows), probe, ddl, table.tableName);
 }
 
 /**

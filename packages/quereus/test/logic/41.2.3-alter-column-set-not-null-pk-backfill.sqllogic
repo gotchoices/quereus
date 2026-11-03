@@ -235,8 +235,10 @@ select count(*) as n from t_bf10 where x = 0 and y = 1;
 drop table t_bf10;
 
 -- ===================================
--- 10. A tightening the transaction can see NO NULL for is metadata-only: the committed keys do
---     not move, and a staged deletion of a NULL-keyed committed row still lands at commit.
+-- 10. A tightening the transaction can see NO NULL for still backfills the committed NULL a
+--     rollback would restore (rule 1 of docs/memory-table.md § DDL and transactions): that
+--     row's key moves, the staged deletion of it follows the moved key, and the delete still
+--     lands at commit.
 -- ===================================
 
 create table t_bf11 (x integer null default 0, y integer null);

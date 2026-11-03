@@ -1125,13 +1125,14 @@ describe('Isolated Store Module', () => {
 
 		it('accepted CREATE UNIQUE INDEX rebuilds the overlay and preserves its rows and tombstones', async () => {
 			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
-			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'c')`);
 
 			await db.exec('BEGIN');
 			await db.exec(`DELETE FROM ddl_tx WHERE id = 2`);      // stages a tombstone
 			await db.exec(`INSERT INTO ddl_tx VALUES (3, 'b')`);   // stages a live row
 
-			// The committed duplicate is gone from this transaction's view, so the build is legal.
+			// The deleted row breaks no rule, so the build is legal and no rollback state
+			// refuses it (a deleted committed DUPLICATE would — 41.2.4-ddl-rollback-states.sqllogic).
 			await db.exec(`CREATE UNIQUE INDEX ddl_tx_ix ON ddl_tx (v)`);
 
 			// Both staged entries survived the rebuild: the tombstone still hides row 2, and the

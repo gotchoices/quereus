@@ -7,6 +7,7 @@ import {
 	planSetNotNull,
 	type AlterColumnContext,
 	type ColumnAttributeChange,
+	type RestorableState,
 } from '../../src/vtab/memory/layer/alter-column.js';
 import { createDefaultColumnSchema } from '../../src/schema/column.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
@@ -53,8 +54,16 @@ function makeCtx(schema: TableSchema, rows: Row[] = [], colIndex = 0): AlterColu
 		columnName: schema.columns[colIndex].name,
 		colIndex,
 		effectiveRows: () => rows,
+		restorableStates: [],
+		ddl: `alter column ${schema.columns[colIndex].name}`,
 		isCollationRegistered: () => false,
 	};
+}
+
+/** The same context with one state a rollback could restore, holding `rows`. */
+function withRestorable(ctx: AlterColumnContext, rows: Row[], backfilled: boolean): AlterColumnContext {
+	const state: RestorableState = { rows: () => rows, backfilled };
+	return { ...ctx, restorableStates: [state] };
 }
 
 /** The same context, but handing back an async stream — a wrapper module's overlay. */
@@ -170,6 +179,31 @@ describe('alter column: planSetNotNull', () => {
 		const ctx = withAsyncRows(makeCtx(schema), [['x'], [null]]);
 		await expectStatus(() => planSetNotNull(ctx, true), StatusCode.CONSTRAINT);
 	});
+
+	it('refuses (BUSY) a NULL held only by a restorable state when the column has no literal DEFAULT', async () => {
+		// The effective rows are clean, so the tightening is not a CONSTRAINT violation — but a
+		// rollback would restore the NULL under a NOT NULL column with nothing to fill it from.
+		const schema = makeSchema([TEXT_COL('a')]);
+		const ctx = withRestorable(makeCtx(schema, [['x']]), [[null]], true);
+		const err = await expectStatus(() => planSetNotNull(ctx, true), StatusCode.BUSY);
+		expect(err.message).to.match(/commit the pending writes first/i);
+		expect(err.message).to.contain('alter column a');
+	});
+
+	it('forces the DEFAULT backfill for a NULL held only by a restorable state the rewrite reaches', async () => {
+		const schema = makeSchema([TEXT_COL('a', { defaultValue: literal('d') })]);
+		const change = await planSetNotNull(withRestorable(makeCtx(schema, [['x']]), [[null]], true), true);
+		expect(change!.rewrite, 'no visible NULL, yet the restorable NULL must be filled').to.not.equal(null);
+		expect(change!.rewrite!.convert(null)).to.equal('d');
+	});
+
+	it('refuses (BUSY) a NULL in a restorable state the backfill cannot reach, DEFAULT or not', async () => {
+		// A wrapper module's savepoint frame: judged as-is, because no rewrite of the manager
+		// reaches it (see `IssuerRowSources.savepoints`).
+		const schema = makeSchema([TEXT_COL('a', { defaultValue: literal('d') })]);
+		const ctx = withRestorable(makeCtx(schema, [['x']]), [[null]], false);
+		await expectStatus(() => planSetNotNull(ctx, true), StatusCode.BUSY);
+	});
 });
 
 describe('alter column: planSetDataType', () => {
@@ -195,6 +229,16 @@ describe('alter column: planSetDataType', () => {
 			StatusCode.MISMATCH,
 		);
 		expect(err.message).to.contain("Cannot convert value in 'a' to integer");
+	});
+
+	it('refuses (BUSY) a value the new type refuses when it is held only by a restorable state', async () => {
+		// Visible rows convert, so this is not a MISMATCH; but a rollback would restore 'hello'
+		// into an integer column. The MISMATCH is carried as the cause.
+		const schema = makeSchema([TEXT_COL('a')]);
+		const ctx = withRestorable(makeCtx(schema, [['1']]), [['hello']], true);
+		const err = await expectStatus(() => planSetDataType(ctx, 'integer'), StatusCode.BUSY);
+		expect(err.message).to.match(/commit the pending writes first/i);
+		expect((err.cause as QuereusError).code).to.equal(StatusCode.MISMATCH);
 	});
 
 	it('rewrites values and re-keys when the comparator moves', async () => {
