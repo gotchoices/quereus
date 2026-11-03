@@ -25,3 +25,5 @@ The run used `autoReconnect: false`, so retries were not observed. Nothing on th
 ## Expected behaviour
 
 A write that sends a table's cells also makes sure its definition is sent, so a new device can bootstrap. One option is for local capture to announce a table the first time it records a cell for one with no live create, reusing `missingCreateEvents`. The ticket that picks this up should weigh that against having a snapshot skip a table it has no definition for.
+
+The first fix run was interrupted by a machine restart. Its probe spec, which ran against `test/sync/_peer-harness.ts`, is saved at `tickets/.logs/zz-probe.unannounced-table.spec.ts.txt`, and its results are at the end of that run's log.
