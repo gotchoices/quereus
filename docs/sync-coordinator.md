@@ -174,7 +174,7 @@ All endpoints are prefixed with `/sync` (configurable).
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/status` | Health check; returns coordinator status and stats |
-| `GET` | `/changes` | Get changes since `?sinceHLC=...` for requesting client |
+| `GET` | `/changes` | Get changes since `?sinceHLC=...` for requesting client; `409 SNAPSHOT_REQUIRED` (with `error.deltaFloor`) when that watermark predates the store's delta floor — take a snapshot instead |
 | `POST` | `/changes` | Apply changes from client; body is `ChangeSet[]` |
 | `GET` | `/snapshot` | Stream full snapshot for initial sync |
 | `POST` | `/snapshot` | Resume snapshot from checkpoint |
@@ -241,6 +241,7 @@ See [`sync-protocol.md` § Protocol version](sync-protocol.md#protocol-version) 
 ```typescript
 | { type: "handshake_ack"; serverSiteId: string; protocolVersion: number }
 | { type: "changes"; changeSets: ChangeSet[] }
+| { type: "snapshot_required"; sinceHLC: string; deltaFloor: string }  // get_changes refused: watermark below the delta floor
 | { type: "apply_result"; result: ApplyResult }
 | { type: "snapshot_chunk"; chunk: SnapshotChunk }
 | { type: "snapshot_complete" }                        // Signals successful end of snapshot stream

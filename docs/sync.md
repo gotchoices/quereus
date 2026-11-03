@@ -204,7 +204,7 @@ The **quoomb-web worker** runs all five sweeps on one periodic loop (5-minute de
 
 The relay-only **`sync-coordinator`** runs the same pass on its own loop (`src/service/maintenance.ts`), started in `CoordinatorService.initialize()` and stopped in `shutdown()`, differing in three ways because it is a multi-tenant relay:
 
-- **Cadence is hourly, not 5-minutely**, because two sweeps are inert on a relay and return 0 — `drainHeldChanges` (no `getTableSchema` oracle) and `evictExpiredBasisTables` (no `dropLocalTable` reclaim callback) — and the drain is the only latency-sensitive one. `pruneTombstones`, `pruneQuarantine` and `repairChangeLog` all do real work here (none of the three depends on a basis oracle or a reclaim callback) and act at horizon granularity or on the whole change log, so hourly is ample. The inert two are still called, for symmetry and because they cost nothing.
+- **Cadence is hourly, not 5-minutely**, because two sweeps are inert on a relay and return 0 — `drainHeldChanges` (no `getTableSchema` oracle) and `evictExpiredBasisTables` (no `dropLocalTable` reclaim callback) — and the drain is the only latency-sensitive one. `pruneTombstones`, `pruneQuarantine` and `repairChangeLog` all do real work here (none of the three depends on a basis oracle or a reclaim callback) and act at horizon granularity or on the whole change log, so hourly is ample. The inert two are still called, for symmetry and because they cost nothing. Each `pruneTombstones` that removes anything also raises the store's **delta floor** (§ *Read side: one ChangeSet per transaction* → *The delta floor*), which is what lets the coordinator refuse a client whose watermark predates the pruned deletes instead of serving it an incomplete delta.
 - **One pass sweeps every open database**, iterating the `StoreManager`'s open set and pinning each store by refcount for its sweep so a concurrent idle-close cannot pull the LevelDB handle out from under a scan. A store closed between the pass snapshotting the open set and reaching it is skipped. Failures are isolated per sweep *and* per store, so one bad tenant cannot starve the rest.
 - **Only already-open databases are swept**; one closed on disk waits until a client next opens it. An eager scan of every database directory was rejected: it would open — and, where disk eviction is enabled, re-download from S3 — databases nobody is using, turning a cheap housekeeping tick into an unbounded I/O storm.
 
@@ -417,10 +417,32 @@ cells + live tombstones** rather than to the replica's lifetime delete volume, a
 lossless by construction — a dropped entry already resolved to `null` and could never
 have appeared in any `ChangeSet`.
 
+**The delta floor.** Pruning a tombstone removes a fact a peer may still need: a peer whose
+received watermark predates that delete would get a delta without it and keep the row
+forever, with nothing on either side reporting anything. So every prune of deliverable
+history raises the replica's **delta floor** — the greatest HLC of any tombstone it has
+pruned, one `df:` record (`metadata/delta-floor.ts`), written in the *same* `WriteBatch`
+as the tombstone deletes so a crash between the two cannot reopen the gap, and only ever
+moving forward. An incremental request `since T` is complete iff `T >= floor` (replies
+carry changes strictly after `T`, so a tombstone at exactly `T` was already delivered);
+`SyncManager.canDeltaSync(sinceHLC)` is exactly that comparison, and `getDeltaFloor()`
+exposes the value. The floor is *not* a wall-clock test: a watermark is the HLC of the
+last change a peer received, not the time it last synced, so a quiet database never ages
+a peer out of delta sync on its own. The floor travels in snapshot headers
+(`deltaFloor` on `SnapshotHeaderChunk` / `Snapshot`) and a receiver takes
+`max(own, sender's)` after its metadata clear — a replica rebuilt from a snapshot (the
+coordinator's S3 restore after disk eviction, say) inherits the sender's incompleteness
+rather than silently resetting to "can serve anything". `pruneQuarantine` does **not**
+raise it: held forwardable changes are not in snapshots either (§ *Snapshot carve-out*),
+so refusing a delta there would force a snapshot that lacks them just the same. The
+coordinator consults the floor before serving `get_changes` and answers
+`snapshot_required` below it; see [sync-protocol.md § Client snapshot
+bootstrap](sync-protocol.md#client-snapshot-bootstrap) for the client's recovery.
+
 Pruning entries by a *time* horizon (`ChangeLogStore.pruneEntriesBefore`) is a different,
-deliberately **unwired** operation: it drops entries for still-live cells, safe only once
-the server refuses delta sync for a too-old `sinceHLC` (`SyncManager.canDeltaSync`,
-likewise not yet called by the coordinator).
+deliberately **unwired** operation: it drops entries for still-live cells, and is safe only
+if it raises the delta floor to its boundary in the same batch, exactly as the tombstone
+prune does.
 
 **Repairing pre-existing orphans.** The forward cleanup above only stops *new* orphans —
 each deletes a `cl:` entry *via* the record it points at, so an entry whose record died

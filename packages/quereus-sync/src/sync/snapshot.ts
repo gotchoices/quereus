@@ -99,6 +99,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	}
 
 	const schemaMigrations = await ctx.schemaMigrations.listAllMigrations();
+	const deltaFloor = await ctx.deltaFloor.get();
 
 	// Collect all tombstones — a GLOBAL pass (not keyed off `tables`), mirroring the
 	// streaming producer: a fully-deleted row has a tombstone but no live
@@ -129,6 +130,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		tables,
 		schemaMigrations,
 		tombstones,
+		...(deltaFloor !== undefined ? { deltaFloor } : {}),
 	};
 }
 
@@ -249,6 +251,12 @@ export async function applySnapshot(
 			}
 
 			await clearBatch.write();
+
+			// Inherit the sender's delta floor (forward-only) — see the streaming
+			// consumer's `header` case for why.
+			if (snapshot.deltaFloor) {
+				await ctx.deltaFloor.raise(snapshot.deltaFloor);
+			}
 
 			// Apply snapshot's column versions and rebuild change log, filed under the
 			// RECEIVER's derived identity. A sender with different keying (a raw-keyed

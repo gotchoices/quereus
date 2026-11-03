@@ -9,6 +9,7 @@ import {
   siteIdFromBase64,
   siteIdToBase64,
   deserializeHLC,
+  serializeHLCForTransport,
   PROTOCOL_VERSION,
   type HLC,
   type ChangeSet,
@@ -195,10 +196,22 @@ export function registerWebSocket(
           sinceHLC = deserializeHLC(Buffer.from(msg.sinceHLC, 'base64'));
         }
 
-        const changes = await service.getChangesSince(session.databaseId, session.identity, sinceHLC);
+        const outcome = await service.getChangesSince(session.databaseId, session.identity, sinceHLC);
+
+        if (outcome.kind === 'snapshot-required') {
+          // A normal protocol outcome, not an `error`: the client's error path
+          // raises onError and the `error` sync event, which a too-old client
+          // does not deserve. It recovers by pushing, snapshotting, catching up.
+          sendMessage({
+            type: 'snapshot_required',
+            sinceHLC: msg.sinceHLC,
+            deltaFloor: serializeHLCForTransport(outcome.deltaFloor),
+          });
+          return;
+        }
 
         // Serialize for JSON transport
-        const serializedChanges = changes.map(cs => serializeChangeSet(cs));
+        const serializedChanges = outcome.changeSets.map(cs => serializeChangeSet(cs));
 
         sendMessage({ type: 'changes', changeSets: serializedChanges });
       } catch (err) {

@@ -62,8 +62,13 @@ import type { SnapshotCheckpoint } from './manager.js';
  * handshake / handshake_ack). If rolling/mixed-version upgrades ever become a
  * requirement, widen to a `{min,max}`-supported range and negotiate — do not
  * silently accept a mismatch.
+ *
+ * Version 2: the server may answer `get_changes` with `snapshot_required`
+ * instead of `changes` (its delta floor is above the client's watermark). A v1
+ * client would log it as an unknown message and sit unsynced forever, so the
+ * change is breaking in effect even though no v1 message shape moved.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // ============================================================================
 // Base64 helpers (work in both browser and Node.js)
@@ -164,6 +169,7 @@ export interface SerializedSnapshotHeaderChunk {
   tableCount: number;
   migrationCount: number;
   snapshotId: string;
+  deltaFloor?: string;                  // base64; present-only
 }
 
 export interface SerializedSnapshotTableStartChunk {
@@ -393,6 +399,9 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): SerializedSnapshot
         tableCount: chunk.tableCount,
         migrationCount: chunk.migrationCount,
         snapshotId: chunk.snapshotId,
+        ...(chunk.deltaFloor !== undefined
+          ? { deltaFloor: serializeHLCForTransport(chunk.deltaFloor) }
+          : {}),
       };
     case 'column-versions':
       return {
@@ -452,6 +461,9 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
         tableCount: obj.tableCount,
         migrationCount: obj.migrationCount,
         snapshotId: obj.snapshotId,
+        ...(obj.deltaFloor !== undefined
+          ? { deltaFloor: deserializeHLCFromTransport(obj.deltaFloor) }
+          : {}),
       };
     case 'column-versions':
       return {
@@ -679,6 +691,22 @@ export interface RequestChangesMessage {
   sinceHLC?: string;
 }
 
+/**
+ * Server → Client: refusal of a `get_changes` whose `sinceHLC` is below the
+ * server's delta floor — a delete the client needs has been pruned, so no
+ * incremental reply can be complete. A normal protocol outcome, not an `error`:
+ * the client answers by pushing its unsent local work, taking a full snapshot,
+ * then catching up from the snapshot's HLC (see docs/sync-protocol.md § Client
+ * snapshot bootstrap).
+ */
+export interface SnapshotRequiredMessage {
+  type: 'snapshot_required';
+  /** Base64-encoded HLC the client asked for, echoed back. */
+  sinceHLC: string;
+  /** Base64-encoded delta floor: the lowest watermark the server can still serve. */
+  deltaFloor: string;
+}
+
 /** Server → Client: Error. */
 export interface ErrorMessage {
   type: 'error';
@@ -705,6 +733,7 @@ export type ServerMessage =
   | ApplyResultMessage
   | SnapshotChunkMessage
   | SnapshotCompleteMessage
+  | SnapshotRequiredMessage
   | RequestChangesMessage
   | ErrorMessage
   | PongMessage;

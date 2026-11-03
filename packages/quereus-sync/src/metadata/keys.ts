@@ -18,6 +18,9 @@
  *   bl: - Basis-table lifecycle (mapped/derivation-source/unreferenced/detached bookkeeping)
  *   fv: - Sync-metadata format version (single record; see SYNC_METADATA_FORMAT_VERSION)
  *   sc: - Snapshot checkpoints (resume position of an interrupted streaming snapshot apply)
+ *   df: - Delta floor (single record: the greatest HLC of any tombstone this replica has
+ *         pruned — the HLC below which it can no longer serve a complete incremental delta;
+ *         see `metadata/delta-floor.ts`)
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -47,6 +50,7 @@ export const SYNC_KEY_PREFIX = {
   FORMAT_VERSION: encoder.encode('fv:'),
   SNAPSHOT_CHECKPOINT: encoder.encode('sc:'),
   TABLE_GENERATION: encoder.encode('tg:'),
+  DELTA_FLOOR: encoder.encode('df:'),
 } as const;
 
 /**

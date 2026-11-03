@@ -15,6 +15,7 @@ import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import type { QuarantineStore } from '../metadata/quarantine.js';
 import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
+import type { DeltaFloorStore } from '../metadata/delta-floor.js';
 import type { TableIdentityStore } from '../metadata/table-identity.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
@@ -37,6 +38,8 @@ export interface SyncContext {
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
 	readonly basisLifecycle: BasisLifecycleStore;
+	/** The `df:` record — see `metadata/delta-floor.ts`. Snapshot apply inherits the sender's. */
+	readonly deltaFloor: DeltaFloorStore;
 	/**
 	 * The name ↔ generation map every `cv:`/`tb:`/`cl:` record is keyed through
 	 * (see `metadata/table-identity.ts`). The record stores resolve it themselves;

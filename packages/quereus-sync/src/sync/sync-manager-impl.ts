@@ -30,6 +30,7 @@ import {
 import { ColumnVersionStore, type ColumnVersionData, deserializeColumnVersion } from '../metadata/column-version.js';
 import { TombstoneStore, deserializeTombstone } from '../metadata/tombstones.js';
 import { PeerStateStore } from '../metadata/peer-state.js';
+import { DeltaFloorStore } from '../metadata/delta-floor.js';
 import { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
 import { QuarantineStore } from '../metadata/quarantine.js';
@@ -185,6 +186,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	readonly columnVersions: ColumnVersionStore;
 	readonly tombstones: TombstoneStore;
 	private readonly peerStates: PeerStateStore;
+	readonly deltaFloor: DeltaFloorStore;
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
@@ -259,6 +261,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.columnVersions = new ColumnVersionStore(kv, this.pkKeying, this.tableIdentity);
 		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs, this.pkKeying, this.tableIdentity);
 		this.peerStates = new PeerStateStore(kv);
+		this.deltaFloor = new DeltaFloorStore(kv);
 		this.changeLog = new ChangeLogStore(kv, this.pkKeying, this.tableIdentity);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
 		this.quarantine = new QuarantineStore(kv);
@@ -1221,6 +1224,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * commit boundary (docs/sync.md § Transaction-Based Change Grouping → Read side).
 	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
+		// A watermark below the delta floor cannot be served in full: a delete
+		// whose tombstone was pruned is missing from the reply, and nothing in it
+		// says so. Warn rather than throw — the coordinator checks `canDeltaSync`
+		// BEFORE calling (so a server never reaches this), and a client's own
+		// outbound push runs below its local floor legitimately (it prunes its own
+		// tombstones too); a throw there would wedge the push path.
+		if (sinceHLC && !(await this.deltaFloor.admits(sinceHLC))) {
+			console.warn(
+				'[Sync] getChangesSince below the delta floor: tombstones the peer needs were pruned, so this delta is incomplete — the peer should take a snapshot',
+			);
+		}
+
 		const dataChanges: Change[] = sinceHLC
 			? await this.collectChangesSince(peerSiteId, sinceHLC, this.config.batchSize)
 			: await this.collectAllChanges(peerSiteId);
@@ -1560,20 +1575,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return drainHeldChangesImpl(this, schema, table);
 	}
 
-	async canDeltaSync(peerSiteId: SiteId, sinceHLC: HLC): Promise<boolean> {
-		const peerState = await this.peerStates.getPeerState(peerSiteId);
-		if (!peerState) {
-			return false;
-		}
+	async canDeltaSync(sinceHLC: HLC): Promise<boolean> {
+		return this.deltaFloor.admits(sinceHLC);
+	}
 
-		// Check if retention horizon covers the requested time range
-		const now = Date.now();
-		const sinceTime = Number(sinceHLC.wallTime);
-		if (now - sinceTime > this.config.retentionHorizonMs) {
-			return false;
-		}
-
-		return true;
+	async getDeltaFloor(): Promise<HLC | undefined> {
+		return this.deltaFloor.get();
 	}
 
 	// ============================================================================
@@ -1616,11 +1623,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * so leaving it would accumulate one dead entry per delete the replica has ever
 	 * seen — the delete-side twin of the column cleanup in
 	 * {@link deleteRowVersionsAndLogEntries}. Both deletions share this batch.
+	 *
+	 * The delta floor (`metadata/delta-floor.ts`) is raised to the greatest
+	 * pruned tombstone HLC in this SAME batch: a peer whose watermark is below it
+	 * can no longer be served a complete delta, and a crash between the deletes
+	 * and the raise would let such a peer sync past the gap silently.
 	 */
 	async pruneTombstones(): Promise<number> {
 		const now = Date.now();
 		let count = 0;
 		const batch = this.kv.batch();
+		let maxPrunedHLC: HLC | undefined;
 
 		const tbBounds = buildAllTombstonesScanBounds();
 		for await (const entry of this.kv.iterate(tbBounds)) {
@@ -1628,6 +1641,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			if (now - tombstone.createdAt > this.config.retentionHorizonMs) {
 				batch.delete(entry.key);
+				if (!maxPrunedHLC || compareHLC(tombstone.hlc, maxPrunedHLC) > 0) {
+					maxPrunedHLC = tombstone.hlc;
+				}
 				const parsed = parseTombstoneKey(entry.key);
 				if (parsed) {
 					// Generation + identity delete: the parsed key already carries both, so
@@ -1641,6 +1657,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			}
 		}
 
+		if (maxPrunedHLC) {
+			await this.deltaFloor.raiseBatch(batch, maxPrunedHLC);
+		}
 		await batch.write();
 		return count;
 	}
@@ -1650,6 +1669,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * the quarantine sibling of {@link pruneTombstones}, keyed off the same
 	 * `retentionHorizonMs`. A held change older than the horizon was already
 	 * outside the delivery guarantee.
+	 *
+	 * NOTE: unlike {@link pruneTombstones} this does NOT raise the delta floor.
+	 * Held forwardable changes are not in snapshots either (docs/sync.md §
+	 * Snapshot carve-out), so refusing a delta here would force a snapshot that
+	 * lacks them just the same — the floor would cost a full copy and buy nothing.
 	 */
 	async pruneQuarantine(): Promise<number> {
 		const cutoff = Date.now() - this.config.retentionHorizonMs;

@@ -52,6 +52,15 @@ export function createCoordinatorMetrics(registry: MetricsRegistry = globalRegis
     'Total number of changes broadcast to clients'
   );
 
+  // A client refused an incremental sync because its watermark predates a
+  // pruned deletion (it is told to take a snapshot instead). A steady rate
+  // here is the signal that SYNC_RETENTION_HORIZON_MS is shorter than real
+  // client absences.
+  const deltaRefusedTotal = registry.registerCounter(
+    'sync_delta_refused_total',
+    'Total get_changes requests refused because the watermark predates the delta floor (snapshot required)'
+  );
+
   const broadcastErrorsTotal = registry.registerCounter(
     'sync_broadcast_errors_total',
     'Total broadcast send failures'
@@ -111,6 +120,7 @@ export function createCoordinatorMetrics(registry: MetricsRegistry = globalRegis
     changesRejectedTotal,
     changesBroadcastTotal,
     broadcastErrorsTotal,
+    deltaRefusedTotal,
 
     // Snapshots
     snapshotRequestsTotal,

@@ -150,9 +150,9 @@ describe('CoordinatorService', () => {
       const client: ClientIdentity = {
         siteId: siteIdFromBase64(TEST_SITE_ID_BASE64),
       };
-      const changes = await service.getChangesSince(TEST_DATABASE_ID, client);
-      expect(changes).to.be.an('array');
-      expect(changes.length).to.equal(0);
+      const outcome = await service.getChangesSince(TEST_DATABASE_ID, client);
+      expect(outcome.kind).to.equal('changes');
+      expect(outcome.kind === 'changes' && outcome.changeSets).to.deep.equal([]);
     });
   });
 

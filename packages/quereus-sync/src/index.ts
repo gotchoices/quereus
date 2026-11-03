@@ -151,6 +151,7 @@ export {
   type ApplyResultMessage,
   type SnapshotChunkMessage,
   type SnapshotCompleteMessage,
+  type SnapshotRequiredMessage,
   type RequestChangesMessage,
   type ErrorMessage,
   type PongMessage,
@@ -282,6 +283,8 @@ export {
   PeerStateStore,
   serializePeerState,
   deserializePeerState,
+  // Delta floor (the HLC below which an incremental delta is incomplete)
+  DeltaFloorStore,
   // Schema versions (column-level)
   type SchemaVersion,
   type SchemaVersionType,

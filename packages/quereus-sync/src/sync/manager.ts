@@ -57,17 +57,26 @@ export interface SyncManager {
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
 
   /**
-   * Check if delta sync is possible with a peer.
+   * Whether an incremental request `since sinceHLC` can be served in full.
    *
-   * Returns false if:
-   * - Tombstone TTL has expired for relevant data
-   * - Peer's last sync is too old
-   * - Full snapshot is required
+   * False once this replica has pruned a tombstone with an HLC above
+   * `sinceHLC` — the delete it backed can no longer be delivered, so the peer
+   * must take a full snapshot instead (see {@link getDeltaFloor}). Nothing
+   * else is consulted: no peer state, no wall clock. A watermark is the HLC of
+   * the last change a peer received, not the time it last synced, so a quiet
+   * database never ages a peer out of delta sync on its own.
    *
-   * @param peerSiteId - The peer to check
-   * @param sinceHLC - The peer's last known HLC
+   * @param sinceHLC - The peer's last known HLC (its received watermark)
    */
-  canDeltaSync(peerSiteId: SiteId, sinceHLC: HLC): Promise<boolean>;
+  canDeltaSync(sinceHLC: HLC): Promise<boolean>;
+
+  /**
+   * The delta floor: the greatest HLC of any tombstone this replica has
+   * pruned, or `undefined` when nothing deliverable has ever been pruned. An
+   * incremental request `since T` is complete iff `T >= floor`. Raised by
+   * {@link pruneTombstones} and inherited from a snapshot's sender on apply.
+   */
+  getDeltaFloor(): Promise<HLC | undefined>;
 
   /**
    * Get a full snapshot for initial sync or TTL expiration recovery.

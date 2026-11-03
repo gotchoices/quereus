@@ -155,6 +155,7 @@ The client implements the Quereus sync WebSocket protocol:
 | `handshake_ack` | Server→Client | Confirm connection |
 | `get_changes` | Client→Server | Request changes since HLC |
 | `changes` | Server→Client | Initial/requested changes |
+| `snapshot_required` | Server→Client | Our watermark predates pruned deletes; the client pushes unsent local changes, takes a full snapshot, then catches up |
 | `apply_changes` | Client→Server | Send local changes |
 | `apply_result` | Server→Client | Confirm changes applied |
 | `push_changes` | Server→Client | Real-time changes from other clients |

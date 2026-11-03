@@ -84,8 +84,9 @@ const result = await syncManager.applyChanges(changeSets);
 When replicas have synced before:
 
 ```typescript
-// Check if delta sync is possible
-if (await syncManager.canDeltaSync(peerSiteId)) {
+// Can the peer's watermark still be served in full? False once a tombstone
+// above it has been pruned (the delta floor) — the peer needs a snapshot then.
+if (await syncManager.canDeltaSync(sinceHLC)) {
   // Get changes since last sync
   const changes = await syncManager.getChangesSince(peerSiteId, sinceHLC);
   // Apply received changes (applyToStore callback set at construction)

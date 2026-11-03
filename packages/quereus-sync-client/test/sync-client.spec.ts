@@ -154,8 +154,12 @@ class MockSyncManager implements SyncManager {
     return this.applyChangesResult;
   }
 
-  async canDeltaSync(_peerSiteId: SiteId, _sinceHLC: HLC): Promise<boolean> {
+  async canDeltaSync(_sinceHLC: HLC): Promise<boolean> {
     return true;
+  }
+
+  async getDeltaFloor(): Promise<HLC | undefined> {
+    return undefined;
   }
 
   async getSnapshot(): Promise<Snapshot> {
@@ -1522,6 +1526,75 @@ describe('SyncClient', () => {
       expect(getChangesIndex).to.be.greaterThan(snapshotIndex);
       expect((messages[getChangesIndex] as { sinceHLC?: string }).sinceHLC)
         .to.equal(serializeHLCForTransport(hlc));
+    });
+
+    it('on snapshot_required: pushes unsent local work, takes the snapshot only after the ack, then catches up from the snapshot HLC', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      const serverSite = generateSiteId();
+      // A device with history: a received watermark (so no auto-bootstrap) and
+      // nothing to push at handshake.
+      syncManager.peerSyncState = hlcAt(5000n, serverSite);
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+      expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
+
+      // Offline work appears, then the server refuses our watermark.
+      const localHlc = hlcAt(6000n, site);
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', localHlc)];
+      ws.simulateMessage({
+        type: 'snapshot_required',
+        sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
+        deltaFloor: serializeHLCForTransport(hlcAt(7000n, serverSite)),
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      // The push went out and the snapshot request is HELD until it is acked.
+      let types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.include('apply_changes');
+      expect(types).to.not.include('get_snapshot');
+      const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId: string };
+
+      // The ack lands: the sent watermark is confirmed, nothing is left to push,
+      // and only now does get_snapshot leave.
+      syncManager.getChangesSinceResult = [];
+      ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      expect(syncManager.updatePeerSentStateCalls.map(c => c.hlc)).to.deep.equal([localHlc]);
+      types = ws.getSentMessages().map(m => m.type);
+      expect(types.indexOf('get_snapshot')).to.be.greaterThan(types.indexOf('apply_changes'));
+      expect(client.isBootstrapping).to.be.true;
+
+      // The snapshot lands; the catch-up asks for changes after ITS hlc.
+      const snapshotHlc = hlcAt(9000n, serverSite);
+      streamSnapshot(ws, snapshotChunks(serverSite, snapshotHlc));
+      await new Promise(r => setTimeout(r, 30));
+      expect(client.isBootstrapping).to.be.false;
+      const messages = ws.getSentMessages();
+      const last = messages[messages.length - 1] as { type: string; sinceHLC?: string };
+      expect(last.type).to.equal('get_changes');
+      expect(last.sinceHLC).to.equal(serializeHLCForTransport(snapshotHlc));
+    });
+
+    it('on snapshot_required in readOnly mode: takes the snapshot at once, pushing nothing', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      syncManager.peerSyncState = hlcAt(5000n, serverSite);
+      syncManager.getChangesSinceResult = [changeSet(syncManager.getSiteId(), 'tx-offline', hlcAt(6000n, syncManager.getSiteId()))];
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, readOnly: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      ws.simulateMessage({
+        type: 'snapshot_required',
+        sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
+        deltaFloor: serializeHLCForTransport(hlcAt(7000n, serverSite)),
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      const types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.not.include('apply_changes');
+      expect(types).to.include('get_snapshot');
+      expect(client.isBootstrapping).to.be.true;
     });
 
     it('bootstrapOnEmpty defaults to true on a raw client', async () => {

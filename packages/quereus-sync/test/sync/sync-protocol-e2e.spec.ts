@@ -434,23 +434,16 @@ describe('Sync Protocol E2E', () => {
       const host = await createReplica('host', config);
       const guest = await createReplica('guest', config);
 
-      // Initially, canDeltaSync should be false (never synced)
-      const canDeltaBefore = await host.manager.canDeltaSync(
-        guest.manager.getSiteId(),
-        guest.manager.getCurrentHLC()
-      );
-      expect(canDeltaBefore).to.be.false;
+      // Never synced: no received watermark for the guest yet.
+      expect(await host.manager.getPeerSyncState(guest.manager.getSiteId())).to.equal(undefined);
 
-      // After sync, should be able to delta sync
       emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
       await new Promise(r => setTimeout(r, 10));
       await performBidirectionalSync(host, guest);
 
-      const canDeltaAfter = await host.manager.canDeltaSync(
-        guest.manager.getSiteId(),
-        guest.manager.getCurrentHLC()
-      );
-      expect(canDeltaAfter).to.be.true;
+      // The sync recorded each side's watermark for the other.
+      expect(await host.manager.getPeerSyncState(guest.manager.getSiteId())).to.not.equal(undefined);
+      expect(await guest.manager.getPeerSyncState(host.manager.getSiteId())).to.not.equal(undefined);
     });
   });
 

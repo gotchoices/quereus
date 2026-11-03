@@ -42,6 +42,16 @@ import { S3BatchStore } from './s3-batch-store.js';
 import { S3SnapshotStore, type SnapshotScheduleConfig } from './s3-snapshot-store.js';
 
 /**
+ * Outcome of a `getChangesSince` request. `snapshot-required` means the
+ * client's watermark predates the store's delta floor — a deletion it needs
+ * has been pruned — so no incremental reply can be complete; the transport
+ * tells the client to take a full snapshot instead.
+ */
+export type GetChangesOutcome =
+  | { kind: 'changes'; changeSets: ChangeSet[] }
+  | { kind: 'snapshot-required'; deltaFloor: HLC };
+
+/**
  * Options for creating a CoordinatorService.
  */
 export interface CoordinatorServiceOptions {
@@ -306,13 +316,15 @@ export class CoordinatorService {
   }
 
   /**
-   * Get changes since a given HLC for a client.
+   * Get changes since a given HLC for a client, or refuse when the watermark
+   * is below the store's delta floor. A request with no `sinceHLC` is a
+   * from-nothing load and is never refused.
    */
   async getChangesSince(
     databaseId: string,
     client: ClientIdentity,
     sinceHLC?: HLC
-  ): Promise<ChangeSet[]> {
+  ): Promise<GetChangesOutcome> {
     serviceLog('getChangesSince db=%s client=%s, sinceHLC: %O',
       databaseId, siteIdToBase64(client.siteId), sinceHLC);
 
@@ -327,9 +339,18 @@ export class CoordinatorService {
     const context = this.buildStoreContext(undefined, client);
     const entry = await this.getStore(databaseId, context);
     try {
-      const changes = await entry.syncManager.getChangesSince(client.siteId, sinceHLC);
+      if (sinceHLC && !(await entry.syncManager.canDeltaSync(sinceHLC))) {
+        // The floor is defined whenever canDeltaSync is false.
+        const deltaFloor = (await entry.syncManager.getDeltaFloor())!;
+        this.metrics.registry.incCounter(this.metrics.deltaRefusedTotal);
+        serviceLog('getChangesSince db=%s client=%s refused: watermark below delta floor %O',
+          databaseId, siteIdToBase64(client.siteId), deltaFloor);
+        endTimer();
+        return { kind: 'snapshot-required', deltaFloor };
+      }
+      const changeSets = await entry.syncManager.getChangesSince(client.siteId, sinceHLC);
       endTimer();
-      return changes;
+      return { kind: 'changes', changeSets };
     } finally {
       this.releaseStore(databaseId);
     }
@@ -503,19 +524,6 @@ export class CoordinatorService {
         this.metrics.registry.incCounter(this.metrics.snapshotChunksTotal);
         yield chunk;
       }
-    } finally {
-      this.releaseStore(databaseId);
-    }
-  }
-
-  /**
-   * Check if delta sync is possible.
-   */
-  async canDeltaSync(databaseId: string, client: ClientIdentity, sinceHLC: HLC): Promise<boolean> {
-    const context = this.buildStoreContext(undefined, client);
-    const entry = await this.getStore(databaseId, context);
-    try {
-      return entry.syncManager.canDeltaSync(client.siteId, sinceHLC);
     } finally {
       this.releaseStore(databaseId);
     }

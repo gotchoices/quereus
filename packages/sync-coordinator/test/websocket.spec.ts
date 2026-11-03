@@ -13,8 +13,13 @@ import {
   createHLC,
   siteIdFromBase64,
   serializeSnapshotCheckpoint,
+  serializeChangeSet,
+  serializeHLCForTransport,
+  type ChangeSet,
+  type HLC,
 } from '@quereus/sync';
 import { createCoordinatorServer, loadConfig, type CoordinatorServer } from '../src/index.js';
+import { runCoordinatorMaintenancePass } from '../src/service/maintenance.js';
 
 // Test database ID in <org_id>:<type>_<id> format
 const TEST_DATABASE_ID = 'default:s_test-scenario';
@@ -511,3 +516,112 @@ describe('WebSocket Handler', () => {
   });
 });
 
+/**
+ * A client whose watermark predates a pruned deletion must be REFUSED, not
+ * handed a delta that silently lacks the delete. Boots its own coordinator with
+ * an instantly-expiring retention horizon so one maintenance pass prunes every
+ * tombstone (as `maintenance.spec.ts` does).
+ */
+describe('Get Changes below the delta floor', () => {
+  let server: CoordinatorServer;
+  let wsUrl: string;
+  let testDataDir: string;
+  const DATABASE_ID = 'default:s_floor-scenario';
+
+  before(async () => {
+    testDataDir = join(tmpdir(), `sync-ws-floor-test-${randomUUID()}`);
+    const config = loadConfig({
+      overrides: {
+        port: 0,
+        dataDir: testDataDir,
+        basePath: '/sync',
+        sync: { retentionHorizonMs: -1 },
+      },
+    });
+    server = await createCoordinatorServer({ config });
+    await server.start();
+    const address = server.app.server.address();
+    const port = typeof address === 'object' && address ? address.port : 3000;
+    wsUrl = `ws://127.0.0.1:${port}/sync/ws`;
+  });
+
+  after(async () => {
+    await server.stop();
+    await rm(testDataDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function connect(): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      ws.on('open', () => resolve(ws));
+      ws.on('error', reject);
+    });
+  }
+
+  function sendAndReceive(ws: WebSocket, message: object): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Timeout')), 5000);
+      ws.once('message', (data) => {
+        clearTimeout(timeout);
+        resolve(JSON.parse(data.toString()));
+      });
+      ws.send(JSON.stringify(message));
+    });
+  }
+
+  async function handshake(ws: WebSocket, siteId: string): Promise<void> {
+    const ack = await sendAndReceive(ws, {
+      type: 'handshake', databaseId: DATABASE_ID, siteId, protocolVersion: PROTOCOL_VERSION,
+    });
+    expect(ack.type).to.equal('handshake_ack');
+  }
+
+  it('answers snapshot_required (floor = the pruned delete) for a pre-delete watermark, and changes for a from-nothing request', async () => {
+    const writerSite = siteIdFromBase64(TEST_SITE_ID_1);
+    const insertHlc: HLC = createHLC(BigInt(Date.now()), 0, writerSite, 0);
+    const deleteHlc: HLC = createHLC(insertHlc.wallTime + 1n, 0, writerSite, 0);
+    const insert: ChangeSet = {
+      siteId: writerSite, transactionId: 'txn-insert', hlc: insertHlc, schemaMigrations: [],
+      changes: [{ type: 'column', schema: 'main', table: 'users', pk: [1], column: 'name', value: 'a', hlc: insertHlc }],
+    };
+    const del: ChangeSet = {
+      siteId: writerSite, transactionId: 'txn-delete', hlc: deleteHlc, schemaMigrations: [],
+      changes: [{ type: 'delete', schema: 'main', table: 'users', pk: [1], hlc: deleteHlc }],
+    };
+
+    const writer = await connect();
+    const reader = await connect();
+    try {
+      await handshake(writer, TEST_SITE_ID_1);
+      const r1 = await sendAndReceive(writer, { type: 'apply_changes', changes: [serializeChangeSet(insert)] });
+      expect(r1.type).to.equal('apply_result');
+      const r2 = await sendAndReceive(writer, { type: 'apply_changes', changes: [serializeChangeSet(del)] });
+      expect(r2.type).to.equal('apply_result');
+
+      // The writer's session keeps the store open, so the pass sweeps it and
+      // the instantly-expired tombstone is pruned, raising the floor.
+      await runCoordinatorMaintenancePass(server.service.storeManager);
+
+      await handshake(reader, TEST_SITE_ID_2);
+      const refused = await sendAndReceive(reader, {
+        type: 'get_changes', sinceHLC: serializeHLCForTransport(insertHlc),
+      });
+      expect(refused.type).to.equal('snapshot_required');
+      expect(refused.sinceHLC).to.equal(serializeHLCForTransport(insertHlc));
+      expect(refused.deltaFloor).to.equal(serializeHLCForTransport(deleteHlc));
+
+      // At the floor itself the delete was already delivered: served normally.
+      const atFloor = await sendAndReceive(reader, {
+        type: 'get_changes', sinceHLC: serializeHLCForTransport(deleteHlc),
+      });
+      expect(atFloor.type).to.equal('changes');
+
+      // A from-nothing load is never refused.
+      const fromNothing = await sendAndReceive(reader, { type: 'get_changes' });
+      expect(fromNothing.type).to.equal('changes');
+    } finally {
+      writer.close();
+      reader.close();
+    }
+  });
+});

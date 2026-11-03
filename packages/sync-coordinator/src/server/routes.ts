@@ -3,7 +3,7 @@
  */
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { siteIdFromBase64, deserializeHLC, type HLC, type ChangeSet, type SerializedChangeSet } from '@quereus/sync';
+import { siteIdFromBase64, deserializeHLC, serializeHLCForTransport, type HLC, type ChangeSet, type SerializedChangeSet } from '@quereus/sync';
 import type { CoordinatorService } from '../service/coordinator-service.js';
 import type { AuthContext, ClientIdentity } from '../service/types.js';
 import { httpLog } from '../common/logger.js';
@@ -103,8 +103,21 @@ export function registerRoutes(
         sinceHLC = deserializeHLC(hlcBytes);
       }
 
-      const changes = await service.getChangesSince(databaseId, client, sinceHLC);
-      const serializedChanges = changes.map(cs => serializeChangeSet(cs));
+      const outcome = await service.getChangesSince(databaseId, client, sinceHLC);
+      if (outcome.kind === 'snapshot-required') {
+        // 409: the request is well-formed but conflicts with the store's state
+        // (its history no longer reaches back to `sinceHLC`). The floor rides in
+        // the body so the caller can see how far behind it is.
+        return reply.status(409).send({
+          ok: false,
+          error: {
+            code: 'SNAPSHOT_REQUIRED',
+            message: 'Watermark predates the delta floor: deletions the client needs have been pruned; take a full snapshot',
+            deltaFloor: serializeHLCForTransport(outcome.deltaFloor),
+          },
+        });
+      }
+      const serializedChanges = outcome.changeSets.map(cs => serializeChangeSet(cs));
 
       return reply.send({ ok: true, data: { changes: serializedChanges } });
     } catch (err) {

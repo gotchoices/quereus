@@ -106,6 +106,11 @@ export class SyncClient {
   // clears it. If a server ever accepts apply_changes but never acks them, this
   // would grow one entry per push; cap it (evict oldest) only if that shows up.
   private readonly pendingSentHLCs = new Map<string, HLC>();
+  // Callers waiting for a specific push's ack (the snapshot_required recovery
+  // must not take a snapshot until its push has landed). Keyed by request id;
+  // settled from handleApplyResult once the id leaves pendingSentHLCs, rejected
+  // when the socket closes or the server reports the push failed.
+  private readonly ackWaiters = new Map<string, Array<{ resolve: () => void; reject: (error: Error) => void }>>();
   // Monotonic per-client counter backing apply-request ids. Deterministic (no
   // Date.now / Math.random) so tests can predict the ids. Intentionally NOT
   // reset on disconnect: pendingSentHLCs is cleared there instead, so a stale
@@ -245,6 +250,7 @@ export class SyncClient {
           // A transfer interrupted by a socket drop aborts here; the saved
           // checkpoint makes the reconnect below resume it via resume_snapshot.
           this.abortSnapshotTransfer(new Error('Connection closed during snapshot transfer'));
+          this.rejectAckWaiters(new Error('Connection closed before the push was acknowledged'));
           const wasError = this._status.status === 'error';
           if (!wasError) {
             this.setStatus({ status: 'disconnected' });
@@ -329,6 +335,7 @@ export class SyncClient {
     // reconnect resumes delta-push instead of replaying local history.
     this.lastSentHLC = null;
     this.pendingSentHLCs.clear();
+    this.rejectAckWaiters(new Error('Disconnected'));
     this.setStatus({ status: 'disconnected' });
     this.emitSyncEvent('state-change', 'Disconnected from sync server (manual)');
   }
@@ -378,6 +385,10 @@ export class SyncClient {
         this.handleSnapshotComplete();
         break;
 
+      case 'snapshot_required':
+        await this.handleSnapshotRequired(message);
+        break;
+
       case 'error':
         this.handleServerError(message);
         break;
@@ -423,6 +434,13 @@ export class SyncClient {
     // below wins — no reconnect, no resume.
     if (fatal || message.code === 'SNAPSHOT_ERROR') {
       this.abortSnapshotTransfer(new Error(`Server error during snapshot: ${message.message}`));
+    }
+
+    // A push the server could not apply gets an `error`, never an apply_result,
+    // so anyone awaiting that ack would wait until the socket closed. The error
+    // carries no requestId, so every waiter is released.
+    if (fatal || message.code === 'APPLY_CHANGES_ERROR') {
+      this.rejectAckWaiters(new Error(`Push not acknowledged: ${message.message}`));
     }
 
     if (fatal) {
@@ -568,6 +586,7 @@ export class SyncClient {
     rejected?: Array<{ reason: string; code?: string }>;
   }): Promise<void> {
     await this.promoteWatermark(message.requestId);
+    this.settleAckWaiters();
 
     this.emitSyncEvent('info', `Server applied ${message.applied ?? 0} change(s)`);
 
@@ -620,6 +639,38 @@ export class SyncClient {
       if (compareHLC(hlc, this.lastSentHLC) <= 0) {
         this.pendingSentHLCs.delete(id);
       }
+    }
+  }
+
+  /**
+   * Resolve once the push identified by `requestId` has been acknowledged.
+   * Resolved immediately when the id is not pending (already acked, or
+   * subsumed by a later ack — see {@link promoteWatermark}); rejected when the
+   * socket closes or the server reports the push failed.
+   */
+  private waitForAck(requestId: string): Promise<void> {
+    if (!this.pendingSentHLCs.has(requestId)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiters = this.ackWaiters.get(requestId) ?? [];
+      waiters.push({ resolve, reject });
+      this.ackWaiters.set(requestId, waiters);
+    });
+  }
+
+  /** Release every waiter whose push is no longer pending (acked or subsumed). */
+  private settleAckWaiters(): void {
+    for (const [requestId, waiters] of this.ackWaiters) {
+      if (this.pendingSentHLCs.has(requestId)) continue;
+      this.ackWaiters.delete(requestId);
+      for (const waiter of waiters) waiter.resolve();
+    }
+  }
+
+  private rejectAckWaiters(error: Error): void {
+    const all = [...this.ackWaiters.values()];
+    this.ackWaiters.clear();
+    for (const waiters of all) {
+      for (const waiter of waiters) waiter.reject(error);
     }
   }
 
@@ -677,6 +728,68 @@ export class SyncClient {
     }
     const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
     if (error) throw error;
+  }
+
+  /**
+   * The server refused our `get_changes`: its delta floor is above our
+   * received watermark, so deletes we need have been pruned and no incremental
+   * reply can be complete. Recover by taking a full copy — but only AFTER our
+   * own unsent work has landed on the server. The snapshot apply clears local
+   * sync metadata and rewrites it from the server's copy: an unpushed local
+   * delete would be undone and an unpushed local insert would become a row
+   * with no sync metadata, invisible to sync forever.
+   *
+   * Order: (1) wait for any push already in flight (the handshake-time push),
+   * then push whatever is still unsent and wait for THAT ack; (2) stream the
+   * snapshot; (3) catch up from the snapshot's HLC, which the transfer recorded
+   * as the received watermark and which is at or above the floor by
+   * construction. A push that fails or a socket that drops stops the sequence:
+   * the reconnect re-sends `get_changes`, is refused again, and lands back
+   * here — pushes are idempotent, so the loop converges.
+   *
+   * Local writes made DURING the transfer remain the gap tracked by
+   * backlog/feat-sync-bootstrap-write-gate; this path does not widen it.
+   */
+  private async handleSnapshotRequired(message: { sinceHLC?: string; deltaFloor?: string }): Promise<void> {
+    if (this.snapshotTransferPromise) {
+      // A transfer is already landing; its own catch-up carries a fresh
+      // watermark, so this refusal of the OLD one is moot.
+      return;
+    }
+
+    this.emitSyncEvent(
+      'state-change',
+      'Server no longer holds history back to our watermark (its delta floor is '
+        + `${message.deltaFloor ?? 'unknown'}): pushing local changes, then taking a full copy`,
+    );
+
+    if (!this.options.readOnly) {
+      try {
+        // NOTE: `pendingSentHLCs` survives an auto-reconnect (only disconnect()
+        // clears it), so this can wait on a push from the PREVIOUS socket whose
+        // ack will never come. It is rescued because the handshake-time push
+        // re-sends everything since the un-promoted lastSentHLC, and its ack
+        // subsumes the stale id (promoteWatermark drops it, settleAckWaiters
+        // releases us). If pending ids are ever cleared or kept differently on
+        // reconnect, scope this wait to the current socket's pushes instead.
+        await Promise.all([...this.pendingSentHLCs.keys()].map(id => this.waitForAck(id)));
+        const requestId = await this.pushLocalChanges();
+        if (requestId) await this.waitForAck(requestId);
+      } catch (err) {
+        // Not an error to surface: the reconnect path retries the whole
+        // sequence, and the refusal that brought us here will repeat.
+        this.emitSyncEvent(
+          'info',
+          `Snapshot recovery deferred: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+    }
+
+    const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
+    if (error) return;
+
+    await this.requestChangesFromServer();
   }
 
   /**
@@ -1056,11 +1169,18 @@ export class SyncClient {
     }, this.options.localChangeDebounceMs);
   }
 
-  private async pushLocalChanges(): Promise<void> {
-    if (this.options.readOnly) return;
-    if (!this.isConnected || !this.serverSiteId) return;
+  /**
+   * Push every local change since `lastSentHLC`.
+   *
+   * @returns the push's request id when a tracked batch left the socket, else
+   *          null (nothing to send, not connected, bootstrapping, or the send
+   *          was dropped).
+   */
+  private async pushLocalChanges(): Promise<string | null> {
+    if (this.options.readOnly) return null;
+    if (!this.isConnected || !this.serverSiteId) return null;
     // No pushes while a snapshot is landing — local data is partial.
-    if (this.isBootstrapping) return;
+    if (this.isBootstrapping) return null;
 
     // Get changes since lastSentHLC (delta sync)
     // Use serverSiteId to filter out changes that originated from the server
@@ -1070,7 +1190,7 @@ export class SyncClient {
       this.lastSentHLC ?? undefined
     );
 
-    if (changes.length === 0) return;
+    if (changes.length === 0) return null;
 
     // Serialize and send
     const serialized = changes.map(cs => serializeChangeSet(cs));
@@ -1091,7 +1211,7 @@ export class SyncClient {
     // Only advance delta-sync state if the bytes actually left. A dropped send
     // must be retried on the next push, so register no pending watermark and
     // leave the pending count untouched.
-    if (!sent) return;
+    if (!sent) return null;
 
     // Record the max HLC this batch carries against its request id; the matching
     // apply_result promotes lastSentHLC to it (see promoteWatermark).
@@ -1100,6 +1220,7 @@ export class SyncClient {
       this.pendingSentHLCs.set(requestId, batchHLC);
     }
     this.pendingLocalChangeCount = 0;
+    return requestId;
   }
 
   /** Next monotonic apply-request id. Deterministic for test predictability. */

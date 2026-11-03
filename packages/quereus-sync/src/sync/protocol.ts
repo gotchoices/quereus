@@ -295,6 +295,14 @@ export interface Snapshot {
    * {@link SnapshotTombstone}.
    */
   readonly tombstones: SnapshotTombstone[];
+  /**
+   * The sender's delta floor (`SyncManager.getDeltaFloor`): tombstones it
+   * pruned before this snapshot are in nobody's copy, so the receiver inherits
+   * them as its own floor (`max(own, this)`). Absent when the sender never
+   * pruned, or on a snapshot persisted before the field existed — the receiver's
+   * floor is then left as it was.
+   */
+  readonly deltaFloor?: HLC;
 }
 
 // ============================================================================
@@ -336,6 +344,8 @@ export interface SnapshotHeaderChunk {
   readonly migrationCount: number;
   /** Unique identifier for this snapshot transfer. */
   readonly snapshotId: string;
+  /** The sender's delta floor; see the same field on {@link Snapshot}. */
+  readonly deltaFloor?: HLC;
 }
 
 /**

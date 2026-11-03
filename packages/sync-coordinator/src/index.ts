@@ -39,6 +39,7 @@ export {
   type CoordinatorHooks,
   CoordinatorService,
   type CoordinatorServiceOptions,
+  type GetChangesOutcome,
   StoreManager,
   type StoreEntry,
   type StoreManagerConfig,

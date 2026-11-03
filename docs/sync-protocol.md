@@ -120,8 +120,15 @@ interface SyncManager {
   /** Apply changes received from a peer; returns statistics about what was applied. */
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
 
-  /** False if a snapshot is required instead — e.g. tombstone TTL expired for relevant data. */
-  canDeltaSync(peerSiteId: SiteId, sinceHLC: HLC): Promise<boolean>;
+  /**
+   * False once a tombstone above sinceHLC has been pruned here — the delete it
+   * backed cannot be delivered, so the peer must take a snapshot. Compares
+   * against the delta floor only (no peer state, no wall clock).
+   */
+  canDeltaSync(sinceHLC: HLC): Promise<boolean>;
+
+  /** The delta floor: greatest pruned-tombstone HLC, or undefined if nothing deliverable was ever pruned. */
+  getDeltaFloor(): Promise<HLC | undefined>;
 
   /** A full snapshot, for initial sync or TTL-expiration recovery. */
   getSnapshot(): Promise<Snapshot>;
@@ -318,7 +325,7 @@ running from.
 For the primary use case of a master server syncing to many frontend replicas:
 
 1. Frontend connects, sending `{ mySiteId, lastSyncHLC }`
-2. Master checks `canDeltaSync()` — if false a full snapshot, if true `getChangesSince()`
+2. Master checks `canDeltaSync(lastSyncHLC)` — if false it answers `snapshot_required` (the frontend pushes its offline work, takes a full snapshot, then catches up from the snapshot's HLC); if true `getChangesSince()`
 3. Master sends `ChangeSet[]`; frontend applies them with `applyChanges(changeSets)`
 4. Frontend sends its own local changes (those made while offline)
 5. Master applies them, resolving conflicts via LWW, and re-sends any winners
@@ -328,7 +335,8 @@ For the primary use case of a master server syncing to many frontend replicas:
 The WebSocket protocol gives real-time bidirectional synchronization — the recommended transport for interactive applications.
 
 A session runs `handshake` → `handshake_ack` (both carrying `protocolVersion`), then
-`get_changes` → `changes`; the client pushes its own work as `apply_changes` →
+`get_changes` → `changes` (or `snapshot_required` when the server can no longer serve
+the client's watermark in full); the client pushes its own work as `apply_changes` →
 `apply_result` (correlated by `requestId`), the server pushes another peer's as
 fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 
@@ -351,6 +359,7 @@ fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 |------|---------|---------|
 | `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId, protocolVersion }` |
 | `changes` | Ordered response to `get_changes` (gap-free; **advances** received watermark) | `{ changeSets: ChangeSet[] }` |
+| `snapshot_required` | Refusal of a `get_changes` whose `sinceHLC` is below the server's delta floor — a delete the client needs was pruned, so no delta can be complete. A normal outcome, not an `error` | `{ sinceHLC, deltaFloor }` (base64) |
 | `push_changes` | Fire-and-forget broadcast from another client (applied, but **never** advances the received watermark) | `{ changeSets: ChangeSet[] }` |
 | `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
 | `snapshot_chunk` | Streamed snapshot data | `{ chunk: SnapshotChunk }` |
@@ -391,6 +400,11 @@ to a message shape or the codec, with no min/max range negotiation; `PROTOCOL_VE
 doc comment in `wire.ts` describes the range-negotiation upgrade path should
 mixed-version rolling upgrades ever be required.
 
+Version history: **v2** added `snapshot_required` as a possible reply to `get_changes`.
+No v1 message shape moved, but a v1 client would log the new reply as an unknown message
+and sit unsynced forever, so it is breaking in effect; coordinator and clients ship
+together.
+
 > **NOTE: accepted tradeoff — mixed-version skew is deliberately neither promised nor
 > tested.** A version-skew test (pin one peer at release N, the other at N-1, assert they
 > still interoperate) was proposed and declined, because it would test a guarantee the
@@ -425,7 +439,7 @@ batch-slice boundary — so advancing it can only land *between* whole transacti
 1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
 2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values, persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
 3. **Reconnection / restart**: On reconnect the client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`), so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
-4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
+4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity — **unless** `sinceHLC` is below its delta floor ([sync.md § Read side → The delta floor](sync.md#read-side-one-changeset-per-transaction)): a delete the client needs has been pruned, so it answers `snapshot_required` and the client recovers as described under *Client snapshot bootstrap* below. A `get_changes` with no `sinceHLC` is a from-nothing load and is never refused
 
 The push loop, end to end: a local change triggers the debounced send (50 ms window);
 the client calls `getChangesSince(serverSiteId, lastSentHLC)` for per-transaction
@@ -471,9 +485,9 @@ per edit become 1 per burst.
 ### Client snapshot bootstrap
 
 A brand-new device cannot catch up incrementally — "changes since nothing" is not the
-database. `SyncClient` downloads a full copy instead, on two triggers, both decided at
-handshake and finished *before* the incremental path (`get_changes`, local-change
-subscription, push) starts:
+database. `SyncClient` downloads a full copy instead, on three triggers. The first two are
+decided at handshake and finished *before* the incremental path (`get_changes`,
+local-change subscription, push) starts:
 
 - `requestSnapshot()`, explicit. Idempotent while a transfer is in flight: a second call
   joins it, and exactly one `get_snapshot` goes on the wire.
@@ -483,6 +497,20 @@ subscription, push) starts:
   met this server, and bootstrapping that clears its sync metadata while leaving its
   rows (divergence). A locally pre-created schema still counts as empty; replicated DDL
   applies idempotently.
+- A `snapshot_required` reply to `get_changes`: the device has been away longer than the
+  server kept its deletion history, so no delta can be complete. This one runs on a
+  device that may hold **unpushed offline work**, and the snapshot apply would destroy it
+  (an unpushed local delete undone, an unpushed insert left as a row with no sync
+  metadata, invisible to sync forever). So the rule is **push first**: unless `readOnly`,
+  the client waits for any push already in flight, pushes everything since `lastSentHLC`,
+  and waits for *that* `apply_result` — only then `get_snapshot`, then `get_changes` from
+  the snapshot's HLC (at or above the floor by construction). A push that fails or a
+  socket that drops stops the sequence; the reconnect re-sends `get_changes`, is refused
+  again, and retries — pushes are idempotent, so this converges. Local writes made
+  *during* the transfer remain the gap noted below. Known limit: a snapshot apply
+  upserts rows but never deletes a local row absent from the snapshot, so the ghost rows
+  such a device holds survive the recovery (they stop diverging further); that is a
+  snapshot-apply defect tracked separately.
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received

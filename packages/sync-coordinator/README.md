@@ -79,9 +79,10 @@ deletion markers and quarantined changes older than `SYNC_RETENTION_HORIZON_MS`.
 already-open databases are swept — a database nobody is connected to keeps its expired
 records until a client next opens it. See `docs/sync.md` § *Who drives the sweep*.
 
-A client that has been offline for longer than the retention horizon can miss deletes that
-have since been swept, and the server does not yet refuse such a client's incremental sync.
-Keep the horizon comfortably longer than the longest client absence you expect.
+A client that has been offline for longer than the retention horizon is refused incremental
+sync (`snapshot_required` over WebSocket, `409 SNAPSHOT_REQUIRED` over HTTP) and takes a
+full snapshot instead; `sync_delta_refused_total` counts those refusals — a steady rate means
+`SYNC_RETENTION_HORIZON_MS` is shorter than real client absences.
 
 ### S3 Durable Storage (Optional)
 

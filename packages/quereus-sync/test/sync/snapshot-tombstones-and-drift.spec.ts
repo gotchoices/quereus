@@ -81,6 +81,33 @@ describe('snapshot carries tombstones', () => {
 	});
 });
 
+describe('snapshot carries the delta floor', () => {
+	it('a receiver inherits the floor of the sender, so a peer the sender could not serve is refused here too', async () => {
+		// The sender prunes instantly: its delete leaves no tombstone, only a floor.
+		const sender = await makePeer('sender', { createOrders: true, ordersDdl: TEXT_ORDERS, config: { retentionHorizonMs: -1 } });
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(sender, "insert into orders (id, note) values ('r1', 'hello')");
+			await localWrite(sender, "delete from orders where id = 'r1'");
+			expect(await sender.manager.pruneTombstones()).to.equal(1);
+			const floor = await sender.manager.getDeltaFloor();
+			expect(floor, 'the prune raised the floor of the sender').to.not.equal(undefined);
+
+			const chunks: SnapshotChunk[] = [];
+			for await (const c of sender.manager.getSnapshotStream()) chunks.push(c);
+			const header = chunks[0];
+			expect(header.type === 'header' && header.deltaFloor, 'the header carries the floor').to.deep.equal(floor);
+
+			expect(await receiver.manager.getDeltaFloor()).to.equal(undefined);
+			await receiver.manager.applySnapshotStream(toStream(chunks));
+			expect(await receiver.manager.getDeltaFloor()).to.deep.equal(floor);
+		} finally {
+			await closePeer(sender);
+			await closePeer(receiver);
+		}
+	});
+});
+
 describe('non-streaming snapshot carries tombstones', () => {
 	let sender: Peer;
 	let receiver: Peer;

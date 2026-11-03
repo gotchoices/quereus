@@ -362,24 +362,13 @@ describe('SyncManager', () => {
   });
 
   describe('canDeltaSync', () => {
-    it('should return false for unknown peer', async () => {
+    // The floor semantics (refuse below a pruned delete, admit at it) are
+    // pinned in delta-floor.spec.ts; this covers the no-prune baseline.
+    it('allows any watermark when nothing was pruned, however old and whoever asks', async () => {
       const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
-      const peerSiteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
-      const canDelta = await manager.canDeltaSync(peerSiteId, hlc);
-      expect(canDelta).to.be.false;
-    });
-
-    it('should return true for known peer within TTL', async () => {
-      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
-      const peerSiteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
-
-      // Register the peer
-      await manager.updatePeerSyncState(peerSiteId, hlc);
-
-      const canDelta = await manager.canDeltaSync(peerSiteId, hlc);
-      expect(canDelta).to.be.true;
+      const ancient: HLC = { wallTime: 1n, counter: 0, siteId: generateSiteId(), opSeq: 0 };
+      expect(await manager.getDeltaFloor()).to.equal(undefined);
+      expect(await manager.canDeltaSync(ancient)).to.be.true;
     });
   });
 

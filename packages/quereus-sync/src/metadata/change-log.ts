@@ -164,12 +164,14 @@ export class ChangeLogStore {
    * any peer whose `sinceHLC` predates the horizon — their delta scan would start
    * past the pruned range and never learn about those cells.
    *
-   * Precondition before wiring it up: the server must first REFUSE delta sync for
-   * a too-old `sinceHLC` and fall back to a snapshot. `SyncManager.canDeltaSync`
-   * is that check, but no production caller invokes it either — the coordinator's
-   * `get_changes` handler passes `sinceHLC` straight through
-   * (packages/sync-coordinator/src/server/websocket.ts). Both halves must land
-   * together. Tracked as `feat-sync-changelog-horizon-pruning`.
+   * Precondition before wiring it up: the server must REFUSE delta sync for a
+   * `sinceHLC` below the pruned range and fall back to a snapshot. The refusal
+   * exists now — `SyncManager.canDeltaSync` compares against the delta floor
+   * (`metadata/delta-floor.ts`), the coordinator consults it before serving
+   * `get_changes`, and the client recovers via snapshot — but the floor is only
+   * raised by `pruneTombstones`. Wiring this up means raising the floor to
+   * `beforeHLC` in the SAME batch as these deletes, exactly as the tombstone
+   * prune does. Tracked as `feat-sync-changelog-horizon-pruning`.
    */
   async pruneEntriesBefore(beforeHLC: HLC): Promise<number> {
     const bounds = buildAllChangeLogScanBounds();

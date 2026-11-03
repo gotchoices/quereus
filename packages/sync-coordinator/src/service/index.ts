@@ -19,6 +19,7 @@ export {
 export {
   CoordinatorService,
   type CoordinatorServiceOptions,
+  type GetChangesOutcome,
 } from './coordinator-service.js';
 
 export {

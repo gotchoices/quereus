@@ -152,6 +152,11 @@ async function* streamSnapshotChunks(
 	const migrations = await ctx.schemaMigrations.listAllMigrations();
 	const migrationCount = migrations.length;
 
+	// The floor is read live even on a RESUMED stream (whose `hlc` is the original
+	// snapshot's): a prune between the two sessions only raises it, and the
+	// receiver takes the max, so the later value is the conservative one.
+	const deltaFloor = await ctx.deltaFloor.get();
+
 	// Yield header
 	const header: SnapshotHeaderChunk = {
 		type: 'header',
@@ -161,6 +166,7 @@ async function* streamSnapshotChunks(
 		tableCount: tableKeys.size,
 		migrationCount,
 		snapshotId,
+		...(deltaFloor !== undefined ? { deltaFloor } : {}),
 	};
 	yield header;
 
@@ -609,6 +615,15 @@ export async function applySnapshotStream(
 					entriesProcessed = checkpoint.entriesProcessed;
 				}
 				await clearExistingMetadata(ctx, new Set(completedTables));
+
+				// Inherit the sender's delta floor: tombstones it pruned before this
+				// snapshot are in nobody's copy, so a peer below that floor can no more
+				// be served a complete delta from here than from the sender. Forward-only
+				// (`max(own, sender's)`); a header without one — a snapshot persisted
+				// before the field existed — leaves the local floor as it was.
+				if (chunk.deltaFloor) {
+					await ctx.deltaFloor.raise(chunk.deltaFloor);
+				}
 
 				// That clear just wiped the CRDT metadata of every table this apply did not
 				// inherit, so ANY OTHER transfer's saved resume position is now stale: it
