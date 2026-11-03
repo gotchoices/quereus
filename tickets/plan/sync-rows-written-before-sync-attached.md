@@ -47,3 +47,26 @@ Default settings delete user data, with no error, on the first connect of a devi
 ## How reversible is this choice
 
 Adoption changes what devices send to servers, and adopted rows then reach other devices, so that part is hard to undo once shipped. The tighter check and the refusal can be changed later without any stored-data consequences.
+
+## Decision (2026-11-02, from the maintainer)
+
+Unblocked. What happens to these rows becomes a client option, and the default never deletes them. This settles the specification question above and replaces the "Proposed rule" and "Alternatives" sections; adoption is no longer the default.
+
+Add one option to the sync client (`packages/quereus-sync-client/src/types.ts`, beside `bootstrapOnEmpty`), working name `unrecordedRows`:
+
+| Value | What happens to rows sync has never recorded |
+|---|---|
+| `'refuse'` (**default**) | An automatic snapshot stops before deleting anything. The error names the affected tables and this option. |
+| `'adopt'` | The rows are recorded as local changes on first attach, then pushed and merged by last-writer-wins. Scans each table once. |
+| `'replace'` | The snapshot deletes them, which is today's behaviour, now only when the app asks. |
+
+Rules that go with it:
+
+- **`snapshot_required` recovery follows the same option.** Under `'refuse'`, a device that fell behind stops with that error until the app chooses.
+- **An explicit `requestSnapshot` stays a full replace**, because the caller asked for it. It is already documented that way.
+- **Quoomb Web sets `'adopt'`**, since someone switching from "store" to "sync" almost certainly wants to keep their data.
+- **`'refuse'` must not break the common path.** A device with no unrecorded rows bootstraps exactly as it does now, and the check must not delete or write anything.
+
+Update `docs/sync.md` § Snapshots replace rows, `docs/sync-protocol.md`, the client README, and the `bootstrapOnEmpty` doc that currently warns about this loss.
+
+Size this for the release going out once it lands. Split `prereq:`-chained implement tickets if `'adopt'` warrants its own run.
