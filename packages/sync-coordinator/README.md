@@ -152,6 +152,7 @@ sync_changes_received_total          # Changes received from clients
 sync_changes_rejected_total          # Changes rejected during validation
 sync_changes_broadcast_total         # Changes broadcast to clients
 sync_broadcast_errors_total          # Broadcast send failures
+sync_delta_refused_total             # get_changes refused: watermark below the delta floor (snapshot required)
 sync_snapshot_requests_total         # Snapshot requests
 sync_snapshot_chunks_total           # Snapshot chunks sent
 sync_auth_attempts_total             # Authentication attempts

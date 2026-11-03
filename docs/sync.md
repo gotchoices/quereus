@@ -430,7 +430,7 @@ exposes the value. The floor is *not* a wall-clock test: a watermark is the HLC 
 last change a peer received, not the time it last synced, so a quiet database never ages
 a peer out of delta sync on its own. The floor travels in snapshot headers
 (`deltaFloor` on `SnapshotHeaderChunk` / `Snapshot`) and a receiver takes
-`max(own, sender's)` after its metadata clear — a replica rebuilt from a snapshot (the
+`max(own, sender's)` in the same batch as its metadata clear — a replica rebuilt from a snapshot (the
 coordinator's S3 restore after disk eviction, say) inherits the sender's incompleteness
 rather than silently resetting to "can serve anything". `pruneQuarantine` does **not**
 raise it: held forwardable changes are not in snapshots either (§ *Snapshot carve-out*),
@@ -582,6 +582,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | `hc:` | HLC state | `{wallTime, counter}` |
 | `fv:` | Sync-metadata format version | decimal string (see *Metadata format version*) |
 | `sc:{snapshotId}` | Snapshot checkpoint — resume position of an interrupted streaming apply (see *Checkpoint presence means partial data*) | `{snapshotId, siteId, hlc, completedTables, entriesProcessed, …}` |
+| `df:` | Delta floor — greatest HLC of any tombstone this replica has pruned; below it no incremental delta is complete (see *The delta floor*) | serialized HLC |
 
 `⟨part⟩` above is a **length-prefixed component**: `{len}:{part}`, `len` being the part's
 length in string code units (`joinKeyParts`, `metadata/keys.ts`). Schema, table and column

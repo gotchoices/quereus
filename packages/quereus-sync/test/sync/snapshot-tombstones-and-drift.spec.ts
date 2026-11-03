@@ -106,6 +106,26 @@ describe('snapshot carries the delta floor', () => {
 			await closePeer(receiver);
 		}
 	});
+
+	it('the non-streaming snapshot carries and inherits it the same way', async () => {
+		const sender = await makePeer('sender', { createOrders: true, ordersDdl: TEXT_ORDERS, config: { retentionHorizonMs: -1 } });
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(sender, "insert into orders (id, note) values ('r1', 'hello')");
+			await localWrite(sender, "delete from orders where id = 'r1'");
+			expect(await sender.manager.pruneTombstones()).to.equal(1);
+			const floor = await sender.manager.getDeltaFloor();
+
+			const snap = await sender.manager.getSnapshot();
+			expect(snap.deltaFloor, 'the snapshot carries the floor').to.deep.equal(floor);
+
+			await receiver.manager.applySnapshot(snap);
+			expect(await receiver.manager.getDeltaFloor()).to.deep.equal(floor);
+		} finally {
+			await closePeer(sender);
+			await closePeer(receiver);
+		}
+	});
 });
 
 describe('non-streaming snapshot carries tombstones', () => {

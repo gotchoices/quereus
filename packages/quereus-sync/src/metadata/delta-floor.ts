@@ -48,17 +48,13 @@ export class DeltaFloorStore {
    * Queue a forward-only raise onto `batch`: the stored floor becomes
    * `max(current, hlc)`. Reads the current value now; the caller owns the
    * batch's write and must not interleave another raise before it lands.
+   * Batch-only on purpose: every raise accounts for tombstone deletes that
+   * must land in the same write (`pruneTombstones`, the snapshot metadata
+   * clear), so there is no standalone variant to reach for by mistake.
    */
   async raiseBatch(batch: WriteBatch, hlc: HLC): Promise<void> {
     const current = await this.get();
     if (current && compareHLC(hlc, current) <= 0) return;
     batch.put(SYNC_KEY_PREFIX.DELTA_FLOOR, serializeHLC(hlc));
-  }
-
-  /** Immediate forward-only raise (its own write). */
-  async raise(hlc: HLC): Promise<void> {
-    const batch = this.kv.batch();
-    await this.raiseBatch(batch, hlc);
-    await batch.write();
   }
 }

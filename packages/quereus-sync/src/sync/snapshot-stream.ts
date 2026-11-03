@@ -384,9 +384,20 @@ function parseBootstrapTables(
  * pass filed under); a name with none has nothing to preserve. With an empty
  * `preserveTables` this deletes everything, identical to a fresh full apply.
  */
+/**
+ * Wipe the CRDT metadata the snapshot will rewrite, and inherit the sender's
+ * delta floor in the SAME batch: tombstones the sender pruned before this
+ * snapshot are in nobody's copy, so a peer below that floor can no more be
+ * served a complete delta from here than from the sender. Forward-only
+ * (`max(own, sender's)`); a header without one — a snapshot persisted before
+ * the field existed — leaves the local floor as it was. One batch, because the
+ * wipe is itself a tombstone delete: a crash between the two would leave a
+ * replica with no tombstones and a floor that says it can serve anything.
+ */
 async function clearExistingMetadata(
 	ctx: SyncContext,
 	preserveTables: ReadonlySet<string>,
+	senderDeltaFloor: HLC | undefined,
 ): Promise<void> {
 	const preserveGenerations = new Set<string>();
 	for (const { schema, table } of parseBootstrapTables([...preserveTables])) {
@@ -410,6 +421,10 @@ async function clearExistingMetadata(
 		const parsed = parseChangeLogKey(entry.key);
 		if (parsed && preserveGenerations.has(parsed.generation)) continue;
 		clearBatch.delete(entry.key);
+	}
+
+	if (senderDeltaFloor) {
+		await ctx.deltaFloor.raiseBatch(clearBatch, senderDeltaFloor);
 	}
 
 	await clearBatch.write();
@@ -614,16 +629,7 @@ export async function applySnapshotStream(
 					tablesProcessed = checkpoint.completedTables.length;
 					entriesProcessed = checkpoint.entriesProcessed;
 				}
-				await clearExistingMetadata(ctx, new Set(completedTables));
-
-				// Inherit the sender's delta floor: tombstones it pruned before this
-				// snapshot are in nobody's copy, so a peer below that floor can no more
-				// be served a complete delta from here than from the sender. Forward-only
-				// (`max(own, sender's)`); a header without one — a snapshot persisted
-				// before the field existed — leaves the local floor as it was.
-				if (chunk.deltaFloor) {
-					await ctx.deltaFloor.raise(chunk.deltaFloor);
-				}
+				await clearExistingMetadata(ctx, new Set(completedTables), chunk.deltaFloor);
 
 				// That clear just wiped the CRDT metadata of every table this apply did not
 				// inherit, so ANY OTHER transfer's saved resume position is now stale: it

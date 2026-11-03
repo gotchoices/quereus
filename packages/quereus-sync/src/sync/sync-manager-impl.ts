@@ -1230,6 +1230,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// BEFORE calling (so a server never reaches this), and a client's own
 		// outbound push runs below its local floor legitimately (it prunes its own
 		// tombstones too); a throw there would wedge the push path.
+		// NOTE: a client that inherited the server's floor via a snapshot recovery
+		// and has pushed nothing since (its sent watermark predates that floor)
+		// logs this on every reconnect's handshake push until it next writes; the
+		// warning is about inbound completeness and is a false positive there. If
+		// the noise matters, let the push path pass a flag that skips this check.
 		if (sinceHLC && !(await this.deltaFloor.admits(sinceHLC))) {
 			console.warn(
 				'[Sync] getChangesSince below the delta floor: tombstones the peer needs were pruned, so this delta is incomplete — the peer should take a snapshot',

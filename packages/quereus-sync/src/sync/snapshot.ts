@@ -250,13 +250,13 @@ export async function applySnapshot(
 				clearBatch.delete(entry.key);
 			}
 
-			await clearBatch.write();
-
-			// Inherit the sender's delta floor (forward-only) — see the streaming
-			// consumer's `header` case for why.
+			// Inherit the sender's delta floor (forward-only) in the SAME batch as the
+			// tombstone wipe above — see the streaming consumer's `clearExistingMetadata`.
 			if (snapshot.deltaFloor) {
-				await ctx.deltaFloor.raise(snapshot.deltaFloor);
+				await ctx.deltaFloor.raiseBatch(clearBatch, snapshot.deltaFloor);
 			}
+
+			await clearBatch.write();
 
 			// Apply snapshot's column versions and rebuild change log, filed under the
 			// RECEIVER's derived identity. A sender with different keying (a raw-keyed

@@ -507,13 +507,15 @@ export class SyncClient {
     const bootstrapOk = await this.maybeBootstrap();
     if (!bootstrapOk) return;
 
-    // Request changes from server since our last sync with this peer
-    await this.requestChangesFromServer();
-
     // Seed the sent watermark from durable per-peer state so a fresh process
     // (or a reconnect) resumes delta-push where it left off instead of
-    // replaying the entire local history to the server.
+    // replaying the entire local history to the server. Seeded BEFORE the
+    // get_changes goes out: its reply may be snapshot_required, whose recovery
+    // pushes from this watermark and must not see it still unseeded.
     await this.seedSentWatermark();
+
+    // Request changes from server since our last sync with this peer
+    await this.requestChangesFromServer();
 
     // In read-only (pull-only) mode, skip push entirely
     if (!this.options.readOnly) {
@@ -710,7 +712,10 @@ export class SyncClient {
    * apply clears sync metadata and rewrites cell records unconditionally — a
    * concurrent local write is silently overwritten and never pushed. Hold
    * application writes until this resolves (watch {@link isBootstrapping} /
-   * the `bootstrapping` status).
+   * the `bootstrapping` status). The same fate meets local work that is still
+   * UNPUSHED when this is called (its metadata is wiped, so it is never sent);
+   * the `snapshot_required` recovery pushes first for that reason — this
+   * explicit path does not, so call it only on a replica with nothing pending.
    *
    * Idempotent while a transfer is in flight: a second call joins the same
    * transfer instead of starting another stream. Rejects when not connected /
@@ -752,8 +757,10 @@ export class SyncClient {
    */
   private async handleSnapshotRequired(message: { sinceHLC?: string; deltaFloor?: string }): Promise<void> {
     if (this.snapshotTransferPromise) {
-      // A transfer is already landing; its own catch-up carries a fresh
-      // watermark, so this refusal of the OLD one is moot.
+      // A transfer is already landing; it records its snapshot HLC as the
+      // received watermark, so this refusal of the OLD one is moot (the next
+      // get_changes — a bootstrap's own catch-up, or the next handshake's —
+      // carries the new one).
       return;
     }
 
@@ -778,6 +785,11 @@ export class SyncClient {
       } catch (err) {
         // Not an error to surface: the reconnect path retries the whole
         // sequence, and the refusal that brought us here will repeat.
+        // NOTE: only a reconnect retries. A push the server answers with
+        // APPLY_CHANGES_ERROR leaves the socket open, so the recovery stays
+        // parked (broadcasts still land; the gap does not) until the socket
+        // next drops. If that shows up, re-send get_changes after the
+        // reconnect backoff instead of returning here.
         this.emitSyncEvent(
           'info',
           `Snapshot recovery deferred: ${err instanceof Error ? err.message : String(err)}`,
