@@ -11,7 +11,7 @@ difficulty: medium
 repro: verified
 severity: wrong-result
 likelihood: normal-use
-tradeoffs: The fix is gated on an unsettled semantics decision - what DATETIME's canonical stored spelling is, and whether it denotes a fixed instant or a wall-clock time - which a maintainer may want to make deliberately in blocked/ rather than inside a bug fix.
+tradeoffs: The semantics are decided (see the end of this ticket); a comparison that normalizes text costs a parse on a path that is plain text comparison today.
 ---
 
 # DATETIME has no settled canonical spelling, and two things break because of it
@@ -163,4 +163,4 @@ stored-identity change for anyone doing this.
 
 The variadic family also has a third spelling the table in Arm B omits: `select datetime('now')` returns `2026-11-03T17:26:47.630Z`, with the `Z` that a DATETIME column never stores. Whatever fixes this should cover comparing a column against `datetime('now')` and storing that value.
 
-Proposed rule, awaiting the maintainer's decision: DATETIME is a fixed instant and the stored spelling stays bare UTC, so no persisted value or downstream content digest changes. Comparisons against text normalize that text the way a write does, and an unparseable text compares as it does today. Arm B takes option 3 (leave and document). Arm C gets a documented note that a shape check on a `datetime` column sees the canonical spelling.
+**Decided by the maintainer 2026-11-03:** DATETIME is a fixed instant and the stored spelling stays bare UTC, so no persisted value or downstream content digest changes. Comparisons against text normalize that text the way a write does, and an unparseable text compares as it does today. Arm B takes option 3 (leave and document). Arm C gets a documented note that a shape check on a `datetime` column sees the canonical spelling.

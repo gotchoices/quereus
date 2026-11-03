@@ -116,3 +116,7 @@ in the file.
   those still return `number` and still round. So arm A is now "widen the text→number
   coercion's return type to `number | bigint` and produce the canonical form
   (`util/numeric-canonical.ts`)", with the rule already decided and documented.
+
+## Decided by the maintainer 2026-11-03
+
+Change the results; both arms go ahead. `min`/`max` over a text column return text in `order by` order, and text-to-number conversion in arithmetic and `sum` stops rounding. `sum` over numeric text keeps working. The change in results needs a callout in the release notes, so say so in the handoff.
