@@ -19,7 +19,7 @@ export type ParsedStatement = ReturnType<Parser['parse']>;
  * never throwing, and never deciding what a failure means: each caller does that for
  * itself (`decideAlterTable` logs it and executes the text as-is;
  * `validatesExistingRows` treats an unparseable migration as non-validating;
- * {@link isAlterPrimaryKeyDDL} treats it as not a key change).
+ * {@link alterPrimaryKeyColumns} treats it as not a key change).
  */
 export function parseMigrationDDL(ddl: string): { stmt?: ParsedStatement; parseError?: Error } {
 	try {
@@ -29,9 +29,16 @@ export function parseMigrationDDL(ddl: string): { stmt?: ParsedStatement; parseE
 	}
 }
 
-/** Whether `ddl` is an `alter table … alter primary key (…)` statement. */
-export function isAlterPrimaryKeyDDL(ddl: string | undefined): boolean {
-	if (!ddl?.trim()) return false;
+/**
+ * The column names, in key order, that an `alter table … alter primary key (…)`
+ * statement makes the key — `undefined` when `ddl` is anything else. The statement
+ * names the key it INSTALLS, so a re-key pass reads its target here rather than from
+ * the catalog, which a later key change may already have moved on (see
+ * `rekey-on-pk-change.ts`).
+ */
+export function alterPrimaryKeyColumns(ddl: string | undefined): string[] | undefined {
+	if (!ddl?.trim()) return undefined;
 	const { stmt } = parseMigrationDDL(ddl);
-	return stmt?.type === 'alterTable' && stmt.action.type === 'alterPrimaryKey';
+	if (stmt?.type !== 'alterTable' || stmt.action.type !== 'alterPrimaryKey') return undefined;
+	return stmt.action.columns.map(column => column.name);
 }

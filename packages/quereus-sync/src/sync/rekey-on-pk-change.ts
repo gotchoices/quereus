@@ -15,10 +15,16 @@
  * staged into the transaction's own batch ahead of its data records, which the engine
  * already re-keyed) and the replicated apply (`change-applicator.ts`, Phase 3, from the
  * executed-DDL list, before the batch's own metadata is filed) — so in both the batch's
- * own records overwrite re-filed ones, never the reverse. The retired key's column
- * names come from the engine's event locally (`oldKeyColumns`) and from the pre-DDL
- * schema on the replicated path; the capture runs after the catalog has swapped, so
- * nothing else still names the old key.
+ * own records overwrite re-filed ones, never the reverse. The pass re-files exactly the
+ * TRANSITION the statement made, old key → new key, and reads neither from the catalog:
+ * the retired key's column names come from the engine's event locally (`oldKeyColumns`)
+ * and from the pre-DDL schema on the replicated path (the capture runs after the catalog
+ * has swapped, so nothing else still names it), and the new key's from the statement's
+ * own `alter primary key (…)` list. The catalog's CURRENT key is not the target: a
+ * later key change can already have moved it on by the time an earlier change's capture
+ * runs (the commit chain lags the engine), and a pass that re-filed to the catalog's
+ * key would leave the later change's own pass looking for records under a key nothing
+ * is filed under — and dropping every one.
  *
  * Per record under the table's generation:
  *
@@ -101,22 +107,23 @@ interface CellRecord {
 
 /**
  * Stage the re-filing of `(schema, table)`'s bookkeeping into `batch`, where
- * `oldKeyColumns` is the key the records are filed under and the table's CURRENT
- * schema is the key they must move to. Returns what was done, or `undefined` when the
- * pass could not run here — nothing was ever filed for the name, or this peer has no
- * engine / schema to read the table through (a relay-only deployment), which is logged.
- * `staged` (local capture only) learns every re-filed record so a later event of the
- * same transaction reads it instead of committed storage.
+ * `oldKeyColumns` is the key the records are filed under and `newKeyColumns` the key
+ * the statement installed, which they must move to. Returns what was done, or
+ * `undefined` when the pass could not run here — nothing was ever filed for the name,
+ * or this peer has no engine / schema to read the table through (a relay-only
+ * deployment), which is logged. `staged` (local capture only) learns every re-filed
+ * record so a later event of the same transaction reads it instead of committed storage.
  */
 export async function rekeyTableBookkeeping(
 	ctx: SyncContext,
 	schema: string,
 	table: string,
 	oldKeyColumns: readonly string[],
+	newKeyColumns: readonly string[],
 	batch: WriteBatch,
 	staged?: StagedTransactionMetadata,
 ): Promise<RekeyCounts | undefined> {
-	const plan = planRekey(ctx, schema, table, oldKeyColumns);
+	const plan = planRekey(ctx, schema, table, oldKeyColumns, newKeyColumns);
 	if (!plan) return undefined;
 	const live = await scanLiveRows(schema, table, plan);
 
@@ -131,34 +138,37 @@ export async function rekeyTableBookkeeping(
 	return counts;
 }
 
-/** Log a pass's cost when it had one, and emit the per-table event either way. */
+/**
+ * Log a pass's cost when it had one, and emit the per-table event either way. Only a
+ * dropped tombstone is a cost: a dropped row group belonged to a row the table no
+ * longer holds, whose own delete filed the tombstone that protects it.
+ */
 export function reportRekeyOutcome(ctx: SyncContext, schema: string, table: string, counts: RekeyCounts): void {
-	const costs: string[] = [];
-	if (counts.rowsDropped > 0) {
-		costs.push(`dropped the cell versions of ${counts.rowsDropped} row(s) the table no longer holds `
-			+ `(expected when the same batch deleted them)`);
-	}
 	if (counts.tombstonesDropped > 0) {
-		costs.push(`dropped ${counts.tombstonesDropped} tombstone(s) whose new key could not be determined `
-			+ `— those deletions no longer protect against a stale write from a peer`);
-	}
-	if (costs.length > 0) {
 		console.warn(
 			`[Sync] ${schema}.${table}: primary key changed — re-filed ${counts.cellsRekeyed} cell version(s) of `
-				+ `${counts.rowsRekeyed} row(s) and ${counts.tombstonesRekeyed} tombstone(s); ${costs.join('; ')}`,
+				+ `${counts.rowsRekeyed} row(s) and ${counts.tombstonesRekeyed} tombstone(s); dropped `
+				+ `${counts.tombstonesDropped} tombstone(s) whose new key could not be determined — those deletions `
+				+ `no longer protect against a stale write from a peer`,
 		);
 	}
 	ctx.syncEvents.emitPrimaryKeyRekeyed({ schema, table, ...counts });
 }
 
-function planRekey(ctx: SyncContext, schema: string, table: string, oldKeyColumns: readonly string[]): RekeyPlan | undefined {
+function planRekey(
+	ctx: SyncContext,
+	schema: string,
+	table: string,
+	oldKeyColumns: readonly string[],
+	newKeyColumns: readonly string[],
+): RekeyPlan | undefined {
 	const generation = ctx.tableIdentity.generationOf(schema, table);
 	if (generation === undefined) return undefined; // nothing was ever filed for the name
 
 	const columns = ctx.getTableColumnNames(schema, table);
-	const newKeyColumns = ctx.getTableKeyColumns(schema, table);
-	const oldKeying = ctx.getRetiredPkKeying(schema, table, oldKeyColumns);
-	if (!ctx.db || !columns || !newKeyColumns || !oldKeying) {
+	const oldKeying = ctx.getPkKeyingOf(schema, table, oldKeyColumns);
+	const newKeying = ctx.getPkKeyingOf(schema, table, newKeyColumns);
+	if (!ctx.db || !columns || !oldKeying || !newKeying) {
 		console.warn(
 			`[Sync] ${schema}.${table}: primary key changed but its sync bookkeeping cannot be re-filed on this peer `
 				+ `(no engine or table schema here) — the conflict history of its existing rows is unreachable from now on`,
@@ -166,38 +176,53 @@ function planRekey(ctx: SyncContext, schema: string, table: string, oldKeyColumn
 		return undefined;
 	}
 	const position = new Map(columns.map((name, i): [string, number] => [name.toLowerCase(), i]));
+	// The statement may spell a key column in any case; the plan carries the catalog's spelling.
+	const canonical = (name: string): string => columns[position.get(name.toLowerCase())!];
 	return {
 		db: ctx.db,
 		generation,
 		columns,
-		oldKeyColumns,
-		newKeyColumns,
+		oldKeyColumns: oldKeyColumns.map(canonical),
+		newKeyColumns: newKeyColumns.map(canonical),
 		newKeyIndices: newKeyColumns.map(name => position.get(name.toLowerCase())!),
 		oldKeying,
-		newKeying: ctx.getPkKeying(schema, table),
+		newKeying,
 	};
 }
 
 /**
  * One scan of the table, projecting each row's old and new key. The key columns are
  * selected under positional aliases (`k0…`) so the projection never depends on how the
- * engine spells a `select *` column.
+ * engine spells a `select *` column. A committed read: the key change this pass follows
+ * has committed, and the scan must neither join nor wait on a statement the host may be
+ * running — the replicated path is host-driven, and the local path runs on the commit
+ * chain, which Phase 3 drains from inside the host's apply call.
  *
  * NOTE: holds one entry per live row (its new pk values and two identity strings) for
  * the length of the pass — bounded by the table, like the engine's own re-key. If a
  * key change on a very large table ever shows up as a memory spike here, stream the
  * table in pk order instead and probe each row's `cv:` group directly.
+ *
+ * NOTE: reads the table as it is NOW, not as the key change left it: a transaction
+ * committed after the key change but before this capture ran has already changed the
+ * rows. A row deleted in between is dropped here and re-protected by that delete's own
+ * tombstone; a key column edited in between is re-filed under the edited value, where
+ * that update's own records then land — both converge. The local capture resolving
+ * keying from the current catalog rather than the catalog at commit time is a wider,
+ * pre-existing gap of the capture (its DML records are filed the same way); if a key
+ * change ever has to be safe against a concurrent write on the same peer, carry the
+ * table's schema on the commit batch and derive every keying from that.
  */
 async function scanLiveRows(schema: string, table: string, plan: RekeyPlan): Promise<LiveRows> {
-	const selected = [...new Map([...plan.oldKeyColumns, ...plan.newKeyColumns].map((name): [string, string] => [name.toLowerCase(), name])).values()];
-	const alias = new Map(selected.map((name, i): [string, string] => [name.toLowerCase(), `k${i}`]));
+	const selected = [...new Set([...plan.oldKeyColumns, ...plan.newKeyColumns])];
+	const alias = new Map(selected.map((name, i): [string, string] => [name, `k${i}`]));
 	const sql = `select ${selected.map((name, i) => `${quoteIdentifier(name)} as k${i}`).join(', ')} `
 		+ `from ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-	const valueOf = (row: Record<string, SqlValue>, name: string): SqlValue => row[alias.get(name.toLowerCase())!];
+	const valueOf = (row: Record<string, SqlValue>, name: string): SqlValue => row[alias.get(name)!];
 
 	const newPkByOld = new Map<string, SqlValue[]>();
 	const oldByNew = new Map<string, string>();
-	for await (const row of plan.db.eval(sql)) {
+	for await (const row of plan.db.eval(sql, undefined, { readConcurrency: 'committed' })) {
 		const oldIdentity = encodePkIdentity(plan.oldKeyColumns.map(name => valueOf(row, name)), plan.oldKeying);
 		const newPk = plan.newKeyColumns.map(name => valueOf(row, name));
 		newPkByOld.set(oldIdentity, newPk);

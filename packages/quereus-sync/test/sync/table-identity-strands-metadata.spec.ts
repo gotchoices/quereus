@@ -16,6 +16,7 @@
 import { expect } from 'chai';
 import type { PrimaryKeyRekeyedEvent } from '../../src/sync/events.js';
 import {
+	changesFor,
 	closePeer,
 	collect,
 	localWrite,
@@ -26,6 +27,25 @@ import {
 
 /** `orders` with a spare non-key column for the sibling ticket's primary-key change. */
 const WIDE_ORDERS_DDL = 'create table orders (id integer primary key, note text, extra text) using store';
+
+/**
+ * Hold the peer's next commit capture until released. The capture is enqueued by the
+ * engine's commit and serialized behind every earlier one, so holding the first
+ * handler's entry delays every capture enqueued meanwhile — the way a slow metadata
+ * store lets the engine run ahead of the capture. Nothing public delays it.
+ */
+function holdNextCapture(peer: Peer): () => void {
+	const manager = peer.manager as unknown as { handleTransactionCommit: (batch: unknown) => Promise<void> };
+	const original = manager.handleTransactionCommit;
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	manager.handleTransactionCommit = async function (batch) {
+		await gate;
+		manager.handleTransactionCommit = original;
+		return original.call(this, batch);
+	};
+	return release;
+}
 
 /** Two peers that each created `orders` and have reconciled those two creates. */
 async function makeReconciledPair(): Promise<[Peer, Peer]> {
@@ -120,6 +140,36 @@ describe('sync bookkeeping follows the table across a rename and its rows across
 		const expected = [{ id: 1, note: 'one' }, { id: 2, note: 'fresh' }];
 		expect(await collect(a.db, 'select id, note from orders order by id'), 'a').to.deep.equal(expected);
 		expect(await collect(b.db, 'select id, note from orders order by id'), 'b').to.deep.equal(expected);
+	});
+
+	// Two key changes, the second committed before the first's capture runs: the catalog
+	// is already at (id, note) when the (id) → (id, extra) capture runs. Each capture must
+	// re-file the transition its own statement made, so the second finds the records where
+	// the first left them; a pass that re-filed to the catalog's key would leave the second
+	// looking under (id, extra) for records filed under (id, note), and dropping them all.
+	// On b the same two statements arrive in one batch and re-file in sequence.
+	it('two primary-key changes committed before the first capture runs re-file in sequence on both peers', async () => {
+		await localWrite(a, "insert into orders (id, note, extra) values (1, 'one', 'x')");
+		await localWrite(a, "insert into orders (id, note, extra) values (2, 'two', 'y')");
+		await relayAll(a, b);
+		const rekeys = new Map<Peer, PrimaryKeyRekeyedEvent[]>([[a, []], [b, []]]);
+		for (const peer of [a, b]) peer.manager.getEventEmitter().onPrimaryKeyRekeyed(e => rekeys.get(peer)!.push(e));
+
+		const release = holdNextCapture(a);
+		await a.db.exec('alter table orders alter primary key (id, extra)');
+		await a.db.exec('alter table orders alter primary key (id, note)');
+		release();
+		await a.manager.whenCommitsSettled();
+		await relayAll(a, b);
+
+		for (const peer of [a, b]) {
+			expect(rekeys.get(peer)!.map(e => [e.rowsRekeyed, e.rowsDropped]), `${peer.name} re-filed both rows twice`)
+				.to.deep.equal([[2, 0], [2, 0]]);
+			// b authored nothing, so excluding its site shows every record on either peer.
+			const pks = (await changesFor(peer, b.manager.getSiteId())).map(c => c.pk);
+			expect(pks, `${peer.name}'s log addresses every record by the final key`).to.have.length(6);
+			expect(pks.every(pk => pk.length === 2 && typeof pk[1] === 'string'), `${peer.name}: ${JSON.stringify(pks)}`).to.equal(true);
+		}
 	});
 });
 

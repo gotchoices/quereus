@@ -81,7 +81,7 @@ import { persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from '.
 import { StagedTransactionMetadata } from './staged-transaction-metadata.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
-import { isAlterPrimaryKeyDDL } from './migration-ddl.js';
+import { alterPrimaryKeyColumns } from './migration-ddl.js';
 import { rekeyTableBookkeeping, reportRekeyOutcome, type RekeyCounts } from './rekey-on-pk-change.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
@@ -416,8 +416,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return tableSchema?.primaryKeyDefinition?.map(def => tableSchema.columns[def.index].name);
 	}
 
-	/** See {@link SyncContext.getRetiredPkKeying}. */
-	getRetiredPkKeying(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined {
+	/** See {@link SyncContext.getPkKeyingOf}. */
+	getPkKeyingOf(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined {
 		const tableSchema = this.getTableSchema?.(schema, table);
 		if (!tableSchema) return undefined;
 		const primaryKeyDefinition: Array<{ index: number }> = [];
@@ -901,8 +901,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Re-file a table's bookkeeping when a LOCAL `alter`/`table` event is an ALTER
 	 * PRIMARY KEY (`rekey-on-pk-change.ts`): staged into the transaction's own `batch`,
 	 * and noted into `staged` so a later event of the same transaction reads the re-filed
-	 * version rather than committed storage. The retired key comes from the event itself
-	 * (`oldKeyColumns`) — the catalog has already swapped by the time the capture runs.
+	 * version rather than committed storage. Both keys come from the event itself — the
+	 * retired one as `oldKeyColumns`, the installed one from its `ddl` — never from the
+	 * catalog, which a later key change may already have moved on by the time this
+	 * capture runs (the commit chain lags the engine).
 	 */
 	private async rekeyOnLocalKeyChange(
 		batch: WriteBatch,
@@ -910,7 +912,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		staged: StagedTransactionMetadata,
 	): Promise<RekeyCounts | undefined> {
 		if (event.objectType !== 'table' || event.type !== 'alter' || event.oldObjectName !== undefined) return undefined;
-		if (!isAlterPrimaryKeyDDL(event.ddl)) return undefined;
+		const newKeyColumns = alterPrimaryKeyColumns(event.ddl);
+		if (newKeyColumns === undefined) return undefined;
 		if (event.oldKeyColumns === undefined) {
 			console.warn(
 				`[Sync] ${event.schemaName}.${event.objectName}: primary key changed but the event does not name the retired key `
@@ -918,7 +921,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			);
 			return undefined;
 		}
-		return rekeyTableBookkeeping(this, event.schemaName, event.objectName, event.oldKeyColumns, batch, staged);
+		return rekeyTableBookkeeping(this, event.schemaName, event.objectName, event.oldKeyColumns, newKeyColumns, batch, staged);
 	}
 
 	/**

@@ -101,12 +101,13 @@ export interface SyncContext {
 	getTableKeyColumns(schema: string, table: string): readonly string[] | undefined;
 
 	/**
-	 * The pk keying a table's records were filed under while `keyColumns` was its key.
-	 * Derivable from the CURRENT columns because ALTER PRIMARY KEY adds and drops none —
-	 * each key column keeps its collation and type. `undefined` off-basis, with no
-	 * oracle, or when a name is not one of the table's columns.
+	 * The pk keying a table's records are filed under while `keyColumns` is its key —
+	 * a retired key's, or one a statement installs. Derivable from the CURRENT columns
+	 * because ALTER PRIMARY KEY adds and drops none — each key column keeps its
+	 * collation and type. `undefined` off-basis, with no oracle, or when a name is not
+	 * one of the table's columns.
 	 */
-	getRetiredPkKeying(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined;
+	getPkKeyingOf(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined;
 
 	/**
 	 * Record cumulative unknown-table disposition stats (surfaced via

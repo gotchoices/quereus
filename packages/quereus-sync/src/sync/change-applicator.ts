@@ -14,7 +14,7 @@ import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
 import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
-import { isAlterPrimaryKeyDDL } from './migration-ddl.js';
+import { alterPrimaryKeyColumns } from './migration-ddl.js';
 import { rekeyTableBookkeeping, reportRekeyOutcome } from './rekey-on-pk-change.js';
 import type {
 	ChangeSet,
@@ -592,8 +592,9 @@ export async function applyChanges(
  * The primary-key column names each table's records are filed under, for every table
  * this batch carries an `alter primary key` migration for — read from the catalog
  * BEFORE Phase 2 runs that DDL. A table the batch also creates has no records and no
- * schema yet, and resolves to nothing; two key changes for one table in a batch share
- * the first retired key (that is where the records are).
+ * schema yet, and resolves to nothing; a table the same batch renames first is looked
+ * up under its new name, which the catalog does not have yet, and resolves to nothing
+ * either — {@link rekeyAfterReplicatedKeyChange} says so when the DDL then runs.
  */
 function captureRetiredKeyColumns(
 	ctx: SyncContext,
@@ -601,7 +602,7 @@ function captureRetiredKeyColumns(
 ): Map<string, readonly string[]> {
 	const retired = new Map<string, readonly string[]>();
 	for (const change of changes) {
-		if (change.type !== 'alter_column' || !isAlterPrimaryKeyDDL(change.ddl)) continue;
+		if (change.type !== 'alter_column' || alterPrimaryKeyColumns(change.ddl) === undefined) continue;
 		const key = tableKey(change.schema, change.table);
 		if (retired.has(key)) continue;
 		const columns = ctx.getTableKeyColumns(change.schema, change.table);
@@ -612,8 +613,9 @@ function captureRetiredKeyColumns(
 
 /**
  * Phase 3 step for the `alter primary key` migrations Phase 2 actually RAN: re-file
- * each such table's bookkeeping (`rekey-on-pk-change.ts`) in its own batch, then
- * re-read the prior version / tombstone of every applied change on those tables.
+ * each such table's bookkeeping (`rekey-on-pk-change.ts`) in its own batch — one pass
+ * per executed statement, in order, each from the key the previous one installed —
+ * then re-read the prior version / tombstone of every applied change on those tables.
  *
  * Phase 1 resolved the batch's changes under the PRE-change keying while their pks —
  * recorded by the sender after its own key change — are under the new one, so it found
@@ -630,16 +632,28 @@ async function rekeyAfterReplicatedKeyChange(
 	retiredKeys: ReadonlyMap<string, readonly string[]>,
 	resolved: ResolvedChange[],
 ): Promise<void> {
+	// Per table, the key its records are filed under as the passes proceed.
+	const filedUnder = new Map(retiredKeys);
 	const rekeyedTables = new Set<string>();
 	for (const change of executed) {
-		if (change.type !== 'alter_column' || !isAlterPrimaryKeyDDL(change.ddl)) continue;
+		if (change.type !== 'alter_column') continue;
+		const newKeyColumns = alterPrimaryKeyColumns(change.ddl);
+		if (newKeyColumns === undefined) continue;
 		const key = tableKey(change.schema, change.table);
-		const oldKeyColumns = retiredKeys.get(key);
-		if (oldKeyColumns === undefined || rekeyedTables.has(key)) continue;
+		const oldKeyColumns = filedUnder.get(key);
+		if (oldKeyColumns === undefined) {
+			console.warn(
+				`[Sync] ${change.schema}.${change.table}: replicated primary key change ran but the key it retired was not `
+					+ `captured (the table was created or renamed by the same batch) — sync bookkeeping for its existing rows `
+					+ `cannot be re-filed`,
+			);
+			continue;
+		}
 		const batch = ctx.kv.batch();
-		const counts = await rekeyTableBookkeeping(ctx, change.schema, change.table, oldKeyColumns, batch);
+		const counts = await rekeyTableBookkeeping(ctx, change.schema, change.table, oldKeyColumns, newKeyColumns, batch);
 		if (!counts) continue;
 		await batch.write();
+		filedUnder.set(key, newKeyColumns);
 		rekeyedTables.add(key);
 		reportRekeyOutcome(ctx, change.schema, change.table, counts);
 	}
