@@ -1190,14 +1190,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// `col_${i}` fallback below is the live path for a RELAY-ONLY manager (no
 		// schema oracle at all). An oracle-wired manager can no longer reach here for
 		// a table the oracle does not know — filterCapturableDataEvents skipped it.
-		const columnNames = this.getTableSchema?.(schemaName, tableName)?.columns?.map(c => c.name);
+		const schema = this.getTableSchema?.(schemaName, tableName);
+		const columnNames = schema?.columns?.map(c => c.name);
+		const keyColumns = new Set(schema?.primaryKeyDefinition?.map(key => key.index));
 
 		for (let i = 0; i < newRow.length; i++) {
 			const newValue = newRow[i];
 
 			// By value: a blob or JSON value read back from a row is a new object each
-			// time, and a key cell recorded as rewritten leaves its row no first write
-			// to show a replica that has pruned (`refuseEditsOfForgottenRows`).
+			// time, and re-recording an untouched cell would overwrite a peer's concurrent
+			// write to it.
 			if (!oldRow || !sqlValueIdentical(oldRow[i], newValue)) {
 				const column = columnNames?.[i] ?? `col_${i}`;
 
@@ -1226,7 +1228,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				// Carry the overwritten cell version as a best-effort before-image on
 				// both the persisted version and the inline change. Spread only when a
 				// prior exists — first writes carry neither field (absent, not undefined).
-				const prior = oldVersion
+				// A key cell never carries one, even rewritten to a new spelling under
+				// `NOCASE`: it is what shows a replica that has pruned that this row is
+				// not one it forgot (`refuseEditsOfForgottenRows`).
+				const prior = oldVersion && !keyColumns.has(i)
 					? { priorHlc: oldVersion.hlc, priorValue: oldVersion.value }
 					: undefined;
 				const version: ColumnVersionData = { hlc, value: newValue, ...prior };

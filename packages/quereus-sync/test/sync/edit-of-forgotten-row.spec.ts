@@ -1,8 +1,8 @@
 /**
  * A replica that has pruned a tombstone cannot tell a deleted row from one it never
  * heard of. An edit of such a row would bring back a fragment, so `applyChanges` refuses
- * it: docs/sync.md § Tombstones and Deletions. Each spec drives a relay-only manager, the
- * shape of the coordinator, with hand-built changes.
+ * it: docs/sync.md § Tombstones and Deletions. Specs drive a relay-only manager, the
+ * shape of the coordinator, with hand-built changes unless a real device is the subject.
  */
 
 import { expect } from 'chai';
@@ -98,15 +98,13 @@ describe('an edit of a row this replica has forgotten', () => {
 		expect(result.applied).to.equal(1);
 	});
 
-	// A blob read back from a row is a new object each time, so comparing cells by
-	// reference would make an update rewrite the key cell, leaving no founding cell.
-	it('is accepted for a new row with a blob key edited before its first push', async () => {
+	it('is accepted for a new row whose key spelling and other cells were rewritten before its first push', async () => {
 		const device = await makePeer('device', {
 			createOrders: true,
-			ordersDdl: 'create table orders (id blob primary key, note text) using store',
+			ordersDdl: 'create table orders (id text collate nocase primary key, note text) using store',
 		});
-		await localWrite(device, `insert into orders (id, note) values (x'01', 'new')`);
-		await localWrite(device, `update orders set note = 'edited offline' where id = x'01'`);
+		await localWrite(device, `insert into orders (id, note) values ('A', 'new')`);
+		await localWrite(device, `update orders set id = 'a', note = 'edited offline' where id = 'A'`);
 		const server = await makeServer();
 		await pruneAnUnrelatedDelete(server);
 
@@ -114,7 +112,21 @@ describe('an edit of a row this replica has forgotten', () => {
 		await closePeer(device);
 
 		expect(result.skipped).to.equal(0);
-		expect(await cellsOf(server, [new Uint8Array([1])])).to.deep.equal(['id', 'note']);
+		expect(await cellsOf(server, ['a'])).to.deep.equal(['id', 'note']);
+	});
+
+	it('is accepted for a row two devices first-wrote, when a relay passes it to a replica that has pruned', async () => {
+		const relay = await makeServer();
+		for (const value of ['from one device', 'from another']) {
+			await relay.applyChanges([changeSet([founding([1], 'id', 1), founding([1], 'note', value)])]);
+		}
+		const replica = await makeServer();
+		await pruneAnUnrelatedDelete(replica);
+
+		const result = await replica.applyChanges(await relay.getChangesSince(replica.getSiteId()));
+
+		expect(result.skipped).to.equal(0);
+		expect(await cellsOf(replica, [1])).to.deep.equal(['id', 'note']);
 	});
 
 	it('is accepted when this replica has never pruned', async () => {
@@ -132,6 +144,28 @@ describe('an edit of a row this replica has forgotten', () => {
 		const result = await server.applyChanges([changeSet([edit([1], 'note', 'edited offline')])]);
 
 		expect(result.applied).to.equal(1);
+	});
+
+	const renameOrders = (): SchemaMigration => ({
+		type: 'rename_table',
+		schema: 'main',
+		table: 'renamed',
+		fromTable: 'orders',
+		ddl: 'alter table orders rename to renamed',
+		hlc: nextHlc(),
+		schemaVersion: 3,
+	});
+
+	const editOfRenamed = (pk: SqlValue[], column: string): ColumnChange => ({ ...edit(pk, column, 5), table: 'renamed' });
+
+	it('is accepted when the same batch renames the table, while a relay still holds its records under the old name', async () => {
+		const server = await makeServer();
+		await pruneAnUnrelatedDelete(server);
+		await server.applyChanges([changeSet([founding([1], 'id', 1)])]);
+
+		const result = await server.applyChanges([changeSet([editOfRenamed([1], 'qty')], [renameOrders()])]);
+
+		expect(result.skipped).to.equal(0);
 	});
 
 	describe('on a table whose primary key was redefined, where a relay never re-files its records', () => {
@@ -165,5 +199,34 @@ describe('an edit of a row this replica has forgotten', () => {
 
 			expect(result.skipped).to.equal(0);
 		});
+
+		it('is accepted when an earlier batch redefined the key and a later one renamed the table', async () => {
+			const server = await makeServer();
+			await pruneAnUnrelatedDelete(server);
+			await server.applyChanges([changeSet([], [redefineKey()])]);
+			await server.applyChanges([changeSet([], [renameOrders()])]);
+
+			const result = await server.applyChanges([changeSet([editOfRenamed([1, 'one'], 'qty')])]);
+
+			expect(result.skipped).to.equal(0);
+		});
+	});
+});
+
+describe('recording a local update', () => {
+	it('leaves an untouched blob cell at the version it had', async () => {
+		const device = await makePeer('device', {
+			createOrders: true,
+			ordersDdl: 'create table orders (id integer primary key, data blob, note text) using store',
+		});
+		await localWrite(device, `insert into orders values (1, x'01', 'new')`);
+		const before = await device.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'data');
+
+		await localWrite(device, `update orders set note = 'edited' where id = 1`);
+
+		const after = await device.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'data');
+		await closePeer(device);
+		expect(before).to.exist;
+		expect(after).to.deep.equal(before);
 	});
 });

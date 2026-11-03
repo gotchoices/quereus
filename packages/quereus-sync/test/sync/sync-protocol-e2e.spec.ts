@@ -1456,9 +1456,11 @@ describe('Sync Protocol E2E', () => {
       const siteA = generateSiteId();
       const freshPeer = generateSiteId();
 
-      const mk = (value: SqlValue, wallTime: bigint): ColumnChange => ({
+      const hlcAt = (wallTime: bigint): HLC => ({ wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC);
+      const mk = (value: SqlValue, wallTime: bigint, priorWallTime?: bigint): ColumnChange => ({
         type: 'column', schema: 'main', table: 'users', pk: [1], column: 'col_1', value,
-        hlc: { wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC,
+        hlc: hlcAt(wallTime),
+        ...(priorWallTime !== undefined ? { priorHlc: hlcAt(priorWallTime), priorValue: 'origin prior' } : {}),
       });
       const cs = (transactionId: string, change: ColumnChange): ChangeSet => ({
         siteId: siteA, transactionId, hlc: change.hlc, changes: [change], schemaMigrations: [],
@@ -1471,8 +1473,8 @@ describe('Sync Protocol E2E', () => {
       // resolve against the pre-batch v0@1000, so the surviving winner's prior is
       // v0@1000 — never the in-batch loser v1@2000.
       await receiver.manager.applyChanges([
-        cs('tx1', mk('v1', 2000n)),
-        cs('tx2', mk('v2', 3000n)),
+        cs('tx1', mk('v1', 2000n, 1000n)),
+        cs('tx2', mk('v2', 3000n, 2000n)),
       ]);
 
       const stored = columnChanges(await receiver.manager.getChangesSince(freshPeer))

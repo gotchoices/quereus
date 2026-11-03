@@ -46,8 +46,10 @@ from what* (audit trails, undo, conflict debugging) without a separate lookup.
   *here*" (`oldVersion` on the local write path, `oldColumnVersion` on apply). In
   causal-order delivery that equals the origin's prior, so a relaying receiver re-emits
   the origin's chain (the prior's own origin HLC, never reset to the receiver's clock).
-- **Best-effort.** Both fields are absent on a cell's first write and on
-  snapshot-reconstructed cells. Producers may omit them; receivers ignore them when
+  A change that arrived with no prior is stored with none, even over a version the
+  receiver holds: its writer saw no earlier version, and the next replica relies on that.
+- **Best-effort.** Both fields are absent on a cell's first write, on every write of a
+  primary-key cell, and on snapshot-reconstructed cells. Producers may omit them; receivers ignore them when
   absent; the no-`conflictResolver` HLC fast path is unchanged. One default outcome reads
   `priorHlc`, and only for its presence: an edit of a row the replica has forgotten by
   pruning is refused ([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)).
