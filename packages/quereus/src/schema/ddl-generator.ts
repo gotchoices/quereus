@@ -115,15 +115,16 @@ function generateTableDDLInternal(
 	// declares none. A declared key and a synthesized one differ in nothing (declaring a
 	// key does not change its columns' nullability), so naming the synthesized one is
 	// lossless and matches the no-`db` form's stance that persisted DDL states everything
-	// explicitly. It is also what gives a column-declared `ON CONFLICT` on an all-columns
-	// key somewhere to ride; the old omission dropped it on every round-trip.
+	// explicitly.
 
 	// A table holds two independent `ON CONFLICT` records and each rides its own clause, so
 	// a re-parse reproduces both: the table-level action on the table-level key clause, a
 	// column's action on that column's clause. Consumers read them differently (a NOT NULL
 	// violation reads only the column's record; a duplicate key reads the table's first),
-	// so folding one into the other changes what the table does.
-	const tableAction = emittedTableKeyAction(tableSchema);
+	// so folding one into the other changes what the table does. A declared ABORT is a
+	// record like any other: it outranks a column's action, including on a column an
+	// `ALTER PRIMARY KEY` later moves the key onto, so eliding it is not neutral.
+	const tableAction = tableSchema.primaryKeyDefaultConflict;
 
 	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when the key renders
 	// table-level below: the empty-key singleton, a composite key, or any key with a
@@ -517,18 +518,6 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 }
 
 /**
- * The table-level key action as it must appear in the text. A declared ABORT equals an
- * absent one (every consumer resolves `statement OR ?? declared ?? ABORT`), so it is elided
- * unless a key column declares an action of its own, which the table's ABORT outranks.
- */
-function emittedTableKeyAction(tableSchema: TableSchema): ConflictResolution | undefined {
-	const action = tableSchema.primaryKeyDefaultConflict;
-	if (action !== ConflictResolution.ABORT) return action;
-	const keyColumnDeclares = tableSchema.primaryKeyDefinition.some(pk => tableSchema.columns[pk.index].defaultConflict !== undefined);
-	return keyColumnDeclares ? action : undefined;
-}
-
-/**
  * Renders the ` ON CONFLICT <action>` tail of a clause, or '' when there is no action.
  *
  * Uppercase to match the surrounding CREATE TABLE keywords; the parser is
@@ -573,8 +562,6 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 		colDef += ` COLLATE ${quoteIdentifier(col.collation)}`;
 	}
 
-	// Inline column-level PK only for a genuine single-column declared PK. A
-	// synthesized single-column key (a one-column no-PK table) emits no PK clause.
 	// DESC is emitted so a descending key survives the round-trip (the re-parse
 	// would otherwise silently re-key ascending).
 	if (isInlinePk) {

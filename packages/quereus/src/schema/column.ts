@@ -60,7 +60,7 @@ export interface ColumnSchema {
 	 * `TableSchema.primaryKeyDefinition` and leaves this `undefined`, and
 	 * `rekeySchemaPrimaryKey` (the shared ALTER PRIMARY KEY mutation) deliberately does not
 	 * write it either. So for the table-level and post-ALTER shapes,
-	 * `buildConstraintsFromColumn` (`runtime/emit/alter-table.ts`, the `RENAME COLUMN`
+	 * `columnSchemaToColumnDef` (`schema/table.ts`, the `RENAME COLUMN`
 	 * AST rebuild) emits `direction: undefined` for a genuinely descending key — and,
 	 * symmetrically, still emits `direction: 'desc'` for a column an ALTER has since
 	 * re-keyed ascending. Harmless today because every consumer reads

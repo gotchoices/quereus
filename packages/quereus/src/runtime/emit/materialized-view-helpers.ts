@@ -10,7 +10,7 @@ import { keysOf } from '../../planner/util/fd-utils.js';
 import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
 import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../planner/analysis/coarsened-key.js';
 import type { ColumnSchema } from '../../schema/column.js';
-import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule, RowOpFlag } from '../../schema/table.js';
+import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, columnSchemaToColumnDef, requireVtabModule, RowOpFlag } from '../../schema/table.js';
 import {
 	validateChecksOverExistingRows,
 	validateForeignKeyOverExistingRows,
@@ -2619,14 +2619,14 @@ function reshapeOpToChange(op: ReshapeColumnOp): SchemaChangeInfo {
 		case 'rename':
 			// Preserve the OLD column's attributes (type / not-null / collation / PK)
 			// under the new name — attribute shifts ride separate alter ops.
-			return { type: 'renameColumn', oldName: op.oldName, newName: op.newName, newColumnDefAst: backingColumnDef(op.oldCol, op.newName) };
+			return { type: 'renameColumn', oldName: op.oldName, newName: op.newName, newColumnDefAst: columnSchemaToColumnDef(op.oldCol, op.newName) };
 		case 'add': {
 			// Add NULLABLE: real values arrive with the reconcile, and any NOT NULL is
 			// asserted post-reconcile so a non-empty backing never trips "ADD NOT NULL
 			// without a default". An added column is never a PK column (a PK change is
 			// inexpressible), so force non-PK in the lifted def.
 			const nullable: ColumnSchema = { ...op.col, notNull: false, primaryKey: false, pkOrder: 0, pkDirection: undefined };
-			return { type: 'addColumn', columnDef: backingColumnDef(nullable, op.col.name) };
+			return { type: 'addColumn', columnDef: columnSchemaToColumnDef(nullable, op.col.name) };
 		}
 		case 'retype':
 			return { type: 'alterColumn', columnName: op.name, setDataType: op.newTypeName };
@@ -2704,7 +2704,7 @@ function graftReshapedRecord(moduleSchema: TableSchema, source: MaintainedTableS
  * NOTE: this RE-DERIVES the attribute shift from live-vs-shape rather than reading
  * `ReshapePlan.postReconcileOps`, which is the authoritative list of the `retype` /
  * `recollate` ops that will actually run. The two agree today because the
- * pre-reconcile structural ops preserve attributes exactly ({@link backingColumnDef}
+ * pre-reconcile structural ops preserve attributes exactly ({@link columnSchemaToColumnDef}
  * carries type + collation through a rename, and an `add` lands the shape column's
  * own attributes), so every live-vs-shape shift has a queued op and vice versa. If a
  * structural op ever stops preserving an attribute, this would preview an attribute
@@ -3416,7 +3416,7 @@ async function renameShiftedBackingColumns(
 			type: 'renameColumn',
 			oldName: liveCol.name,
 			newName,
-			newColumnDefAst: backingColumnDef(liveCol, newName),
+			newColumnDefAst: columnSchemaToColumnDef(liveCol, newName),
 		});
 	}
 	if (current !== backing) {
@@ -3433,16 +3433,6 @@ async function renameShiftedBackingColumns(
 			newObject: renamed,
 		});
 	}
-}
-
-/** Minimal ColumnDef AST for a backing-column rename. Backing columns carry only
- *  type / not-null / PK / collation — never defaults or generated expressions
- *  (see {@link buildBackingTableSchema}) — so the lift is total. */
-function backingColumnDef(col: ColumnSchema, newName: string): AST.ColumnDef {
-	const constraints: AST.ColumnDef['constraints'] = [{ type: col.notNull ? 'notNull' : 'null', onConflict: col.defaultConflict }];
-	if (col.primaryKey) constraints.push({ type: 'primaryKey', direction: col.pkDirection });
-	if (col.collation && col.collation !== 'BINARY') constraints.push({ type: 'collate', collation: col.collation });
-	return { name: newName, dataType: col.logicalType.name, constraints };
 }
 
 /**

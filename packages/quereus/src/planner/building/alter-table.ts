@@ -57,6 +57,10 @@ export function buildAlterTableStmt(
 
   switch (stmt.action.type) {
     case 'addConstraint': {
+      // NOTE: a CHECK added here cannot read the table's `with context` variables (it fails
+      // with `Column not found`, even on an empty table), though the same CHECK is accepted
+      // in CREATE TABLE. If ALTER needs parity, resolve them as CREATE TABLE's CHECK does.
+      //
       // Reject a typo'd / mis-sited reserved `quereus.*` tag on the constraint at
       // plan-build, mirroring CREATE TABLE's named-constraint leg and SET TAGS — a
       // bad tag can't be silently stored when introduced via ALTER ... ADD CONSTRAINT.

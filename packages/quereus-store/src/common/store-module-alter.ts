@@ -441,7 +441,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		//
 		// The column arm walks `updatedColumns` — the array this hook is about to persist.
 		// Its renamed entry is a fresh `ColumnSchema` built from `newColumnDefAst`, but that
-		// def carries the SAME expression nodes (`buildConstraintsFromColumn` passes them in
+		// def carries the SAME expression nodes (`columnSchemaToColumnDef` passes them in
 		// by reference and `columnDefToSchema` assigns them straight back), and every other
 		// entry is `oldSchema`'s by reference — so this is the same one-rewrite-covers-all
 		// story as the two above, reverse pass included. `formatColumnDef` renders BOTH a

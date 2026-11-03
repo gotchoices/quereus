@@ -8,7 +8,7 @@ import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, columnSchemaToColumnDef, collectTableConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -424,11 +424,7 @@ async function runRenameColumn(
 	const existingCol = tableSchema.columns[colIndex];
 
 	// Build a ColumnDef AST for the renamed column (preserving type info)
-	const newColumnDef: ColumnDef = {
-		name: newName,
-		dataType: existingCol.logicalType.name,
-		constraints: buildConstraintsFromColumn(existingCol),
-	};
+	const newColumnDef = columnSchemaToColumnDef(existingCol, newName);
 
 	// Call module.alterTable if available (handles data-level changes)
 	const module = requireVtabModule(tableSchema);
@@ -2697,29 +2693,4 @@ function rewriteOtherTableColumnExpressions(
 		}
 	}
 	return changed;
-}
-
-/**
- * Build a minimal constraints array from an existing ColumnSchema
- * so that the ColumnDef AST accurately represents the column.
- */
-function buildConstraintsFromColumn(col: ColumnSchema): ColumnDef['constraints'] {
-	const constraints: ColumnDef['constraints'] = [];
-	constraints.push({ type: col.notNull ? 'notNull' : 'null', onConflict: col.defaultConflict });
-	if (col.primaryKey) {
-		constraints.push({ type: 'primaryKey', direction: col.pkDirection });
-	}
-	if (col.defaultValue) {
-		constraints.push({ type: 'default', expr: col.defaultValue });
-	}
-	if (col.collation && col.collation !== 'BINARY') {
-		constraints.push({ type: 'collate', collation: col.collation });
-	}
-	if (col.generated) {
-		constraints.push({
-			type: 'generated',
-			generated: col.generatedExpr ? { expr: col.generatedExpr, stored: col.generatedStored ?? false } : undefined
-		});
-	}
-	return constraints;
 }

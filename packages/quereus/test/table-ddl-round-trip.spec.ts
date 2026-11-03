@@ -80,10 +80,10 @@ function columnActionSpelling(schema: TableSchema): string[] {
 		`${col.name}: ${col.defaultConflict === undefined ? '-' : ConflictResolution[col.defaultConflict]}`);
 }
 
-/** The raw table-level action, with a declared ABORT reading as absent (see `conflictSpelling`). */
+/** The raw table-level action. Unlike `conflictSpelling`, a declared ABORT differs from absent. */
 function tableActionSpelling(schema: TableSchema): string {
 	const action = schema.primaryKeyDefaultConflict;
-	return action === undefined || action === ConflictResolution.ABORT ? '(none)' : ConflictResolution[action];
+	return action === undefined ? '(none)' : ConflictResolution[action];
 }
 
 /** `name: notNull` for every column, in declaration order. */
@@ -278,11 +278,13 @@ const SHAPES: Shape[] = [
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
 	},
 	{
-		// ABORT is the parser's default for an absent clause, so it must NOT be emitted —
-		// otherwise the text differs from an equivalent table that never named it.
-		label: 'PK with ON CONFLICT ABORT emits no ON CONFLICT (the default)',
+		// A declared ABORT is not the same record as no action: it outranks a column's action,
+		// including after an ALTER PRIMARY KEY moves the key onto a column that declares one.
+		label: 'table-level ON CONFLICT ABORT is emitted and stays on the table record',
 		statements: [`create table t (a integer, b text, v integer, primary key (a) on conflict abort)`],
 		expectedKey: ['a collate binary'],
+		expectedConflict: '(none)',
+		expectedText: 'PRIMARY KEY ("a") ON CONFLICT ABORT',
 	},
 	{
 		// A descending component is part of the key and must be spelled in the clause, or the
@@ -342,8 +344,7 @@ const SHAPES: Shape[] = [
 		expectedText: '"a" INTEGER NOT NULL ON CONFLICT ROLLBACK, "v" INTEGER NOT NULL, PRIMARY KEY ("a") ON CONFLICT REPLACE',
 	},
 	{
-		// The table's ABORT outranks the column's REPLACE here, so unlike a lone table-level
-		// ABORT it cannot be elided without the key flipping to REPLACE.
+		// The table's ABORT outranks the column's REPLACE: losing it would flip the key to REPLACE.
 		label: 'single-column key, table-level ABORT outranking a column action',
 		statements: [`create table t (a integer not null on conflict replace, v integer, primary key (a) on conflict abort)`],
 		expectedKey: ['a collate binary'],
@@ -361,27 +362,26 @@ const SHAPES: Shape[] = [
 	},
 	{
 		// No reload involved: RENAME COLUMN rebuilds the column from a synthesized definition.
-		label: 'column action survives RENAME COLUMN',
+		label: 'column action and tags survive RENAME COLUMN',
 		statements: [
-			`create table t (id integer primary key, x integer not null on conflict ignore)`,
+			`create table t (id integer primary key, x integer not null on conflict ignore with tags (k = 1))`,
 			`alter table t rename column x to z`,
 		],
 		expectedKey: ['id collate binary'],
 		expectedColumnActions: ['id: -', 'z: IGNORE'],
-		expectedText: '"z" INTEGER NOT NULL ON CONFLICT IGNORE',
+		expectedText: '"z" INTEGER NOT NULL ON CONFLICT IGNORE WITH TAGS (k = 1)',
 	},
 	{
-		// Same loss through a different builder: a source rename reshapes the maintained
-		// table's backing column from its own synthesized definition.
-		label: 'column action survives a source rename reaching a maintained table',
+		// A source rename reshapes the maintained table's column through the same lift.
+		label: 'column action, default and tags survive a source rename reaching a maintained table',
 		statements: [
 			`create table s (id integer primary key, v integer)`,
-			`create table t (id integer primary key, v integer not null on conflict ignore) maintained as select id, v from s`,
+			`create table t (id integer primary key, v integer not null on conflict ignore default 3 with tags (k = 1)) maintained as select id, v from s`,
 			`alter table s rename column v to v2`,
 		],
 		expectedKey: ['id collate binary'],
 		expectedColumnActions: ['id: -', 'v2: IGNORE'],
-		expectedText: '"v2" INTEGER NOT NULL ON CONFLICT IGNORE',
+		expectedText: '"v2" INTEGER NOT NULL ON CONFLICT IGNORE DEFAULT 3 WITH TAGS (k = 1)',
 	},
 ];
 

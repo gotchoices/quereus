@@ -338,7 +338,7 @@ export function renameColumnInCheckConstraints(
  * Same sharing and idempotence story as {@link renameColumnInCheckConstraints}: a
  * module's rename hook rebuilds only the renamed column's `ColumnSchema` and keeps every
  * other one by reference, and even the rebuilt one carries the SAME expression nodes
- * (`buildConstraintsFromColumn` passes them into the reconstructed `ColumnDef` by
+ * (`columnSchemaToColumnDef` passes them into the reconstructed `ColumnDef` by
  * reference and `columnDefToSchema` assigns them straight back), so one in-place rewrite
  * reaches every holder and a second call with the same pair is a no-op.
  *

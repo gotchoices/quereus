@@ -625,6 +625,36 @@ export function columnDefToSchema(
 }
 
 /**
+ * Lifts a live column back to the definition AST that {@link columnDefToSchema} re-derives it
+ * from, under `name`. A module's rename hook rebuilds the column from this, so a clause left
+ * out here is lost by every rename, with no reload involved. Expression nodes are passed by
+ * reference, which the rename rewriters rely on.
+ *
+ * NOTE: not a perfect inverse. `declaredType` flattens to the logical type name, any non-BINARY
+ * collation comes back as `collationExplicit`, and `pkOrder` comes back as 1. All three are
+ * mirrors or informational today; if a consumer starts depending on one, carry it here.
+ */
+export function columnSchemaToColumnDef(col: ColumnSchema, name: string): ColumnDef {
+	const constraints: ColumnDef['constraints'] = [{ type: col.notNull ? 'notNull' : 'null', onConflict: col.defaultConflict }];
+	if (col.primaryKey) {
+		constraints.push({ type: 'primaryKey', direction: col.pkDirection });
+	}
+	if (col.defaultValue) {
+		constraints.push({ type: 'default', expr: col.defaultValue });
+	}
+	if (col.collation && col.collation !== 'BINARY') {
+		constraints.push({ type: 'collate', collation: col.collation });
+	}
+	if (col.generated) {
+		constraints.push({
+			type: 'generated',
+			generated: col.generatedExpr ? { expr: col.generatedExpr, stored: col.generatedStored ?? false } : undefined,
+		});
+	}
+	return { name, dataType: col.logicalType.name, constraints, tags: col.tags ? { ...col.tags } : undefined };
+}
+
+/**
  * Mutation context variable definition
  */
 export interface MutationContextDefinition {
