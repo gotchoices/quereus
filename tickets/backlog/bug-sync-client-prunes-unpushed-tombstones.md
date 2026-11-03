@@ -24,3 +24,7 @@ Inferred from code: `pruneTombstones` consults no watermark; the worker wires th
 A replica must not prune a tombstone it has not yet pushed to every peer it pushes to. The natural rule: `pruneTombstones` keeps any tombstone whose HLC is above the **minimum sent watermark** across known peers (`pt:` records), regardless of age. A replica with no sent watermark (never pushed) keeps everything. The server (which pushes to no one) is unaffected because it has no `pt:` records.
 
 Alternative worth comparing: the host decides. The library pass takes an optional "do not prune above" HLC that the sync client supplies from its sent watermark; the worker's maintenance ticker already has the sync manager and client in hand. Simpler in the library, but every host has to remember to pass it.
+
+## Note from sync-client-pushes-back-server-changes
+
+Once that ticket lands, a device's sent watermark moves only when it pushes its own writes, and a device that never writes has none. The "minimum sent watermark" rule above would then keep other devices' tombstones forever on such a device. Apply the rule to tombstones this device wrote, since those are the only ones it has to push. The client's push will also read through `getChangesToPush`, which has no delta-floor warning, so the warning mentioned above no longer fires on this path.
