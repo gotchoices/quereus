@@ -178,7 +178,8 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 }
 
 /**
- * Apply a full snapshot, replacing all local data.
+ * Apply a full snapshot: each table it has a section for ends up holding exactly
+ * its rows (docs/sync.md § Snapshots replace rows).
  */
 export async function applySnapshot(
 	ctx: SyncContext,

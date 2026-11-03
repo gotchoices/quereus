@@ -88,11 +88,13 @@ import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } fr
 import {
 	getSnapshotStream as getSnapshotStreamImpl,
 	applySnapshotStream as applySnapshotStreamImpl,
+	resumeSnapshotStream as resumeSnapshotStreamImpl,
+} from './snapshot-stream.js';
+import {
 	getSnapshotCheckpoint as getSnapshotCheckpointImpl,
 	listSnapshotCheckpoints as listSnapshotCheckpointsImpl,
 	clearSnapshotCheckpoint as clearSnapshotCheckpointImpl,
-	resumeSnapshotStream as resumeSnapshotStreamImpl,
-} from './snapshot-stream.js';
+} from './snapshot-checkpoint.js';
 
 /**
  * Guard a transaction's running `opSeq` against the uint32 bound. `opSeq` is
@@ -399,6 +401,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	isTableInBasis(schema: string, table: string): boolean {
 		return this.getTableSchema ? this.getTableSchema(schema, table) !== undefined : true;
+	}
+
+	/** See {@link SyncContext.isMaterializedView}. */
+	isMaterializedView(schema: string, table: string): boolean {
+		return this.getTableSchema?.(schema, table)?.derivation !== undefined;
 	}
 
 	/**

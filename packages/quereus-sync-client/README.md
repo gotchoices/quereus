@@ -93,7 +93,7 @@ interface SyncClientOptions {
   /** Debounce window for local changes in ms (default: 50) */
   localChangeDebounceMs?: number;
 
-  /** Auto-download a full snapshot on first connect to an empty replica (default: true) */
+  /** Auto-download a full snapshot on first connect to a replica with no sync history (default: true). Rows written before sync attached have no history, and are deleted if the snapshot covers their table and lacks them */
   bootstrapOnEmpty?: boolean;
 
   /** Snapshot stall watchdog: abort if no chunk arrives within this window in ms (default: 60000) */
@@ -108,7 +108,7 @@ interface SyncClientOptions {
 
 - `connect(url: string, databaseId: string, token?: string): Promise<void>` - Connect to sync server
 - `disconnect(): Promise<void>` - Disconnect and stop reconnection attempts
-- `requestSnapshot(): Promise<void>` - Explicitly download a full snapshot. **Do not write to the database while it is landing** — a concurrent local write is overwritten by the snapshot and never pushed
+- `requestSnapshot(): Promise<void>` - Explicitly download a full snapshot. **Do not write to the database while it is landing** — a concurrent local write is overwritten by the snapshot and never pushed. Each table the snapshot covers ends up holding exactly the snapshot's rows, so local rows it lacks are deleted, unpushed ones included
 - `hasPendingSnapshot(): Promise<boolean>` - Whether an interrupted snapshot left the local database partial (usable before connecting; the next connect resumes the transfer)
 - `status: SyncStatus` - Current connection status (getter property)
 - `isConnected: boolean` - Whether the WebSocket is open (getter property)

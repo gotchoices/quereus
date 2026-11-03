@@ -126,7 +126,9 @@ export interface SyncClientOptions {
   /**
    * Automatically request a full snapshot on the first connect to an EMPTY
    * replica — one that has never synced with this server and holds no local
-   * change facts of its own. Disable to keep bootstrap purely explicit via
+   * change facts of its own. Rows written before sync attached have no change
+   * facts, so they do not stop this, and the snapshot deletes them if it covers
+   * their table and lacks them. Disable to keep bootstrap purely explicit via
    * {@link SyncClient.requestSnapshot}.
    * @default true
    */

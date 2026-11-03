@@ -49,11 +49,17 @@ export function tablesToAnnounce(ctx: SyncContext): Array<{ generation: string; 
  * what removes a local row the replica never pushed (docs/sync.md § Snapshots replace
  * rows). A relay-only peer has no row data, so there is nothing to do there.
  *
- * NOTE: a table outside the store module (`using memory`) has no external write path,
- * so an absent row in one aborts the apply with "Table not found for external write",
- * as a section with cells for such a table already does. A table like that with rows
- * cannot sync today in any direction; if that ever becomes supported, keep such tables
- * out of `tablesToAnnounce` too, or an empty one on the sender will fail its receivers.
+ * A materialized view is skipped: its rows are derived and never carry cells, so its
+ * section is always empty and says nothing about its contents, and it may have no
+ * external write path at all. `bootstrapFinalize` rebuilds it from the replaced rows.
+ * The guard is here rather than in `tablesToAnnounce` because a relay has no catalog:
+ * it announces a view on the strength of the view's `create_table` migration.
+ *
+ * NOTE: a base table outside the store module (`using memory`) has no external write
+ * path, so an absent row in one aborts the apply with "Table not found for external
+ * write", as a section with cells for such a table already does. A table like that
+ * with rows cannot sync today in any direction; if that ever becomes supported, skip
+ * such tables here too, or an empty one on the sender will fail its receivers.
  */
 export async function removeRowsAbsentFromSnapshot(
 	ctx: SyncContext,
@@ -62,7 +68,7 @@ export async function removeRowsAbsentFromSnapshot(
 	keying: PkKeying,
 	keep: { has(identity: string): boolean },
 ): Promise<void> {
-	if (!ctx.applyToStore) return;
+	if (!ctx.applyToStore || ctx.isMaterializedView(schema, table)) return;
 
 	const keyColumns = ctx.getTableKeyColumns(schema, table);
 	if (!ctx.db || !keyColumns) {

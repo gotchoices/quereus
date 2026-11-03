@@ -96,6 +96,19 @@ describe('snapshot apply replaces rows absent from the snapshot', () => {
 		expect(await collect(receiver.db, 'select id from local_only')).to.deep.equal([{ id: 7 }]);
 	});
 
+	it('leaves a materialized view to the finalize refresh, since its rows never travel and it may have no write path', async () => {
+		const createView = 'create materialized view by_note using memory as select note, count(*) as c from orders group by note';
+		await sender.db.exec(createView);
+		await receiver.db.exec(createView);
+		await deleteAndPrune(sender, 'id = 2');
+
+		const chunks = await chunksOf(sender);
+		expect(chunks.some(chunk => chunk.type === 'table-start' && chunk.table === 'by_note')).to.equal(true);
+		await receiver.manager.applySnapshotStream(toStream(chunks));
+
+		expect(await collect(receiver.db, 'select note, c from by_note')).to.deep.equal([{ note: 'one', c: 1 }]);
+	});
+
 	it('a transfer resumed after a table completed still removes that table\'s absent row', async () => {
 		await deleteAndPrune(sender, 'id = 2');
 		await sender.db.exec('create table trailer (id integer primary key, v text) using store');

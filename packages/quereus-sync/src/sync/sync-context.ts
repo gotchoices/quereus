@@ -87,6 +87,12 @@ export interface SyncContext {
 	isTableInBasis(schema: string, table: string): boolean;
 
 	/**
+	 * Whether `(schema, table)` is a materialized view here, whose rows are derived
+	 * rather than replicated. `false` off-basis or with no `getTableSchema` oracle.
+	 */
+	isMaterializedView(schema: string, table: string): boolean;
+
+	/**
 	 * Current column names for an in-basis table, or `undefined` when the table is
 	 * outside the local basis (or no `getTableSchema` oracle was wired). Backs both
 	 * the drain path's basis gate (`undefined` ⇒ the held group's table is not back,

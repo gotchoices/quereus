@@ -3,6 +3,7 @@ files:
   - packages/sync-coordinator/src/server/websocket.ts          # handleResumeSnapshot (~269)
   - packages/sync-coordinator/src/service/coordinator-service.ts # resumeSnapshotStream (~469)
   - packages/quereus-sync/src/sync/snapshot-stream.ts           # resumeSnapshotStream / SnapshotCheckpoint
+  - packages/quereus-sync/src/sync/snapshot-checkpoint.ts       # decodeCheckpoint, at-rest checkpoint records
 repro: none
 severity: edge-case
 likelihood: contrived
@@ -57,7 +58,7 @@ snapshot's HLC, which is the point-in-time the transfer is completing.)
 
 Found reviewing `feat-sync-snapshot-checkpoint-discovery`. The two arms above are about a
 checkpoint arriving over the wire. The stored copy is read with no validation either:
-`decodeCheckpoint` (`packages/quereus-sync/src/sync/snapshot-stream.ts`) `JSON.parse`s the
+`decodeCheckpoint` (`packages/quereus-sync/src/sync/snapshot-checkpoint.ts`) `JSON.parse`s the
 record and reaches straight into `obj.hlc.wallTime` / `obj.hlc.siteId` / `obj.siteId`. A
 truncated or corrupt record throws a raw `SyntaxError`/`TypeError`.
 
