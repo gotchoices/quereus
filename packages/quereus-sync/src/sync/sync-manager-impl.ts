@@ -1192,66 +1192,123 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// a table the oracle does not know — filterCapturableDataEvents skipped it.
 		const schema = this.getTableSchema?.(schemaName, tableName);
 		const columnNames = schema?.columns?.map(c => c.name);
+		const columnAt = (i: number): string => columnNames?.[i] ?? `col_${i}`;
 		const keyColumns = new Set(schema?.primaryKeyDefinition?.map(key => key.index));
 
+		const priors = new Map<number, ColumnVersionData | undefined>();
 		for (let i = 0; i < newRow.length; i++) {
-			const newValue = newRow[i];
-
 			// By value: a blob or JSON value read back from a row is a new object each
 			// time, and re-recording an untouched cell would overwrite a peer's concurrent
 			// write to it.
-			if (!oldRow || !sqlValueIdentical(oldRow[i], newValue)) {
-				const column = columnNames?.[i] ?? `col_${i}`;
-
-				// Overlay first: a cell this same transaction rewrote reads its staged
-				// version (so the staged entry is the one deduped, and the before-image
-				// chains correctly); one it deleted reads as absent (a reinsert after a
-				// delete records no before-image, exactly like a first write).
-				const stagedCell = staged.columnVersion(schemaName, tableName, pk, column);
-				const oldVersion: ColumnVersionData | undefined = stagedCell === null
-					? undefined                                     // staged as deleted
-					: stagedCell ?? await this.columnVersions.getColumnVersion(schemaName, tableName, pk, column);
-
-				if (oldVersion) {
-					this.changeLog.deleteEntryBatch(
-						batch,
-						oldVersion.hlc,
-						'column',
-						schemaName,
-						tableName,
-						pk,
-						column
-					);
-				}
-
-				const hlc = nextHlc();
-				// Carry the overwritten cell version as a best-effort before-image on
-				// both the persisted version and the inline change. Spread only when a
-				// prior exists — first writes carry neither field (absent, not undefined).
-				// A key cell never carries one, even rewritten to a new spelling under
-				// `NOCASE`: it is what shows a replica that has pruned that this row is
-				// not one it forgot (`refuseEditsOfForgottenRows`).
-				const prior = oldVersion && !keyColumns.has(i)
-					? { priorHlc: oldVersion.hlc, priorValue: oldVersion.value }
-					: undefined;
-				const version: ColumnVersionData = { hlc, value: newValue, ...prior };
-				this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
-				this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
-				staged.noteColumnVersion(schemaName, tableName, pk, column, version);
-
-				const change: ColumnChange = {
-					type: 'column',
-					schema: schemaName,
-					table: tableName,
-					pk,
-					column,
-					value: newValue,
-					hlc,
-					...prior,
-				};
-				changes.push(change);
+			if (!oldRow || !sqlValueIdentical(oldRow[i], newRow[i])) {
+				priors.set(i, await this.priorCellVersion(schemaName, tableName, pk, columnAt(i), staged));
 			}
 		}
+
+		const cellsToRecord = oldRow && await this.isFirstEditOfUnrecordedRow(schemaName, tableName, pk, priors, staged)
+			? newRow.keys()
+			: priors.keys();
+
+		for (const i of cellsToRecord) {
+			const column = columnAt(i);
+			const newValue = newRow[i];
+			const oldVersion = priors.get(i);
+
+			if (oldVersion) {
+				this.changeLog.deleteEntryBatch(
+					batch,
+					oldVersion.hlc,
+					'column',
+					schemaName,
+					tableName,
+					pk,
+					column
+				);
+			}
+
+			const hlc = nextHlc();
+			// Carry the overwritten cell version as a best-effort before-image on
+			// both the persisted version and the inline change. Spread only when a
+			// prior exists — first writes carry neither field (absent, not undefined).
+			// A key cell never carries one, even rewritten to a new spelling under
+			// `NOCASE`: it is what shows a replica that has pruned that this row is
+			// not one it forgot (`refuseEditsOfForgottenRows`).
+			const prior = oldVersion && !keyColumns.has(i)
+				? { priorHlc: oldVersion.hlc, priorValue: oldVersion.value }
+				: undefined;
+			const version: ColumnVersionData = { hlc, value: newValue, ...prior };
+			this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
+			this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
+			staged.noteColumnVersion(schemaName, tableName, pk, column, version);
+
+			const change: ColumnChange = {
+				type: 'column',
+				schema: schemaName,
+				table: tableName,
+				pk,
+				column,
+				value: newValue,
+				hlc,
+				...prior,
+			};
+			changes.push(change);
+		}
+	}
+
+	/**
+	 * The version a local write to this cell replaces. Overlay first: a cell this same
+	 * transaction rewrote reads its staged version (so the staged entry is the one
+	 * deduped, and the before-image chains correctly); one it deleted reads as absent (a
+	 * reinsert after a delete records no before-image, exactly like a first write).
+	 */
+	private async priorCellVersion(
+		schemaName: string,
+		tableName: string,
+		pk: SqlValue[],
+		column: string,
+		staged: StagedTransactionMetadata,
+	): Promise<ColumnVersionData | undefined> {
+		const stagedCell = staged.columnVersion(schemaName, tableName, pk, column);
+		return stagedCell === null
+			? undefined                                     // staged as deleted
+			: stagedCell ?? await this.columnVersions.getColumnVersion(schemaName, tableName, pk, column);
+	}
+
+	/**
+	 * Whether an update is the first sync has seen of its row, which then needs every
+	 * column recorded: the row has no cells, so replicas would otherwise materialize it
+	 * from the changed ones alone (docs/sync.md § Rows sync has never recorded). A no-op
+	 * update reads nothing and answers no, leaving the row for the `unrecordedRows` check.
+	 *
+	 * The overlay check is not redundant with the committed read: `alter primary key`
+	 * re-files a row's cells into the transaction's batch, so committed storage shows
+	 * nothing under the new key while the overlay holds them.
+	 *
+	 * NOTE: a remote apply writes rows before filing their records, so a local update landing
+	 * in that window stamps the whole row, and the apply's metadata then overwrites those
+	 * cells but leaves their newer change-log entries, one per column where the edited cell
+	 * alone did this before. Each breaks `collectChangesSince`'s invariant that an entry's HLC
+	 * equals its cell's. If a push ever lands inside the window and shows up as clobbered
+	 * concurrent edits, have capture wait or skip while an apply is in flight.
+	 *
+	 * NOTE: a streaming snapshot's header clears this metadata, so a row edited during the
+	 * transfer answers yes here too. A row the snapshot carries is overwritten by its table's
+	 * flush, and one it lacks survives as it did before and is pushed whole, not as a
+	 * fragment. Writes during a transfer stay the gap `feat-sync-bootstrap-write-gate` tracks.
+	 */
+	private async isFirstEditOfUnrecordedRow(
+		schemaName: string,
+		tableName: string,
+		pk: SqlValue[],
+		priors: ReadonlyMap<number, ColumnVersionData | undefined>,
+		staged: StagedTransactionMetadata,
+	): Promise<boolean> {
+		if (priors.size === 0) return false;
+		for (const prior of priors.values()) {
+			if (prior) return false;
+		}
+		if (staged.rowState(schemaName, tableName, pk)?.stagedColumns.size) return false;
+		return !(await this.columnVersions.hasRowVersions(schemaName, tableName, pk));
 	}
 
 	// ============================================================================

@@ -111,7 +111,8 @@ async function holdsUnrecordedRow(
 
 /**
  * The key of the first live row with no cell record. Local capture records every column
- * of an inserted row, so a recorded row always has at least one cell.
+ * of an inserted row, and of the first edit of an unrecorded one, so a recorded row
+ * always has at least one cell.
  *
  * NOTE: one `cv:` range read per recorded row, and on the store module all of them under
  * the execution mutex, so a fully recorded table blocks writers for its whole scan. It

@@ -141,7 +141,7 @@ Deletions are recorded as "tombstones" with an HLC timestamp, preventing deleted
 A row with a first write in the same batch, in either order, is accepted: a primary-key cell never carries a before-image, even rewritten to a new spelling under `NOCASE`, and a relay never adds one, so a new row inserted then edited offline always has one such cell to show. So is a row with cells here from an earlier batch, which a device's timestamp-ordered pushes guarantee. So is any row of a table the same batch renames, because the records still answer to the old name while the rule reads. This rule does not cover:
 
 - **A re-sent insert.** It carries no before-image, so a whole row returns on the server and the writer while a replica holding the tombstone stays without it (`bug-sync-resent-insert-returns-pruned-row`).
-- **A row sync never recorded.** Editing one produces a fragment with no before-image (`bug-sync-edit-of-unrecorded-row-sends-partial-row`).
+- **A row sync never recorded.** Its first edit records the whole row with no before-image, so it behaves as a re-sent insert: the row returns on the server and the writer while a replica holding the tombstone stays without it (see [Rows sync has never recorded](#rows-sync-has-never-recorded)).
 - **A table whose primary key was redefined.** Edits to it are always accepted, because a relay cannot re-file its records and a row can look unknown under its new key. A fragment can still return on such a table.
 - **A key rewritten to a new spelling.** An offline edit of a forgotten row that also rewrites its key's spelling counts as a first write and brings a fragment back.
 - **`allowResurrection: true`**, whose own fragment bug is `bug-sync-allow-resurrection-update-returns-partial-row`.
@@ -197,7 +197,12 @@ Sync keeps a `cv:` cell record for each cell it knows about. A row written befor
 - **What counts.** `SyncManager.findTablesWithUnrecordedRows()` reads every table in the basis, stopping each at its first row with no cell record, and writes nothing. It skips materialized views, whose rows are derived, and `memory` tables, which a snapshot cannot delete from. A custom virtual table module with rows does refuse: the exclusion is by name, so a wrapped store module is still checked and a wrong guess costs a refusal rather than data.
 - **Rows that only look unrecorded.** A local commit is recorded just after it lands, and a remote apply writes rows before their records. So the check waits for commits and applies under way, and reports a table only when two scans with that wait between them name the same row.
 - **Broader than what the snapshot would delete.** A table the server does not have is left alone by a snapshot, but the client cannot know the server's tables until the stream starts, and by then the header has cleared the metadata the check needs. So a table only this device has, with unrecorded rows, also refuses.
-- **Only never-recorded rows count.** A row with any cell record counts as recorded. An update made while sync was detached, to a row that has records, is still a silent divergence and is not detected.
+- **Only never-recorded rows count.** A row with any cell record counts as recorded, so its first edit takes a row out of the check, and a row already holding only some of its cells is not repaired. An update made while sync was detached, to a row that has records, is still a silent divergence and is not detected.
+- **The first edit records the whole row.** An update that changes a value in such a row records every column with no before-image, as an insert does, so other devices receive the whole row rather than one with its other columns empty.
+  - Its cells take the time of the edit, so like adopted rows they win over older server values for the same key, untouched columns included.
+  - An update that changes no value records nothing, so the row stays unrecorded and the check still finds it.
+  - The device's other unrecorded rows stay local. A device with any recorded change is not empty, so no bootstrap or check runs for them until a `snapshot_required`, which refuses under the default.
+  - An edit announces no table, any more than an insert does, so a table only this device has still fails a new device's snapshot (`bug-sync-write-to-unannounced-table-strands-new-devices`).
 
 ##### Adopting rows
 

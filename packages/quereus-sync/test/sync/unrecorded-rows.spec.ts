@@ -4,10 +4,11 @@
  */
 
 import { expect } from 'chai';
-import { Database, MemoryTableModule } from '@quereus/quereus';
+import { Database, MemoryTableModule, type SqlValue } from '@quereus/quereus';
 import { InMemoryKVStore, StoreEventEmitter, StoreModule, type KVStore } from '@quereus/store';
-import { collect, closePeer, createInMemoryProvider, localWrite, makePeer, relay, relayAll, settle, toStream, type Peer } from './_peer-harness.js';
+import { changesFor, collect, closePeer, createInMemoryProvider, localWrite, makePeer, relay, relayAll, settle, toStream, type Peer } from './_peer-harness.js';
 import { createSyncModule } from '../../src/create-sync-module.js';
+import type { HLC } from '../../src/clock/hlc.js';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
 import { DATA_FLUSH_SIZE } from '../../src/sync/snapshot-coverage.js';
@@ -173,6 +174,73 @@ describe('findTablesWithUnrecordedRows', () => {
 
 		await closePeer(sender);
 		await closePeer(receiver);
+	});
+});
+
+describe('editing a row', () => {
+	const ORDERS = 'create table orders (id integer primary key, note text, qty integer) using store';
+	let peer: Peer;
+
+	afterEach(async () => {
+		await closePeer(peer);
+	});
+
+	it('records the whole row on the first edit of an unrecorded one, so a receiver gets no fragment', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (9, 'nine', 9)` });
+		const receiver = await makePeer('b', { createOrders: true, ordersDdl: ORDERS });
+
+		await localWrite(peer, `update orders set note = 'nine2' where id = 9`);
+
+		const changes = await changesFor(peer, receiver.manager.getSiteId());
+		expect(changes.map(change => change.type === 'column' && change.column).sort()).to.deep.equal(['id', 'note', 'qty']);
+		expect(changes.filter(change => change.type === 'column' && change.priorHlc !== undefined)).to.deep.equal([]);
+
+		await relay(peer, receiver);
+		expect(await collect(receiver.db, 'select id, note, qty from orders')).to.deep.equal([{ id: 9, note: 'nine2', qty: 9 }]);
+		await closePeer(receiver);
+	});
+
+	it('leaves an unrecorded row unrecorded when an update changes nothing', async () => {
+		peer = await makePeer('a', { beforeSync: `${ORDERS}; insert into orders values (9, 'nine', 9)` });
+
+		await localWrite(peer, 'update orders set note = note where id = 9');
+
+		expect(await peer.manager.getChangesSince(generateSiteId())).to.deep.equal([]);
+		expect(await peer.manager.findTablesWithUnrecordedRows()).to.deep.equal([{ schema: 'main', table: 'orders' }]);
+	});
+
+	describe('a recorded row, first writing a column added since', () => {
+		beforeEach(async () => {
+			peer = await makePeer('a', { createOrders: true, ordersDdl: ORDERS });
+			await localWrite(peer, `insert into orders values (1, 'one', 1)`);
+			await localWrite(peer, 'alter table orders add column extra text null');
+		});
+
+		async function qtyHlc(pk: SqlValue[]): Promise<HLC | undefined> {
+			return (await peer.manager.columnVersions.getColumnVersion('main', 'orders', pk, 'qty'))?.hlc;
+		}
+
+		it('records only that cell', async () => {
+			const before = await qtyHlc([1]);
+
+			await localWrite(peer, `update orders set extra = 'x' where id = 1`);
+
+			expect(await qtyHlc([1])).to.deep.equal(before);
+			expect((await peer.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'extra'))?.value).to.equal('x');
+		});
+
+		it('records only that cell when the same transaction re-keys the table, whose records it has only staged', async () => {
+			const before = await qtyHlc([1]);
+
+			await peer.db.exec('begin');
+			await peer.db.exec('alter table orders alter primary key (id, note)');
+			await peer.db.exec(`update orders set extra = 'x' where id = 1`);
+			await peer.db.exec('commit');
+			await settle();
+
+			expect(await qtyHlc([1, 'one'])).to.deep.equal(before);
+			expect((await peer.manager.columnVersions.getColumnVersion('main', 'orders', [1, 'one'], 'extra'))?.value).to.equal('x');
+		});
 	});
 });
 

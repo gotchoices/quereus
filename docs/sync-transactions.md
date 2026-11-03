@@ -61,7 +61,8 @@ onTransactionCommit(batch):
   opSeq = 0; kvBatch = kv.batch()
   for each local schema event (DDL before DML):
      record migration with hlc = {...base, opSeq: opSeq++}
-  for each local data event, for each fact (per changed column, or the deletion):
+  for each local data event, for each fact (per changed column, per column on a first
+  edit of a row sync never recorded, or the deletion):
      record column-version / tombstone + change-log entry, hlc = {...base, opSeq: opSeq++}
   persist HLC clock state (wallTime/counter only) into kvBatch
   kvBatch.write()                       // all metadata for the transaction, atomically

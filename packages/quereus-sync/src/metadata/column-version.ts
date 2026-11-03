@@ -276,6 +276,23 @@ export class ColumnVersionStore {
   }
 
   /**
+   * Whether the row has any committed cell record. Reads at most one entry and parses
+   * none, where `getRowVersions` would parse every cell of a row that has them.
+   */
+  async hasRowVersions(
+    schemaName: string,
+    tableName: string,
+    pk: SqlValue[]
+  ): Promise<boolean> {
+    const identity = this.identity(schemaName, tableName, pk);
+    const generation = this.tables.generationOf(schemaName, tableName);
+    if (generation === undefined) return false;
+    const bounds = buildColumnVersionScanBounds(generation, identity);
+    for await (const _entry of this.kv.iterate({ ...bounds, limit: 1 })) return true;
+    return false;
+  }
+
+  /**
    * Queue deletion of ONE column's cell record into `batch`, whether or not a
    * committed record exists — the caller may be removing a record that is only
    * STAGED in this same batch (the local-capture delete cleanup; see
