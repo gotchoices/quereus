@@ -9,6 +9,7 @@
 import type { AssertionViolation, Row, SqlValue } from '@quereus/quereus';
 import { type HLC, compareHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
+import { joinKeyParts } from '../metadata/keys.js';
 
 // ============================================================================
 // Change Types
@@ -123,12 +124,39 @@ export interface SchemaMigration {
   readonly fromTable?: string;
   readonly ddl: string;           // The DDL statement
   readonly hlc: HLC;              // When migration occurred
-  readonly schemaVersion: number; // Monotonic per (object kind, object name)
+  /**
+   * Monotonic per (object kind, object name), from 1 for ordinary migrations.
+   *
+   * Version {@link BASELINE_SCHEMA_VERSION} (0) is a **baseline**: a `create_table`
+   * or `add_index` recorded by a device that found itself writing to an object its
+   * migrations never brought into existence (created before sync attached). It
+   * says "here is this object's definition, for any device that has none". A
+   * receiver that already has the object keeps its own shape (never a conflict);
+   * one that lacks it creates it. Ordinary versions start at 1, so a baseline can
+   * never collide with a real migration; two baselines compete only with each
+   * other, by HLC. See docs/sync-schema.md § Baselines.
+   */
+  readonly schemaVersion: number;
+}
+
+/** The `schemaVersion` of a baseline migration — see {@link SchemaMigration.schemaVersion}. */
+export const BASELINE_SCHEMA_VERSION = 0;
+
+export function isBaselineVersion(schemaVersion: number): boolean {
+	return schemaVersion === BASELINE_SCHEMA_VERSION;
 }
 
 /**
- * Order migrations causally — ascending HLC, stable, so migrations that cannot be
- * distinguished by HLC keep arrival order.
+ * What {@link orderMigrations} needs to know about each item it orders: the
+ * migration's HLC, the stream it belongs to (`(schema, object kind, name)`) and
+ * whether it is a baseline. A `SchemaMigration` satisfies it directly.
+ */
+export type MigrationOrderKey = Pick<SchemaMigration, 'hlc' | 'type' | 'schema' | 'table' | 'schemaVersion'>;
+
+/**
+ * Order migrations causally: ascending HLC, stable, so migrations that cannot be
+ * distinguished by HLC keep arrival order — then each baseline (version 0) is moved
+ * ahead of the first alteration or drop of its own object.
  *
  * Every consumer replays DDL as a plain array in list order, and migrations are
  * order-dependent across objects as well as within one: `create index` fails
@@ -136,13 +164,50 @@ export interface SchemaMigration {
  * (schema, then object kind, then name — every index before every table) nor
  * changeset arrival order is causal, so both snapshot and delta paths sort here.
  *
- * Generic over anything HLC-stamped so a consumer that has to carry something
- * alongside each migration (the streaming snapshot pairs each with the
- * `SchemaChangeToApply` it built at chunk time) orders the pairs directly rather
- * than re-deriving this comparator.
+ * A baseline is recorded whenever a device first writes to an object it never
+ * announced, so its HLC says nothing about where the object's history begins: a
+ * fresh receiver replaying `[alter_column, older-shape baseline]` in HLC order would
+ * create the old shape and end without the altered column, and one replaying
+ * `[drop_table, baseline]` would end with a table every other device dropped. Moving
+ * the baseline ahead of the stream's first alteration or drop gives both the
+ * intended end state. It stays behind a `rename_table` (a receiver holding the old
+ * name must rename first, or the baseline creates an empty table under the new name
+ * and the rename then collides with it) and behind a real `create_table` /
+ * `add_index` (that create already defines the object, so the baseline only has to
+ * keep it; ahead of it, the real create would be judged against the baseline's
+ * shape instead).
+ *
+ * Generic over anything a `keyOf` can reduce to a {@link MigrationOrderKey}, so a
+ * consumer carrying something alongside each migration (the streaming snapshot
+ * pairs each with the `SchemaChangeToApply` it built at chunk time) orders the
+ * pairs directly rather than re-deriving this order.
  */
-export function sortMigrationsByHLC<T extends { readonly hlc: HLC }>(migrations: readonly T[]): T[] {
-	return [...migrations].sort((a, b) => compareHLC(a.hlc, b.hlc));
+export function orderMigrations<T>(items: readonly T[], keyOf: (item: T) => MigrationOrderKey): T[] {
+	const ordered = [...items].sort((a, b) => compareHLC(keyOf(a).hlc, keyOf(b).hlc));
+	for (let i = 0; i < ordered.length; i++) {
+		const key = keyOf(ordered[i]);
+		if (!isBaselineVersion(key.schemaVersion)) continue;
+		const stream = migrationStreamKey(key);
+		const target = ordered.findIndex(item => {
+			const candidate = keyOf(item);
+			return displacesBaseline(candidate.type) && migrationStreamKey(candidate) === stream;
+		});
+		// Moving one element to an earlier index shifts the ones between it and the
+		// target right by one; `i` then names an element already visited, and the next
+		// iteration reaches the element that followed the moved one.
+		if (target !== -1 && target < i) ordered.splice(target, 0, ...ordered.splice(i, 1));
+	}
+	return ordered;
+}
+
+/** The migration kinds a baseline must run ahead of: everything that alters or removes its object. */
+function displacesBaseline(type: SchemaMigrationType): boolean {
+	return type === 'alter_column' || type === 'add_column' || type === 'drop_column'
+		|| type === 'drop_table' || type === 'drop_index';
+}
+
+function migrationStreamKey(key: MigrationOrderKey): string {
+	return joinKeyParts(key.schema, migrationObjectKind(key.type), key.table);
 }
 
 // ============================================================================
@@ -521,6 +586,15 @@ export interface SchemaChangeToApply {
    * comparison.
    */
   readonly localDDLAtVersion?: string;
+  /**
+   * Present when the migration is a baseline (`schemaVersion` 0, see
+   * {@link SchemaMigration.schemaVersion}): a definition for a receiver that has
+   * none. The store adapter keeps an existing object over it rather than
+   * reporting a conflict, and runs a baseline `add_index` only on a table the same
+   * apply created from a baseline. Set by {@link toSchemaChange}, so every ingress
+   * path shares one rule.
+   */
+  readonly baseline?: true;
 }
 
 /**
@@ -543,6 +617,7 @@ export function toSchemaChange(
 		...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
 		ddl: migration.ddl,
 		...(localDDLAtVersion !== undefined ? { localDDLAtVersion } : {}),
+		...(isBaselineVersion(migration.schemaVersion) ? { baseline: true as const } : {}),
 	};
 }
 

@@ -38,8 +38,9 @@ import {
 	type DataChangeToApply,
 	type SchemaChangeToApply,
 	type SchemaObjectKind,
+	type SchemaMigration,
 	migrationObjectKind,
-	sortMigrationsByHLC,
+	orderMigrations,
 	toSchemaChangeWithLocalRecord,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
@@ -68,7 +69,8 @@ const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
  * to file once that apply has committed (never before — see `flushDataToStore`).
  */
 interface PendingSchemaChange {
-	readonly hlc: HLC;
+	/** The wire migration, which is also what the flush orders the pending set by. */
+	readonly migration: SchemaMigration;
 	readonly change: SchemaChangeToApply;
 	readonly record: {
 		readonly schema: string;
@@ -502,9 +504,9 @@ export async function applySnapshotStream(
 
 	// Pending data to apply to store (batched for efficiency)
 	let pendingDataChanges: DataChangeToApply[] = [];
-	// Kept HLC-stamped so the flush can re-order them causally instead of trusting the
-	// sender's chunk order — DDL replays in list order and `create index` needs its
-	// table's `create table` to have run. The `SchemaChangeToApply` is built at CHUNK
+	// Kept with their migration so the flush can re-order them causally instead of
+	// trusting the sender's chunk order — DDL replays in list order and `create index`
+	// needs its table's `create table` to have run. The `SchemaChangeToApply` is built at CHUNK
 	// time (it carries what THIS device's own migration at that version recorded, which
 	// the record write below overwrites), and the record write is carried alongside it
 	// so the flush can order the two: apply first, record second.
@@ -519,7 +521,7 @@ export async function applySnapshotStream(
 		// storage failure emits `status:'error'` and aborts the stream mid-flight,
 		// before the footer emits `status:'synced'` / clears the checkpoint — so the
 		// checkpoint stays in place and the transfer resumes/retries.
-		const ordered = sortMigrationsByHLC(pendingSchemaChanges);
+		const ordered = orderMigrations(pendingSchemaChanges, pending => pending.migration);
 		const schemaChanges = ordered.map(p => p.change);
 		const result = await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
 		// Table-identity transitions for the DDL that RAN (a replicated drop retires
@@ -856,7 +858,7 @@ export async function applySnapshotStream(
 				// create against it rather than against the table's current shape, which a
 				// local alteration has moved on from.
 				pendingSchemaChanges.push({
-					hlc: migration.hlc,
+					migration,
 					change: await toSchemaChangeWithLocalRecord(ctx.schemaMigrations, migration),
 					record: {
 						schema: migration.schema,

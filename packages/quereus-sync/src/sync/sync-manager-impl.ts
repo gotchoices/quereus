@@ -12,6 +12,7 @@ import type {
 	Database,
 	KeyNormalizerResolver,
 	LensDeploymentSnapshot,
+	TableSchema,
 	TransactionCommitBatch,
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
@@ -56,7 +57,7 @@ import {
 	joinKeyParts,
 	type PkKeying,
 } from '../metadata/keys.js';
-import { migrationObjectKind } from './protocol.js';
+import { BASELINE_SCHEMA_VERSION, migrationObjectKind } from './protocol.js';
 import { createPkKeyingResolver, resolvePkKeying, type PkKeyingResolver } from '../metadata/pk-identity.js';
 import { TableIdentityStore, withIdentityRecovery } from '../metadata/table-identity.js';
 import type { AdoptedRows, SyncManager, SnapshotCheckpoint } from './manager.js';
@@ -97,7 +98,9 @@ import {
 } from './snapshot-checkpoint.js';
 import {
 	adoptUnrecordedRows as adoptUnrecordedRowsImpl,
+	announcementFor,
 	findTablesWithUnrecordedRows as findTablesWithUnrecordedRowsImpl,
+	receiversCanWrite,
 } from './unrecorded-rows.js';
 
 /**
@@ -167,6 +170,51 @@ export function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): Schema
 	}
 }
 
+/** One table's uncaptured facts in a transaction, for the log line. */
+interface SkippedTable {
+	count: number;
+	reason: 'dropped here' | 'outside the basis' | 'unwritable';
+	/** `unwritable` only: the definition, so the warning can be issued once per schema object. */
+	definition?: TableSchema;
+}
+
+/**
+ * Whether `recordDataEvent` records anything for the event: a delete always files a
+ * tombstone; an insert or update files a cell only where a value changed, by the same
+ * by-value test `recordColumnVersions` applies. An update that changes nothing records
+ * nothing and leaves an unrecorded row unrecorded, so it announces nothing either.
+ */
+function recordsAFact(event: DatabaseDataChangeEvent): boolean {
+	if (!event.key) return false;
+	if (event.type === 'delete') return true;
+	const { oldRow, newRow } = event;
+	if (!newRow) return false;
+	return !oldRow || newRow.some((value, i) => !sqlValueIdentical(oldRow[i], value));
+}
+
+/**
+ * The name a table had before this transaction's own renames, which is the name whose
+ * migrations storage holds, and whether the transaction created it under any name along
+ * the way (then its own create is recorded and nothing needs announcing).
+ */
+function originOfName(
+	localSchema: DatabaseSchemaChangeEvent[],
+	schema: string,
+	table: string,
+): { name: string; createdHere: boolean } {
+	const isTableEvent = (e: DatabaseSchemaChangeEvent, name: string): boolean =>
+		e.objectType === 'table' && e.schemaName === schema && e.objectName === name;
+	const visited = new Set<string>();
+	let name = table;
+	for (;;) {
+		if (localSchema.some(e => e.type === 'create' && isTableEvent(e, name))) return { name, createdHere: true };
+		const rename = localSchema.find(e => e.type === 'alter' && e.oldObjectName !== undefined && isTableEvent(e, name));
+		if (!rename || visited.has(name)) return { name, createdHere: false };
+		visited.add(name);
+		name = rename.oldObjectName!;
+	}
+}
+
 /**
  * The engine behind a transaction source, when it is one. `TransactionCommitSource` is
  * the narrow slice the capture subscribes to; the primary-key re-key pass also has to
@@ -227,6 +275,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	// Settles when every adoption started so far has. A snapshot apply waits on it: see applySnapshot.
 	private adoptionsInFlight: Promise<void> = Promise.resolve();
+
+	// Tables whose migrations are known to bring them into existence, so a repeat write
+	// reads no migrations (see announceUnrecordedTables). Keyed by the catalog's schema
+	// OBJECT: local and replicated DDL both register a fresh one, so any schema change
+	// invalidates the entry for free, as `createPkKeyingResolver`'s cache does. A table
+	// joins only once the batch that checked or announced it has committed.
+	private readonly announcedTables = new WeakSet<TableSchema>();
+
+	// Tables whose facts were already reported as uncapturable, so the warning fires
+	// once per schema object rather than on every write to a scratch table.
+	private readonly unwritableWarned = new WeakSet<TableSchema>();
 
 	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
 	// basis-drift warning in recordLensDeployment — a warning, not durable state.
@@ -843,6 +902,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * transaction's data facts (docs/sync-schema.md § DDL Application Order). All metadata
 	 * for the transaction — schema migrations, column versions, tombstones, change-log
 	 * entries, and the HLC clock state — lands in a single KV batch.
+	 *
+	 * A table the facts belong to that no recorded migration brought into existence is
+	 * announced with them ({@link announceUnrecordedTables}), so its definition reaches
+	 * every device that lacks it.
 	 */
 	private async recordCommitBatch(batch: TransactionCommitBatch): Promise<void> {
 		// Capture only LOCAL facts. An all-remote group is a pure sync-apply echo:
@@ -855,6 +918,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			localSchema,
 		);
 		if (localSchema.length === 0 && localData.length === 0) return;
+
+		// Announcements come AFTER the transaction's own schema events: a rename in the
+		// same transaction must `move` the table's generation before the announcement's
+		// `ensure` under the new name, which would otherwise mint a second one. An
+		// ordinary announcement is recorded like any local create; a baseline is
+		// recorded at version 0, after the real migrations, by `recordBaselineMigration`.
+		const announced = await this.announceUnrecordedTables(localSchema, localData);
+		const schemaEvents = [...localSchema, ...announced.ordinary];
 
 		// ONE tick per committed transaction. tick() returns opSeq 0; the closure
 		// below stamps each successive fact with the next opSeq off the same base.
@@ -881,7 +952,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// a rename's rows (relabelled to the new name by the engine) under the moved
 		// one. Same batch as everything else, so the mapping and the records that
 		// depend on it commit together.
-		await this.applyLocalTableTransitions(kvBatch, localSchema);
+		await this.applyLocalTableTransitions(kvBatch, [...schemaEvents, ...announced.baseline]);
 
 		// DDL before DML: migrations take the lowest opSeqs. A primary-key change also
 		// re-files the table's existing records here, BEFORE the data events below — the
@@ -889,10 +960,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// reverse — and is reported only once the batch has committed.
 		const versionCounters = new Map<string, number>();
 		const rekeyed: Array<{ schema: string; table: string; counts: RekeyCounts }> = [];
-		for (const event of localSchema) {
+		for (const event of schemaEvents) {
 			await this.recordSchemaMigration(kvBatch, event, nextHlc, versionCounters);
 			const counts = await this.rekeyOnLocalKeyChange(kvBatch, event, staged);
 			if (counts) rekeyed.push({ schema: event.schemaName, table: event.objectName, counts });
+		}
+		for (const event of announced.baseline) {
+			this.recordBaselineMigration(kvBatch, event, nextHlc);
 		}
 
 		for (const event of localData) {
@@ -904,6 +978,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		await kvBatch.write();
 
+		// Only now: a batch that failed announced nothing, and must be announced again.
+		for (const definition of announced.settled) this.announcedTables.add(definition);
 		for (const { schema, table, counts } of rekeyed) reportRekeyOutcome(this, schema, table, counts);
 		this.syncEvents.emitLocalChange({
 			transactionId,
@@ -987,10 +1063,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * classify the log line — an expected skip reads differently from a table that
 	 * vanished for some other reason.
 	 *
-	 * ONLY the unknown-table case is skipped. Any other keying failure — a pk column
-	 * whose collation the wired `keyNormalizerResolver` does not know, say — still
-	 * throws out of `recordDataEvent` and fails the transaction loudly; silently
-	 * discarding those rows would bury a real misconfiguration.
+	 * Also dropped: the events of a table no receiver could write to (`receiversCanWrite`
+	 * — a `memory` table, say). One such cell fails a receiver's whole batch and strands
+	 * a new device's snapshot, and no definition can help, since the receiver has no way
+	 * to write the table at all. Gated on an apply path being wired, as adoption is: a
+	 * manager with none (a relay, or a test over a stub store) has no receivers to
+	 * protect. A definition with no module at all is a test oracle's stub and is left
+	 * alone.
+	 *
+	 * ONLY those cases are skipped. Any other keying failure — a pk column whose
+	 * collation the wired `keyNormalizerResolver` does not know, say — still throws out
+	 * of `recordDataEvent` and fails the transaction loudly; silently discarding those
+	 * rows would bury a real misconfiguration.
 	 *
 	 * A relay-only manager (no `getTableSchema` oracle) reports every table in basis,
 	 * so nothing is skipped there.
@@ -1002,42 +1086,128 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// NOTE: one oracle lookup per ROW (a schema-map hit today, and dwarfed by the
 		// per-row record work below). If `getTableSchema` ever becomes expensive, memo
 		// the verdict per table for the duration of the transaction.
-		const skipCounts = new Map<string, number>();
+		const skips = new Map<string, SkippedTable>();
 		const kept = events.filter(event => {
-			if (this.isTableInBasis(event.schemaName, event.tableName)) return true;
+			const skip = this.captureSkip(event.schemaName, event.tableName, localSchema);
+			if (!skip) return true;
 			const tableKey = `${event.schemaName}.${event.tableName}`;
-			skipCounts.set(tableKey, (skipCounts.get(tableKey) ?? 0) + 1);
+			const seen = skips.get(tableKey);
+			if (seen) seen.count++;
+			else skips.set(tableKey, { ...skip, count: 1 });
 			return false;
 		});
 
-		if (skipCounts.size > 0) this.logSkippedTables(skipCounts, localSchema);
+		if (skips.size > 0) this.logSkippedTables(skips);
 		return kept;
+	}
+
+	/** Why one table's facts are not captured, or `undefined` when they are. */
+	private captureSkip(
+		schema: string,
+		table: string,
+		localSchema: DatabaseSchemaChangeEvent[],
+	): Omit<SkippedTable, 'count'> | undefined {
+		if (!this.getTableSchema) return undefined;
+		const definition = this.getTableSchema(schema, table);
+		if (!definition) {
+			const droppedHere = localSchema.some(e =>
+				e.objectType === 'table' && e.type === 'drop' && e.schemaName === schema && e.objectName === table);
+			return { reason: droppedHere ? 'dropped here' : 'outside the basis' };
+		}
+		if (this.applyToStore && definition.vtabModule !== undefined && !receiversCanWrite(definition)) {
+			return { reason: 'unwritable', definition };
+		}
+		return undefined;
 	}
 
 	/**
 	 * Report skipped tables: ONE line per table with its change count, never one per
 	 * row. A table this same transaction dropped is expected and logs informationally;
-	 * anything else is a warning — the table vanished for some other reason.
+	 * a table that vanished for some other reason is a warning. A table no receiver
+	 * can write is warned about once per schema object, since every write to a scratch
+	 * table would otherwise repeat it.
 	 */
-	private logSkippedTables(
-		skipCounts: ReadonlyMap<string, number>,
-		localSchema: DatabaseSchemaChangeEvent[],
-	): void {
-		const droppedHere = new Set(
-			localSchema
-				.filter(e => e.objectType === 'table' && e.type === 'drop')
-				.map(e => `${e.schemaName}.${e.objectName}`),
-		);
+	private logSkippedTables(skips: ReadonlyMap<string, SkippedTable>): void {
 		// NOTE: the only `console.log` in this package (everything else is warn/error) —
 		// an expected skip is not a warning. If the package ever gains a real logger
 		// abstraction, this is the call site that wants an `info` level.
-		for (const [tableKey, count] of skipCounts) {
-			if (droppedHere.has(tableKey)) {
+		for (const [tableKey, { count, reason, definition }] of skips) {
+			if (reason === 'dropped here') {
 				console.log(`[Sync] Skipped ${count} change(s) for ${tableKey} — table dropped by the same transaction`);
-			} else {
+			} else if (reason === 'outside the basis') {
 				console.warn(`[Sync] Skipped ${count} change(s) for ${tableKey} — table is outside the local basis, so sync pk identity is unresolvable`);
+			} else if (definition && !this.unwritableWarned.has(definition)) {
+				this.unwritableWarned.add(definition);
+				console.warn(
+					`[Sync] Not capturing changes to ${tableKey}: other devices cannot write to a table using module `
+						+ `'${definition.vtabModuleName}', so its rows stay on this device`,
+				);
 			}
 		}
+	}
+
+	/**
+	 * The `create` events to record with this transaction's facts for each table they
+	 * touch whose migrations never brought it into existence, usually one created before
+	 * sync attached (docs/sync.md § Rows sync has never recorded). Without them the
+	 * facts reach the coordinator with no definition: other devices quarantine them and
+	 * a new device's snapshot cannot resolve the table at all. `announcementFor` decides
+	 * what to send; this chooses the tables:
+	 *
+	 * - only a fact `recordDataEvent` will record — a no-op update records nothing and
+	 *   leaves its row unrecorded, so it announces nothing either;
+	 * - only a table a receiver could write (`receiversCanWrite`), since no definition
+	 *   helps a table receivers cannot write;
+	 * - not a table this transaction creates, whose own create is recorded; a table it
+	 *   renames is judged by the migrations of the name storage still has.
+	 *
+	 * `settled` is what to remember once the batch commits: every table looked at, since
+	 * after the commit each one's migrations leave it live (or it is never announced).
+	 */
+	private async announceUnrecordedTables(
+		localSchema: DatabaseSchemaChangeEvent[],
+		localData: DatabaseDataChangeEvent[],
+	): Promise<{ baseline: DatabaseSchemaChangeEvent[]; ordinary: DatabaseSchemaChangeEvent[]; settled: TableSchema[] }> {
+		const announced = { baseline: [] as DatabaseSchemaChangeEvent[], ordinary: [] as DatabaseSchemaChangeEvent[], settled: [] as TableSchema[] };
+		if (!this.getTableSchema) return announced;
+
+		const considered = new Set<string>();
+		for (const event of localData) {
+			if (!recordsAFact(event)) continue;
+			const { schemaName, tableName } = event;
+			const tableKey = joinKeyParts(schemaName, tableName);
+			if (considered.has(tableKey)) continue;
+			considered.add(tableKey);
+
+			const definition = this.getTableSchema(schemaName, tableName);
+			if (!definition || this.announcedTables.has(definition)) continue;
+			announced.settled.push(definition);
+			if (!receiversCanWrite(definition)) continue;
+
+			const origin = originOfName(localSchema, schemaName, tableName);
+			if (origin.createdHere) continue;
+			const announcement = await announcementFor(this, definition, origin.name);
+			if (announcement) announced[announcement.kind].push(...announcement.events);
+		}
+		return announced;
+	}
+
+	/**
+	 * Record an announcement's `create` event as a baseline — schema version
+	 * {@link BASELINE_SCHEMA_VERSION}, see `SchemaMigration.schemaVersion` — where
+	 * {@link recordSchemaMigration} would file it as the next real version.
+	 */
+	private recordBaselineMigration(batch: WriteBatch, event: DatabaseSchemaChangeEvent, nextHlc: () => HLC): void {
+		const migrationType = mapSchemaMigrationType(event);
+		if (migrationType !== 'create_table' && migrationType !== 'add_index') {
+			throw new Error(`Only a create can be recorded as a baseline, not ${event.type} ${event.objectType}`);
+		}
+		this.schemaMigrations.recordMigrationBatch(batch, event.schemaName, migrationObjectKind(migrationType), event.objectName, {
+			type: migrationType,
+			ddl: event.ddl ?? '',
+			hlc: nextHlc(),
+			schemaVersion: BASELINE_SCHEMA_VERSION,
+		});
 	}
 
 	/**

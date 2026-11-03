@@ -193,10 +193,11 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     // list keeps run order across the two phases; the three identity-changing kinds
     // (create / drop / rename table) are never deferred, so among themselves they
     // stay in the caller's HLC order.
+    const applyState: SchemaApplyState = { baselineCreated: new Set() };
     const applySchemaPhase = async (phase: readonly SchemaChangeToApply[]): Promise<void> => {
       for (const schemaChange of phase) {
         try {
-          if (await applySchemaChange(db, events, schemaChange, applyOptions)) {
+          if (await applySchemaChange(db, events, schemaChange, applyOptions, applyState)) {
             executedSchemaChanges.push(schemaChange);
           }
           result.schemaChangesApplied++;
@@ -475,17 +476,25 @@ function assertDefinitionMatches(
  * about one alteration's effect, neither of which a later local migration
  * invalidates.
  *
+ * A baseline (`change.baseline`, see `SchemaChangeToApply.baseline`) is decided by
+ * presence alone: an absent table is created, a present one is kept whatever its
+ * shape ({@link keepLocalOverBaseline}). A baseline index runs only on a table this
+ * same invocation created from a baseline; a device with its own table keeps its
+ * own indexes, since a baseline index over a column it lacks, or a unique one over
+ * its duplicates, would throw and stop that device permanently.
+ *
  * NOTE: presence is read from the in-memory catalog (`db.schemaManager`), which
  * is assumed to reflect what is persisted — true once a database has finished
  * `rehydrateCatalog`. If a peer ever drives sync against a half-rehydrated
  * catalog, a table present in storage but absent from the catalog decides
  * `execute` and the underlying "already exists" throw returns.
  */
-function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
+function decideSchemaChange(db: Database, change: SchemaChangeToApply, state: SchemaApplyState): SchemaChangeAction {
   switch (change.type) {
     case 'create_table': {
       const local = db.schemaManager.getTable(change.schema, change.table);
       if (!local) return 'execute';
+      if (change.baseline) return keepLocalOverBaseline(change, generateTableDDL(local));
 
       // | incoming create | local record at the same version | verdict |
       // |---|---|---|
@@ -532,8 +541,10 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // schemas, not rendered strings.
       // NOTE: this fallback keeps the pre-record failure mode — a table altered
       // locally since a create that was never recorded still reads as a divergence.
-      // Only reachable for the two cases above; if either becomes common, record a
-      // migration for the pre-sync create rather than widening the comparison.
+      // A table created before sync attached now announces itself as a baseline on
+      // its first write (never a conflict, see above), so this is reached for one
+      // such table only while its device has not written to it since, or for a
+      // version whose local record is some other migration type.
       assertDefinitionMatches(change, generateTableDDL(local));
       return 'already-applied';
     }
@@ -547,8 +558,15 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // `findIndexOwner` is the engine's own by-name owner resolver — the same one
       // `DROP INDEX` uses, at the same default scope — so the receiver's verdict
       // here can never disagree with what the replicated DDL would then resolve to.
+      if (change.baseline && !indexesBaselineCreatedTable(change, state)) {
+        console.debug(
+          `[Sync] Baseline ${change.type} for ${change.schema}.${change.table} skipped — this apply did not create its table from a baseline`,
+        );
+        return 'already-applied';
+      }
       const owner = db.schemaManager.findIndexOwner(change.schema, change.table);
       if (!owner) return decideAbsentIndexCreate(db, change);
+      if (change.baseline) return keepLocalOverBaseline(change, generateIndexDDL(owner.index, owner.table));
       // NOTE: still compares the index's CURRENT shape, which is safe only because
       // no ALTER form modifies an index in place — a live index always renders as
       // the create that made it. If in-place index alteration ever lands, this arm
@@ -574,6 +592,43 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // them as before.
       return 'execute';
   }
+}
+
+/**
+ * Facts one `applyToStore` invocation carries across its schema changes: the tables
+ * it created from a baseline, which are the only tables a baseline `add_index` may
+ * run on (see {@link decideSchemaChange}). Keyed `schema.table`.
+ */
+interface SchemaApplyState {
+  readonly baselineCreated: Set<string>;
+}
+
+function schemaObjectKey(schema: string, object: string): string {
+  return `${schema}.${object}`;
+}
+
+/** Whether a baseline `add_index` indexes a table this same invocation created from a baseline. */
+function indexesBaselineCreatedTable(change: SchemaChangeToApply, state: SchemaApplyState): boolean {
+  const owner = createIndexOwner(change);
+  return owner !== undefined && state.baselineCreated.has(schemaObjectKey(change.schema, owner));
+}
+
+/**
+ * A baseline names an object this receiver already has: keep the local shape. A
+ * baseline is a definition for devices that have none, not a claim about anyone
+ * else's, so a difference is reported but is never a conflict — the same drift the
+ * data path already tolerates between two devices with different pre-sync shapes
+ * (docs/sync-schema.md § Baselines).
+ */
+function keepLocalOverBaseline(change: SchemaChangeToApply, localDDL: string): SchemaChangeAction {
+  if (normalizeDDL(localDDL) !== normalizeDDL(change.ddl)) {
+    console.warn(
+      `[Sync] Baseline ${change.type} for ${change.schema}.${change.table} differs from the local definition — keeping the local shape.\n` +
+      `  local:  ${localDDL}\n` +
+      `  remote: ${change.ddl}`,
+    );
+  }
+  return 'already-applied';
 }
 
 /**
@@ -1060,7 +1115,8 @@ async function applySchemaChange(
   db: Database,
   events: StoreEventEmitter,
   change: SchemaChangeToApply,
-  _options: ApplyToStoreOptions
+  _options: ApplyToStoreOptions,
+  state: SchemaApplyState,
 ): Promise<boolean> {
   // A blank `ddl` can still reach here from a peer on an older build (blank
   // drop/index/alter migrations). Such a migration runs nothing; skip it before
@@ -1082,7 +1138,7 @@ async function applySchemaChange(
     return false;
   }
 
-  if (decideSchemaChange(db, change) === 'already-applied') {
+  if (decideSchemaChange(db, change, state) === 'already-applied') {
     console.debug(
       `[Sync] Remote ${change.type} for ${change.schema}.${change.table} already applied locally — converging without re-executing DDL`
     );
@@ -1108,6 +1164,9 @@ async function applySchemaChange(
     await db.exec(change.ddl);
   } finally {
     for (const name of scopeNames) events.endRemoteSchemaScope(change.schema, name);
+  }
+  if (change.baseline && change.type === 'create_table') {
+    state.baselineCreated.add(schemaObjectKey(change.schema, change.table));
   }
   return true;
 }

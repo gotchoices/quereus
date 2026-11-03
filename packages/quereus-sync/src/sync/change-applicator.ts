@@ -25,8 +25,9 @@ import type {
 	DataChangeToApply,
 	SchemaChangeToApply,
 	SchemaMigration,
+	SchemaObjectKind,
 } from './protocol.js';
-import { migrationObjectKind, sameVersionLocalDDL, sortMigrationsByHLC, toSchemaChange } from './protocol.js';
+import { isBaselineVersion, migrationObjectKind, orderMigrations, sameVersionLocalDDL, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { admitGroup } from './admission.js';
@@ -305,7 +306,7 @@ export async function applyChanges(
 	// IS schemaVersion order (the origin assigns versions monotonically as it ticks).
 	// It also pins the `migration.schemaVersion ?? getCurrentVersion() + 1` fallback
 	// below, which reads storage that no migration in this batch has written yet.
-	for (const migration of orderMigrationsByHLC(changes)) {
+	for (const migration of orderBatchMigrations(changes)) {
 		// NOTE: the `??` fallback reads storage no migration in this batch has written
 		// yet, so two migrations of ONE object that BOTH omit `schemaVersion` compute
 		// the SAME version and collapse onto one `sm:` key (the later, max-HLC, wins).
@@ -315,6 +316,15 @@ export async function applyChanges(
 		const kind = migrationObjectKind(migration.type);
 		const schemaVersion = migration.schemaVersion ??
 			(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
+
+		// A baseline (version 0) is a definition for a receiver that has none. A receiver
+		// whose own record of the object ends on a drop has decided it is gone: the
+		// baseline is skipped rather than recorded, so the object does not come back on
+		// this device alone, and its cells take the unknown-table route below.
+		if (isBaselineVersion(schemaVersion) && await localStreamEndsOnDrop(ctx, migration.schema, kind, migration.table)) {
+			skipped++;
+			continue;
+		}
 
 		const existingMigration = await ctx.schemaMigrations.getMigration(
 			migration.schema,
@@ -713,14 +723,26 @@ function orderDataChangesByHLC(applied: readonly ResolvedChange[]): DataChangeTo
 }
 
 /**
- * Flatten a batch's schema migrations into one HLC-ordered list.
+ * Flatten a batch's schema migrations into one causally ordered list.
  *
  * Same reason as {@link orderDataChangesByHLC}: the DDL list reaches the store adapter
  * as a plain array replayed in order, so arrival order across changesets must not
- * decide which runs first. Ordering itself is {@link sortMigrationsByHLC}.
+ * decide which runs first. Ordering itself is {@link orderMigrations}.
  */
-function orderMigrationsByHLC(changes: readonly ChangeSet[]): SchemaMigration[] {
-	return sortMigrationsByHLC(changes.flatMap(changeSet => [...changeSet.schemaMigrations]));
+function orderBatchMigrations(changes: readonly ChangeSet[]): SchemaMigration[] {
+	return orderMigrations(changes.flatMap(changeSet => [...changeSet.schemaMigrations]), migration => migration);
+}
+
+/** Whether this receiver's own migration record of the object ends on a `drop_table` / `drop_index`. */
+async function localStreamEndsOnDrop(
+	ctx: SyncContext,
+	schema: string,
+	kind: SchemaObjectKind,
+	object: string,
+): Promise<boolean> {
+	let last: SchemaMigration['type'] | undefined;
+	for await (const { type } of ctx.schemaMigrations.getAllMigrations(schema, kind, object)) last = type;
+	return last === 'drop_table' || last === 'drop_index';
 }
 
 /**

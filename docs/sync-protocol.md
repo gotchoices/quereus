@@ -104,7 +104,8 @@ interface SchemaMigration {
   fromTable?: string;                // `rename_table` only: the name before the rename
   ddl: string;                       // The DDL statement
   hlc: HLC;
-  schemaVersion: number;             // Monotonic per (object kind, object name)
+  schemaVersion: number;             // Monotonic per (object kind, object name) from 1;
+                                     // 0 is a baseline (sync-schema.md § Baselines)
 }
 ```
 

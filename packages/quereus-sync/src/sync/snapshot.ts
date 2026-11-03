@@ -25,7 +25,7 @@ import {
 	type DataChangeToApply,
 	type SchemaChangeToApply,
 	migrationObjectKind,
-	sortMigrationsByHLC,
+	orderMigrations,
 	toSchemaChangeWithLocalRecord,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
@@ -215,7 +215,7 @@ export async function applySnapshot(
 
 	// Re-order rather than trust the sender's list order: DDL replays in list order
 	// and `create index` needs its table's `create table` to have run first.
-	const orderedMigrations = sortMigrationsByHLC(snapshot.schemaMigrations);
+	const orderedMigrations = orderMigrations(snapshot.schemaMigrations, migration => migration);
 
 	for (const migration of orderedMigrations) {
 		// Resolve what THIS device's own migration at the same version said BEFORE

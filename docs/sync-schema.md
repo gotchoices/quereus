@@ -62,7 +62,9 @@ B: ADD COLUMN bar TEXT     @ HLC(2000, 1, B)
 
 Why the sort is needed at all: neither `sm:` key order (schema, kind, name — index
 migrations ahead of table ones) nor arrival order is causal, so producers and consumers on
-both paths sort (`sortMigrationsByHLC`).
+both paths sort (`orderMigrations` in `protocol.ts`): ascending HLC, then each
+*baseline* (schema version 0, see § Baselines) moved ahead of the first alteration or drop
+of its own object, behind any `rename_table` and behind any real create of it.
 
 "Within a batch" is the whole guarantee: a streamed snapshot is many batches (the
 receiver flushes every 100 pending row changes), so DDL arriving *after* a flush cannot
@@ -138,6 +140,7 @@ the migration's wanted state:
 | Object absent (create) / present (drop) | Execute the DDL |
 | Object already in the wanted state, definition matches | **Converge silently** — nothing is executed, the change still counts as applied and its migration metadata commits |
 | Object already exists with a **different** definition | Error naming the object and printing both definitions |
+| A **baseline** create (schema version 0, see § Baselines) names an object already present | Keep the local definition, warning if it differs — never an error |
 
 For a `create_table`, "definition matches" is decided against **this device's own
 recorded migration at the same schema version** — not against the table's current shape.
@@ -167,12 +170,62 @@ sync was attached records its first *alteration* at version 1, and comparing a c
 against that `ALTER TABLE` text would manufacture a conflict out of nothing.
 
 The **fallback**, used when there is no such record (a table created before sync was
-attached, or a version whose record is some other migration type), and the comparison
-every other object type uses, regenerates the canonical
+attached and not written to since, or a version whose record is some other migration
+type), and the comparison every other object type uses, regenerates the canonical
 DDL from the local `TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL`
 with no `db` argument — exactly how the origin produced the DDL it put on the wire). It
 keeps the pre-record limitation: a table altered locally since a create that was never
-recorded still reads as a divergence.
+recorded still reads as a divergence. A table created before sync attached announces
+itself as a baseline on its first write (next section), which never takes this path.
+
+### Baselines
+
+A **baseline** is a `create_table` or `add_index` migration recorded at **schema version
+0**. It means "this object existed on some device before sync attached; here is its
+definition, for any device that has none". Ordinary migrations are versioned from 1, so a
+baseline never collides with a real migration; two baselines of one object compete only
+with each other, by HLC, and either outcome is the same definition for devices that lack
+the object. Nothing about the wire or stored encoding changes: it is a version number.
+
+**When one is recorded.** Local capture records a baseline alongside the first fact it
+records for a table whose migrations never brought it into existence — created before sync
+attached, and perhaps altered or renamed since (a `rename_table` counts as live only when
+the old name's stream is live). The table's create comes first, then one `add_index` per
+index. A table whose own stream ends on a `drop_table` (dropped under sync, re-created
+while detached) is a real new table and gets an ordinary next-version create instead, since
+a baseline would sort ahead of the drop it follows. A table this transaction creates needs
+nothing; one it renames is judged by the migrations of the name it had. Adoption
+(`adoptUnrecordedRows`, [sync.md § Adopting rows](sync.md#adopting-rows)) goes through the
+same capture and announces the same way. A no-op update records nothing and announces
+nothing. The answer is remembered per catalog schema object, so repeat writes read no
+migrations; any DDL registers a fresh object and re-checks.
+
+**How a receiver decides it** (`decideSchemaChange`):
+
+| baseline | receiver state | verdict |
+|---|---|---|
+| `create_table` | table absent | execute — the table is created from the baseline |
+| `create_table` | table present, any shape | keep the local definition; warn if it differs |
+| `add_index` | this same apply created its table from a baseline | as an ordinary `add_index`: execute if absent, keep if present |
+| `add_index` | the table was already here | skip — a baseline index over a column the receiver lacks, or a unique one over its duplicates, would throw and stop the device for good |
+| either | this receiver's own stream for the object ends on a drop | skipped in Phase 1a of a delta apply, so the object does not return on one device alone; its cells take the unknown-table route |
+
+**Apply order.** After the HLC sort, `orderMigrations` moves each baseline ahead of the
+first `alter_column` / `drop_table` / `drop_index` of its object (on every path: delta,
+whole snapshot, streamed snapshot). A fresh device replaying `[alter_column, older-shape
+baseline]` in HLC order would create the old shape and end without the column; replaying
+`[drop_table, baseline]` would end with a table every other device dropped. The baseline
+stays behind a `rename_table` — a device holding the old name must rename first, or the
+baseline creates an empty table under the new name and the rename collides with it — and
+behind a real `create_table` / `add_index`, which already defines the object and which the
+baseline then only keeps.
+
+**What it does not do.** Shape differences between devices are tolerated, not resolved:
+sender-only columns are dropped on apply, receiver-only columns stay null. A baseline
+carries one device's shape and never rewrites another's. A fresh device that receives an
+alteration and the older baseline in *separate* delta batches applies the alteration to
+an absent table (converging with a warning) and then creates the old shape; the snapshot
+paths and a single delta batch order them correctly.
 
 Either way the two strings are compared after a small normalization: trim, drop a
 trailing `;`, collapse whitespace runs, compare case-insensitively.
@@ -319,8 +372,10 @@ there: `create_table`, `drop_table`, `add_index` and `drop_index`. The store mod
 attaches the canonical text at each emit site — the two creates via `generateTableDDL` /
 `generateIndexDDL`, the two drops via `generateDropTableDDL` / `generateDropIndexDDL` (all
 in `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
-attaches the same four, though there is no end-to-end sync path for memory-backed tables
-today.
+attaches the same four, so a memory table's DDL replicates, but its rows never do:
+receivers have no way to write such a table, so local capture records nothing for it
+(`filterCapturableDataEvents`, gated on an apply path being wired) and warns once per
+table.
 
 **Table alterations replicate too.** Every `ALTER TABLE` statement's schema-change event
 carries the statement's **canonical, schema-qualified SQL** in `ddl`: the engine renders

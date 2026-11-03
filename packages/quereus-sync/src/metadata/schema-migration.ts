@@ -14,7 +14,7 @@ import {
   parseSchemaMigrationKey,
 } from './keys.js';
 import {
-  sortMigrationsByHLC,
+  orderMigrations,
   type SchemaMigration,
   type SchemaMigrationType,
   type SchemaObjectKind,
@@ -236,7 +236,7 @@ export class SchemaMigrationStore {
       });
     }
 
-    return sortMigrationsByHLC(migrations);
+    return orderMigrations(migrations, migration => migration);
   }
 
   /**

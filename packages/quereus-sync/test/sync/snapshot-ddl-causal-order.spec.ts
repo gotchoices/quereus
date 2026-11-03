@@ -7,7 +7,7 @@
  * fresh receiver `create index note_idx on orders (...)` before `create table orders`
  * — which fails outright with `no such table: orders`, aborting the bootstrap.
  *
- * The producers therefore order by HLC (`sortMigrationsByHLC`), and both consumers
+ * The producers therefore order by HLC (`orderMigrations`), and both consumers
  * re-sort rather than trust the sender's list.
  */
 

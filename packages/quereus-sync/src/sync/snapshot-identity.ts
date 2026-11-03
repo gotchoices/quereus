@@ -39,6 +39,14 @@ export interface ReconciledRow {
  * A resolution failure (no local table definition, and none installed by the
  * snapshot's own DDL) emits `status:'error'` before propagating, for parity with
  * the data-apply failure path.
+ *
+ * NOTE: a snapshot section with cells for a table the receiver ends up without still
+ * fails the whole snapshot here, where the delta path would hold the cells as an
+ * unknown table. A write to a table nobody announced now carries the definition
+ * (`announcementFor`), so this takes a server that already held such cells from before,
+ * whose writer never writes to that table again — or cells written to a table another
+ * device had dropped, whose baseline the snapshot's own DDL then runs ahead of the drop.
+ * If either shows up, hold those cells as the delta path does rather than throwing.
  */
 export function createSnapshotKeyingResolver(ctx: SyncContext): SnapshotKeyingResolver {
 	const cache = new Map<string, PkKeying>();

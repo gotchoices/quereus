@@ -89,7 +89,8 @@ describe('getChangesToPush', () => {
 			expect(rowIds, 'whole own transactions, one per batch').to.deep.equal([[1, 1], [2, 2]]);
 
 			const sets = batches.flat();
-			expect(sets.flatMap(cs => cs.schemaMigrations).map(migration => migration.table)).to.deep.equal(['our_table']);
+			// `orders` was created before sync attached, so its first write announces it as a baseline.
+			expect(sets.flatMap(cs => cs.schemaMigrations).map(migration => migration.table)).to.deep.equal(['our_table', 'orders']);
 			expect(sets.every(cs => siteIdEquals(cs.siteId, peer.manager.getSiteId())), 'nothing from another device').to.equal(true);
 		}
 	});

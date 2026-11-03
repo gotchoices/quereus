@@ -8,6 +8,11 @@
  * Finding them is strictly read-only. In particular `hasRowVersions` resolves a table's
  * generation without minting one, so a table with no `tg:` record simply reads as
  * unrecorded.
+ *
+ * Also here: the definition a write to such a table has to carry. A table created before
+ * sync attached has no migration bringing it into existence, so its first recorded fact
+ * is announced with a create for the table and its indexes ({@link announcementFor}),
+ * which local capture records alongside the fact.
  */
 
 import {
@@ -184,9 +189,10 @@ export async function adoptUnrecordedRows(
  * tables, directly or through a wrapper exposing the store as `underlying`, the ownership
  * rule of `StoreModule.getTableForExternalWrite`. One row of any other table fails the
  * receiver's whole batch, so it would stop every other device from syncing and every new
- * device from bootstrapping. Such a table cannot sync in any direction today.
+ * device from bootstrapping. Such a table cannot sync in any direction today, so local
+ * capture records nothing for it either (`SyncManagerImpl.filterCapturableDataEvents`).
  */
-function receiversCanWrite(table: TableSchema): boolean {
+export function receiversCanWrite(table: TableSchema): boolean {
 	const writable = (module: unknown): boolean =>
 		typeof (module as { getTableForExternalWrite?: unknown } | undefined)?.getTableForExternalWrite === 'function';
 	const module: unknown = table.vtabModule;
@@ -196,7 +202,9 @@ function receiversCanWrite(table: TableSchema): boolean {
 /**
  * Adopt one table's unrecorded rows, `DATA_FLUSH_SIZE` to a synthetic transaction, so no
  * table has to fit in memory and a crash loses only the unfinished batch. Writing under
- * the open scan is safe: `record` writes to the sync KV store, not to the table.
+ * the open scan is safe: `record` writes to the sync KV store, not to the table. The
+ * table's definition travels with the first batch as it does with any write to a table
+ * nobody announced: `record` is local capture, which announces it (`announcementFor`).
  *
  * NOTE: a table with more columns than `batchSize / DATA_FLUSH_SIZE` (10 by default) makes
  * each batch an oversized transaction, which is sent whole and logs a warning per read. If
@@ -217,9 +225,7 @@ async function adoptTable(
 	let adopted = 0;
 	let pending: DatabaseDataChangeEvent[] = [];
 	const flush = async (): Promise<void> => {
-		// With the first row, so a table with nothing to send sends no schema either.
-		const schemaEvents = adopted === 0 ? await missingCreateEvents(ctx, table) : [];
-		await record({ schemaEvents, dataEvents: pending });
+		await record({ schemaEvents: [], dataEvents: pending });
 		adopted += pending.length;
 		pending = [];
 	};
@@ -260,40 +266,73 @@ function insertEvent(table: TableSchema, pk: SqlValue[], row: Row): DatabaseData
 }
 
 /**
- * The `create` events a table and its indexes lack. The coordinator keeps no table
+ * The `create` events to record with the first fact of a table whose migrations never
+ * brought it into existence, and how to record them. The coordinator keeps no table
  * definitions, so a cell for a table nobody announced is quarantined by another device
  * and aborts a new device's snapshot (docs/sync.md § Unknown-Table Disposition).
- * The DDL is what the store module puts on its own create events: no `db` argument, so
- * fully qualified, and byte-identical across devices adopting the same table.
- *
- * A table announced here gets every index announced after it, whatever the index's own
- * migrations say. A receiver replays an older `add_index` ahead of this create, finds no
- * table, and converges without the index.
  */
-async function missingCreateEvents(ctx: SyncContext, table: TableSchema): Promise<DatabaseSchemaChangeEvent[]> {
+export interface TableAnnouncement {
+	/**
+	 * `baseline`: nothing recorded ever created the table, so it is announced at
+	 * schema version 0 (`SchemaMigration.schemaVersion`): a definition for devices that
+	 * have none, which a device holding the table keeps its own shape over.
+	 * `ordinary`: the table's own stream ends on a drop (dropped under sync, re-created
+	 * while detached), so this is a real new table, recorded as the next version with
+	 * the usual conflict rule. A baseline there would sort ahead of the drop it follows.
+	 */
+	readonly kind: 'baseline' | 'ordinary';
+	/** The table's create, then one per index, in the shape the store module emits. */
+	readonly events: DatabaseSchemaChangeEvent[];
+}
+
+/**
+ * What to announce for `table`, or nothing when its migrations already bring it into
+ * existence and leave it there. `streamName` is the name whose migrations decide: the
+ * table's own, or the name it had before a rename in the transaction being recorded,
+ * which storage has not seen yet.
+ *
+ * The DDL is what the store module puts on its own create events: no `db` argument, so
+ * fully qualified, and byte-identical across devices announcing the same table. Every
+ * index is announced with its table, whatever the index's own migrations say: a receiver
+ * that replays an older `add_index` ahead of this create finds no table and converges
+ * without the index, and a baseline index runs only where the table itself came from the
+ * baseline (`store-adapter.ts` § `decideSchemaChange`).
+ */
+export async function announcementFor(ctx: SyncContext, table: TableSchema, streamName: string): Promise<TableAnnouncement | undefined> {
+	const state = await migrationStreamState(ctx, table.schemaName, 'table', streamName);
+	if (state === 'live') return undefined;
+	return { kind: state === 'dropped' ? 'ordinary' : 'baseline', events: createEvents(table) };
+}
+
+function createEvents(table: TableSchema): DatabaseSchemaChangeEvent[] {
 	const { schemaName, name, vtabModuleName: moduleName } = table;
-	const events: DatabaseSchemaChangeEvent[] = [];
-	const tableAnnounced = await hasLiveCreate(ctx, schemaName, 'table', name);
-	if (!tableAnnounced) {
-		events.push({ type: 'create', objectType: 'table', moduleName, schemaName, objectName: name, ddl: generateTableDDL(table), remote: false });
-	}
+	const events: DatabaseSchemaChangeEvent[] = [
+		{ type: 'create', objectType: 'table', moduleName, schemaName, objectName: name, ddl: generateTableDDL(table), remote: false },
+	];
 	for (const index of table.indexes ?? []) {
 		if (isHiddenImplicitIndex(table, index.name)) continue;
-		if (tableAnnounced && await hasLiveCreate(ctx, schemaName, 'index', index.name)) continue;
 		events.push({ type: 'create', objectType: 'index', moduleName, schemaName, objectName: index.name, ddl: generateIndexDDL(index, table), remote: false });
 	}
 	return events;
 }
 
 /**
- * Whether the object's migrations bring it into existence and leave it there. A version
- * count would not do: a table created before sync attached and altered since has only an
- * `alter_column`, and one dropped under sync and re-created while detached ends on its
- * `drop_table`. Either way a receiver replaying them ends with no table.
+ * How an object's recorded migrations leave it:
  *
- * NOTE: a rename counts as a create, on the assumption that the old name's stream holds
- * one. A table created before sync attached and renamed since breaks that: a receiver has
- * neither name, so it converges without a table. If that shows up, follow `fromTable`.
+ * - `live`: brought into existence and left there.
+ * - `dropped`: its own stream ends on a drop. Dropped under sync and re-created while
+ *   detached, if the object exists now.
+ * - `unrecorded`: nothing recorded brings it into existence. Created before sync
+ *   attached, and perhaps renamed or altered since.
+ *
+ * A version count would not do: a table created before sync attached and altered since
+ * has only an `alter_column`. A `rename_table` files under the new name with the old one
+ * in `fromTable`, so it counts as live exactly when the old name's stream is live.
+ *
+ * NOTE: a rename chain returning to a name it already visited (renamed away and back)
+ * reads as `unrecorded`, because a version-ordered walk cannot tell whether that name's
+ * create came before or after the rename back. The cost is a baseline every receiver keeps
+ * its own table over, never a missing definition.
  *
  * NOTE: streams can also read live after the object has gone. A rename files under the new
  * name, so a table renamed away leaves its old name's stream ending on `create_table`, and
@@ -301,11 +340,27 @@ async function missingCreateEvents(ctx: SyncContext, table: TableSchema): Promis
  * `add_index`. A table or index created under such a name while detached is then not
  * announced. If that shows up, compare against the owning table's latest create.
  */
-async function hasLiveCreate(ctx: SyncContext, schema: string, kind: SchemaObjectKind, name: string): Promise<boolean> {
-	let live = false;
-	for await (const { type } of ctx.schemaMigrations.getAllMigrations(schema, kind, name)) {
-		if (type === 'create_table' || type === 'add_index' || type === 'rename_table') live = true;
-		else if (type === 'drop_table' || type === 'drop_index') live = false;
+export type MigrationStreamState = 'live' | 'dropped' | 'unrecorded';
+
+export async function migrationStreamState(
+	ctx: SyncContext,
+	schema: string,
+	kind: SchemaObjectKind,
+	name: string,
+	visited: Set<string> = new Set(),
+): Promise<MigrationStreamState> {
+	if (visited.has(name)) return 'unrecorded';
+	visited.add(name);
+	let state: MigrationStreamState = 'unrecorded';
+	for await (const { type, fromTable } of ctx.schemaMigrations.getAllMigrations(schema, kind, name)) {
+		if (type === 'create_table' || type === 'add_index') {
+			state = 'live';
+		} else if (type === 'rename_table') {
+			const from = fromTable === undefined ? 'unrecorded' : await migrationStreamState(ctx, schema, kind, fromTable, visited);
+			state = from === 'live' ? 'live' : 'unrecorded';
+		} else if (type === 'drop_table' || type === 'drop_index') {
+			state = 'dropped';
+		}
 	}
-	return live;
+	return state;
 }
