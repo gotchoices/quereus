@@ -11,7 +11,8 @@
  * both the memory and the store backend — lives in
  * `test/logic/50.4-declare-schema-apply-restore.sqllogic`. This spec covers what the sqllogic
  * runner cannot reach: the catalog fingerprint, the schema-event channel, the shape of the
- * error, a module whose undo fails, and the strict DDL-transaction policy.
+ * error, a module whose undo fails, the strict DDL-transaction policy, and the primary-key
+ * rebuild the journal cannot restore rows for, which is refused instead.
  */
 
 import { expect } from 'chai';
@@ -20,7 +21,9 @@ import type { Database as DatabaseType } from '../src/core/database.js';
 import { QuereusError } from '../src/common/errors.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
 import { renderCatalogForComparison, renderCatalogForRestoreCheck } from '../src/schema/catalog-rendering.js';
-import type { SqlValue } from '../src/common/types.js';
+import { StatusCode, type SqlValue } from '../src/common/types.js';
+import type { AnyVirtualTableModule } from '../src/vtab/module.js';
+import { makeNoAlterModule } from './no-alter-module.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, SqlValue>>> {
 	const out: Array<Record<string, SqlValue>> = [];
@@ -506,6 +509,133 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		expect(snapshot!.catalogRendering, 'the snapshot still describes the live catalog').to.equal(fingerprint(db));
 		await db.exec(SETTLED);
 		expect(await planOf(db)).to.deep.equal([]);
+	});
+
+	describe('a primary-key rebuild that is not the only effect of the apply', () => {
+		const REKEYABLE = { withRenameTable: true };
+		const WORKAROUND = /alter table t alter primary key \(\.\.\.\)` on its own/;
+		/** The key moved from `a` to `c`. `extras` adds the rest of the plan. */
+		const rekeyedT = (extras = '') => `table t { a INTEGER, c INTEGER, b INTEGER, primary key (c) ${extras} }`;
+
+		async function startOn(module: AnyVirtualTableModule): Promise<void> {
+			db.registerModule('stub', module);
+			db.setDefaultVtabName('stub');
+			await db.exec('create table t (a integer, c integer, b integer, primary key (a))');
+			await db.exec('insert into t values (1, 10, 1), (2, 20, 1)');
+		}
+
+		async function expectAllRows(): Promise<void> {
+			expect(await rows(db, 'select a, c, b from t order by a')).to.deep.equal([{ a: 1, c: 10, b: 1 }, { a: 2, c: 20, b: 1 }]);
+		}
+
+		/** Asserts `apply` is refused with the workaround and leaves the catalog, the key included, and the rows alone. */
+		async function expectRefused(apply = 'apply schema main'): Promise<Error> {
+			const before = fingerprint(db);
+			const err = await rejection(db.exec(apply));
+			expect(err.message).to.match(WORKAROUND);
+			expect(err.message, 'a refusal leaves nothing to report as partially migrated').to.not.match(/could not be restored/);
+			expect(fingerprint(db)).to.equal(before);
+			await expectAllRows();
+			return err;
+		}
+
+		it('a hookless module: the refusal names the workaround, and following it succeeds', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			// Without the refusal, the ADD fails on b = 1 and rolls back the rebuild's row copy.
+			await db.exec(`declare schema main { ${rekeyedT(', constraint ck check (b > 1)')} }`);
+			expect(await planOf(db)).to.have.length(2);
+
+			const err = await expectRefused();
+			expect((err as QuereusError).code).to.equal(StatusCode.ERROR);
+			expect(err.message).to.contain("module 'stub'");
+
+			await db.exec('alter table t alter primary key (c)');
+			await expectAllRows();
+			expect(await planOf(db), 'no key change is left to plan').to.deep.equal(['ALTER TABLE t ADD constraint ck check (b > 1)']);
+			await db.exec('update t set b = 2');
+			await db.exec('apply schema main');
+			expect(await planOf(db)).to.deep.equal([]);
+			expect(await rows(db, 'select a from t order by a')).to.deep.equal([{ a: 1 }, { a: 2 }]);
+		});
+
+		it('refuses before any step runs, so a table the plan drops first survives', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			await db.exec('create table old (id integer primary key)');
+			await db.exec('insert into old values (1)');
+			await db.exec(`declare schema main { ${rekeyedT()} }`);
+			expect(await planOf(db)).to.deep.equal(['DROP TABLE IF EXISTS old', 'ALTER TABLE t ALTER PRIMARY KEY (c)']);
+
+			await expectRefused();
+			expect(await rows(db, 'select id from old')).to.deep.equal([{ id: 1 }]);
+		});
+
+		it('finds a table the plan renames under its live name, before any step runs', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			await db.exec('create table old (id integer primary key)');
+			await db.exec(`declare schema main {
+				table renamed { a INTEGER, c INTEGER, b INTEGER, primary key (c) } with tags ("quereus.previous_name" = 't')
+			}`);
+			expect(await planOf(db)).to.deep.equal([
+				'ALTER TABLE t RENAME TO renamed',
+				'DROP TABLE IF EXISTS old',
+				'ALTER TABLE renamed ALTER PRIMARY KEY (c)',
+			]);
+
+			await expectRefused();
+			expect(await rows(db, 'select count(*) as n from old')).to.deep.equal([{ n: 0 }]);
+		});
+
+		it('a hook that declines: refused at the rebuild, with the earlier step unwound', async () => {
+			await startOn(makeNoAlterModule({ ...REKEYABLE, declineAlterPrimaryKey: true }));
+			await db.exec(`declare schema main { ${rekeyedT()} table n1 { id INTEGER PRIMARY KEY } }`);
+			expect(await planOf(db)).to.deep.equal(['create table n1 (id INTEGER primary key)', 'ALTER TABLE t ALTER PRIMARY KEY (c)']);
+
+			const err = await expectRefused();
+			expect(err.message).to.match(/^Failed to execute DDL: ALTER TABLE t ALTER PRIMARY KEY/);
+			await rejection(rows(db, 'select * from n1'));
+		});
+
+		it('a one-step plan is refused when a registered module could refuse the commit', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			db.registerModule('refuses_commit', {
+				...makeNoAlterModule(),
+				beginSchemaBatch: async () => {},
+				endSchemaBatch: async () => { throw new Error('forced commit refusal'); },
+			});
+			await db.exec(`declare schema main { ${rekeyedT()} }`);
+			expect(await planOf(db)).to.have.length(1);
+
+			await expectRefused();
+		});
+
+		it('a one-step plan is refused when seed rows would follow it', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			await db.exec(`declare schema main { ${rekeyedT()} seed t ((3, 30, 3)) }`);
+			expect(await planOf(db)).to.have.length(1);
+
+			await expectRefused('apply schema main with seed');
+		});
+
+		it('a module that can never rebuild gets that answer rather than a workaround that cannot work', async () => {
+			await startOn(makeNoAlterModule());
+			await db.exec(`declare schema main { ${rekeyedT()} table n1 { id INTEGER PRIMARY KEY } }`);
+
+			const err = await rejection(db.exec('apply schema main'));
+			expect(err.message).to.match(/does not support ALTER PRIMARY KEY/);
+			await rejection(rows(db, 'select * from n1'));
+		});
+
+		it('a one-step plan with nothing following it still rebuilds and keeps its rows', async () => {
+			await startOn(makeNoAlterModule(REKEYABLE));
+			await db.exec(`declare schema main { ${rekeyedT()} }`);
+			expect(await planOf(db)).to.have.length(1);
+
+			// `with seed` and no seed rows declared: nothing will be seeded, so this still qualifies.
+			await db.exec('apply schema main with seed');
+
+			await expectAllRows();
+			expect(await planOf(db), 'the key did change').to.deep.equal([]);
+		});
 	});
 
 	it('under ddl_transaction_policy = strict the refused forward step is unwound like any other failure', async () => {

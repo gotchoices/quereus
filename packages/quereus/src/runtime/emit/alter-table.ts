@@ -8,6 +8,7 @@ import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
+import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, columnSchemaToColumnDef, collectTableConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
@@ -23,7 +24,7 @@ import { generateTableDDL, generateIndexDDL } from '../../schema/ddl-generator.j
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
-import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
+import { assertDdlTransactionPolicy, isExplicitTransactionOpen, rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { assertNoColumnExpressionNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
@@ -1910,42 +1911,26 @@ async function runAlterPrimaryKey(
 		}
 	}
 
-	// Rebuild fallback. Two preconditions, both refusals rather than repairs — see
-	// `rebuildViaShadowTable` for why neither has a correct outcome. Checked here, after the
+	// Rebuild fallback. Its preconditions are refusals rather than repairs — see
+	// `rebuildViaShadowTable` for why none has a correct outcome. Checked here, after the
 	// native attempt, so both entry paths into the rebuild (no `alterTable` hook at all; the
 	// hook raised UNSUPPORTED) are covered by one check each; a module that raised
 	// UNSUPPORTED has by contract mutated nothing, so a refusal here leaves the catalog, the
 	// table and the enclosing transaction untouched. Capability first: it is unconditional,
-	// so it is the more informative answer when both apply.
-	if (!module.renameTable) {
-		throw new QuereusError(
-			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
-				+ `'${tableSchema.name}': it cannot re-key in place (it implements no 'alterTable' hook, or the `
-				+ `hook declined), and the engine's fallback rebuild finishes by renaming a shadow table over `
-				+ `this one — without 'renameTable' the module would keep the rows under the shadow name and `
-				+ `the rebuilt table could not be opened.`,
-			StatusCode.UNSUPPORTED,
-		);
-	}
-	// Second capability check: the rebuild re-creates the table's user indexes with
-	// CREATE INDEX statements (the shadow's CREATE TABLE carries every constraint, but
-	// indexes have their own statements), and CREATE INDEX routes through
-	// `module.createIndex`. Refuse up front — failing after the original table is
-	// dropped would strand a half-rebuilt table, and silently dropping the indexes is
-	// data loss of a different kind (a UNIQUE index stops enforcing).
-	if (!module.createIndex && rebuildUserIndexes(tableSchema).length > 0) {
-		throw new QuereusError(
-			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
-				+ `'${tableSchema.name}': it cannot re-key in place, and the engine's fallback rebuild must `
-				+ `re-create the table's indexes on the rebuilt table — without 'createIndex' they would be `
-				+ `silently lost. Drop the indexes first, or use a module that can re-key or create indexes.`,
-			StatusCode.UNSUPPORTED,
-		);
-	}
-	// NOTE: refused on every `DdlTransactionality` tier, including a module declaring
-	// 'transactional'. None does today; if one appears its DROP + RENAME would roll back
-	// together with the row copy, making this refusal over-broad — exempt that tier then, the
-	// way `assertDdlTransactionPolicy` already does.
+	// so it is the more informative answer when several apply. The apply refusal precedes the
+	// transaction one because its workaround answers both, where the transaction one's would
+	// only lead the caller back here.
+	assertModuleCanRebuild(tableSchema, module);
+	// NOTE: both refusals below hold on every `DdlTransactionality` tier, including a module
+	// declaring 'transactional'. None does today; if one appears its DROP + RENAME would roll
+	// back together with the row copy, making both over-broad — exempt that tier then, the way
+	// `assertDdlTransactionPolicy` already does.
+	//
+	// NOTE: when the plan also renames this table, the apply refusal's workaround names the new
+	// name, which the unwind then takes away, so following it literally reports no such table.
+	// Only a declining hook gets here (the before-any-step check knows the live name) and no
+	// rows are at risk; if that shape ever matters, carry the pre-apply name on the flag.
+	if (rctx.db._isPrimaryKeyRebuildRefused()) throw rebuildNotOnlyEffectError(tableSchema);
 	if (isExplicitTransactionOpen(rctx.db)) {
 		throw new QuereusError(
 			`ALTER PRIMARY KEY on table '${tableSchema.name}' is not allowed inside an explicit transaction: `
@@ -2084,6 +2069,38 @@ function rebuildUserIndexes(tableSchema: TableSchema): IndexSchema[] {
 }
 
 /**
+ * The refusals that hold in any context: a module failing these can never take the rebuild, so
+ * no later statement or different plan shape would get it through. Also called by `apply schema`
+ * before it refuses a rebuild for its own reasons, so its workaround is never one that cannot work.
+ */
+export function assertModuleCanRebuild(tableSchema: TableSchema, module: AnyVirtualTableModule): void {
+	if (!module.renameTable) {
+		throw new QuereusError(
+			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
+				+ `'${tableSchema.name}': it cannot re-key in place (it implements no 'alterTable' hook, or the `
+				+ `hook declined), and the engine's fallback rebuild finishes by renaming a shadow table over `
+				+ `this one — without 'renameTable' the module would keep the rows under the shadow name and `
+				+ `the rebuilt table could not be opened.`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+	// The rebuild re-creates the table's user indexes with CREATE INDEX statements (the
+	// shadow's CREATE TABLE carries every constraint, but indexes have their own statements),
+	// and CREATE INDEX routes through `module.createIndex`. Refuse up front — failing after the
+	// original table is dropped would strand a half-rebuilt table, and silently dropping the
+	// indexes is data loss of a different kind (a UNIQUE index stops enforcing).
+	if (!module.createIndex && rebuildUserIndexes(tableSchema).length > 0) {
+		throw new QuereusError(
+			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
+				+ `'${tableSchema.name}': it cannot re-key in place, and the engine's fallback rebuild must `
+				+ `re-create the table's indexes on the rebuilt table — without 'createIndex' they would be `
+				+ `silently lost. Drop the indexes first, or use a module that can re-key or create indexes.`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+}
+
+/**
  * SET MAINTAINED [(cols)] AS <body> — attach a derivation to a plain table, or
  * atomically replace an already-maintained table's derivation (the differ's
  * body-change primitive). All gates, the verify-by-diff reconcile, the
@@ -2181,6 +2198,11 @@ async function runDropMaintained(
  *    transaction began. Making the schema half roll back needs transactional DDL no module
  *    offers; making the data half survive would commit part of the user's transaction behind
  *    their back.
+ *  - **In `apply schema`, the rebuild must be the apply's only effect.** An apply in autocommit
+ *    runs in one implicit transaction, so anything failing after the rebuild (a later step, a
+ *    module refusing the commit, a malformed seed row) rolls back the row copy the same way,
+ *    and the apply's restore check passes because it renders the catalog and cannot see rows.
+ *    `emitApplySchema` decides this and holds `Database._setPrimaryKeyRebuildRefused`.
  *
  * The statements are engine scaffolding, not statements the application issued, so the
  * whole rebuild runs with the PUBLIC event channels suppressed — see the scope inside.

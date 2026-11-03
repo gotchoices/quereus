@@ -1,8 +1,10 @@
 import type { Database } from '../../core/database.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { DdlTransactionality } from '../../vtab/capabilities.js';
+import type { TableSchema } from '../../schema/table.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { quoteIdentifier } from '../../emit/ast-stringify.js';
 
 /**
  * Resolve a module's declared DDL-transactionality tier, applying the engine-side
@@ -29,6 +31,27 @@ export function resolveDdlTransactionality(
  */
 export function isExplicitTransactionOpen(db: Database): boolean {
 	return !db.getAutocommit() && !db._isImplicitTransaction();
+}
+
+/**
+ * The refusal for a primary-key rebuild in an `apply schema` that does anything besides it.
+ * Raised from two places: before any step when the table's module has no `alterTable` hook, and
+ * at the rebuild itself when a hook declined. See docs/schema-undo-plan.md § A primary-key rebuild.
+ *
+ * The workaround says `(...)` rather than spelling the declared key because the declaration may
+ * name a column this apply also renames, which does not exist under that name yet.
+ */
+export function rebuildNotOnlyEffectError(table: TableSchema): QuereusError {
+	const schemaPrefix = table.schemaName.toLowerCase() === 'main' ? '' : `${quoteIdentifier(table.schemaName)}.`;
+	return new QuereusError(
+		`apply schema cannot change the primary key of table '${table.name}' alongside other work: `
+			+ `module '${table.vtabModuleName ?? '<unknown>'}' cannot re-key in place, so the change needs a `
+			+ `shadow-table rebuild whose DROP + RENAME survives a rollback while its row copy does not, and `
+			+ `anything failing after it in this apply would leave the table empty. Run `
+			+ `\`alter table ${schemaPrefix}${quoteIdentifier(table.name)} alter primary key (...)\` on its own in `
+			+ `autocommit mode, then re-apply.`,
+		StatusCode.ERROR,
+	);
 }
 
 /**

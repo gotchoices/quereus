@@ -6,7 +6,7 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
 import { renderCatalogForComparison, renderCatalogForRestoreCheck } from '../../schema/catalog-rendering.js';
-import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, type MigrationStep } from '../../schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
 import { computeShortSchemaHash } from '../../schema/schema-hasher.js';
 import { deployLogicalSchema } from '../../schema/lens-compiler.js';
 import type * as AST from '../../parser/ast.js';
@@ -16,6 +16,8 @@ import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { TableSchema } from '../../schema/table.js';
 import { quoteIdentifier } from '../../emit/ast-stringify.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
+import { assertModuleCanRebuild } from './alter-table.js';
+import { rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 
 const log = createLogger('runtime:emit:declare');
 
@@ -227,6 +229,10 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
  * explicit transaction, and a replicating peer must hear about them. Each generated
  * sub-statement runs its own emitter and so carries its own inner scope: a landed statement
  * keeps its event until the outer verdict, the failing one retracts its own.
+ *
+ * Rows are outside what the undo journal can restore, which is why a primary-key change that
+ * needs the engine's shadow-table rebuild is refused unless it is all the apply does: see
+ * `rebuildWouldBeOnlyEffect`.
  */
 export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const applyStmt = (plan as unknown as { statementAst: AST.ApplySchemaStmt }).statementAst;
@@ -348,10 +354,17 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			// idempotency fast-path: no module batch hooks fire. The restore fingerprint
 			// is rendered only when there is something to restore from.
 			if (migrationStatements.length > 0) {
-				await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements, {
-					preApplyFingerprint: renderCatalogForRestoreCheck(actualCatalog),
-					eventWatermark,
-				});
+				const refuseRebuild = !rebuildWouldBeOnlyEffect(rctx.db, schemaName, migrationStatements.length, applyStmt.withSeed);
+				if (refuseRebuild) refuseCertainRebuild(rctx.db, schemaName, diff);
+				const priorRefused = rctx.db._setPrimaryKeyRebuildRefused(refuseRebuild);
+				try {
+					await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements, {
+						preApplyFingerprint: renderCatalogForRestoreCheck(actualCatalog),
+						eventWatermark,
+					});
+				} finally {
+					rctx.db._setPrimaryKeyRebuildRefused(priorRefused);
+				}
 			}
 
 			// A migrating apply records nothing: `catalogRendering` describes the
@@ -506,6 +519,45 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 		run: asRun(run),
 		note: `explain schema ${explainStmt.schemaName || 'main'}`
 	};
+}
+
+/**
+ * Whether a primary-key rebuild in this apply would be its only effect, the one shape in which a
+ * rebuild may run. The rebuild's DROP + RENAME survives a rollback and its row copy does not, so
+ * nothing that can fail may follow it: no other step, no seed row, and no module able to refuse the
+ * commit. Any registered module counts, whichever one owns the table, because the batch spans them
+ * all. The answer costs a plan with no rebuild nothing: the flag it sets is only read on the way
+ * into a rebuild. See docs/schema-undo-plan.md § A primary-key rebuild.
+ */
+function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: number, withSeed: boolean | undefined): boolean {
+	if (stepCount !== 1) return false;
+	if (withSeed && [...db.declaredSchemaManager.getAllSeedData(schemaName).values()].some(rows => rows.length > 0)) return false;
+	for (const { module } of db.schemaManager.allModules()) {
+		if (typeof module.endSchemaBatch === 'function') return false;
+	}
+	return true;
+}
+
+/**
+ * Refuses, before any step runs, a key change certain to need a rebuild because its table's module
+ * has no `alterTable` hook to try first. It has to be this early because `DROP TABLE` steps run
+ * before the key change, so a refusal at the rebuild would already have destroyed that table's rows.
+ * A hook may decline, and only running it shows that, so those tables are left to the check in
+ * `runAlterPrimaryKey`.
+ *
+ * `alter.tableName` is the post-rename name; the table is still under its old one here.
+ */
+function refuseCertainRebuild(db: Database, schemaName: string, diff: SchemaDiff): void {
+	for (const alter of diff.tablesToAlter) {
+		if (!alter.primaryKeyChange) continue;
+		const declaredName = alter.tableName.toLowerCase();
+		const rename = diff.renames.find(r => r.kind === 'table' && r.newName.toLowerCase() === declaredName);
+		const table = db.schemaManager.getTable(schemaName, rename?.oldName ?? alter.tableName);
+		const module = table?.vtabModule;
+		if (!table || !module || module.alterTable) continue;
+		assertModuleCanRebuild(table, module);
+		throw rebuildNotOnlyEffectError(table);
+	}
 }
 
 /** What the migration loop needs to make a failed apply all-or-nothing. */

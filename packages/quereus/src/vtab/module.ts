@@ -654,7 +654,11 @@ export interface VirtualTableModule<
 	 *   state. From a module whose first commit landed, it reports the schema as not
 	 *   restored, since its store then holds the migration under a restored catalog.
 	 *
-	 * See docs/schema-undo-plan.md § A refused commit.
+	 * Defining this hook has one cost beyond the module itself: since it could refuse the
+	 * commit after a primary-key rebuild, `apply schema` refuses every rebuild while any such
+	 * module is registered, whichever module owns the table.
+	 *
+	 * See docs/schema-undo-plan.md § A refused commit and § A primary-key rebuild.
 	 */
 	endSchemaBatch?(db: Database, schemaName: string, error?: unknown): Promise<void>;
 

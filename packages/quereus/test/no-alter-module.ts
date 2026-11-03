@@ -9,14 +9,19 @@
  * the shadow table's name. Pass `withRenameTable: true` for the backend shape that CAN take
  * the rebuild.
  *
- * Shared by `alter-table-conformance.spec.ts`, `alter-primary-key-in-transaction.spec.ts`, and
- * `alter-table-events.spec.ts`.
+ * `declineAlterPrimaryKey: true` adds the other route into the rebuild: an `alterTable` that
+ * raises UNSUPPORTED for a re-key, the documented protocol, and forwards every other arm.
+ *
+ * Shared by `alter-table-conformance.spec.ts`, `alter-primary-key-in-transaction.spec.ts`,
+ * `alter-table-events.spec.ts`, and `apply-schema-restore.spec.ts`.
  */
 
+import { QuereusError } from '../src/common/errors.js';
+import { StatusCode } from '../src/common/types.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { AnyVirtualTableModule } from '../src/vtab/module.js';
 
-export function makeNoAlterModule(opts: { withRenameTable?: boolean; withCreateIndex?: boolean } = {}): AnyVirtualTableModule {
+export function makeNoAlterModule(opts: { withRenameTable?: boolean; withCreateIndex?: boolean; declineAlterPrimaryKey?: boolean } = {}): AnyVirtualTableModule {
 	const inner = new MemoryTableModule();
 	return {
 		concurrencyMode: inner.concurrencyMode,
@@ -25,13 +30,23 @@ export function makeNoAlterModule(opts: { withRenameTable?: boolean; withCreateI
 		destroy: inner.destroy.bind(inner),
 		getCapabilities: inner.getCapabilities.bind(inner),
 		getBestAccessPlan: inner.getBestAccessPlan.bind(inner),
-		// alterTable intentionally omitted; `renameTable` too unless opted back in.
+		// alterTable intentionally omitted unless opted in to decline; `renameTable` too unless opted back in.
 		...(opts.withRenameTable ? { renameTable: inner.renameTable.bind(inner) } : {}),
 		// `createIndex`/`dropIndex` opt-in: the rebuild fallback refuses up front when a
 		// table has user indexes and the module cannot re-create them, so the index-survival
 		// arm of the rebuild is only reachable with these forwarded.
 		...(opts.withCreateIndex
 			? { createIndex: inner.createIndex.bind(inner), dropIndex: inner.dropIndex.bind(inner) }
+			: {}),
+		...(opts.declineAlterPrimaryKey
+			? {
+				alterTable: async (...args: Parameters<MemoryTableModule['alterTable']>) => {
+					if (args[3].type === 'alterPrimaryKey') {
+						throw new QuereusError('this stub cannot re-key in place', StatusCode.UNSUPPORTED);
+					}
+					return inner.alterTable(...args);
+				},
+			}
 			: {}),
 	};
 }

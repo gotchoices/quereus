@@ -2853,6 +2853,29 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this._schemaUnwinding;
 	}
 
+	/** @internal Rebuild refusal flag — see {@link _setPrimaryKeyRebuildRefused}. */
+	private _primaryKeyRebuildRefused = false;
+
+	/** @internal Marks that the DDL re-entering the executor belongs to an `apply schema` in
+	 *  which a primary-key rebuild would not be the only effect, so `runAlterPrimaryKey`
+	 *  refuses to fall back to one: anything failing after the rebuild rolls back its row copy
+	 *  while its DROP + RENAME stands. A native re-key is unaffected. Held around the whole
+	 *  migration loop, so an undo that would need a rebuild is refused too, and only with the
+	 *  statement mutex held, so no other statement observes it. Returns the prior value so the
+	 *  caller restores it in a `finally`. Docs: `docs/schema-undo-plan.md` § A primary-key
+	 *  rebuild. */
+	public _setPrimaryKeyRebuildRefused(value: boolean): boolean {
+		const prior = this._primaryKeyRebuildRefused;
+		this._primaryKeyRebuildRefused = value;
+		return prior;
+	}
+
+	/** @internal Whether a primary-key rebuild is refused — see
+	 *  {@link _setPrimaryKeyRebuildRefused}. */
+	public _isPrimaryKeyRebuildRefused(): boolean {
+		return this._primaryKeyRebuildRefused;
+	}
+
 	/** @internal FK cascade re-entry flag — see {@link _setFkCascadeReentry}. */
 	private _fkCascadeReentry = false;
 

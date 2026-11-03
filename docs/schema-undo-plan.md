@@ -82,3 +82,26 @@ Two limits are reported rather than solved:
 - **An undo statement that itself needs the store** can fail if the store is why the commit was refused (a module whose `dropIndex` first builds the table, say). The apply then reports *undo statement `Y` failed (…)*, with no special case.
 
 Why an undo journal rather than transactional DDL: the undo statements are ordinary DDL, so this works identically on every module tier (`transactional`, `non-transactional`, `auto-commit`) and needs nothing new from module authors. On an `auto-commit` module the forward DDL may have force-committed the surrounding transaction; the undo DDL commits the same way, so the end state is still the pre-apply catalog. Raising the built-in backends to the transactional tier is separate work (`feat-transactional-ddl-native-backends`) and would not change the contract described here.
+
+### A primary-key rebuild
+
+The journal restores the catalog, not rows. That falls short for one step the planner cannot mark `irreversible`, because whether it destroys anything depends on the module: `ALTER PRIMARY KEY` on a module that cannot re-key in place. The engine then rebuilds the table through a shadow copy ([SQL § ALTER PRIMARY KEY](sql-alter.md)), whose drop and rename survive a rollback while its row copy does not. An apply in autocommit runs in one implicit transaction, so anything failing after the rebuild rolls back the copied rows. The undo journal restores the catalog and the fingerprint check passes, because it cannot see rows.
+
+So within an apply, a rebuild may run only when it is the apply's only effect, which means all of:
+
+- the plan has exactly one step;
+- no seed rows will be applied (`with seed` and at least one table has rows), because a malformed row would fail the apply afterwards;
+- no registered module defines `endSchemaBatch`, because any of them could refuse the commit afterwards. Every module counts, whichever one owns the table, so a rebuild is refused in any database with the isolation module registered.
+
+Otherwise the rebuild is refused with `ERROR`. The message names the table and module and gives the way forward: run `alter table … alter primary key (…)` on its own in autocommit, then re-apply, which has no key change left to plan. Two checks raise the same error (`rebuildNotOnlyEffectError` in `ddl-transaction-policy.ts`):
+
+| check | catches | outcome |
+|---|---|---|
+| Before any step (`refuseCertainRebuild` in `schema-declarative.ts`) | a module with no `alterTable` hook, where a rebuild is certain | Nothing has run. It has to come first because `DROP TABLE` steps precede the key change, so a later refusal would already have destroyed that table's rows. |
+| At the rebuild (`runAlterPrimaryKey`, through `Database._setPrimaryKeyRebuildRefused`) | a hook that raises `UNSUPPORTED`, which only running it reveals. The isolation wrapper always defines the hook, so it takes this route. | The step fails like any other: earlier steps are unwound, and an earlier irreversible step reports the partially-migrated residual. |
+
+A module that fails the rebuild's capability preconditions (`renameTable`, `createIndex`) gets that refusal from both checks instead: the module can never do this, so the workaround could not succeed.
+
+The flag is held around the whole migration loop, so an undo that would need a rebuild is refused and reported as *undo statement `Y` failed (…)* rather than losing rows. No rebuild can run during an unwind any other way, because the one-step case that may rebuild has an empty journal and no module able to refuse.
+
+Committing the implicit transaction right after the rebuild would keep the apply undoable, and was rejected: a nested statement would be committing a transaction its outer statement owns, and the commit would run deferred checks and assertions against a half-migrated schema. A direct `ALTER PRIMARY KEY` whose implicit commit fails loses rows the same way, and no refusal can fix that (`bug-rebuild-loses-rows-when-implicit-commit-fails`).
