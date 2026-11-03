@@ -189,7 +189,16 @@ function recordsAFact(event: DatabaseDataChangeEvent): boolean {
 	if (event.type === 'delete') return true;
 	const { oldRow, newRow } = event;
 	if (!newRow) return false;
-	return !oldRow || newRow.some((value, i) => !sqlValueIdentical(oldRow[i], value));
+	return newRow.some((value, i) => cellChanged(oldRow, i, value));
+}
+
+/**
+ * Whether a write changes cell `i`, by value: a blob or JSON value read back from a row
+ * is a new object each time, and re-recording an untouched cell would overwrite a
+ * peer's concurrent write to it. An insert (no `oldRow`) changes every cell.
+ */
+function cellChanged(oldRow: Row | undefined, i: number, value: SqlValue): boolean {
+	return !oldRow || !sqlValueIdentical(oldRow[i], value);
 }
 
 /**
@@ -1368,10 +1377,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		const priors = new Map<number, ColumnVersionData | undefined>();
 		for (let i = 0; i < newRow.length; i++) {
-			// By value: a blob or JSON value read back from a row is a new object each
-			// time, and re-recording an untouched cell would overwrite a peer's concurrent
-			// write to it.
-			if (!oldRow || !sqlValueIdentical(oldRow[i], newRow[i])) {
+			if (cellChanged(oldRow, i, newRow[i])) {
 				priors.set(i, await this.priorCellVersion(schemaName, tableName, pk, columnAt(i), staged));
 			}
 		}

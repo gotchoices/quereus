@@ -184,6 +184,10 @@ export type MigrationOrderKey = Pick<SchemaMigration, 'hlc' | 'type' | 'schema' 
  */
 export function orderMigrations<T>(items: readonly T[], keyOf: (item: T) => MigrationOrderKey): T[] {
 	const ordered = [...items].sort((a, b) => compareHLC(keyOf(a).hlc, keyOf(b).hlc));
+	// NOTE: one scan of the list per baseline, so quadratic in the worst case. A
+	// replica's migration list is one record per DDL statement ever run, and a baseline
+	// is one per table announced, so both are small; if a snapshot's migration list ever
+	// grows large, index each stream's first displacer once instead.
 	for (let i = 0; i < ordered.length; i++) {
 		const key = keyOf(ordered[i]);
 		if (!isBaselineVersion(key.schemaVersion)) continue;

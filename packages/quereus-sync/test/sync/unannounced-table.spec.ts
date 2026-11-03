@@ -177,6 +177,22 @@ describe('a write to a table sync never announced', () => {
 		}
 	});
 
+	for (const path of APPLY_PATHS) {
+		it(`a table altered under sync before its first write replays on a fresh device without re-adding the column (${path})`, async () => {
+			// The baseline carries the ALTERED shape and is ordered ahead of the alteration
+			// it was recorded after, so the fresh device replays an add-column it already has.
+			const d = await peer('d', { beforeSync: `${EXTRA}; insert into extra values (1, 'one')` });
+			await localWrite(d, 'alter table extra add column note text null');
+			await localWrite(d, `update extra set note = 'n' where id = 1`);
+			expect(await migrationsOf(d)).to.deep.equal(['alter_column extra@1', 'create_table extra@0']);
+
+			const fresh = await freshDevice(d, 'fresh', path);
+
+			expect(columnsOf(fresh, 'extra')).to.deep.equal(['id', 'v', 'note']);
+			expect(await collect(fresh.db, 'select id, v, note from extra')).to.deep.equal([{ id: 1, v: 'one', note: 'n' }]);
+		});
+	}
+
 	it('a table one device dropped is not revived by a crossing baseline, on that device or on a fresh one', async () => {
 		const a = await peer('a', { beforeSync: EXTRA });
 		await localWrite(a, 'drop table extra');

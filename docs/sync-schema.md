@@ -211,7 +211,8 @@ migrations; any DDL registers a fresh object and re-checks.
 | either | this receiver's own stream for the object ends on a drop | skipped in Phase 1a of a delta apply, so the object does not return on one device alone; its cells take the unknown-table route |
 
 **Apply order.** After the HLC sort, `orderMigrations` moves each baseline ahead of the
-first `alter_column` / `drop_table` / `drop_index` of its object (on every path: delta,
+first alteration (`alter_column`, or the legacy `add_column` / `drop_column`) or drop
+(`drop_table` / `drop_index`) of its object (on every path: delta,
 whole snapshot, streamed snapshot). A fresh device replaying `[alter_column, older-shape
 baseline]` in HLC order would create the old shape and end without the column; replaying
 `[drop_table, baseline]` would end with a table every other device dropped. The baseline
@@ -372,10 +373,11 @@ there: `create_table`, `drop_table`, `add_index` and `drop_index`. The store mod
 attaches the canonical text at each emit site — the two creates via `generateTableDDL` /
 `generateIndexDDL`, the two drops via `generateDropTableDDL` / `generateDropIndexDDL` (all
 in `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
-attaches the same four, so a memory table's DDL replicates, but its rows never do:
-receivers have no way to write such a table, so local capture records nothing for it
-(`filterCapturableDataEvents`, gated on an apply path being wired) and warns once per
-table.
+attaches the same four when its event emitter is wired (otherwise the engine's own
+create event carries no DDL and the migration crosses the wire as an empty statement),
+but a memory table's rows never replicate: receivers have no way to write such a table,
+so local capture records nothing for it (`filterCapturableDataEvents`, gated on an apply
+path being wired) and warns once per table.
 
 **Table alterations replicate too.** Every `ALTER TABLE` statement's schema-change event
 carries the statement's **canonical, schema-qualified SQL** in `ddl`: the engine renders
