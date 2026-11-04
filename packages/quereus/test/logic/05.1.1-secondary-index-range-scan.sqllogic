@@ -33,7 +33,7 @@ SELECT id FROM idx_t WHERE k >= 10 AND k < 30 ORDER BY k;
 DROP TABLE idx_t;
 
 -- Multi-column SECONDARY index with a DESC leading column. The secondary
--- branch carries isDescFirstColumn handling (the lower-bound wrap is
+-- branch carries DESC bound-column handling (the lower-bound wrap is
 -- direction-independent), so a leading-column range still returns every row.
 -- (The primary branch lacks this handling — tracked separately.)
 CREATE TABLE idx_d (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v TEXT);
@@ -129,6 +129,10 @@ select id from sfxd where k = 'b' order by r;
 
 select id from sfxd where k = 'c';
 → []
+
+-- A range after the prefix takes its direction from its own column, not the leading one.
+select id from sfxd where k = 'd' and r > 1;
+→ [{"id":3}]
 
 drop table sfxd;
 
@@ -226,3 +230,100 @@ select x.s from sfxr x join sfxr y on x.s = y.s where x.g = 'g' and y.g = 'g' or
 → [{"s":"a"},{"s":"B"},{"s":"c"}]
 
 drop table sfxr;
+
+-- A range on a DESC column after the prefix. Larger values sort first, so the walk seeks
+-- from the upper bound and stops at the lower one. Groups sort on both sides of 'a', so a
+-- walk that starts or ends in the wrong place loses rows or gains extras.
+create table prd (id integer primary key, k text, r integer);
+create index prd_kr on prd (k, r desc);
+insert into prd values (1, 'a', 1), (2, 'a', 2), (3, 'a', 3), (4, 'b', 9), (5, '0', 9);
+
+select id from prd where k = 'a' and r > 1 order by id;
+→ [{"id":2},{"id":3}]
+
+select id from prd where k = 'a' and r >= 2 order by id;
+→ [{"id":2},{"id":3}]
+
+-- The exclusive upper bound rejects the row the seek lands on, which must not end the walk.
+select id from prd where k = 'a' and r > 1 and r < 3 order by id;
+→ [{"id":2}]
+
+select id from prd where k = 'a' and r between 2 and 3 order by id;
+→ [{"id":2},{"id":3}]
+
+select id from prd where k = 'a' and r < 3 order by id;
+→ [{"id":1},{"id":2}]
+
+-- params: ["a", 1]
+select id from prd where k = ? and r > ? order by id;
+→ [{"id":2},{"id":3}]
+
+-- Read through a transaction's own writes.
+begin;
+insert into prd values (6, 'a', 4);
+delete from prd where id = 2;
+
+select id from prd where k = 'a' and r >= 2 and r <= 4 order by id;
+→ [{"id":3},{"id":6}]
+
+rollback;
+
+drop table prd;
+
+-- Several rows share a bound value through a later key column. The seek must land before
+-- all of them, and the walk must not stop among them.
+create table prdm (id integer primary key, k text, r integer, s integer);
+create index prdm_krs on prdm (k, r desc, s);
+insert into prdm values (1, 'a', 1, 1), (2, 'a', 2, 1), (3, 'a', 2, 2), (4, 'a', 3, 1), (5, 'b', 9, 9);
+
+select id from prdm where k = 'a' and r >= 2 order by id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+select id from prdm where k = 'a' and r <= 2 order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+drop table prdm;
+
+-- Two equality columns, so the bound column is not the one just after the leading column.
+create table prdq (id integer primary key, a integer, b integer, r integer);
+create index prdq_abr on prdq (a desc, b, r desc);
+insert into prdq values (1, 1, 1, 1), (2, 1, 1, 2), (3, 1, 1, 3), (4, 1, 2, 9), (5, 2, 1, 9);
+
+select id from prdq where a = 1 and b = 1 and r > 1 order by id;
+→ [{"id":2},{"id":3}]
+
+drop table prdq;
+
+-- Stored NULLs in the range column never match, and sit at the end of a DESC group.
+create table prdn (id integer primary key, k text, r integer null);
+create index prdn_kr on prdn (k, r desc);
+insert into prdn values (1, 'a', null), (2, 'a', 1), (3, 'a', 2), (4, 'a', 3), (5, 'b', null);
+
+select id from prdn where k = 'a' and r > 1 order by id;
+→ [{"id":3},{"id":4}]
+
+select id from prdn where k = 'a' and r < 3 order by id;
+→ [{"id":2},{"id":3}]
+
+drop table prdn;
+
+-- At the start of an ascending group, NULLs sit below the upper bound and must not stop the walk.
+create table prn (id integer primary key, k text, r integer null);
+create index prn_kr on prn (k, r);
+insert into prn values (1, 'a', null), (2, 'a', 1), (3, 'a', 2), (4, 'a', 3), (5, 'b', null);
+
+select id from prn where k = 'a' and r < 3 order by id;
+→ [{"id":2},{"id":3}]
+
+drop table prn;
+
+-- A collated range column stops at the boundary of the collation's order: 'A' equals 'a'
+-- under NOCASE, so the exclusive bound rejects it, while 'C' sorts above 'a'.
+create table prdc (id integer primary key, k text, r text collate nocase);
+create index prdc_kr on prdc (k, r desc);
+insert into prdc values (1, 'a', 'A'), (2, 'a', 'b'), (3, 'a', 'C');
+
+select id from prdc where k = 'a' and r > 'a' order by id;
+→ [{"id":2},{"id":3}]
+
+drop table prdc;

@@ -2,7 +2,7 @@ import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
 import { keyParts, leadingKeyPart, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
-import { StatusCode, type Row } from '../../../common/types.js';
+import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
 import { planAppliesToKey, resolveScanComparators, type ResolvedScanComparators } from './plan-filter.js';
@@ -46,6 +46,52 @@ function orderSeekKeys(
 	return plan.descending
 		? [...keys].sort((a, b) => -compare(a, b))
 		: [...keys].sort(compare);
+}
+
+/**
+ * True when `value`, the range-bound column of a key the plan rejected, has passed the bound
+ * the walk terminates at. The other bound is not compared: the walk starts from it, and it can
+ * reject the row the seek lands on (an exclusive bound positioned on an exact match) with
+ * matching rows still ahead. `comparators.bound` is built like the tree's key comparator, so
+ * the walk ends at the boundary of the tree's own order.
+ *
+ * `undefined` means the key has no such column (a prefix as long as the key), which no bound
+ * constrains. A stored NULL is safe here because the comparator ranks it lowest: it sits before
+ * an ascending column's values, below the upper bound, and after a `DESC` column's values, where
+ * stopping at the lower bound loses nothing since NULL never satisfies a range.
+ */
+function pastTerminatingBound(
+	value: SqlValue | undefined,
+	plan: ScanPlan,
+	seekFromUpper: boolean,
+	comparators: ResolvedScanComparators,
+): boolean {
+	if (value === undefined) return false;
+	if (!seekFromUpper && plan.upperBound) {
+		const cmp = comparators.bound(value, plan.upperBound.value);
+		return cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT);
+	}
+	if (seekFromUpper && plan.lowerBound) {
+		const cmp = comparators.bound(value, plan.lowerBound.value);
+		return cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT);
+	}
+	return false;
+}
+
+/** True when a key the plan rejected shows that no later key in the walk can match. */
+function walkIsExhausted(
+	key: BTreeKey,
+	plan: ScanPlan,
+	seekFromUpper: boolean,
+	comparators: ResolvedScanComparators,
+): boolean {
+	const prefix = plan.equalityPrefix;
+	if (!prefix) {
+		return pastTerminatingBound(leadingKeyPart(key, comparators.keyIsTuple), plan, seekFromUpper, comparators);
+	}
+	const parts = keyParts(key, comparators.keyIsTuple);
+	return prefix.some((value, i) => comparators.equalityPrefix[i](parts[i], value) !== 0)
+		|| pastTerminatingBound(parts[prefix.length], plan, seekFromUpper, comparators);
 }
 
 /**
@@ -129,6 +175,9 @@ function* scanLayerResolved(
 
 	const schema = layer.getSchema();
 	const { primaryKeyExtractorFromRow, primaryKeyComparator } = layer.getPkExtractorsAndComparators(schema);
+	// The column a range bound applies to. The prefix columns are fixed within the walk, so
+	// only this column's direction decides where the walk seeks from and where it stops.
+	const boundPosition = plan.equalityPrefix?.length ?? 0;
 
 	if (plan.indexName === 'primary') {
 		const tree = layer.getModificationTree('primary');
@@ -148,10 +197,11 @@ function* scanLayerResolved(
 		}
 
 		const isAscending = !plan.descending;
-		// When the leading PK column is DESC the BTree is physically ordered with
-		// that column descending. The synthesized all-columns fallback definition
-		// carries no `desc`, so the `?.` chain yields false there, which is correct.
-		const isDescFirstColumn = schema.primaryKeyDefinition?.[0]?.desc === true;
+		// When the bound PK column is DESC the BTree is physically ordered with that
+		// column descending. The synthesized all-columns fallback definition carries
+		// no `desc`, and a full-key prefix has no bound column, so the `?.` chain
+		// yields false for both, which is correct.
+		const isDescBoundColumn = schema.primaryKeyDefinition?.[boundPosition]?.desc === true;
 		// NOTE: `> 1`, whereas the key-shape flag `comparators.keyIsTuple` uses `!== 1`.
 		// They differ only for the zero-column singleton PK, which stores `[]`: neither
 		// branch below can reach it (an `equalityPrefix` needs a PK column, and there is
@@ -160,22 +210,24 @@ function* scanLayerResolved(
 		const isComposite = (schema.primaryKeyDefinition?.length ?? schema.columns.length) > 1;
 
 		// Seek-start selection must depend on the *physical* walk direction, not just
-		// the key's declared direction. The four {isAscending}×{isDescFirstColumn}
+		// the bound column's declared direction. The four {isAscending}×{isDescBoundColumn}
 		// combinations each seek from one bound and terminate at the other:
-		//   ascending  + ASC-leading  → seek from lower, terminate at upper
-		//   ascending  + DESC-leading → seek from upper, terminate at lower
-		//   descending + ASC-leading  → seek from upper, terminate at lower
-		//   descending + DESC-leading → seek from lower, terminate at upper
-		// i.e. seek from the upper bound exactly when isAscending === isDescFirstColumn
+		//   ascending  + ASC bound column  → seek from lower, terminate at upper
+		//   ascending  + DESC bound column → seek from upper, terminate at lower
+		//   descending + ASC bound column  → seek from upper, terminate at lower
+		//   descending + DESC bound column → seek from lower, terminate at upper
+		// i.e. seek from the upper bound exactly when isAscending === isDescBoundColumn
 		// (and terminate at the complement). Absent the chosen bound we fall back to
-		// the tree end `safeIterate` picks for the direction.
-		const seekFromUpper = isAscending === isDescFirstColumn;
+		// the tree end `safeIterate` picks for the direction, or to the start of the
+		// prefix's group.
+		const seekFromUpper = isAscending === isDescBoundColumn;
+		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 
 		// Determine start key for range scans
 		let startKey: { value: BTreeKeyForPrimary } | undefined;
 		if (plan.equalityPrefix) {
 			const compositeStart = [...plan.equalityPrefix];
-			if (plan.lowerBound) compositeStart.push(plan.lowerBound.value);
+			if (seekBound) compositeStart.push(seekBound.value);
 			// A non-composite PK stores SCALAR keys: an array-shaped seek key would
 			// position PAST the scalar match (the comparator orders the wrapped form
 			// after its scalar), silently skipping the row a full-PK-length prefix
@@ -190,7 +242,6 @@ function* scanLayerResolved(
 			// Composite PKs store array-shaped keys; wrap the scalar leading-column
 			// bound in a single-element array so the comparator's prefix handling
 			// positions the seek before all full keys sharing that prefix.
-			const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 			if (seekBound) {
 				const seekValue = isComposite ? [seekBound.value] : seekBound.value;
 				startKey = { value: seekValue as BTreeKeyForPrimary };
@@ -201,37 +252,7 @@ function* scanLayerResolved(
 			const row = value as Row;
 			const primaryKey = primaryKeyExtractorFromRow(row);
 			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator, comparators)) {
-				// Early termination for a prefix walk: break when the prefix no longer matches
-				if (plan.equalityPrefix) {
-					const keyArr = keyParts(primaryKey, comparators.keyIsTuple);
-					let prefixMismatch = false;
-					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
-							prefixMismatch = true;
-							break;
-						}
-					}
-					if (prefixMismatch) break;
-				} else {
-					// Past the bound we terminate at — early exit. We seek from one end
-					// and terminate at the other, so this is the complement of
-					// seekFromUpper and holds for both physical walk directions. The
-					// terminating compare uses the bound column's typed comparator (same
-					// construction as the tree's key comparator) so the walk terminates
-					// at the boundary of the tree's own order.
-					const keyForComparison = leadingKeyPart(primaryKey, comparators.keyIsTuple);
-					if (!seekFromUpper && plan.upperBound) {
-						const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
-						if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
-							break;
-						}
-					} else if (seekFromUpper && plan.lowerBound) {
-						const cmp = comparators.bound(keyForComparison, plan.lowerBound.value);
-						if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
-							break;
-						}
-					}
-				}
+				if (walkIsExhausted(primaryKey, plan, seekFromUpper, comparators)) break;
 				continue;
 			}
 			yield row;
@@ -278,22 +299,23 @@ function* scanLayerResolved(
 
 		const isAscending = !plan.descending;
 		const indexDef = schema.indexes?.find(idx => idx.name === plan.indexName);
-		const isDescFirstColumn = indexDef?.columns[0]?.desc === true;
+		const isDescBoundColumn = indexDef?.columns[boundPosition]?.desc === true;
 
 		// Seek-from end depends on the physical walk direction (see the primary
 		// branch for the full rationale): seek from the upper bound exactly when
-		// isAscending === isDescFirstColumn, terminate at the complement. Composite
+		// isAscending === isDescBoundColumn, terminate at the complement. Composite
 		// secondary indexes store array-shaped keys, so wrap the scalar
 		// leading-column bound so the comparator's prefix handling positions the
 		// seek correctly (mirrors the primary branch).
 		const isComposite = (indexDef?.columns.length ?? 1) > 1;
-		const seekFromUpper = isAscending === isDescFirstColumn;
+		const seekFromUpper = isAscending === isDescBoundColumn;
+		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 
 		// Determine start key
 		let startKey: { value: BTreeKeyForIndex } | undefined;
 		if (plan.equalityPrefix) {
 			const compositeStart = [...plan.equalityPrefix];
-			if (plan.lowerBound) compositeStart.push(plan.lowerBound.value);
+			if (seekBound) compositeStart.push(seekBound.value);
 			// Mirror the primary branch: a non-composite index stores SCALAR keys, so
 			// a single-element prefix must seek with the scalar (see above).
 			// NOTE: latent mirror — no consumer today emits a single-column secondary-index
@@ -305,46 +327,14 @@ function* scanLayerResolved(
 					? compositeStart[0]
 					: compositeStart) as BTreeKeyForIndex,
 			};
-		} else {
-			const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-			if (seekBound) {
-				const seekValue = isComposite ? [seekBound.value] : seekBound.value;
-				startKey = { value: seekValue as BTreeKeyForIndex };
-			}
+		} else if (seekBound) {
+			const seekValue = isComposite ? [seekBound.value] : seekBound.value;
+			startKey = { value: seekValue as BTreeKeyForIndex };
 		}
 
 		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
-				// Early termination for a prefix walk: break when the prefix no longer matches
-				if (plan.equalityPrefix) {
-					const keyArr = keyParts(indexEntry.indexKey, comparators.keyIsTuple);
-					let prefixMismatch = false;
-					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
-							prefixMismatch = true;
-							break;
-						}
-					}
-					if (prefixMismatch) break;
-					continue;
-				}
-				// Early termination: break once the leading column passes the bound we
-				// terminate at (the complement of seekFromUpper; holds for both
-				// physical walk directions). Uses the bound column's typed comparator
-				// (same construction as the index tree's key comparator) so the walk
-				// terminates at the boundary of the tree's own order.
-				const keyForComparison = leadingKeyPart(indexEntry.indexKey, comparators.keyIsTuple);
-				if (!seekFromUpper && plan.upperBound) {
-					const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
-					if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
-						break;
-					}
-				} else if (seekFromUpper && plan.lowerBound) {
-					const cmp = comparators.bound(keyForComparison, plan.lowerBound.value);
-					if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
-						break;
-					}
-				}
+				if (walkIsExhausted(indexEntry.indexKey, plan, seekFromUpper, comparators)) break;
 				continue;
 			}
 			if (!primaryTree) continue;

@@ -10,9 +10,9 @@
  * Before the fix, a DESC-leading key always seeked from `upperBound` and an
  * ASC-leading key always seeked from `lowerBound`, regardless of direction, so
  * a backward walk started from the wrong end and dropped front-of-order rows.
- * The fix seeks from the upper bound exactly when `isAscending === isDescFirstColumn`
+ * The fix seeks from the upper bound exactly when `isAscending === isDescBoundColumn`
  * (and terminates at the complement), covering all four
- * `{isAscending}×{isDescFirstColumn}` combinations symmetrically in both the
+ * `{isAscending}×{isDescBoundColumn}` combinations symmetrically in both the
  * primary and secondary-index branches.
  */
 import { expect } from 'chai';

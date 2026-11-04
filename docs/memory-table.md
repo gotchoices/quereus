@@ -88,7 +88,7 @@ detection lives in `quereus-isolation`.
     *   Fast equality lookups (`WHERE indexed_col = ?`) on single or composite keys
     *   Equality on leading columns of a composite key (`WHERE a = ?` on `idx(a, b)`), which reads only that group of rows and provides the order of the next column within it
     *   Range scans (`WHERE indexed_col > ?`, etc.) on the first column of chosen index
-    *   Prefix-equality + trailing-range scans on composite indexes (`WHERE a = ? AND b > ?` on `idx(a, b)`)
+    *   Prefix-equality + trailing-range scans on composite indexes (`WHERE a = ? AND b > ?` on `idx(a, b)`). The range column's own direction sets the walk: over `idx(a, b desc)` larger values of `b` sort first, so the scan seeks from the upper bound and stops at the lower one
     *   `ORDER BY` satisfaction using index ordering, when the index column's collation is the table column's
 
 ### **Schema Evolution:**

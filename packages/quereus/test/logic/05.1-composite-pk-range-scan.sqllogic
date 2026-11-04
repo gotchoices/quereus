@@ -219,6 +219,10 @@ select x from pfxd where k = 'b' order by r;
 select x from pfxd where k = 'c';
 → []
 
+-- A range after the prefix takes its direction from its own column, not the leading one.
+select x from pfxd where k = 'd' and r > 1;
+→ [{"x":40}]
+
 drop table pfxd;
 
 -- One and two leading columns of a three-column key.
@@ -264,3 +268,21 @@ select r from pfxb where flag = 1 and r > 1;
 → [{"r":2}]
 
 drop table pfxb;
+
+-- A range on a DESC column after the prefix. Larger values sort first, so the walk seeks
+-- from the upper bound and stops at the lower one. Groups sort on both sides of 'a', so a
+-- walk that starts or ends in the wrong place loses rows or gains extras.
+create table pfxr (k text, r integer, primary key (k, r desc));
+insert into pfxr values ('a', 1), ('a', 2), ('a', 3), ('b', 9), ('0', 9);
+
+select r from pfxr where k = 'a' and r > 1 order by r;
+→ [{"r":2},{"r":3}]
+
+-- The exclusive upper bound rejects the row the seek lands on, which must not end the walk.
+select r from pfxr where k = 'a' and r >= 2 and r < 3 order by r;
+→ [{"r":2}]
+
+select r from pfxr where k = 'a' and r < 3 order by r;
+→ [{"r":1},{"r":2}]
+
+drop table pfxr;
