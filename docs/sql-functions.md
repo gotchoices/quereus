@@ -351,7 +351,7 @@ window w as (partition by product_id order by sales_date);
 Table-valued functions return a result set that can be queried like a table.
 
 **Generation Functions:**
-- `generate_series(start, stop[, step])`: Generates a series of integer values from start to stop
+- `generate_series(start, stop)`: Generates the integers from start to stop, inclusive
 - `split_string(str, delimiter)`: Splits a string into rows based on a delimiter
 
 **Schema Introspection Functions:**

@@ -711,11 +711,19 @@ Custom functions (scalar, aggregate, table-valued) can be registered via the [Pl
 
 ## Generation Functions (TVFs)
 
-**`generate_series(start, stop)`** -- Generates integers from `start` to `stop` (inclusive), step 1.
+**`generate_series(start, stop)`** -- Generates the integers `n` with `start <= n <= stop`, ascending, step 1.
 
 Returns a single column `value` (INTEGER).
+
+- A fractional bound rounds inward: a fractional `start` rounds up and a fractional `stop` rounds down, so no value falls outside the requested range.
+- A NULL, infinite or NaN bound gives no rows. So does an empty string, which converts to NULL.
+- A text bound goes through the NUMERIC conversion: `'2.5'` reads as 2.5, `'9007199254740993'` reads exactly, and `'2abc'` reads its leading number, 2. Text with no leading number, and a blob, raise a conversion error.
+- Values past 2^53 are exact: they are returned as `bigint`, and each one differs from the last by exactly 1.
 
 ```sql
 select * from generate_series(1, 5);
 -- 1, 2, 3, 4, 5
+
+select * from generate_series(0.5, 3);
+-- 1, 2, 3
 ```
