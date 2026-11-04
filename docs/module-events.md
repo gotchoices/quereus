@@ -278,7 +278,7 @@ Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TA
 
 What this means for a module with a native emitter:
 
-- **Emit during the write, not at your own commit.** Events you emit while the engine's statement is executing are correctly suppressed. Events you defer to a later tick or to your own commit callback arrive after the scope has closed and would leak the rebuild's row copy to subscribers.
+- **Emit during the write, not at your own commit.** Events you emit while the engine's statement is executing are correctly suppressed, and so are events from your own commit callback for the row copy, which commits inside the scope. Events you defer to a later tick arrive after the scope has closed and would leak the row copy to subscribers, and commit-time events for the statements after the copy (the drop, the rename, the index re-creation) arrive at the statement's own commit, also outside the scope.
 - Suppression covers only the application-facing channels. The internal catalog-change notifier keeps firing, so cached schemas are invalidated normally and the rebuilt table is immediately usable under its new key.
 
 ## Remote vs Local Events

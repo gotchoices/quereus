@@ -980,8 +980,9 @@ export function buildInsertStmt(
 		});
 	}
 
-	// Build constraint checks at plan time
-	const constraintChecks = buildConstraintChecks(
+	// Build constraint checks at plan time. Skipped at plan time, not at run time, because
+	// compiling a CHECK that reads a `with context` variable is itself what raises the refusal.
+	const constraintChecks = stmt.skipRowChecks ? [] : buildConstraintChecks(
 		schemaAuthoredCtx,
 		tableReference.tableSchema,
 		RowOpFlag.INSERT,
@@ -993,7 +994,7 @@ export function buildInsertStmt(
 	);
 
 	// Build FK constraint checks if foreign_keys pragma is enabled
-	if (ctx.db.options.getBooleanOption('foreign_keys')) {
+	if (!stmt.skipRowChecks && ctx.db.options.getBooleanOption('foreign_keys')) {
 		const fkChecks = buildChildSideFKChecks(
 			schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.INSERT,
 			oldAttributes, newAttributes, contextAttributes
@@ -1003,7 +1004,7 @@ export function buildInsertStmt(
 
 	// Pre-build DEFAULT evaluators for NOT NULL columns. Used by REPLACE to
 	// substitute the default when the user supplied NULL.
-	const notNullDefaults = buildNotNullDefaults(
+	const notNullDefaults = stmt.skipRowChecks ? [] : buildNotNullDefaults(
 		schemaAuthoredCtx, tableReference.tableSchema, newAttributes, contextAttributes, defaultRowContextScope
 	);
 

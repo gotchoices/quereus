@@ -230,8 +230,8 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
  * sub-statement runs its own emitter and so carries its own inner scope: a landed statement
  * keeps its event until the outer verdict, the failing one retracts its own.
  *
- * Rows are outside what the undo journal can restore, which is why a primary-key change that
- * needs the engine's shadow-table rebuild is refused unless it is all the apply does: see
+ * A primary-key change that needs the engine's shadow-table rebuild commits part-way, which the
+ * undo journal cannot take back, so it is refused unless it is all the apply does: see
  * `rebuildWouldBeOnlyEffect`.
  */
 export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
@@ -523,14 +523,12 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 
 /**
  * Whether a primary-key rebuild in this apply would be its only effect, the one shape in which a
- * rebuild may run. The rebuild's DROP + RENAME survives a rollback and its row copy does not, so
- * nothing that can fail may follow it: no other step, no seed row, and no module able to refuse the
- * commit. Any registered module counts, whichever one owns the table, because the batch spans them
- * all. The answer costs a plan with no rebuild nothing: the flag it sets is only read on the way
- * into a rebuild. See docs/schema-undo-plan.md § A primary-key rebuild.
- *
- * NOTE: the implicit commit still follows an allowed rebuild and can fail, so this does not close
- * the loss for that one shape: backlog `bug-rebuild-loses-rows-when-implicit-commit-fails`.
+ * rebuild may run. The rebuild commits the implicit transaction part-way, so nothing may precede it
+ * in that transaction, and undoing it would be another rebuild, so nothing that can fail may follow
+ * it: no other step, no seed row, and no module able to refuse the commit. Any registered module
+ * counts, whichever one owns the table, because the batch spans them all. The answer costs a plan
+ * with no rebuild nothing: the flag it sets is only read on the way into a rebuild. See
+ * docs/schema-undo-plan.md § A primary-key rebuild.
  */
 function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: number, withSeed: boolean | undefined): boolean {
 	if (stepCount !== 1) return false;

@@ -579,7 +579,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 
 		it('a hookless module: the refusal names the workaround, and following it succeeds', async () => {
 			await startOn(makeNoAlterModule(REKEYABLE));
-			// Without the refusal, the ADD fails on b = 1 and rolls back the rebuild's row copy.
+			// Without the refusal, the rebuild commits and the ADD then fails on b = 1, past undoing.
 			await db.exec(`declare schema main { ${rekeyedT(', constraint ck check (b > 1)')} }`);
 			expect(await planOf(db)).to.have.length(2);
 
@@ -670,6 +670,24 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 
 			// `with seed` and no seed rows declared: nothing will be seeded, so this still qualifies.
 			await db.exec('apply schema main with seed');
+
+			await expectAllRows();
+			expect(await planOf(db), 'the key did change').to.deep.equal([]);
+		});
+
+		it('a one-step plan over a foreign key orphan still rebuilds and keeps its rows', async () => {
+			db.registerModule('stub', makeNoAlterModule(REKEYABLE));
+			db.setDefaultVtabName('stub');
+			const fk = 'constraint fk foreign key (b) references p(id) deferrable initially deferred';
+			await db.exec(`create table p (id integer primary key)`);
+			await db.exec(`create table t (a integer, c integer, b integer, primary key (a), ${fk})`);
+			await db.exec('pragma foreign_keys = false');
+			await db.exec('insert into t values (1, 10, 1), (2, 20, 1)');
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main { table p { id INTEGER PRIMARY KEY } ${rekeyedT(`, ${fk}`)} }`);
+			expect(await planOf(db)).to.have.length(1);
+
+			await db.exec('apply schema main');
 
 			await expectAllRows();
 			expect(await planOf(db), 'the key did change').to.deep.equal([]);

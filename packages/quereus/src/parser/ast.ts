@@ -295,6 +295,12 @@ export interface InsertStmt extends AstNode {
 	contextValues?: ContextAssignment[]; // Optional mutation context assignments
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
 	tags?: Record<string, SqlValue>; // Optional WITH TAGS clause — statement-level metadata tags (reserved keys validated at the dml-stmt site)
+	/**
+	 * Engine-only; the parser never sets it. Builds the insert without CHECK, child-side foreign
+	 * key or NOT NULL default machinery, for a statement moving rows a table already holds. The
+	 * module still enforces uniqueness. Set by the row copy of the ALTER PRIMARY KEY shadow rebuild.
+	 */
+	skipRowChecks?: boolean;
 }
 
 // UPDATE statement

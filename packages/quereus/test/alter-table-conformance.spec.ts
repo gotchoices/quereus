@@ -853,6 +853,148 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 		]);
 	});
 
+	// A re-key changes no row, so a violation already standing must not stop it. Each shape below
+	// reaches the copy through a different builder, and each must still bind the next write.
+	it('a subquery CHECK whose subject has moved does not stop the re-key, and still refuses a new violation', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table o (id integer primary key) using noalter`);
+		await db.exec(`insert into o values (1)`);
+		await db.exec(`create table t (id integer primary key, code integer not null, x integer not null, constraint ck check (x > (select max(id) from o))) using noalter`);
+		await db.exec(`insert into t values (1, 100, 5)`);
+		await db.exec(`insert into o values (10)`);
+
+		await db.exec(`alter table t alter primary key (code)`);
+
+		expect(await pkColumns(db), 'PK re-keyed').to.deep.equal(['code']);
+		expect(await rows(db, `select id, code, x from t`), 'row kept').to.deep.equal([{ id: 1, code: 100, x: 5 }]);
+		await expectConstraint(db, `insert into t values (2, 200, 5)`, 'subquery CHECK after rebuild');
+	});
+
+	it('a foreign key orphan does not stop the re-key, and a new orphan is still refused', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table p (id integer primary key) using noalter`);
+		await db.exec(`create table t (id integer primary key, code integer not null, pid integer not null, constraint fk foreign key (pid) references p(id)) using noalter`);
+		await db.exec(`pragma foreign_keys = false`);
+		await db.exec(`insert into t values (1, 100, 99)`);
+		await db.exec(`pragma foreign_keys = true`);
+
+		await db.exec(`alter table t alter primary key (code)`);
+
+		expect(await pkColumns(db), 'PK re-keyed').to.deep.equal(['code']);
+		expect(await rows(db, `select id, code, pid from t`), 'orphan kept').to.deep.equal([{ id: 1, code: 100, pid: 99 }]);
+		await expectConstraint(db, `insert into t values (2, 200, 98)`, 'FK after rebuild');
+		await db.exec(`insert into p values (1)`);
+		await expectConstraint(db, `insert into t values (2, 100, 1)`, 'new key after rebuild');
+	});
+
+	for (const [reader, column] of [
+		['CHECK', 'v integer not null, constraint c check (new.v <= cap)'],
+		['DEFAULT', 'v integer not null default cap'],
+	]) {
+		it(`a table whose ${reader} reads a context variable re-keys and keeps its rows`, async () => {
+			db = openRebuildDb();
+			await db.exec(`create table t (id integer primary key, code integer not null, ${column}) using noalter with context (cap integer)`);
+			await db.exec(`insert into t values (1, 100, 5) with context cap = 10`);
+
+			await db.exec(`alter table t alter primary key (code)`);
+
+			expect(await pkColumns(db), 'PK re-keyed').to.deep.equal(['code']);
+			expect(await rows(db, `select id, code, v from t`), 'row kept').to.deep.equal([{ id: 1, code: 100, v: 5 }]);
+		});
+	}
+
+	describe('a failure while the rows are being moved', () => {
+		const ROW = [{ id: 1, code: 100 }];
+
+		/** A rebuild database whose `onRename` runs before the module hears of each rename. */
+		function openDbWithRenameHook(onRename: () => void): Database {
+			const module = makeNoAlterModule({ withRenameTable: true });
+			const rename = module.renameTable!.bind(module);
+			module.renameTable = async (...args) => {
+				onRename();
+				await rename(...args);
+			};
+			const fresh = new Database();
+			fresh.registerModule('noalter', module);
+			return fresh;
+		}
+
+		/** Makes every module commit throw while the returned switch is on. */
+		function failCommitsOn(database: Database): { on: boolean } {
+			const failing = { on: false };
+			const register = database.registerConnection.bind(database);
+			database.registerConnection = async connection => {
+				const commit = connection.commit.bind(connection);
+				connection.commit = async () => {
+					if (failing.on) throw new Error('forced commit failure');
+					await commit();
+				};
+				await register(connection);
+			};
+			return failing;
+		}
+
+		async function failure(sql: string): Promise<Error> {
+			try {
+				await db.exec(sql);
+			} catch (e) {
+				return e as Error;
+			}
+			throw new Error(`expected '${sql}' to fail`);
+		}
+
+		const seedT = () => db.exec(`create table t (id integer primary key, code integer not null) using noalter; insert into t values (1, 100)`);
+
+		it('a commit failing on the copy leaves the original table intact and no shadow behind', async () => {
+			db = openRebuildDb();
+			const commits = failCommitsOn(db);
+			await seedT();
+
+			commits.on = true;
+			expect((await failure(`alter table t alter primary key (code)`)).message).to.equal('forced commit failure');
+			commits.on = false;
+
+			expect(await pkColumns(db), 'PK unchanged').to.deep.equal(['id']);
+			expect(await rows(db, `select id, code from t`), 'rows unchanged').to.deep.equal(ROW);
+			expect([...db.schemaManager.getSchema('main')!.getAllTables()].map(table => table.name), 'no shadow left').to.deep.equal(['t']);
+		});
+
+		it('a commit failing after the swap keeps the rows under the new key', async () => {
+			let commits: { on: boolean } = { on: false };
+			db = openDbWithRenameHook(() => { commits.on = true; });
+			commits = failCommitsOn(db);
+			await seedT();
+
+			expect((await failure(`alter table t alter primary key (code)`)).message).to.equal('forced commit failure');
+			commits.on = false;
+
+			expect(await pkColumns(db), 'the key did change').to.deep.equal(['code']);
+			expect(await rows(db, `select id, code from t`), 'rows kept').to.deep.equal(ROW);
+		});
+
+		it('a failed rename keeps the shadow, says where the rows are, and its recovery statement works', async () => {
+			let renameFails = true;
+			db = openDbWithRenameHook(() => { if (renameFails) throw new Error('forced rename failure'); });
+			await seedT();
+
+			const err = await failure(`alter table t alter primary key (code)`);
+			expect(err.message, 'the original failure is reported').to.contain('forced rename failure');
+			expect(err.cause, 'and carried as the cause').to.have.property('message', 'forced rename failure');
+			const shadow = /t__rekey_\d+/.exec(err.message)?.[0];
+			expect(shadow, 'the error names the shadow').to.be.a('string');
+			expect(db.schemaManager.findTable('t'), 'the original is gone').to.equal(undefined);
+			expect(await rows(db, `select id, code from ${shadow!}`), 'the shadow holds the rows').to.deep.equal(ROW);
+
+			renameFails = false;
+			const recovery = /`(alter table .+ rename to t)`/.exec(err.message)?.[1];
+			expect(recovery, 'the error gives the recovery statement').to.be.a('string');
+			await db.exec(recovery!);
+
+			expect(await pkColumns(db), 'the new key took effect').to.deep.equal(['code']);
+			expect(await rows(db, `select id, code from t`), 'rows back under the real name').to.deep.equal(ROW);
+		});
+	});
+
 	it('the canonical DDL before and after a rebuild differs ONLY in the PRIMARY KEY clause', async () => {
 		// The general subsumer for every arm above: whatever `generateTableDDL` renders is
 		// what a store-backed catalog persists and re-parses, so if the two texts agree

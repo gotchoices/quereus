@@ -1923,8 +1923,8 @@ async function runAlterPrimaryKey(
 	assertModuleCanRebuild(tableSchema, module);
 	// NOTE: both refusals below hold on every `DdlTransactionality` tier, including a module
 	// declaring 'transactional'. None does today; if one appears its DROP + RENAME would roll
-	// back together with the row copy, making both over-broad — exempt that tier then, the way
-	// `assertDdlTransactionPolicy` already does.
+	// back together with the row copy, making both over-broad and the rebuild's commit needless
+	// — exempt that tier then, the way `assertDdlTransactionPolicy` already does.
 	//
 	// NOTE: when the plan also renames this table, the apply refusal's workaround names the new
 	// name, which the unwind then takes away, so following it literally reports no such table.
@@ -1935,9 +1935,9 @@ async function runAlterPrimaryKey(
 		throw new QuereusError(
 			`ALTER PRIMARY KEY on table '${tableSchema.name}' is not allowed inside an explicit transaction: `
 				+ `module '${tableSchema.vtabModuleName ?? '<unknown>'}' cannot re-key in place, so the statement `
-				+ `would fall back to a shadow-table rebuild whose DROP + RENAME survives ROLLBACK while its row `
-				+ `copy does not — a rollback would leave an empty table and destroy rows committed before this `
-				+ `transaction began. COMMIT or ROLLBACK first, then re-issue in autocommit mode.`,
+				+ `would fall back to a shadow-table rebuild whose DROP + RENAME survives ROLLBACK. Keeping the `
+				+ `rows through that takes a commit before the DROP, which here would commit this transaction `
+				+ `behind your back. COMMIT or ROLLBACK first, then re-issue in autocommit mode.`,
 			StatusCode.ERROR,
 		);
 	}
@@ -2177,6 +2177,23 @@ async function runDropMaintained(
 }
 
 /**
+ * The failure when the original table is gone and the shadow has not taken its name. The rows are
+ * not lost, but they are not where the caller expects, so the error says where they are and how to
+ * put them back. The table's user indexes have not been re-created yet, so it names those too.
+ */
+function shadowHoldsRowsError(tableSchema: TableSchema, qualifiedShadow: string, cause: unknown): QuereusError {
+	const indexes = rebuildUserIndexes(tableSchema).map(idx => idx.name);
+	const recreateIndexes = indexes.length > 0 ? `, then re-create its indexes (${indexes.join(', ')})` : '';
+	return new QuereusError(
+		`ALTER PRIMARY KEY on table '${tableSchema.name}' failed after the original table was dropped, and `
+			+ `its rows are held in shadow table ${qualifiedShadow}: ${cause instanceof Error ? cause.message : String(cause)}. `
+			+ `To restore the table, run \`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableSchema.name)}\`${recreateIndexes}.`,
+		StatusCode.ERROR,
+		cause instanceof Error ? cause : undefined,
+	);
+}
+
+/**
  * Generic rebuild via shadow table SQL, for a module without a native
  * `alterPrimaryKey`.
  *
@@ -2196,13 +2213,21 @@ async function runDropMaintained(
  *    transaction and IS undone. A ROLLBACK would therefore keep the new empty table and
  *    discard the copy of the rows it replaced — destroying data committed before the
  *    transaction began. Making the schema half roll back needs transactional DDL no module
- *    offers; making the data half survive would commit part of the user's transaction behind
- *    their back.
+ *    offers; making the data half survive, which is what the commit below does in autocommit,
+ *    would commit part of the user's transaction behind their back.
  *  - **In `apply schema`, the rebuild must be the apply's only effect.** An apply in autocommit
- *    runs in one implicit transaction, so anything failing after the rebuild (a later step, a
- *    module refusing the commit, a malformed seed row) rolls back the row copy the same way,
- *    and the apply's restore check passes because it renders the catalog and cannot see rows.
+ *    runs in one implicit transaction, so the commit below would carry its earlier steps along,
+ *    and a later failure (a later step, a module refusing the commit, a malformed seed row) could
+ *    not take the rebuild back, because undoing it is another rebuild.
  *    `emitApplySchema` decides this and holds `Database._setPrimaryKeyRebuildRefused`.
+ *
+ * The row copy commits before the original is dropped, because the DROP and RENAME survive a
+ * rollback and an uncommitted copy does not. What a failure leaves depends on where it lands:
+ *
+ *  - up to and including the DROP: the original is intact and the shadow is dropped;
+ *  - the RENAME: the table is gone, the shadow holds the rows, and the error says so;
+ *  - re-creating an index: the new key and the rows, with that index missing;
+ *  - the statement's own commit: the new key and the rows, under an error.
  *
  * The statements are engine scaffolding, not statements the application issued, so the
  * whole rebuild runs with the PUBLIC event channels suppressed — see the scope inside.
@@ -2239,14 +2264,16 @@ async function rebuildViaShadowTable(
 	// firing throughout (it is what invalidates the optimizer's and the write path's cached
 	// schemas), which is why the rebuilt table is immediately plannable under its new key.
 	//
-	// NOTE: a module whose own emitter defers delivery to its own commit — rather than
-	// emitting during the write — can still leak the copy's inserts, because its events
-	// arrive after this scope has closed. Conditional, not a live defect: no module that
-	// reaches this rebuild behaves that way (memory and the store both re-key in place and
-	// never enter it). If one ever does, suppression has to become name-keyed (covering the
-	// shadow name as well as the real one) or the events have to be dropped out of the batch
-	// after the fact.
+	// NOTE: the copy commits inside this scope, so a module's commit-time events for its inserts
+	// are suppressed too. Two kinds still leak, because they arrive after this scope has closed:
+	// events a module defers to a later tick, and commit-time events for the statements after
+	// the copy, which arrive at the statement's own commit. Conditional, not a live defect: no
+	// module that reaches this rebuild behaves that way (memory and the store both re-key in
+	// place and never enter it). If one ever does, suppression has to become name-keyed
+	// (covering the shadow name as well as the real one) or the events have to be dropped out
+	// of the batch after the fact.
 	await rctx.db._getEventEmitter().withPublicEventsSuppressed(async () => {
+		let shadowHoldsTheRows = false;
 		try {
 			await rctx.db._execWithinTransaction(createDdl);
 			// `or abort` is load-bearing, not decoration. The shadow now declares the table's
@@ -2260,12 +2287,32 @@ async function rebuildViaShadowTable(
 			// (see row-constraints.ts: statement OR clause > per-constraint default > ABORT)
 			// and surfaces the collision the way every other re-key path does.
 			//
-			// NOTE: the shadow also declares the table's `with context` variables, and this copy
-			// has no values for them, so a table whose CHECK or DEFAULT reads one is refused
-			// here — see backlog `bug-rebuild-copy-refused-when-table-reads-context`.
-			await rctx.db._execWithinTransaction(
+			// `skipRowChecks` because a re-key changes no row: it must not fail on a violation
+			// already standing (an orphan, a subquery CHECK whose subject has moved), and it has
+			// no values for the `with context` variables the shadow declares. Uniqueness is the
+			// module's to enforce, so the collision above is still refused.
+			const [rowCopy] = rctx.db._parseSql(
 				`insert or abort into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
-			);
+			) as [AST.InsertStmt];
+			rowCopy.skipRowChecks = true;
+			await rctx.db._execAstWithinTransaction([rowCopy]);
+			// Before the DROP, while the original and the shadow are both whole: the DROP and
+			// RENAME survive a rollback and an uncommitted copy does not, so any failure from
+			// here on would otherwise leave the table empty.
+			//
+			// NOTE: commits the whole implicit transaction. Safe because the rebuild is refused
+			// wherever anything else could be in it (explicit transaction, apply with other
+			// effects); if a new path ever issues ALTER PRIMARY KEY nested inside a statement that
+			// has written, this commit carries those writes and the path needs its own refusal.
+			//
+			// NOTE: accepted tradeoff — the statement's own commit still follows the swap. With
+			// nothing staged only a module failing an empty commit can fail it, and then the
+			// statement reports an error although the key changed, and the discarded batch
+			// delivers no `alter` event. The rows are safe and re-issuing the statement runs
+			// another rebuild, which delivers the event, so this stands; revisit if such a module
+			// appears behind a syncing peer, which misses the key change until someone re-issues.
+			await rctx.db._commitTransaction();
+			await rctx.db._ensureTransaction();
 			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from
 			// being renamed back over it. Two FK situations would otherwise refuse it:
 			//  - a SELF-referencing FK — the shadow's copy references the ORIGINAL by name
@@ -2296,11 +2343,13 @@ async function rebuildViaShadowTable(
 			} finally {
 				rctx.db._setFkRestrictSuppressed(priorSuppress);
 			}
+			shadowHoldsTheRows = true;
 			// The rename's propagate pass rewrites the shadow's dangling references to the
 			// dropped original (e.g. a self-referencing FK) onto the restored name.
 			await rctx.db._execWithinTransaction(
 				`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableName)}`
 			);
+			shadowHoldsTheRows = false;
 			// Re-create the table's user indexes on the rebuilt table (see
 			// rebuildUserIndexes for what is included and why). AFTER the rename so the
 			// index names — unique per schema — never coexist with the original's, and
@@ -2312,6 +2361,7 @@ async function rebuildViaShadowTable(
 				await rctx.db._execWithinTransaction(generateIndexDDL(idx, tableSchema));
 			}
 		} catch (e) {
+			if (shadowHoldsTheRows) throw shadowHoldsRowsError(tableSchema, qualifiedShadow, e);
 			try {
 				await rctx.db._execWithinTransaction(
 					`drop table if exists ${qualifiedShadow}`

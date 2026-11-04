@@ -46,9 +46,9 @@ export function rebuildNotOnlyEffectError(table: TableSchema): QuereusError {
 	return new QuereusError(
 		`apply schema cannot change the primary key of table '${table.name}': `
 			+ `module '${table.vtabModuleName ?? '<unknown>'}' cannot re-key in place, so the change needs a `
-			+ `shadow-table rebuild whose DROP + RENAME survives a rollback while its row copy does not, and `
-			+ `this apply has other steps, seed rows or a module able to refuse the commit, any of which `
-			+ `failing afterwards would leave the table empty. Run `
+			+ `shadow-table rebuild that commits part-way, and this apply has other steps, seed rows or a `
+			+ `module able to refuse the commit. The rebuild would commit the earlier steps and could not be `
+			+ `rolled back with the later ones. Run `
 			+ `\`alter table ${schemaPrefix}${quoteIdentifier(table.name)} alter primary key (...)\` on its own in `
 			+ `autocommit mode, then re-apply.`,
 		StatusCode.ERROR,
