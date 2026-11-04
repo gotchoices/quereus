@@ -182,6 +182,26 @@ class MyTable extends VirtualTable {
 }
 ```
 
+#### Skip building events no one will receive
+
+Building an event can be expensive, and a module that holds events until commit pays for that memory on every row of the transaction. Ask the database whether anyone will receive them:
+
+```typescript
+async update(args: UpdateArgs): Promise<Row | undefined> {
+  const result = await this.performUpdate(args);
+  if (this.db.needsDataEvents()) {
+    this.queueEvent(this.buildEvent(args, result));
+  }
+  return result;
+}
+```
+
+`db.needsDataEvents()` is `true` when the database has an `onDataChange` or `onTransactionCommit` listener, and `false` inside an [engine-internal scope](#engine-internal-scaffolding-is-silent), where the event would be dropped anyway. Do not use `db.hasDataListeners()` for this: it counts only `onDataChange` listeners, so a host subscribed only to `onTransactionCommit` would stop receiving data events through `batch.dataEvents`. Your emitter's own `hasDataListeners()` does not help either, because the database subscribes to your emitter when the module is registered, so it stays `true`.
+
+- **Ask on each write, or once per statement. Do not keep the answer for a whole transaction.** An engine-internal scope can close partway through a transaction, and a listener can subscribe at any time.
+- **A late subscriber can miss earlier writes.** The answer describes the moment you ask, so a listener that subscribes in the middle of a transaction does not see events for writes made before it subscribed. The engine's own automatic events have the same limit: they sample once at the start of each statement.
+- **It only knows about the database's listeners.** Anything subscribed directly to your emitter, including through `db.getTable(...).getEventEmitter()`, is not counted. If your emitter can have direct subscribers, track them yourself and build the event when either applies. A module instance registered with more than one `Database` must build the event if any of them needs it.
+
 #### Don't hand-roll the `ALTER TABLE` event shape
 
 A subscriber must see the same facts whichever backend holds the table, so the per-arm

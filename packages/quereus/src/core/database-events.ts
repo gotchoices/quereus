@@ -488,7 +488,8 @@ export class DatabaseEventEmitter {
 	 * listener is registered. A transaction-commit listener needs the grouped data
 	 * events, so the auto-event generation gate must open for it too even when no
 	 * per-event data listener is subscribed. Consulted by the DML executor's
-	 * auto-event gate (see `dml-executor.ts`).
+	 * auto-event gate (see `dml-executor.ts`) and exposed to modules as the public
+	 * `Database.needsDataEvents`.
 	 *
 	 * Always false inside a {@link withPublicEventsSuppressed} scope — the cheapest place
 	 * to suppress is before the event is ever built.

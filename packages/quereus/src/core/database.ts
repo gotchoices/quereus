@@ -1397,7 +1397,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * Check if there are any data change listeners registered.
+	 * Check if there are any `onDataChange` listeners registered. A listener on
+	 * `onTransactionCommit` also receives data events but is not counted here; use
+	 * {@link needsDataEvents} to decide whether to build events.
 	 */
 	hasDataListeners(): boolean {
 		return this.eventEmitter.hasDataListeners();
@@ -1411,20 +1413,25 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * @internal Whether the engine must generate/collect data-change events for
-	 * this statement — true when any `onDataChange` OR `onTransactionCommit`
-	 * listener is registered. The DML executor's auto-event gate consults this so a
-	 * consumer subscribed only to the grouped transaction-commit channel still gets
-	 * data events collected.
+	 * Whether anyone will receive data-change events at this moment — true when any
+	 * `onDataChange` or `onTransactionCommit` listener is registered, false inside an
+	 * engine-internal suppression scope. A module with its own event emitter can use
+	 * this to skip building events; the DML executor's auto-event gate consults it too.
+	 *
+	 * The answer is sampled when asked, so do not keep it for a whole transaction.
+	 * Listeners subscribed directly to a module's own emitter are not counted. Returns
+	 * false, rather than throwing, on a closed database.
+	 *
+	 * See docs/module-events.md § For Modules with Native Events.
 	 */
-	_needsDataEvents(): boolean {
+	needsDataEvents(): boolean {
 		return this.eventEmitter.needsDataEvents();
 	}
 
 	/**
 	 * @internal Whether the engine must generate/collect schema-change events —
 	 * true when any `onSchemaChange` OR `onTransactionCommit` listener is
-	 * registered. Companion to {@link _needsDataEvents}; consulted by the schema
+	 * registered. Companion to {@link needsDataEvents}; consulted by the schema
 	 * manager's auto-event gate.
 	 */
 	_needsSchemaEvents(): boolean {

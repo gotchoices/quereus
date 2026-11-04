@@ -279,6 +279,23 @@ describe('Database-Level Event System', () => {
 			assert.equal(db.hasDataListeners(), false);
 			assert.equal(db.hasSchemaListeners(), false);
 		});
+
+		it('needsDataEvents counts transaction-commit listeners, unlike hasDataListeners', () => {
+			assert.equal(db.hasDataListeners(), true);
+			assert.equal(db.needsDataEvents(), true);
+
+			unsubData();
+			assert.equal(db.hasDataListeners(), false);
+			assert.equal(db.needsDataEvents(), false);
+
+			const off = db.onTransactionCommit(() => {});
+			assert.equal(db.hasDataListeners(), false);
+			assert.equal(db.needsDataEvents(), true);
+
+			off();
+			assert.equal(db.hasDataListeners(), false);
+			assert.equal(db.needsDataEvents(), false);
+		});
 	});
 
 	describe('Listener Error Handling', () => {

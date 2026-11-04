@@ -1147,7 +1147,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
+		const needsAutoEvents = ctx.db.needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 		const writeScope = resolveWriteScope(ctx, vtab);
 
@@ -1429,7 +1429,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
+		const needsAutoEvents = ctx.db.needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 		const writeScope = resolveWriteScope(ctx, vtab);
 
@@ -1618,7 +1618,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
+		const needsAutoEvents = ctx.db.needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 		const writeScope = resolveWriteScope(ctx, vtab);
 

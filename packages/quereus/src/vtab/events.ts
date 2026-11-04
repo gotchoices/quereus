@@ -103,7 +103,9 @@ export interface VTableEventEmitter {
 	onDataChange?(listener: VTableDataChangeListener): () => void;
 
 	/**
-	 * Check if there are any data change listeners registered
+	 * Check if there are any data change listeners registered. Once a module is
+	 * registered the database is itself a listener, so this does not tell a module
+	 * whether anyone downstream is listening; see `Database.needsDataEvents`.
 	 */
 	hasDataListeners?(): boolean;
 
