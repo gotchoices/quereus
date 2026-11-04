@@ -409,6 +409,13 @@ describe('Serialization round-trip', () => {
 			[...((b.columns === 'all' ? new Set<string>() : b.columns))]);
 	});
 
+	it('keeps the conversion a bound parameter needs', async () => {
+		await db.exec('CREATE TABLE d (t DATETIME PRIMARY KEY, v TEXT) USING memory');
+		const scope = scopeFor(db, 'select v from d where t = ?');
+		const roundTripped = deserializeChangeScope(JSON.parse(JSON.stringify(serializeChangeScope(scope))));
+		expect(roundTripped.watches[0].scope).to.deep.equal(scope.watches[0].scope);
+	});
+
 	it('structuredClone round-trips to deepEqual', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		const scope = scopeFor(db, 'select * from t where id = ?');

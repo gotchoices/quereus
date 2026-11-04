@@ -708,17 +708,16 @@ export function extractRowKeyValues(
 }
 
 export function scopeValueFromExpr(expr: ScalarPlanNode, unboundParams: Set<number | string>): ScopeValue | undefined {
-	const inner = expr.nodeType === PlanNodeType.Cast
-		? (expr as unknown as { operand: ScalarPlanNode }).operand
-		: expr;
+	const cast = expr instanceof CastNode ? expr : undefined;
+	const inner = cast ? cast.operand : expr;
 	if (inner instanceof ParameterReferenceNode) {
 		unboundParams.add(inner.nameOrIndex);
 		return {
 			kind: 'param',
 			index: inner.nameOrIndex,
 			type: portableFromScalarType(inner.targetType),
-			...(expr instanceof CastNode
-				? { conversion: { typeName: expr.getType().logicalType.name, synthetic: expr.synthetic } }
+			...(cast
+				? { conversion: { typeName: cast.getType().logicalType.name, synthetic: cast.synthetic } }
 				: {}),
 		};
 	}
@@ -1055,6 +1054,8 @@ export function bindParameters(scope: ChangeScope, params: SqlParameters | SqlVa
 		if (isParamScopeValue(v)) {
 			const bound = lookup(v.index);
 			if (bound !== undefined) {
+				// NOTE: a scope bound in a process that lacks a plugin's type falls back to BLOB
+				// here and watches a wrong key; if scopes cross such a boundary, reject it instead.
 				return v.conversion
 					? castConverter(getTypeOrDefault(v.conversion.typeName), v.conversion.synthetic)(bound)
 					: bound;
@@ -1118,7 +1119,7 @@ type SerializedWatchScope =
 
 type SerializedScopeValue =
 	| { v: SqlValue }
-	| { p: number | string; t: PortableScalarType };
+	| { p: number | string; t: PortableScalarType; c?: ParamScopeConversion };
 
 /** On-wire form of a {@link TableWatch}: the column set becomes a sorted array. */
 export interface SerializedTableWatch {
@@ -1168,7 +1169,7 @@ function serializeScope(scope: WatchScope): SerializedWatchScope {
 
 function serializeScopeValue(v: ScopeValue): SerializedScopeValue {
 	if (isParamScopeValue(v)) {
-		return { p: v.index, t: { ...v.type } };
+		return { p: v.index, t: { ...v.type }, ...(v.conversion ? { c: { ...v.conversion } } : {}) };
 	}
 	return { v: v as SqlValue };
 }
@@ -1207,7 +1208,9 @@ function deserializeScope(scope: SerializedWatchScope): WatchScope {
 }
 
 function deserializeScopeValue(v: SerializedScopeValue): ScopeValue {
-	if ('p' in v) return { kind: 'param', index: v.p, type: { ...v.t } };
+	if ('p' in v) {
+		return { kind: 'param', index: v.p, type: { ...v.t }, ...(v.c ? { conversion: { ...v.c } } : {}) };
+	}
 	return v.v;
 }
 

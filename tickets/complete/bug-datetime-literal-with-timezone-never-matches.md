@@ -111,3 +111,57 @@ Each pinned the old mismatch and was checked against the decisions above.
 
 - **GitHub issue #28 still needs an answer posted to the reporter, who carries a local patch.** A person posts that. Point them at the shape-check note in `docs/types-ordering.md` § DATETIME against text.
 - While measuring, I found an unrelated crash and filed it as `bug-many-inserts-in-one-transaction-overflow-stack` in `backlog/`.
+
+## Review findings
+
+Reviewed from the diff of `ticket(implement): bug-datetime-literal-with-timezone-never-matches`, then by running probe scripts against the engine. The probes are not kept; the outcomes are recorded here.
+
+**Fixed in this pass**
+
+- **Bug: a serialized change scope lost the parameter conversion.** `serializeChangeScope` and `deserializeChangeScope` dropped the new `conversion` field, so a scope sent over JSON and then bound keyed on the `Z` spelling and its watch never fired. This is the stale-watch bug the implementer fixed, still present on the JSON path, and it broke the "structurally identical" promise in `docs/change-scope.md`. The wire form now carries it as `c`. Reproduced before the fix and added a test in `change-scope-analyzer.spec.ts` ("keeps the conversion a bound parameter needs").
+- **Cleanup in `scopeValueFromExpr`:** replaced the mix of a `nodeType` check, an `as unknown as` cast and `instanceof` with one `instanceof CastNode` check.
+- **Stale reference:** the `15.1.4` header pointed at `docs/types.md`; the rule lives in `docs/types-ordering.md`.
+- **Source hygiene:** rewrapped an overlong line in the `comparisonGroupCoercions` `NOTE`.
+- **Docs:** `docs/usage-types.md` is the user-facing DATETIME page and said nothing about comparisons. It now has one sentence and a link.
+
+**Filed**
+
+- `bug-datetime-zone-annotation-keeps-local-wall-clock` in `tickets/fix/`. A value with a named zone, such as `…-05:00[America/New_York]`, stores the local clock reading rather than UTC, contrary to `docs/types.md`. Reproduced. It predates this ticket, and fixing it changes what new writes store, so it was not fixed here.
+
+**Tripwire added**
+
+- A bound `conversion` naming a type the process has not registered falls back to BLOB and watches a wrong key. `NOTE:` at the substitution in `bindParameters`.
+
+**Checked, no defect**
+
+- **The two fixes the implementer flagged.** The fingerprint split is kept for every target type. `rule-scalar-cse` is its only consumer, so the cost is only a missed merge, and narrowing it to DATETIME would add a condition for a rare query. The watch fix behaves as documented for DATETIME and for an integer key, apart from the serialization defect above.
+- **Seeks on the converted side.** `text_col = cast('…Z' as datetime)`, and the range, IN and parameter forms, over a text index and a text primary key return every spelling of the instant. `unwrapCast` strips only no-op casts, so the column under a converting cast is never used as a seek key.
+- **False equalities.** `distinct` and `group by` over `x = t` keep two text spellings of one instant apart, and pinning either side still filters correctly.
+- **Non-text comparands.** Numbers, bigints, booleans, blobs, NULL and unparseable text through `greatest`, `least`, `nullif`, simple CASE, IN and BETWEEN, bound and from an ANY column, order by storage class without throwing.
+- **Subquery forms.** Empty and all-NULL subqueries, correlated IN, NOT IN with and without NULL members, EXISTS, scalar subqueries, a UNION ALL mixing text and DATETIME, and `in (null, t)`.
+- **Other paths.** UPDATE and DELETE by a `Z` spelling, and `t + timespan(...) = '…Z'`. A partial index predicate spelled with a `Z`: the results are correct, though the probed plans chose the primary key, so the partial index itself was not exercised.
+- **Plans.** Index seek or range for `=`, `>=`, BETWEEN and IN, and for `t = ?` on a secondary index and a primary key. `di.t = s.x` is a plain join with a condition, as the ticket says.
+- **Tests.** Nothing cut. The three-table repetition in `15.1.4` is justified because each table reaches the comparison by a different route.
+
+**Considered and left alone**
+
+- `inMembershipKeys` arm 1c re-derives what `comparisonGroupCoercions` decides, as arms 1 and 1b already did. Unifying them is a refactor of existing code with no defect behind it.
+- The known gaps the handoff lists (collation dropped on the converted side, over-reported nullability, mixed lists, per-row parsing, rows already stored with a `Z`). Each is documented or carries a `NOTE:`. A column holding a `Z` could not be created for a test, so `update t set c = datetime(c)` is confirmed by reading the code only.
+- The memo and per-row timings in the handoff were not re-measured.
+
+**Validation after the fixes**
+
+| Command | Result |
+|---|---|
+| `yarn lint` | clean |
+| `yarn docs:check` | passes; the `docs/runtime.md` and `docs/sql-alter.md` failures were resolved by the triage commit |
+| `yarn test` | passes; `packages/quereus` 10,950 passing, 25 pending |
+| `yarn test:store` | 10,943 passing, 32 pending |
+| `yarn test:repr-strict` | 10,959 passing, 16 pending |
+| `yarn test:fork-strict` | 10,930 passing, 45 pending |
+| `yarn test:context-strict` | 10,953 passing, 22 pending, on a solo re-run |
+| `yarn build`, `yarn bench:gate` | build done; gate passed |
+
+The first `yarn test:context-strict` run stopped on a 10-second timeout in `test/property.spec.ts` (View Round-Trip Laws, decomposition fan-out) while the fork-strict and store suites ran at the same time. It passed when run alone. That test does not involve DATETIME, so load is the likely cause, though this was not proven further.
+
+**Still open outside the code:** a person needs to answer GitHub issue #28, pointing the reporter at the shape-check note in `docs/types-ordering.md` § DATETIME against text.

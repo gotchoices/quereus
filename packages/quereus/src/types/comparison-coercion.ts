@@ -164,7 +164,8 @@ function textCoercionTarget(numeric: LogicalType): LogicalType {
  * disagrees with the `=` disjunction on the numeric member. A list mixing DATETIME
  * and text has the same gap: hoisting would make `text_col in (dt_col, '…Z')` miss an
  * exact text match that the `=` disjunction finds, so that probe stays unconverted and
- * disagrees on the DATETIME member instead. Closing it needs a per-value probe, which `IN` cannot express — its members live in ONE key space
+ * disagrees on the DATETIME member instead. Closing it needs a per-value probe, which
+ * `IN` cannot express — its members live in ONE key space
  * (a BTree keyed under one collation, `runtime/emit/subquery.ts`). If that shape
  * ever matters, desugar a mixed `IN` list into an `OR` of `=` comparisons at build
  * time rather than widening the hoist here.
