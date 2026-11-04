@@ -563,3 +563,46 @@ select z from c;
 
 drop table c;
 drop table p;
+
+-- v reads a column t gains, so it is created after t's ADD COLUMN, written first or not.
+-- Then ub fails over the duplicate b, and the view goes back before the column does.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+
+declare schema main {
+	view v as select d from t
+	table t {
+		id integer primary key,
+		b integer null,
+		d integer null,
+		constraint ub unique (b)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t ADD COLUMN d integer null"}, {"ddl": "create view v as select d from t"}, {"ddl": "ALTER TABLE t ADD constraint ub unique (b)"}]
+
+apply schema main;
+-- error: ub
+
+select name from schema() where type = 'view';
+→ []
+
+select * from t order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+update t set b = 2 where id = 2;
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+select d from v order by d;
+→ [{"d": null}, {"d": null}]
+
+drop view v;
+drop table t;

@@ -738,12 +738,7 @@ describe('Schema Differ', () => {
 			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
-		it('a hinted view rename renders its recreate DDL with the resolver-guarded inverse (inner subquery ref preserved)', () => {
-			// `columnReconciledViewStmt` renders actual recreate DDL, not just a compare:
-			// the RENAME COLUMN emits after view creates, so the create must spell the
-			// OLD column name for the outer ref — while the inner `max(cap)` legitimately
-			// binds to lim's own column and must NOT be inverse-captured (a false capture
-			// would render `max(qty)`, which fails at apply: lim has no qty).
+		it('a hinted view rename recreates the declared statement as written, after the RENAME COLUMN', () => {
 			const declared = parseDeclaredSchema(
 				`declare schema main {
 					table lim { id integer primary key, cap integer }
@@ -765,8 +760,9 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.have.length(1);
-			expect(diff.viewsToCreate[0].sql, 'outer ref inverse-renamed to the OLD column name').to.match(/extra = qty \+/);
-			expect(diff.viewsToCreate[0].sql, 'inner subquery ref NOT falsely inverse-captured').to.match(/max\(cap\)/);
+			expect(diff.viewsToCreate[0].sql, 'outer ref keeps the declared column name').to.match(/extra = cap \+/);
+			const ddl = generateMigrationDDL(diff, 'main');
+			expect(ddl.findIndex(s => s.includes('RENAME COLUMN'))).to.be.lessThan(ddl.findIndex(s => s.startsWith('create view')));
 		});
 
 		it('a non-FROM table\'s column rename referenced in a clause-expr subquery reconciles — pure rename, no recreate', () => {
@@ -855,36 +851,6 @@ describe('Schema Differ', () => {
 			expect(diff.viewsToDrop).to.deep.equal([]);
 			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 			expect(diff.renames).to.deep.include({ kind: 'table', oldName: 'audit', newName: 'audit2' });
-		});
-
-		it('a hinted view rename renders its recreate DDL with the non-FROM clause-expr ref inverse-renamed', () => {
-			// Cross-table variant of the resolver-guarded recreate-DDL spec above:
-			// `columnReconciledViewStmt` shares the cross-table pass (with no table
-			// renames), and in migration order the view create emits BEFORE audit's
-			// RENAME COLUMN — so the recreate must spell the OLD name `c`; the
-			// post-create forward propagation rewrites it to `c2` (clause exprs plan
-			// lazily at write-through time, so both spellings converge).
-			const declared = parseDeclaredSchema(
-				`declare schema main {
-					table t { id integer primary key, ts integer }
-					table audit {
-						id integer primary key,
-						c2 integer with tags ("quereus.previous_name" = 'c')
-					}
-					view v2 as select id from t with defaults (ts = (select max(c2) from audit)) with tags ("quereus.previous_name" = 'v')
-				}`
-			);
-			const catalog = makeCatalog(
-				[
-					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
-					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
-				],
-				[catalogView('create view v as select id from t with defaults (ts = (select max(c) from audit))')],
-			);
-			const diff = computeSchemaDiff(declared, catalog);
-			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
-			expect(diff.viewsToCreate).to.have.length(1);
-			expect(diff.viewsToCreate[0].sql, 'non-FROM clause-expr subquery ref spelled under the OLD name').to.match(/max\(c\)/);
 		});
 
 		it('a genuine definition edit layered on an in-diff rename still recreates', () => {

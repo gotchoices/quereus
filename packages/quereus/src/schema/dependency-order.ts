@@ -6,18 +6,24 @@
  * Items in a cycle cannot all follow each other, so the edges between them are ignored: they
  * keep their relative order, and everything outside the cycle is still ordered around them.
  *
- * `keyOf` and `dependenciesOf` must spell a key the same way. A dependency on the item itself,
- * or on a key no item has, is ignored.
+ * A preferred dependency orders items the same way, but gives way to the others: it is skipped
+ * when the graph built so far already needs its target to follow the item that prefers it.
+ *
+ * `keyOf` and the dependency functions must spell a key the same way. A dependency on the item
+ * itself, or on a key no item has, is ignored.
  */
 export function orderDependenciesFirst<T>(
 	items: readonly T[],
 	keyOf: (item: T) => string,
 	dependenciesOf: (item: T) => Iterable<string>,
+	preferredDependenciesOf: (item: T) => Iterable<string> = () => [],
 ): T[] {
 	const edges = resolveEdges(items, keyOf, dependenciesOf);
-	if (edges.every(dependencies => dependencies.length === 0)) return [...items];
+	const preferred = resolveEdges(items, keyOf, preferredDependenciesOf);
+	if ([...edges, ...preferred].every(dependencies => dependencies.length === 0)) return [...items];
 
 	const acyclic = edges.map((dependencies, item) => dependencies.filter(d => !reaches(edges, d, item)));
+	addEdgesThatCloseNoCycle(acyclic, preferred);
 	const placed = new Set<number>();
 	const ordered: T[] = [];
 	// NOTE: rescans from the start for each placement. That is quadratic in the items, and only
@@ -61,6 +67,21 @@ function resolveEdges<T>(
 			if (target !== undefined && target !== position) resolved.add(target);
 		}
 		return [...resolved];
+	});
+}
+
+/**
+ * Adds `candidates` to the acyclic `graph` one at a time. Each is checked against the edges added
+ * before it, because candidates that each pass alone can still form a cycle together.
+ *
+ * NOTE: one graph walk per candidate. A plan has a candidate per new view per altered table; if
+ * plans with thousands of those show up in profiles, compute reachability once and update it.
+ */
+function addEdgesThatCloseNoCycle(graph: number[][], candidates: readonly number[][]): void {
+	candidates.forEach((dependencies, item) => {
+		for (const dependency of dependencies) {
+			if (!reaches(graph, dependency, item)) graph[item].push(dependency);
+		}
 	});
 }
 

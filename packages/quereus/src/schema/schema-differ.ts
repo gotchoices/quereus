@@ -188,9 +188,9 @@ export interface TableAlterDiff {
 	/** Column renames discovered via `quereus.id` / `quereus.previous_name` on declared columns. */
 	columnsToRename: ColumnRenameOp[];
 	/**
-	 * Lowercased post-rename names of the tables this table's added columns refer to. The plan
-	 * runs this table's column and key changes after theirs. Carried here because `diff schema`
-	 * plans with no catalog. Omitted when there are none.
+	 * Lowercased post-rename names of the tables and views this table's added columns refer to. The
+	 * plan runs this table's column and key changes after their changes or creates. Carried here
+	 * because `diff schema` plans with no catalog. Omitted when there are none.
 	 */
 	addedColumnReads?: string[];
 	/**
@@ -657,10 +657,9 @@ export function computeSchemaDiff(
 	// name, and the question being answered is "in the declared world, does
 	// this inner FROM source expose that name (so the unqualified ref binds
 	// there, not to the owning seed)?". The walk's `realSources` carry OLD
-	// table names when the inverse table-rename pass has pre-normalized
-	// qualifiers (and DECLARED names when it hasn't — `columnReconciledViewStmt`),
-	// hence the old→new table-name mapping before the declared lookup: an
-	// already-declared name simply misses the rename find and passes through.
+	// table names once the inverse table-rename pass has pre-normalized
+	// qualifiers, hence the old→new table-name mapping before the declared
+	// lookup: a table no rename touched misses the find and passes through.
 	// Cross-schema sources answer false (the catalog is single-schema) —
 	// conservative where the forward path's live lookup could say yes; worst
 	// case a benign drop+recreate. A VIEW source answers false for the same
@@ -768,23 +767,17 @@ export function computeSchemaDiff(
 	// first; on mismatch a rename-RECONCILED render (every in-diff table/column
 	// rename inverse-applied NEW→OLD — see `reconciledDeclaredViewDefinition`)
 	// re-compares, so a dependent view over a source renamed in this same diff
-	// does not churn a spurious recreate. That reconciliation is
-	// correctness-critical, not just churn: `generateMigrationDDL` emits view
-	// creates BEFORE the table-alter block where RENAME COLUMN lives, and CREATE
-	// VIEW plans its body at create time — an unreconciled recreate naming the
-	// NEW column would fail at apply. A RENAME-matched view (hinted via
+	// does not churn a spurious recreate. Reconciliation is for the comparison
+	// only: a recreate runs after RENAME COLUMN (see `pushTableAlters`), so it
+	// executes the declared statement as written. A RENAME-matched view (hinted via
 	// quereus.id / quereus.previous_name) resolves to drop(actual old name) +
 	// create(declared new name) whether or not its definition changed — its
 	// `kind: 'view'` rename op is metadata only (no ALTER VIEW … RENAME TO
-	// primitive), so the convergence DDL must come from these buckets. A
-	// definition-UNCHANGED hinted rename renders the recreate with the in-diff
-	// COLUMN renames inverse-applied while keeping declared TABLE names (table
-	// renames run before creates; column renames run after — see
-	// `columnReconciledViewStmt`); the recreate carries the declared tags, so a
-	// rename + tag drift converges through it and the in-place SET TAGS branch
-	// below never double-emits (renames `continue` past it). A pure name match
-	// whose definition is unchanged but tags drifted still takes the in-place
-	// `ALTER VIEW … SET TAGS`.
+	// primitive), so the convergence DDL must come from these buckets. The recreate
+	// carries the declared tags, so a rename + tag drift converges through it and
+	// the in-place SET TAGS branch below never double-emits (renames `continue` past
+	// it). A pure name match whose definition is unchanged but tags drifted still
+	// takes the in-place `ALTER VIEW … SET TAGS`.
 	let viewRecreates = 0; // deliberate drop+create pairs, excluded from the require-hint counts
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
@@ -809,17 +802,9 @@ export function computeSchemaDiff(
 				canonical => canonical === matchedActual.definition,
 				tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn);
 		}
-		if (definitionDrifted) {
+		if (definitionDrifted || matchedActual.name.toLowerCase() !== name) {
 			diff.viewsToDrop.push(matchedActual.name);
 			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(stmt, targetSchemaName)));
-			viewRecreates++;
-			continue;
-		}
-		if (matchedActual.name.toLowerCase() !== name) {
-			// Hinted rename, definition unchanged → drop(old) + recreate(declared),
-			// rendered with in-diff column renames inverse-applied (NEW→OLD).
-			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn), targetSchemaName)));
 			viewRecreates++;
 			continue;
 		}
@@ -1552,18 +1537,17 @@ function reconciledDeclaredViewDefinition(
 
 /**
  * Core inverse-rename pass shared by {@link reconciledDeclaredViewDefinition}
- * (which threads ALL in-diff table renames) and {@link columnReconciledViewStmt}
- * (which passes none — its render must keep declared table names): clones the
- * declared select and `insert defaults` clause (the rewriters mutate in place;
- * the declared stmt backs the declared-schema store / recreate DDL) and
- * rewrites the in-diff renames NEW→OLD.
+ * and {@link declaredViewMatchesModuloRenameArtifacts}: clones the declared
+ * select and `insert defaults` clause (the rewriters mutate in place; the
+ * declared stmt backs the declared-schema store / recreate DDL) and rewrites the
+ * in-diff renames NEW→OLD.
  *
  * Reconciled body: inverse table renames over the select clone for ALL threaded
  * renames FIRST — so both a direct FROM reference and a cross-table reference in
  * a subquery normalize to OLD names — THEN each renamed table's column renames
  * NEW→OLD, seeded with that table's OLD name (qualifiers are pre-normalized to
- * OLD by the table pass; with no own-table rename — in particular with no table
- * pass at all — the seed is the DECLARED name the qualifiers still carry).
+ * OLD by the table pass; with no own-table rename the seed is the DECLARED name,
+ * which is also its old one).
  * Sequential inverse application is order-independent: `resolveRenames` makes
  * chains/swaps unrepresentable, so no inverse output (oldName) can match another
  * inverse input (newName).
@@ -1612,8 +1596,8 @@ function inverseRenamedViewParts(
 		// `absorbRenameArtifacts` over the clone this pass returns (or over a
 		// plain clone when no renames are in play) before the canonical-string /
 		// hash compare, normalizing the declared side toward the actual spelling
-		// exactly where the two are equivalent. Recreate DDL renders
-		// (`columnReconciledViewStmt`) never absorb — they must stay as-authored.
+		// exactly where the two are equivalent. Recreate DDL never absorbs: it
+		// stays as-authored.
 		renameTableInAst(selectClone, {
 			oldName: r.newName, newName: r.oldName, schemaName,
 			resolve: resolveRef, resolveAfter: resolveRef,
@@ -1761,35 +1745,6 @@ function declaredCheckMatchesModuloRenameArtifacts(
 	const clone = cloneExpr(declaredCheck);
 	absorbRenameArtifacts(clone, actual.check, schemaName);
 	return expressionToString(clone) === actual.definition;
-}
-
-/**
- * Declared {@link AST.CreateViewStmt} with the in-diff COLUMN renames
- * inverse-applied (NEW→OLD); table references untouched. Renders the recreate
- * DDL of a hinted-RENAME-matched view whose definition is otherwise unchanged:
- * in migration order the create runs AFTER `ALTER TABLE … RENAME TO` (declared
- * table names are already live) but BEFORE `ALTER TABLE … RENAME COLUMN` (a
- * body naming the NEW column would fail to plan at create time). After the
- * create, the live column-rename propagation rewrites the fresh body, so the
- * post-apply state and a re-diff converge. Unlike
- * {@link reconciledDeclaredViewDefinition} there is NO inverse table pass (it
- * would name a table that no longer exists at create time) — the shared
- * {@link inverseRenamedViewParts} core runs with no table renames, seeding the
- * column rewrites with each table's DECLARED name, which the body's qualifiers
- * still carry. Identity when the diff carries no column renames.
- */
-function columnReconciledViewStmt(
-	stmt: AST.CreateViewStmt,
-	/** Declared (new) table name (lowercased) → that table's column renames. */
-	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
-	schemaName: string,
-	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
-	resolveDeclaredColumn: ResolveColumnInSource,
-): AST.CreateViewStmt {
-	if (columnRenamesByTable.size === 0) return stmt;
-	// The reconciled body carries any trailing `with defaults (…)` clause inline.
-	const reconciledSelect = inverseRenamedViewParts(stmt.select, [], columnRenamesByTable, schemaName, resolveDeclaredColumn);
-	return { ...stmt, select: reconciledSelect };
 }
 
 /**
@@ -2590,8 +2545,8 @@ function computeTableAlterDiff(
  * `SET DEFAULT` makes no edge: it does not validate its expression, and a `SET NOT NULL` backfill
  * folds the default to a literal rather than evaluating it, so nothing in the plan reads what it names.
  *
- * NOTE: only a name written directly in the column definition counts, so a DEFAULT reading a
- * view over `t` is not ordered after `t`. If that shows up, follow the reach with `reachableObjects`.
+ * NOTE: only a name written directly in the column definition counts, so a DEFAULT reading an
+ * existing view over `t` is not ordered after `t`. If that shows up, follow the reach with `reachableObjects`.
  *
  * NOTE: an edge is per table, not per column. `t.d references u(z)` needing a new `u.z`, beside
  * `u.z references t(id)` naming an existing `t.id`, reads as a cycle and keeps declaration order,
@@ -2623,7 +2578,7 @@ function recordCrossTableReads(
 	}
 }
 
-/** Adds the tables in `schemaName` that a column definition's foreign keys and expressions name. */
+/** Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions name. */
 function collectColumnDefReads(col: AST.ColumnDef, schemaName: string, into: Set<string>): void {
 	for (const constraint of col.constraints) {
 		const fk = constraint.foreignKey;
@@ -2633,12 +2588,15 @@ function collectColumnDefReads(col: AST.ColumnDef, schemaName: string, into: Set
 	}
 }
 
-/** Adds the tables in `schemaName` that a written-row expression names; another schema's are skipped. */
+/** Adds the tables and views in `schemaName` that a written-row expression names. */
 function collectExpressionReads(expr: AST.Expression, schemaName: string, into: Set<string>): void {
-	const refs = collectTableRefsInAst(expr, singleSchemaObjectRefResolver(schemaName), { rowImageContext: true });
-	for (const [key, name] of refs) {
-		if (key === objectRefKey(schemaName, name)) into.add(name);
-	}
+	for (const name of objectsNamedIn(expr, schemaName, { rowImageContext: true })) into.add(name);
+}
+
+/** The lowercased names of the tables and views in `schemaName` that `node` names; another schema's are skipped. */
+function objectsNamedIn(node: AST.AstNode, schemaName: string, opts?: TableRenameOpts): string[] {
+	const refs = collectTableRefsInAst(node, singleSchemaObjectRefResolver(schemaName), opts);
+	return [...refs].filter(([key, name]) => key === objectRefKey(schemaName, name)).map(([, name]) => name);
 }
 
 /**
@@ -3189,9 +3147,12 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	const pushText = (sql: string, undoOf: (u: UndoRenderer) => StepUndo): void => {
 		statements.push(undo ? { sql, ...undoOf(undo) } : { sql });
 	};
-	/** Appends a create bucket; each create undoes to the `DROP … IF EXISTS` of what it made. */
+	/** Appends a create; it undoes to the `DROP … IF EXISTS` of what it made. */
+	const pushCreate = (create: MigrationCreate, kind: CreatedObjectKind): void => {
+		statements.push(undo ? { ...create, ...undo.dropCreated(create, kind) } : create);
+	};
 	const pushCreates = (bucket: readonly MigrationCreate[], kind: CreatedObjectKind): void => {
-		for (const create of bucket) statements.push(undo ? { ...create, ...undo.dropCreated(create, kind) } : create);
+		for (const create of bucket) pushCreate(create, kind);
 	};
 
 	// Renames first — they free old names for subsequent creates and re-target
@@ -3246,11 +3207,11 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	// as the `create materialized view` sugar) and re-materializes as part of its
 	// create.
 	pushCreates(diff.tablesToCreate, 'table');
-	pushCreates(diff.viewsToCreate, 'view');
-	// Index and assertion creates do NOT go here — they run last, after the table
+	// View creates do NOT go here: they are sorted in with stage 2 of the table alters.
+	// Index and assertion creates do NOT either — they run last, after the table
 	// alters and the maintained re-attaches. See the pushes at the end of this function.
 
-	pushTableAlters(diff.tablesToAlter, { schemaPrefix, pushText, undo });
+	pushTableAlters(diff.tablesToAlter, diff.viewsToCreate, { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo });
 
 	// Attach / re-attach maintained tables (`set maintained as`) LATE — where MV
 	// creates ran — after every table create/alter, so the target's final shape and
@@ -3317,9 +3278,21 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 
 /** The parts of {@link generateMigrationPlan} a table-alter step is pushed through. */
 interface AlterStepSink {
+	schemaName: string;
 	schemaPrefix: string;
 	pushText: (sql: string, undoOf: (u: UndoRenderer) => StepUndo) => void;
+	pushCreate: (create: MigrationCreate, kind: CreatedObjectKind) => void;
 	undo: UndoRenderer | undefined;
+}
+
+/** What stage 2 of {@link pushTableAlters} sorts: one table's steps, or one view create. */
+interface StageTwoItem {
+	key: string;
+	/** What has to run first. */
+	runsAfter: readonly string[];
+	/** What should run first, unless that would close a cycle. */
+	prefersToRunAfter: readonly string[];
+	push: () => void;
 }
 
 const alterKey = (alter: TableAlterDiff): string => alter.tableName.toLowerCase();
@@ -3338,6 +3311,11 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      arrives inside `ADD COLUMN` and cannot wait for stage 3. These stay per table rather than
  *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
  *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`.
+ *      New views are sorted in here, because `CREATE VIEW` plans its body as it runs. A view
+ *      follows every table's steps, unless a table's new column reads it, directly or through
+ *      other new views: then it goes ahead of that table. It is ordered after every altered table,
+ *      not only those it names, because a view reached through an existing view would need the
+ *      catalog to follow, and `diff schema` plans with none.
  *   3. ADD CONSTRAINT, once every table has its columns and key. Two tables' named foreign keys
  *      can point at each other's new columns.
  *   4. DROP COLUMN, once every table's `DROP CONSTRAINT` has cleared the guards that refuse a drop
@@ -3345,17 +3323,46 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      drops precede those of the tables its dropped columns' expressions read.
  *   5. SET TAGS, last, because a constraint's tags can name a constraint from stage 3.
  */
-function pushTableAlters(alters: readonly TableAlterDiff[], sink: AlterStepSink): void {
+function pushTableAlters(alters: readonly TableAlterDiff[], viewCreates: readonly MigrationCreate[], sink: AlterStepSink): void {
 	for (const alter of alters) pushColumnRenames(alter, sink);
-	for (const alter of orderDependenciesFirst(alters, alterKey, a => a.addedColumnReads ?? [])) {
-		pushColumnAdds(alter, sink);
-		pushColumnAlters(alter, sink);
-		pushConstraintRenamesAndDrops(alter, sink);
-		pushPrimaryKeyChange(alter, sink);
-	}
+	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink)), ...viewStageTwoItems(viewCreates, alters, sink)];
+	for (const item of orderDependenciesFirst(stageTwo, i => i.key, i => i.runsAfter, i => i.prefersToRunAfter)) item.push();
 	for (const alter of alters) pushConstraintAdds(alter, sink);
 	for (const alter of orderDependentsFirst(alters, alterKey, a => a.droppedColumnReads ?? [])) pushColumnDrops(alter, sink);
 	for (const alter of alters) pushTagChanges(alter, sink);
+}
+
+function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwoItem {
+	return {
+		key: alterKey(alter),
+		runsAfter: alter.addedColumnReads ?? [],
+		prefersToRunAfter: [],
+		push: () => {
+			pushColumnAdds(alter, sink);
+			pushColumnAlters(alter, sink);
+			pushConstraintRenamesAndDrops(alter, sink);
+			pushPrimaryKeyChange(alter, sink);
+		},
+	};
+}
+
+/**
+ * A view has to follow only the new views it names. A table it names is one of the altered tables
+ * it merely prefers to follow: a new column on that table may read this view.
+ * The keys can share a sort with table names because tables and views share one namespace.
+ */
+function viewStageTwoItems(viewCreates: readonly MigrationCreate[], alters: readonly TableAlterDiff[], sink: AlterStepSink): StageTwoItem[] {
+	const viewKey = (create: MigrationCreate): string => (create.ast.type === 'createView' ? create.ast.view.name : create.sql).toLowerCase();
+	const newViews = new Set(viewCreates.map(viewKey));
+	const alteredTables = alters.map(alterKey);
+	return viewCreates.map(create => ({
+		key: viewKey(create),
+		runsAfter: create.ast.type === 'createView'
+			? objectsNamedIn(create.ast.select, sink.schemaName).filter(name => newViews.has(name))
+			: [],
+		prefersToRunAfter: alteredTables,
+		push: () => sink.pushCreate(create, 'view'),
+	}));
 }
 
 function pushColumnRenames(alter: TableAlterDiff, sink: AlterStepSink): void {

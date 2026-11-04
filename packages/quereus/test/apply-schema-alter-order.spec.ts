@@ -92,8 +92,7 @@ describe('apply schema: table alters run in stages across tables', () => {
 			}`);
 		});
 
-		// View creates run ahead of the alters, so an added column's DEFAULT can read one. Moving view
-		// creates after the alters has to keep this applying.
+		// A view follows the alters unless an added column reads it, as this DEFAULT does.
 		it('applies a DEFAULT reading a view the same plan creates', async () => {
 			await applies(`declare schema main {
 				table u { id integer primary key, y integer null, z integer null default ((select m from w)) }
@@ -101,6 +100,73 @@ describe('apply schema: table alters run in stages across tables', () => {
 				table t { id integer primary key, b integer null }
 			}`);
 		});
+
+		it('applies a DEFAULT reading a new view over a column its own table already has', async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null, z integer null default ((select m from w)) }
+				view w as select max(b) as m from t
+				table u { id integer primary key, y integer null }
+			}`);
+		});
+	});
+
+	describe('a new view reading what the plan changes', () => {
+		beforeEach(async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null }
+				table u { id integer primary key, y integer null }
+			}`);
+		});
+
+		it('applies a view reading a column its table gains', async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null, d integer null }
+				table u { id integer primary key, y integer null }
+				view v as select d from t
+			}`);
+		});
+
+		it('applies an edited view naming a column renamed in the same apply', async () => {
+			await db.exec('create view v as select b from t');
+			await applies(`declare schema main {
+				table t { id integer primary key, b2 integer null with tags ("quereus.previous_name" = 'b') }
+				table u { id integer primary key, y integer null }
+				view v as select b2 from t where id > 0
+			}`);
+		});
+
+		it('applies a view written before the new view it reads', async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null }
+				table u { id integer primary key, y integer null }
+				view c as select b from w
+				view w as select b from t
+			}`);
+		});
+
+		// `t` is not named by `v2`, and following `v1` to it would need a catalog `diff schema` lacks.
+		it('applies a view reading a new column through an existing view', async () => {
+			await db.exec('create view v1 as select * from t');
+			await applies(`declare schema main {
+				view v2 as select d from v1
+				view v1 as select * from t
+				table t { id integer primary key, b integer null, d integer null }
+				table u { id integer primary key, y integer null }
+			}`);
+		});
+
+		const reader = 'table u { id integer primary key, y integer null, z integer null default ((select m from w)) }';
+		const gainer = 'table t { id integer primary key, b integer null, d integer null }';
+		const writtenOrders: Array<[string, string]> = [['the reader', `${reader} ${gainer}`], ['the gaining table', `${gainer} ${reader}`]];
+
+		for (const [first, tables] of writtenOrders) {
+			it(`applies a DEFAULT reading a view over a column another table gains, ${first} written first`, async () => {
+				await applies(`declare schema main {
+					${tables}
+					view w as select max(d) as m from t
+				}`);
+			});
+		}
 	});
 
 	describe('a table giving up something another table still refers to, written first', () => {
@@ -182,6 +248,23 @@ describe('apply schema: table alters run in stages across tables', () => {
 		expect(error.message).to.match(/ub/).and.not.match(/could not be restored/);
 		expect(renderCatalogForComparison(collectSchemaCatalog(db, 'main'))).to.equal(before);
 	});
+
+	it('a failure after a view create takes the view back before the column it reads', async () => {
+		await applies(`declare schema main {
+			table t { id integer primary key, b integer null }
+		}`);
+		await db.exec('insert into t (id, b) values (1, 1), (2, 1)');
+		const before = renderCatalogForComparison(collectSchemaCatalog(db, 'main'));
+
+		await db.exec(`declare schema main {
+			table t { id integer primary key, b integer null, d integer null, constraint ub unique (b) }
+			view v as select d from t
+		}`);
+		const error = await rejection(db.exec('apply schema main'));
+
+		expect(error.message).to.match(/ub/).and.not.match(/partially migrated|could not be restored/);
+		expect(renderCatalogForComparison(collectSchemaCatalog(db, 'main'))).to.equal(before);
+	});
 });
 
 describe('dependency ordering', () => {
@@ -196,5 +279,18 @@ describe('dependency ordering', () => {
 	it('keeps a cycle in input order and orders everything else around it', () => {
 		const inCycle = { x: ['a'], a: ['b'], b: ['a'] };
 		expect(orderDependenciesFirst(['x', 'a', 'c', 'b'], key, edges(inCycle))).to.deep.equal(['a', 'x', 'c', 'b']);
+	});
+
+	it('a preferred dependency orders items, and is skipped when it would close a cycle', () => {
+		expect(orderDependenciesFirst(['v', 't'], key, edges({}), edges({ v: ['t'] }))).to.deep.equal(['t', 'v']);
+		expect(orderDependenciesFirst(['v', 't'], key, edges({ t: ['v'] }), edges({ v: ['t'] }))).to.deep.equal(['v', 't']);
+	});
+
+	// Each preferred edge passes when checked against the required edges alone, but all of them
+	// together would leave nothing ready to place.
+	it('a preferred dependency is also skipped when it would close a cycle with other preferred ones', () => {
+		const required = { t: ['v2'], s: ['v1'] };
+		const preferred = { v1: ['t'], v2: ['s'] };
+		expect(orderDependenciesFirst(['v1', 'v2', 't', 's'], key, edges(required), edges(preferred))).to.deep.equal(['v2', 't', 'v1', 's']);
 	});
 });
