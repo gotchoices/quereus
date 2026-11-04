@@ -128,7 +128,8 @@ function renderTable(t: CatalogTable): string {
 }
 
 function renderColumn(c: CatalogTable['columns'][number]): string {
-	const { name, type, notNull, primaryKey, defaultValue, collation, tags, ...rest } = c;
+	// `generatedExpr` omitted: the table's `ddl` already renders it, and no undo statement changes it.
+	const { name, type, notNull, primaryKey, defaultValue, generatedExpr: _generatedExpr, collation, tags, ...rest } = c;
 	assertEveryFieldConsidered(rest);
 	return `column ${name} ${type} ${notNull ? 'not null' : 'null'} ${primaryKey ? 'pk' : '-'}`
 		// `defaultValue` is an `AST.Expression`; rendered with the same

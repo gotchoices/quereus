@@ -8,8 +8,9 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
+import { collectTableRefsInAst, renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameOpts } from './rename-rewriter.js';
+import { orderDependenciesFirst, orderDependentsFirst } from './dependency-order.js';
 import { Parser } from '../parser/parser.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
@@ -186,6 +187,18 @@ export interface TableAlterDiff {
 	columnsToAlter: ColumnAttributeChange[];
 	/** Column renames discovered via `quereus.id` / `quereus.previous_name` on declared columns. */
 	columnsToRename: ColumnRenameOp[];
+	/**
+	 * Lowercased post-rename names of the tables this table's added columns refer to. The plan
+	 * runs this table's column and key changes after theirs. Carried here because `diff schema`
+	 * plans with no catalog. Omitted when there are none.
+	 */
+	addedColumnReads?: string[];
+	/**
+	 * Lowercased post-rename names of the tables its dropped columns' DEFAULT and generated
+	 * expressions read.
+	 * The plan drops this table's columns before theirs. Omitted when there are none.
+	 */
+	droppedColumnReads?: string[];
 	/** Constraint renames discovered via tag hints (user-named CHECK / UNIQUE / FK). */
 	constraintsToRename?: ColumnRenameOp[];
 	/**
@@ -2190,7 +2203,7 @@ function countActualChecks(actualTable: CatalogTable): number {
 /**
  * The lowercased constraint names a minted name must avoid at the point the
  * `ADD CONSTRAINT` steps run (after every DROP / RENAME CONSTRAINT and ADD COLUMN
- * of the table — see the phase order in `generateMigrationPlan`): the live names
+ * of the table — see the stage order in `pushTableAlters`): the live names
  * minus the dropped ones, plus every declared user name (each exists by then),
  * plus — over-approximated — what `ADD COLUMN` mints for an inline clause on a new
  * column. An unnamed UNIQUE's backing-structure name (`_uc_<cols>`) is included:
@@ -2391,6 +2404,8 @@ function computeTableAlterDiff(
 		}
 	}
 
+	recordCrossTableReads(diff, declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase())), actualTable, tableRenames, schemaName);
+
 	// Apply require-hint to columns within this table
 	if (policy === 'require-hint') {
 		enforceRequireHint(`column (${actualTable.name})`, diff.columnsToAdd.length, diff.columnsToDrop.length);
@@ -2566,6 +2581,64 @@ function computeTableAlterDiff(
 	markMaintainedTagRoute(diff, liveMaintained);
 
 	return diff;
+}
+
+/**
+ * Records what orders this table's steps against other tables' (see `pushTableAlters`).
+ * A declared name is already post-rename. A catalog expression is spelled pre-rename, so its
+ * names go through `tableRenames` to match the post-rename `TableAlterDiff.tableName`.
+ *
+ * `SET DEFAULT` makes no edge: it does not validate its expression, and a `SET NOT NULL` backfill
+ * folds the default to a literal rather than evaluating it, so nothing in the plan reads what it names.
+ *
+ * NOTE: only a name written directly in the column definition counts, so a DEFAULT reading a
+ * view over `t` is not ordered after `t`. If that shows up, follow the reach with `reachableObjects`.
+ *
+ * NOTE: an edge is per table, not per column. `t.d references u(z)` needing a new `u.z`, beside
+ * `u.z references t(id)` naming an existing `t.id`, reads as a cycle and keeps declaration order,
+ * though `u` first would work. If that shows up, skip the edge when an FK's parent column list
+ * names only columns the parent already has.
+ */
+function recordCrossTableReads(
+	diff: TableAlterDiff,
+	addedColumns: readonly AST.ColumnDef[],
+	actualTable: CatalogTable,
+	tableRenames: ReadonlyArray<RenameOp>,
+	schemaName: string,
+): void {
+	const added = new Set<string>();
+	for (const col of addedColumns) collectColumnDefReads(col, schemaName, added);
+	if (added.size > 0) diff.addedColumnReads = [...added];
+
+	const droppedColumns = new Set(diff.columnsToDrop.map(c => c.toLowerCase()));
+	const dropped = new Set<string>();
+	for (const col of actualTable.columns) {
+		if (!droppedColumns.has(col.name.toLowerCase())) continue;
+		if (col.defaultValue) collectExpressionReads(col.defaultValue, schemaName, dropped);
+		if (col.generatedExpr) collectExpressionReads(col.generatedExpr, schemaName, dropped);
+	}
+	if (dropped.size > 0) {
+		diff.droppedColumnReads = [...dropped].map(name =>
+			tableRenames.find(r => r.oldName.toLowerCase() === name)?.newName.toLowerCase() ?? name);
+	}
+}
+
+/** Adds the tables in `schemaName` that a column definition's foreign keys and expressions name. */
+function collectColumnDefReads(col: AST.ColumnDef, schemaName: string, into: Set<string>): void {
+	for (const constraint of col.constraints) {
+		const fk = constraint.foreignKey;
+		if (fk && (!fk.schema || fk.schema.toLowerCase() === schemaName.toLowerCase())) into.add(fk.table.toLowerCase());
+		if (constraint.expr) collectExpressionReads(constraint.expr, schemaName, into);
+		if (constraint.generated) collectExpressionReads(constraint.generated.expr, schemaName, into);
+	}
+}
+
+/** Adds the tables in `schemaName` that a written-row expression names; another schema's are skipped. */
+function collectExpressionReads(expr: AST.Expression, schemaName: string, into: Set<string>): void {
+	const refs = collectTableRefsInAst(expr, singleSchemaObjectRefResolver(schemaName), { rowImageContext: true });
+	for (const [key, name] of refs) {
+		if (key === objectRefKey(schemaName, name)) into.add(name);
+	}
 }
 
 /**
@@ -3017,6 +3090,9 @@ export function serializeSchemaDiff(diff: SchemaDiff): string {
  * "child references parent" within the set, child appears before parent.
  * Falls back to the input order on a cycle (shouldn't happen for simple FKs,
  * but self/cyclic FKs would otherwise hang the migration).
+ *
+ * Not built on `orderDependentsFirst`: this one reverses unrelated tables and breaks ties and
+ * cycles by walk order, so moving it would change the `DROP TABLE` order `diff schema` shows.
  */
 function orderDropsByFKDependency(
 	dropSet: Set<string>,
@@ -3174,116 +3250,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	// Index and assertion creates do NOT go here — they run last, after the table
 	// alters and the maintained re-attaches. See the pushes at the end of this function.
 
-	// Alter existing tables.
-	// Phase order within one table:
-	//   RENAME COLUMN (so subsequent phases see post-rename column names)
-	//   → ADD COLUMN
-	//   → ALTER COLUMN (comparison domain, then default, then nullability — so SET
-	//     NOT NULL can rely on an already-populated DEFAULT for backfill; the
-	//     type/collation pair orders internally, see comparisonDomainAlters; a
-	//     retype whose replaced default would veto it is preceded by a DROP DEFAULT,
-	//     see dropStaleDefaultFirst)
-	//   → RENAME CONSTRAINT, then DROP CONSTRAINT (free / remove a name before any
-	//     re-add; a UNIQUE drop precedes the PK change so it can't strand a PK dep)
-	//   → ALTER PRIMARY KEY
-	//   → ADD CONSTRAINT (after the PK change and the column adds it may reference)
-	//   → DROP COLUMN (last, so NOT NULL relaxation never blocks subsequent drops)
-	for (const alter of diff.tablesToAlter) {
-		const quotedTable = `${schemaPrefix}${quoteIdentifier(alter.tableName)}`;
-		for (const r of alter.columnsToRename) {
-			pushText(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
-				() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
-			undo?.columnRenameLanded(alter.tableName, r);
-		}
-		for (const colDef of alter.columnsToAdd) {
-			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`, u => u.dropAddedColumn(alter.tableName, quotedTable, colDef));
-		}
-		for (const colAlter of alter.columnsToAlter) {
-			const quotedCol = quoteIdentifier(colAlter.columnName);
-			const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol}`;
-			// A default the retype would choke on and this migration replaces anyway is
-			// cleared BEFORE the comparison-domain phase (see `dropStaleDefaultFirst`).
-			if (colAlter.dropStaleDefaultFirst) {
-				pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
-			}
-			// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
-			// comparison-domain changes), before DEFAULT / NOT NULL.
-			for (const s of comparisonDomainAlters(quotedTable, quotedCol, colAlter)) {
-				pushText(s.sql, u => s.attribute === 'dataType'
-					? u.retypedColumn(alter.tableName, colAlter.columnName)
-					: u.undoSetCollation(alter.tableName, colAlter.columnName, alterColumn));
-			}
-			if (colAlter.defaultValue !== undefined) {
-				if (colAlter.defaultValue === null) {
-					// Already dropped above when it preceded the retype.
-					if (!colAlter.dropStaleDefaultFirst) {
-						pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
-					}
-				} else {
-					// After `dropStaleDefaultFirst` the column reaches this step with no
-					// default — the stale one was cleared earlier in this phase — so the
-					// reversal is a plain DROP DEFAULT, not the pre-apply default (Rule 1).
-					pushText(`${alterColumn} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`, u => colAlter.dropStaleDefaultFirst
-						? { undo: [`${alterColumn} DROP DEFAULT`] }
-						: u.undoSetDefault(alter.tableName, colAlter.columnName, alterColumn));
-				}
-			}
-			if (colAlter.notNull !== undefined) {
-				pushText(colAlter.notNull ? `${alterColumn} SET NOT NULL` : `${alterColumn} DROP NOT NULL`,
-					() => ({ undo: [colAlter.notNull ? `${alterColumn} DROP NOT NULL` : `${alterColumn} SET NOT NULL`] }));
-			}
-		}
-		// Constraint lifecycle: RENAME (free a name) then DROP (remove a stale /
-		// conflicting constraint), both BEFORE re-adds and before the PK change so a
-		// dropped UNIQUE can't strand a PK dependency.
-		for (const r of alter.constraintsToRename ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
-				() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
-			undo?.constraintRenameLanded(alter.tableName, r);
-		}
-		for (const name of alter.constraintsToDrop ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`, u => u.readdConstraint(alter.tableName, name, quotedTable));
-		}
-		if (alter.primaryKeyChange) {
-			const pkCols = alter.primaryKeyChange.newPkColumns
-				.map(c => {
-					let s = quoteIdentifier(c.name);
-					if (c.direction === 'desc') s += ' desc';
-					return s;
-				})
-				.join(', ');
-			pushText(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`, u => u.restorePrimaryKey(alter.tableName, quotedTable));
-		}
-		// ADD CONSTRAINT after the PK change (a new UNIQUE / FK may align with the new
-		// key) and after the column adds it may reference. CHECK adds apply in-place;
-		// UNIQUE / FK adds depend on module ADD CONSTRAINT support (see constraintsToAdd).
-		for (const frag of alter.constraintsToAdd ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} ADD ${frag}`, u => u.dropAddedConstraint(quotedTable, frag));
-		}
-		for (const colName of alter.columnsToDrop) {
-			pushText(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`, u => u.droppedColumn(alter.tableName, colName));
-		}
-		// Tags phase — last, so a SET TAGS lands on the post-structural column /
-		// constraint set (a tag set emitted alongside a RENAME COLUMN targets the
-		// post-rename name). Whole-set replacement; an empty set clears.
-		if (alter.tableTagsChange !== undefined) {
-			// A maintained table's tag edit must use ALTER MATERIALIZED VIEW (fires
-			// materialized_view_modified so a store catalog re-persists; the ALTER
-			// TABLE handler rejects a tag action on a maintained table). See
-			// `TableAlterDiff.maintainedTags`.
-			const tagVerb = alter.maintainedTags ? 'ALTER MATERIALIZED VIEW' : 'ALTER TABLE';
-			pushText(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`, u => u.restoreTableTags(alter.tableName, `${tagVerb} ${quotedTable}`));
-		}
-		for (const colAlter of alter.columnsToAlter) {
-			if (colAlter.tags === undefined) continue;
-			const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)}`;
-			pushText(`${alterColumn} SET TAGS ${tagsBodyToString(colAlter.tags)}`, u => u.restoreColumnTags(alter.tableName, colAlter.columnName, alterColumn));
-		}
-		for (const ctc of alter.constraintTagsChanges ?? []) {
-			const alterConstraint = `ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)}`;
-			pushText(`${alterConstraint} SET TAGS ${tagsBodyToString(ctc.tags)}`, u => u.restoreConstraintTags(alter.tableName, ctc.constraintName, alterConstraint));
-		}
-	}
+	pushTableAlters(diff.tablesToAlter, { schemaPrefix, pushText, undo });
 
 	// Attach / re-attach maintained tables (`set maintained as`) LATE — where MV
 	// creates ran — after every table create/alter, so the target's final shape and
@@ -3346,6 +3313,173 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	}
 
 	return statements;
+}
+
+/** The parts of {@link generateMigrationPlan} a table-alter step is pushed through. */
+interface AlterStepSink {
+	schemaPrefix: string;
+	pushText: (sql: string, undoOf: (u: UndoRenderer) => StepUndo) => void;
+	undo: UndoRenderer | undefined;
+}
+
+const alterKey = (alter: TableAlterDiff): string => alter.tableName.toLowerCase();
+
+const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
+	`${sink.schemaPrefix}${quoteIdentifier(alter.tableName)}`;
+
+/**
+ * Emits the table alters in stages that span every table, because an `ALTER` validates what it
+ * refers to, and one table's statement can refer to what another table's statement changes.
+ * Within one table the steps keep the relative order the stages give them.
+ *
+ *   1. RENAME COLUMN, so every later statement in any table sees post-rename names.
+ *   2. Per table: ADD COLUMN, ALTER COLUMN, RENAME CONSTRAINT, DROP CONSTRAINT, ALTER PRIMARY KEY.
+ *      A table follows the tables its new columns refer to: an inline foreign key or DEFAULT
+ *      arrives inside `ADD COLUMN` and cannot wait for stage 3. These stay per table rather than
+ *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
+ *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`.
+ *   3. ADD CONSTRAINT, once every table has its columns and key. Two tables' named foreign keys
+ *      can point at each other's new columns.
+ *   4. DROP COLUMN, once every table's `DROP CONSTRAINT` has cleared the guards that refuse a drop
+ *      still referred to. A DEFAULT or generated body has no constraint to drop first, so a table's
+ *      drops precede those of the tables its dropped columns' expressions read.
+ *   5. SET TAGS, last, because a constraint's tags can name a constraint from stage 3.
+ */
+function pushTableAlters(alters: readonly TableAlterDiff[], sink: AlterStepSink): void {
+	for (const alter of alters) pushColumnRenames(alter, sink);
+	for (const alter of orderDependenciesFirst(alters, alterKey, a => a.addedColumnReads ?? [])) {
+		pushColumnAdds(alter, sink);
+		pushColumnAlters(alter, sink);
+		pushConstraintRenamesAndDrops(alter, sink);
+		pushPrimaryKeyChange(alter, sink);
+	}
+	for (const alter of alters) pushConstraintAdds(alter, sink);
+	for (const alter of orderDependentsFirst(alters, alterKey, a => a.droppedColumnReads ?? [])) pushColumnDrops(alter, sink);
+	for (const alter of alters) pushTagChanges(alter, sink);
+}
+
+function pushColumnRenames(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const r of alter.columnsToRename) {
+		sink.pushText(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
+			() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
+		sink.undo?.columnRenameLanded(alter.tableName, r);
+	}
+}
+
+function pushColumnAdds(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const colDef of alter.columnsToAdd) {
+		sink.pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`, u => u.dropAddedColumn(alter.tableName, quotedTable, colDef));
+	}
+}
+
+/**
+ * Per column: comparison domain, then default, then nullability, so SET NOT NULL can rely on an
+ * already-populated DEFAULT for backfill. The type/collation pair orders internally (see
+ * {@link comparisonDomainAlters}), and a retype whose replaced default would veto it is preceded
+ * by a DROP DEFAULT (see {@link ColumnAttributeChange.dropStaleDefaultFirst}).
+ */
+function pushColumnAlters(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const colAlter of alter.columnsToAlter) {
+		const quotedCol = quoteIdentifier(colAlter.columnName);
+		const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol}`;
+		// A default the retype would choke on and this migration replaces anyway is
+		// cleared BEFORE the comparison-domain phase (see `dropStaleDefaultFirst`).
+		if (colAlter.dropStaleDefaultFirst) {
+			sink.pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
+		}
+		// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
+		// comparison-domain changes), before DEFAULT / NOT NULL.
+		for (const s of comparisonDomainAlters(quotedTable, quotedCol, colAlter)) {
+			sink.pushText(s.sql, u => s.attribute === 'dataType'
+				? u.retypedColumn(alter.tableName, colAlter.columnName)
+				: u.undoSetCollation(alter.tableName, colAlter.columnName, alterColumn));
+		}
+		if (colAlter.defaultValue !== undefined) {
+			if (colAlter.defaultValue === null) {
+				// Already dropped above when it preceded the retype.
+				if (!colAlter.dropStaleDefaultFirst) {
+					sink.pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
+				}
+			} else {
+				// After `dropStaleDefaultFirst` the column reaches this step with no
+				// default — the stale one was cleared earlier in this phase — so the
+				// reversal is a plain DROP DEFAULT, not the pre-apply default (Rule 1).
+				sink.pushText(`${alterColumn} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`, u => colAlter.dropStaleDefaultFirst
+					? { undo: [`${alterColumn} DROP DEFAULT`] }
+					: u.undoSetDefault(alter.tableName, colAlter.columnName, alterColumn));
+			}
+		}
+		if (colAlter.notNull !== undefined) {
+			sink.pushText(colAlter.notNull ? `${alterColumn} SET NOT NULL` : `${alterColumn} DROP NOT NULL`,
+				() => ({ undo: [colAlter.notNull ? `${alterColumn} DROP NOT NULL` : `${alterColumn} SET NOT NULL`] }));
+		}
+	}
+}
+
+/** RENAME frees a name and DROP removes a stale constraint, both before any re-add, and before the PK change so a dropped UNIQUE can't strand a PK dependency. */
+function pushConstraintRenamesAndDrops(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const r of alter.constraintsToRename ?? []) {
+		sink.pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
+			() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
+		sink.undo?.constraintRenameLanded(alter.tableName, r);
+	}
+	for (const name of alter.constraintsToDrop ?? []) {
+		sink.pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`, u => u.readdConstraint(alter.tableName, name, quotedTable));
+	}
+}
+
+function pushPrimaryKeyChange(alter: TableAlterDiff, sink: AlterStepSink): void {
+	if (!alter.primaryKeyChange) return;
+	const quotedTable = quotedAlterTable(alter, sink);
+	const pkCols = alter.primaryKeyChange.newPkColumns
+		.map(c => {
+			let s = quoteIdentifier(c.name);
+			if (c.direction === 'desc') s += ' desc';
+			return s;
+		})
+		.join(', ');
+	sink.pushText(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`, u => u.restorePrimaryKey(alter.tableName, quotedTable));
+}
+
+/** A new UNIQUE / FK may align with the new key. CHECK adds apply in place; UNIQUE / FK adds depend on module ADD CONSTRAINT support (see {@link TableAlterDiff.constraintsToAdd}). */
+function pushConstraintAdds(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const frag of alter.constraintsToAdd ?? []) {
+		sink.pushText(`ALTER TABLE ${quotedTable} ADD ${frag}`, u => u.dropAddedConstraint(quotedTable, frag));
+	}
+}
+
+function pushColumnDrops(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	for (const colName of alter.columnsToDrop) {
+		sink.pushText(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`, u => u.droppedColumn(alter.tableName, colName));
+	}
+}
+
+/** Lands on the post-structural column / constraint set: a tag set emitted alongside a RENAME COLUMN targets the post-rename name. Whole-set replacement; an empty set clears. */
+function pushTagChanges(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
+	if (alter.tableTagsChange !== undefined) {
+		// A maintained table's tag edit must use ALTER MATERIALIZED VIEW (fires
+		// materialized_view_modified so a store catalog re-persists; the ALTER
+		// TABLE handler rejects a tag action on a maintained table). See
+		// `TableAlterDiff.maintainedTags`.
+		const tagVerb = alter.maintainedTags ? 'ALTER MATERIALIZED VIEW' : 'ALTER TABLE';
+		sink.pushText(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`, u => u.restoreTableTags(alter.tableName, `${tagVerb} ${quotedTable}`));
+	}
+	for (const colAlter of alter.columnsToAlter) {
+		if (colAlter.tags === undefined) continue;
+		const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)}`;
+		sink.pushText(`${alterColumn} SET TAGS ${tagsBodyToString(colAlter.tags)}`, u => u.restoreColumnTags(alter.tableName, colAlter.columnName, alterColumn));
+	}
+	for (const ctc of alter.constraintTagsChanges ?? []) {
+		const alterConstraint = `ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)}`;
+		sink.pushText(`${alterConstraint} SET TAGS ${tagsBodyToString(ctc.tags)}`, u => u.restoreConstraintTags(alter.tableName, ctc.constraintName, alterConstraint));
+	}
 }
 
 /** The reversal half of a {@link MigrationStep}: the statements that undo it, or why none can. */

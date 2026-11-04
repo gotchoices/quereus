@@ -41,6 +41,8 @@ export interface CatalogTable {
 		notNull: boolean;
 		primaryKey: boolean;
 		defaultValue: AST.Expression | null;
+		/** A generated column's body, read by the migration planner to order `DROP COLUMN` steps across tables. */
+		generatedExpr?: AST.Expression;
 		/** Canonical collation (normalized, uppercase). Default `'BINARY'`. */
 		collation: string;
 		tags?: Readonly<Record<string, SqlValue>>;
@@ -331,6 +333,7 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,
 		defaultValue: col.defaultValue ?? null,
+		generatedExpr: col.generatedExpr,
 		collation: col.collation || 'BINARY',
 		tags: col.tags,
 	}));

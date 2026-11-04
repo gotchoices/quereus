@@ -421,3 +421,145 @@ drop assertion a;
 drop table temp.zz;
 drop table t;
 pragma schema_path = 'main';
+
+-- ===================================
+-- 10. Tables altered together: the order they are written in does not decide the outcome
+-- ===================================
+
+-- u is written first and its foreign key names a column t gains, so the plan runs t's ADD COLUMN
+-- ahead of u's ADD constraint. Then ub fails over the duplicate b, and both are taken back.
+create table t (id integer primary key, b integer null);
+create table u (id integer primary key, y integer null);
+insert into t values (1, 1), (2, 1);
+
+declare schema main {
+	table u {
+		id integer primary key,
+		y integer null,
+		constraint fu foreign key (y) references t(d)
+	}
+	table t {
+		id integer primary key,
+		b integer null,
+		d integer null unique,
+		constraint ub unique (b)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t ADD COLUMN d integer null unique"}, {"ddl": "ALTER TABLE u ADD constraint fu foreign key (y) references t(d)"}, {"ddl": "ALTER TABLE t ADD constraint ub unique (b)"}]
+
+apply schema main;
+-- error: ub
+
+select * from t order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+select * from u;
+→ []
+
+-- Once the duplicate is gone the same declaration applies, and the foreign key is enforced.
+update t set b = 2 where id = 2;
+apply schema main;
+update t set d = 30 where id = 1;
+insert into u values (1, 30);
+
+-- run
+
+diff schema main;
+→ []
+
+insert into u values (2, 99);
+-- error: fu
+
+-- The reverse: t is written first and gives up the column u's foreign key names. u's DROP CONSTRAINT
+-- runs ahead of t's DROP COLUMN.
+delete from u;
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		constraint ub unique (b)
+	}
+	table u {
+		id integer primary key,
+		y integer null
+	}
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table u;
+drop table t;
+
+-- A DEFAULT has no constraint to drop first, so u's column goes before the t column it reads.
+create table t (id integer primary key, d integer null);
+create table u (id integer primary key, z integer null default ((select max(d) from t)));
+
+declare schema main {
+	table t {
+		id integer primary key
+	}
+	table u {
+		id integer primary key
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE u DROP COLUMN z"}, {"ddl": "ALTER TABLE t DROP COLUMN d"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table u;
+drop table t;
+
+-- c's inline foreign key names p's implicit key, so c's column has to arrive after p's key change.
+-- Over a row with z = 50, it is validated against the new key.
+create table p (a integer, b integer, d integer, primary key (a, b));
+create table c (id integer primary key);
+insert into p values (1, 1, 50);
+insert into c values (1);
+
+declare schema main {
+	table p {
+		a integer,
+		b integer,
+		d integer primary key
+	}
+	table c {
+		id integer primary key,
+		z integer null default 50 references p
+	}
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+select z from c;
+→ [{"z": 50}]
+
+drop table c;
+drop table p;
