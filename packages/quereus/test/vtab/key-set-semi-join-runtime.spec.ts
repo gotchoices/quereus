@@ -266,6 +266,15 @@ describe('KeySetSemiJoin runtime', () => {
 				expect(result.scanned, 'a seek would read 1000').to.equal(2);
 			});
 
+			it('counts the OFFSET in the bound: 1000 keys, limit 1 offset 998', async () => {
+				await db.exec('delete from small');
+				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				const result = await runCounted(
+					'select id from big b where b.id in (select bid from small) order by b.v limit 1 offset 998');
+				expect(result.rows).to.deep.equal([{ id: 3 }]);
+				expect(result.scanned, 'a walk would read most of the table').to.equal(1000);
+			});
+
 			it('reaches through the is-not-null Filter of min over a nullable column', async () => {
 				// ids 1 to 3 hold NULL, so the walk reads those three, then n = 4 (not a key) and
 				// n = 5, where it stops. A seek would read all 1000 keys. Analyzed because a

@@ -577,7 +577,8 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// dropped Sort) may depend on that order. The replacement must be able
 		// to claim the same order — KeySetSemiJoinNode does so exactly when
 		// this predicate holds. (The hash arm needs no such gate: BloomJoinNode
-		// propagates no ordering, so nothing above it can have depended on one.)
+		// claims no ordering, so the only order above it is an already dropped
+		// Sort's, which `seekRestoresTargetOrder` puts back.)
 		if (!seekPreservesTargetOrder(leaf, pushdown)) {
 			log('decline: merge join propagates the probe order and the seek cannot reproduce it');
 			return null;

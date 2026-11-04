@@ -163,15 +163,6 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 	});
 	const keySourceInstruction = emitPlanNode(plan.keySource, ctx);
 
-	async function* probeTarget(targetRows: AsyncIterable<Row>, probe: ReadonlySet<string>): AsyncIterable<Row> {
-		for await (const targetRow of targetRows) {
-			const key = extractKey(targetRow, targetIndices);
-			if (key !== null && probe.has(key)) {
-				yield targetRow;
-			}
-		}
-	}
-
 	async function* run(
 		rctx: RuntimeContext,
 		targetRows: AsyncIterable<Row>,
@@ -213,14 +204,15 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 
 		stateByCtx.set(rctx, { probe, seekKeys });
 		try {
-			const matching = probeTarget(targetRows, probe);
-			if (seekKeys && compareRestoredOrder) {
-				const buffered: Row[] = [];
-				for await (const row of matching) buffered.push(row);
-				yield* buffered.sort(compareRestoredOrder);
-			} else {
-				yield* matching;
+			const restoreOrder = seekKeys ? compareRestoredOrder : null;
+			const buffered: Row[] = [];
+			for await (const targetRow of targetRows) {
+				const key = extractKey(targetRow, targetIndices);
+				if (key === null || !probe.has(key)) continue;
+				if (restoreOrder) buffered.push(targetRow);
+				else yield targetRow;
 			}
+			if (restoreOrder) yield* buffered.sort(restoreOrder);
 		} finally {
 			stateByCtx.delete(rctx);
 		}
