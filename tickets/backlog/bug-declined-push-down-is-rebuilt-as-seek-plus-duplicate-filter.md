@@ -113,3 +113,4 @@ it and no seek. Not both.
 - The cost comparison itself was corrected in `seek-vs-scan-baseline-quoted-by-the-module`,
   which made both sides of it come from the same backend. That fix is what makes the
   decline branch rare rather than routine; it does not make it correct.
+- `bug-claimed-null-test-lost-under-isolation-overlay` adds another instance: once every claimed filter is reattached, a claimed non-seek filter (`is null`, `is not null`, `like`) on this no-context path gets two identical `Filter` nodes, the kept one and the reattached one. The fix here should cover those as well as the seek-family case.
