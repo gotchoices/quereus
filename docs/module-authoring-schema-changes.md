@@ -2,7 +2,7 @@
 
 > **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
 
-The `alterTable` contract: every arm of the `SchemaChangeInfo` union, what the engine guarantees before it calls, what a module owes each arm, the `ddl` emit-iff-set rule, and the engine-side rebuild fallback when a module raises `UNSUPPORTED`. A satellite of [Virtual Table Module Authoring Guide](module-authoring.md).
+The `alterTable` contract: every arm of the `SchemaChangeInfo` union, what the engine guarantees before it calls, what a module owes each arm, the `ddl` emit-iff-set rule, and the engine-side rebuild fallback when a module raises `UNSUPPORTED`. Also the separate optional [`alterTags`](#altertags-metadata-tag-edits) hook for metadata-tag edits. A satellite of [Virtual Table Module Authoring Guide](module-authoring.md).
 
 When `ALTER TABLE` performs a data-affecting change, the engine calls
 
@@ -101,3 +101,48 @@ The engine will also decline to run the fallback at all in four cases, raising a
 None of these checks run before your `alterTable` — all sit between it and the rebuild, so a module raising `UNSUPPORTED` (which by contract has mutated nothing) still sees the catalog, the table and the transaction left untouched by the refusal.
 
 Two commits reach your connections during a rebuild: one carrying the copied rows, before the `DROP`, and one at the statement's end with nothing staged. Do not fail a commit that has no work in it: the statement would report an error after the key changed, and no `alter` event would be delivered. If `renameTable` throws, the original table is already gone, so the rows stay in the shadow table, which the error names along with the statement that restores it ([SQL § ALTER PRIMARY KEY](sql-alter.md)).
+
+## `alterTags`: metadata-tag edits
+
+`alter table … set / add / drop tags`, on the table, a column or a named constraint, is not an `alterTable` arm. It reaches a module through a separate optional hook, and presence is the opt-in:
+
+```typescript
+export type TagChangeTarget =
+	| { kind: 'table' }
+	| { kind: 'column'; columnName: string }
+	| { kind: 'constraint'; constraintName: string };
+
+export type TagEdit =
+	| { readonly mode: 'replace' | 'merge'; readonly tags: Readonly<Record<string, SqlValue>> }
+	| { readonly mode: 'drop'; readonly keys: readonly string[] };
+
+export type TagChangeInfo = { readonly target: TagChangeTarget; readonly ddl?: string } & TagEdit;
+
+VirtualTableModule.alterTags?(db, schemaName, tableName, change: TagChangeInfo): Promise<TableSchema>
+```
+
+A module without the hook owes nothing: the statement edits the engine's catalog and fires `table_modified`. Implement the hook if the module keeps its own durable copy of the table definition, or gives some tag keys a storage meaning and so has to refuse some edits. A `table_modified` listener can do neither: the notifier catches and logs a listener's throw, listeners are synchronous while a durable write is async, and a listener cannot tell a user's tag edit from the module's own schema re-publish. The generic store stays on its listener, because it has no key it must refuse.
+
+`mode` is `replace` for SET, `merge` for ADD and `drop` for DROP. `change` carries what the user wrote, not the resulting set, so compute the result against your own stored view, which may hold keys the engine's view does not. `target` names the column or constraint in its stored spelling, so `alter column V …` on column `v` arrives as `v`. Tag keys are verbatim, because they are case-sensitive. A `null` value in `tags` is a stored value, distinct from a drop.
+
+**When the engine calls.** First it runs every check the catalog-only path runs, against the live table, so an unknown column or constraint, an ambiguous constraint name and a DROP of an absent key all fail with no call to you. Then it awaits the hook. Then it registers your answer, fires `table_modified` and announces the statement. These never reach the hook:
+
+- an empty `add tags ()` or `drop tags ()`, which changes nothing (`set tags ()` is a real clear, and does call);
+- a reserved `quereus.*` key on SET or ADD that fails validation at plan-build (a DROP of a reserved key is legal, and does call);
+- a materialized view, which `ALTER TABLE` refuses before dispatch;
+- `alter index`, `alter view` and `alter materialized view … set tags`, which stay catalog-only.
+
+**What the hook owes.**
+
+- **Apply or throw.** Never accept the call and leave the edit unapplied ([SCH-004](invariants.md#sch-004--a-module-never-silently-no-ops-an-altertable-arm)). The engine cannot detect this, because your result may legitimately differ from what it would compute.
+- **Be atomic.** A throw reaches the user unchanged, with the catalog untouched and no `table_modified` and no event. Undoing anything you wrote before throwing is your duty.
+- **Change only tags.** The engine registers the returned schema verbatim and does not check it. On the `apply schema` path the restore check is the backstop.
+- **Accept a restoring edit you accepted before.** `apply schema` runs the differ's tag drift as ordinary `SET TAGS`, so the hook is called in `replace` mode inside your schema batch, and an unwind's restoring `SET TAGS` calls it too. See [Restoring a failed apply](schema-undo-plan.md#restoring-a-failed-apply).
+
+You need not carry `ANALYZE` statistics or the generated-column graph in your answer. The engine keeps the live statistics when the return omits them, since a tag edit moves no value, and re-derives the graph as it does for ADD COLUMN.
+
+The hook falls under your `ddlTransactionality` declaration: on a non-transactional module a tag edit escapes `rollback`, like every other ALTER arm, and `ddl_transaction_policy = strict` refuses it inside an explicit transaction before dispatch.
+
+**Announcing.** Tag statements on a module without the hook report nothing, but a call to the hook announces, because tags a module opted into may change storage behavior that a replicating peer must replay. A module with its own emitter emits iff `change.ddl` is set, using the exported `tagChangeEventShape(change)`: `alter`/`column` with `columnName` for a column target, `alter`/`table` otherwise. The engine announces the same shape for a module with no emitter.
+
+`IsolationModule` assigns `alterTags` only when its underlying has it. The forward touches no overlay, since a tag edit moves no row. The programmatic `SchemaManager.set*Tags` / `merge*Tags` / `drop*Tags` are synchronous and bypass the hook.

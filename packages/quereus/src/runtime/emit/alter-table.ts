@@ -8,7 +8,8 @@ import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
-import type { AnyVirtualTableModule } from '../../vtab/module.js';
+import type { AnyVirtualTableModule, TagChangeInfo, TagChangeTarget, TagEdit } from '../../vtab/module.js';
+import { tagChangeEventShape } from '../../vtab/alter-event-shape.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, columnSchemaToColumnDef, collectTableConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
@@ -82,7 +83,7 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 	async function run(rctx: RuntimeContext, ...args: unknown[]): Promise<SqlValue> {
 		// Strict-policy gate (see ddl-transaction-policy.ts). Every ALTER arm changes a
 		// module table's schema in a way that escapes rollback on a non-transactional
-		// module — including the catalog-only tag/rename arms and the engine-side
+		// module — including the tag and rename arms, catalog-only or not, and the engine-side
 		// schema-only renameColumn fallback — so gate uniformly here, before any
 		// dispatch or catalog mutation.
 		assertDdlTransactionPolicy(
@@ -143,26 +144,10 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 					return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns, plan.sql);
 				case 'alterColumn':
 					return runAlterColumn(rctx, tableSchema, schema, action, plan.sql);
-				case 'setTags': {
-					const target = action.target;
-					if (action.mode === 'merge') {
-						// ADD TAGS — per-key merge onto the live tag set.
-						if (target.kind === 'column') return runMergeColumnTags(rctx, tableSchema, target.columnName, action.tags);
-						if (target.kind === 'constraint') return runMergeConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
-						return runMergeTableTags(rctx, tableSchema, action.tags);
-					}
-					// SET TAGS — whole-set replace.
-					if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, action.tags);
-					if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
-					return runSetTableTags(rctx, tableSchema, action.tags);
-				}
-				case 'dropTags': {
-					// DROP TAGS — per-key delete (atomic NOTFOUND if any key absent).
-					const target = action.target;
-					if (target.kind === 'column') return runDropColumnTags(rctx, tableSchema, target.columnName, action.keys);
-					if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, action.keys);
-					return runDropTableTags(rctx, tableSchema, action.keys);
-				}
+				case 'setTags':
+					return runTagEdit(rctx, tableSchema, schema, action.target, { mode: action.mode, tags: action.tags }, plan.sql);
+				case 'dropTags':
+					return runTagEdit(rctx, tableSchema, schema, action.target, { mode: 'drop', keys: action.keys }, plan.sql);
 				case 'setMaintained':
 					return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select);
 				case 'dropMaintained':
@@ -1686,11 +1671,90 @@ function alterColumnEventValueRemap(
 }
 
 /**
- * Catalog-only metadata-tag mutations. Tags touch no stored row and no physical
- * layout, so these never call `module.alterTable` — they delegate to the
- * SchemaManager setters, which swap the in-memory schema and fire `table_modified`
- * (so optimizer caches invalidate). This makes SET TAGS succeed even on modules
- * without an `alterTable` hook.
+ * SET / ADD / DROP TAGS on the table, a column or a named constraint. A module that
+ * implements `alterTags` owns the edit: it is asked first, and its answer is what the catalog
+ * registers. Every other module, and an empty ADD or DROP (which has nothing to persist or
+ * refuse), takes the catalog-only path.
+ */
+async function runTagEdit(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: Schema,
+	target: TagChangeTarget,
+	edit: TagEdit,
+	sql: string,
+): Promise<SqlValue> {
+	const module = requireVtabModule(tableSchema);
+	if (!module.alterTags || isEmptyPerKeyTagEdit(edit)) {
+		return runCatalogOnlyTagEdit(rctx, tableSchema, target, edit);
+	}
+
+	const { live, target: storedTarget } = rctx.db.schemaManager.previewTagEdit(tableSchema.name, target, edit, tableSchema.schemaName);
+	const change: TagChangeInfo = { target: storedTarget, ...edit, ddl: sql };
+	const returned = await module.alterTags(rctx.db, live.schemaName, live.name, change);
+
+	// A module's answer carries no generated-column bookkeeping (same as the ADD COLUMN arm).
+	// A tag edit moves no value, so `ANALYZE`'s numbers stay correct, and a module that builds
+	// its return from its own stored view must not discard them and change query plans.
+	const registered = schema.addTable({
+		...withGeneratedColumnGraph(returned, buildColumnSourceResolver(rctx.db)),
+		statistics: returned.statistics ?? live.statistics,
+	});
+
+	rctx.db.schemaManager.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: live.schemaName,
+		objectName: live.name,
+		oldObject: live,
+		newObject: registered,
+	});
+
+	// Unlike the catalog-only path, this announces: the reason that path stays silent (the
+	// engine derives no behavior from tags) does not hold for a module that opted in, whose
+	// tags may change storage behavior a replicating peer has to replay.
+	emitAlterSchemaEvent(rctx, live, { ...tagChangeEventShape(change), objectName: live.name, ddl: sql });
+
+	log('Applied tag edit (%s) through module on %s.%s', edit.mode, live.schemaName, live.name);
+	return null;
+}
+
+/** `add tags ()` or `drop tags ()`. `set tags ()` is not one: it clears the set. */
+function isEmptyPerKeyTagEdit(edit: TagEdit): boolean {
+	switch (edit.mode) {
+		case 'replace': return false;
+		case 'merge': return Object.keys(edit.tags).length === 0;
+		case 'drop': return edit.keys.length === 0;
+	}
+}
+
+function runCatalogOnlyTagEdit(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	target: TagChangeTarget,
+	edit: TagEdit,
+): SqlValue {
+	switch (edit.mode) {
+		case 'replace':
+			if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, edit.tags);
+			if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, edit.tags);
+			return runSetTableTags(rctx, tableSchema, edit.tags);
+		case 'merge':
+			if (target.kind === 'column') return runMergeColumnTags(rctx, tableSchema, target.columnName, edit.tags);
+			if (target.kind === 'constraint') return runMergeConstraintTags(rctx, tableSchema, target.constraintName, edit.tags);
+			return runMergeTableTags(rctx, tableSchema, edit.tags);
+		case 'drop':
+			if (target.kind === 'column') return runDropColumnTags(rctx, tableSchema, target.columnName, edit.keys);
+			if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, edit.keys);
+			return runDropTableTags(rctx, tableSchema, edit.keys);
+	}
+}
+
+/**
+ * Catalog-only metadata-tag mutations, for a module without `alterTags`. Tags touch no
+ * stored row and no physical layout, so these never call `module.alterTable` — they
+ * delegate to the SchemaManager setters, which swap the in-memory schema and fire
+ * `table_modified` (so optimizer caches invalidate). This makes SET TAGS succeed even on
+ * modules without an `alterTable` hook.
  *
  * NOTE: store-backed modules persist DDL from their own `alterTable`, which this
  * path deliberately bypasses. The generic store module recovers the tag change by

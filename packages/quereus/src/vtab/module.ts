@@ -583,6 +583,30 @@ export interface VirtualTableModule<
 	): Promise<TableSchema>;
 
 	/**
+	 * Apply a metadata-tag edit: `alter table … set / add / drop tags` on the table, a
+	 * column, or a named constraint. Presence is the opt-in. Without this hook those
+	 * statements stay catalog-only, so a module that keeps its own durable table definition
+	 * implements it to save the edit and to refuse one it cannot accept.
+	 *
+	 * The engine has already validated the statement and calls this before it touches the
+	 * catalog, so a throw fails the statement with the error unchanged and the catalog
+	 * as it was. Undoing anything the module wrote before throwing is the module's duty.
+	 * The returned schema differs from the module's stored one in tags only, and the engine
+	 * registers it. `ANALYZE` statistics are kept if the return omits them, and the
+	 * generated-column graph is re-derived.
+	 *
+	 * Applies the edit or throws; it never accepts the call and leaves the edit unapplied.
+	 * Not called for an empty `add tags ()` or `drop tags ()`, which change nothing.
+	 * See docs/module-authoring-schema-changes.md § "`alterTags`: metadata-tag edits".
+	 */
+	alterTags?(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		change: TagChangeInfo,
+	): Promise<TableSchema>;
+
+	/**
 	 * Rename a table. Called by ALTER TABLE ... RENAME TO before the engine
 	 * updates the in-memory schema catalog.
 	 *
@@ -826,6 +850,31 @@ export interface VirtualTableModule<
  * view persists an ordinary table bundle alongside its MV entry.
  */
 export type CatalogObjectKind = 'view' | 'materializedView' | 'table';
+
+/** What a tag statement addresses. Column and constraint names are in their stored spelling. */
+export type TagChangeTarget =
+	| { kind: 'table' }
+	| { kind: 'column'; columnName: string }
+	| { kind: 'constraint'; constraintName: string };
+
+/**
+ * A tag statement as the user wrote it. `replace` is SET TAGS, `merge` is ADD TAGS and
+ * `drop` is DROP TAGS. Tag keys are verbatim (they are case-sensitive), and a `null` value
+ * in `tags` is a stored value, not a delete.
+ */
+export type TagEdit =
+	| { readonly mode: 'replace' | 'merge'; readonly tags: Readonly<Record<string, SqlValue>> }
+	| { readonly mode: 'drop'; readonly keys: readonly string[] };
+
+/**
+ * The tag edit passed to {@link VirtualTableModule.alterTags}. It carries the edit rather
+ * than the resulting set because the module computes the result against its own stored
+ * view, which may hold keys the engine's live view does not, and the reverse.
+ *
+ * `ddl` follows the rule of {@link SchemaChangeInfo}'s `ddl`: an emitter-backed module emits
+ * a schema-change event iff it is set, shaped by `tagChangeEventShape`.
+ */
+export type TagChangeInfo = { readonly target: TagChangeTarget; readonly ddl?: string } & TagEdit;
 
 /**
  * Defines the structure for schema change information passed to xAlterSchema

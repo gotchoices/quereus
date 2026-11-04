@@ -1189,6 +1189,7 @@ for why the fast path safely skips this check.
 
 - code: `packages/quereus/src/runtime/emit/alter-table.ts` — `runAlterColumn`
 - code: `packages/quereus/src/vtab/module.ts` — `alterTable`
+- code: `packages/quereus/src/vtab/module.ts` — `alterTags`
 - guard: `packages/quereus/test/alter-table-conformance.spec.ts` — `ALTER conformance matrix — module without alterTable (sited UNSUPPORTED)`
 - doc: [Module Capability Negotiation § `alterTable` sub-arms](module-capabilities.md#altertable-sub-arms--the-fine-grained-mandate-layer)
 
@@ -1198,7 +1199,8 @@ negotiated behaviorally. A module handed an arm it cannot honor MUST throw
 leave the physical state unchanged. The engine relies on that throw to substitute a defined
 fallback — generic rebuild, schema-only rename, engine-side logical enforcement — or to surface
 a clean user error. A silent no-op leaves the catalog and the physical state diverged with the
-engine none the wiser, and stays invisible until a later read returns wrong rows.
+engine none the wiser, and stays invisible until a later read returns wrong rows. The same holds
+for the separate `alterTags` hook: it applies the tag edit or throws, and never silently no-ops.
 
 ### SCH-005 — One table, one backing structure name
 

@@ -99,11 +99,11 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * SET TAGS / ADD TAGS — catalog-only metadata-tag mutation on the table, a
-		 * column, or a named table-level constraint. `mode` selects the semantics:
-		 * `'replace'` (SET TAGS) swaps the whole set (`tags` empty = clear);
-		 * `'merge'` (ADD TAGS) overlays the listed keys onto the current set
-		 * (`tags` empty = no-op). No module round-trip (see runtime emitter).
+		 * SET TAGS / ADD TAGS — metadata-tag mutation on the table, a column, or a
+		 * named table-level constraint. `mode` selects the semantics: `'replace'`
+		 * (SET TAGS) swaps the whole set (`tags` empty = clear); `'merge'` (ADD TAGS)
+		 * overlays the listed keys onto the current set (`tags` empty = no-op).
+		 * Catalog-only unless the module implements `alterTags` (see runtime emitter).
 		 */
 		type: 'setTags';
 		target:
@@ -115,12 +115,12 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * DROP TAGS — catalog-only per-key deletion of metadata tags on the table, a
-		 * column, or a named table-level constraint. `keys` is the bare list of keys
-		 * to remove. Atomic: every listed key must be present, else NOTFOUND names the
-		 * missing key(s) and nothing is dropped. Dropping the last key(s) leaves
-		 * `tags IS NULL`; an empty list is a no-op. No value validation (a reserved
-		 * key may be dropped). No module round-trip (see runtime emitter).
+		 * DROP TAGS — per-key deletion of metadata tags on the table, a column, or a
+		 * named table-level constraint. `keys` is the bare list of keys to remove.
+		 * Atomic: every listed key must be present, else NOTFOUND names the missing
+		 * key(s) and nothing is dropped. Dropping the last key(s) leaves `tags IS NULL`;
+		 * an empty list is a no-op. No value validation (a reserved key may be dropped).
+		 * Catalog-only unless the module implements `alterTags` (see runtime emitter).
 		 */
 		type: 'dropTags';
 		target:

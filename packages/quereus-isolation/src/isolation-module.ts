@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, TagChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
 import { describeAlterColumn, rolledBackRowsWouldViolate, MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -213,6 +213,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	getRowCount?: (db: Database, table: TableSchema) => ModuleRowCount | undefined;
 
+	/**
+	 * Tag-edit forward (see {@link VirtualTableModule.alterTags}) — assigned only when the
+	 * underlying implements it, so a wrapped store or memory underlying keeps the engine's
+	 * catalog-only path. A tag edit moves no row and changes no layout, so no overlay is
+	 * touched, migrated or poisoned; only the cached underlying instance's schema snapshot
+	 * is refreshed, as {@link alterTable} does.
+	 */
+	alterTags?: (db: Database, schemaName: string, tableName: string, change: TagChangeInfo) => Promise<TableSchema>;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -232,6 +241,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const underlyingGetRowCount = this.underlying.getRowCount;
 		if (underlyingGetRowCount) {
 			this.getRowCount = (db, table) => underlyingGetRowCount.call(this.underlying, db, table);
+		}
+
+		const underlyingAlterTags = this.underlying.alterTags;
+		if (underlyingAlterTags) {
+			this.alterTags = async (db, schemaName, tableName, change) => {
+				const updated = await underlyingAlterTags.call(this.underlying, db, schemaName, tableName, change);
+				const underlyingState = this.getUnderlyingState(schemaName, tableName);
+				if (underlyingState) underlyingState.underlyingTable.tableSchema = updated;
+				return updated;
+			};
 		}
 
 		const underlyingCreateBacking = this.underlying.createBacking;

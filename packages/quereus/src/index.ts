@@ -59,7 +59,7 @@ export {
 	planKindFromCode,
 	planCodeFromKind,
 } from './vtab/idx-str.js';
-export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, IssuerRowSources, ModuleRowCount, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
+export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, IssuerRowSources, ModuleRowCount, SchemaChangeInfo, TagChangeInfo, TagChangeTarget, TagEdit, VtabConcurrencyMode } from './vtab/module.js';
 export { describeAlterColumn, judgeRestorableStates, rolledBackRowsWouldViolate, type AlterColumnAttributes, type RestorableRows } from './vtab/rollback-states.js';
 export { COST_PRESETS, resolveModuleCostProfile } from './vtab/cost-profile.js';
 export type { ModuleCostProfile, ResolvedModuleCostProfile } from './vtab/cost-profile.js';
@@ -85,7 +85,7 @@ export type {
 } from './vtab/events.js';
 export { DefaultVTableEventEmitter } from './vtab/events.js';
 export type { AlterEventShape } from './vtab/alter-event-shape.js';
-export { alterEventShape } from './vtab/alter-event-shape.js';
+export { alterEventShape, tagChangeEventShape } from './vtab/alter-event-shape.js';
 
 // Database-Level Event System (unified reactivity)
 export type {

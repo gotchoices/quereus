@@ -15,7 +15,7 @@ The contract signals capability three different ways, and the behavior when a mo
 
 | Signaling | Members | Engine consults it? |
 | --- | --- | --- |
-| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `normalizeCreateSchema`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `finalizeRename`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `onRegister`, `assertCatalogObjectPersistable` | yes, per call site (varies) |
+| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `normalizeCreateSchema`, `createIndex` / `dropIndex`, `alterTable`, `alterTags`, `renameTable`, `finalizeRename`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `onRegister`, `assertCatalogObjectPersistable` | yes, per call site (varies) |
 | **Static field** | `concurrencyMode`, `costProfile` | yes, before dispatch (the clean model) |
 | **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`, `permitsGrandfatheredNotNullViolators`, `ddlTransactionality` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first five |
 
@@ -43,6 +43,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `normalizeCreateSchema` | presence | engine-side fallback (identity — the module is taken to create schemas verbatim) | n/a | ✓ supplies the table-level key collation `K` to an implicit-collation text primary-key column (`reconcilePkCollations`; `create` routes through the hook so the rewrite has one owner) | conditional forward (constructor-assigned **only when the underlying implements it** — a wrapper that delegates `create` but hides the hook makes the engine's probe disagree with the actual create) | via store |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |
+| `alterTags` | presence | engine-side fallback (`alter table … set / add / drop tags` stays catalog-only and silent; see [`alterTags`](module-authoring-schema-changes.md#altertags-metadata-tag-edits)) | n/a | n/a — keeps its `table_modified` listener | conditional forward (constructor-assigned **only when the underlying implements it**; touches no overlay) | via store |
 | `renameTable` | presence | engine-side fallback (schema-only rename) | ✓ | ✓ physical move | forwards + rekeys maps | via store |
 | `finalizeRename` | presence | engine-side fallback (no-op — `renameTable` did all the work) | n/a | ✓ deletes old catalog entry after dependents persist (two-phase, see [schema.md](schema.md)) | forwards | via store |
 | `beginSchemaBatch` / `endSchemaBatch` | presence | engine-side fallback (per-DDL commits) | n/a | ✓ | forwards | via store |
@@ -59,7 +60,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getCapabilities().ddlTransactionality` | flag (live) | engine-side gate (`ddl_transaction_policy = strict` refuses module-dispatching DDL inside an explicit transaction unless the tier is `transactional`; default `permissive` never consults it — see [DDL transactionality tiers](#ddl-transactionality-tiers)) | `non-transactional` | `auto-commit` | **forwards underlying verbatim, never upgrades** | via store |
 | `getCapabilities().{isolation,savepoints,persistent,secondaryIndexes,rangeScans}` | flag (informational) | **never consulted by engine** — asserted only in tests; isolation augments `isolation` / `savepoints` but nothing reads them | varies | varies | augments | varies |
 
-> **Isolation wrapper asymmetry is intentional.** `IsolationModule` forwards the isolation-transparent hooks (`getBestAccessPlan`, `getRowCount`, `getMappingAdvertisements`, the batch + lens lifecycle hooks, `onRegister`, `assertCatalogObjectPersistable`, `renameTable`, `finalizeRename`, `alterTable`) but **suppresses** `supports` (so the overlay always sees every row to merge), computes a conservative `concurrencyMode` (the weaker of the underlying and overlay modes, capped at `reentrant-reads` because its own write path is never fully-reentrant), and forwards the underlying's `costProfile`. See the **Transparent hook forwarding** paragraph in [`packages/quereus-isolation/README.md`](../packages/quereus-isolation/README.md) for the full rationale — do not restate it divergently here.
+> **Isolation wrapper asymmetry is intentional.** `IsolationModule` forwards the isolation-transparent hooks (`getBestAccessPlan`, `getRowCount`, `getMappingAdvertisements`, the batch + lens lifecycle hooks, `onRegister`, `assertCatalogObjectPersistable`, `renameTable`, `finalizeRename`, `alterTable`, `alterTags`) but **suppresses** `supports` (so the overlay always sees every row to merge), computes a conservative `concurrencyMode` (the weaker of the underlying and overlay modes, capped at `reentrant-reads` because its own write path is never fully-reentrant), and forwards the underlying's `costProfile`. See the **Transparent hook forwarding** paragraph in [`packages/quereus-isolation/README.md`](../packages/quereus-isolation/README.md) for the full rationale — do not restate it divergently here.
 
 ## DDL transactionality tiers
 
@@ -113,8 +114,9 @@ Engine-only schema objects (`create view`, `create assertion`, `declare schema`)
 of the gate's scope: they touch no module, and the engine's own schema is transient by
 design (see [architecture.md § Transient Schema](architecture.md)). Tag-only edits
 (`alter view/index/materialized view … set tags`) are likewise ungated — they dispatch to
-no module either. The one inconsistency: `alter table … set tags` *is* refused, because
-the `ALTER TABLE` emitter gates all of its arms uniformly rather than per-arm.
+no module either. `alter table … set tags` *is* refused, because the `ALTER TABLE` emitter
+gates all of its arms uniformly rather than per-arm, and it can reach a module's
+`alterTags`.
 
 `apply schema` runs its generated migration DDL through the engine's *implicit*
 transaction, so the gate does not fire statement-by-statement inside a migration. It does

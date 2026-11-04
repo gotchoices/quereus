@@ -44,6 +44,8 @@ Exactly three steps are irreversible, and they are the data-destroying ones: no 
 
 An undo statement that throws stops the unwind where it is: the schema is then in a state neither the user nor the plan asked for, and continuing past a failed undo would only compound it. A failure on the first step has an empty journal and passes its error through untouched. If `beginSchemaBatch` itself throws, no step ran and nothing is unwound. Seeding runs after the loop and is outside the guarantee.
 
+A restoring `SET TAGS` on a table whose module implements [`alterTags`](module-authoring-schema-changes.md#altertags-metadata-tag-edits) calls that hook like any other tag statement, so a hook that refuses during an unwind is reported as *undo statement `Y` failed*. A module must therefore accept a restoring edit it accepted before.
+
 ### Guards during an unwind
 
 `CREATE TABLE` does not check what its foreign keys and CHECK / DEFAULT subqueries refer to, so a table the plan creates may refer to a column, table or view a later step adds. The unwind runs in exact reverse, so it removes that target while the referring table still exists. An existing assertion can also come to name what the plan added without being edited: a new column can capture a bare name in its body, or widen a `*` under a view it reads, and a new table can capture a name that used to resolve further down the schema path. The guards on `DROP COLUMN`, `DROP TABLE` and `DROP VIEW` exist to stop a user's drop from breaking a working reference, and that reason does not apply here: the target state is the pre-apply catalog, so a reference the unwind breaks belongs to an object a later undo removes, was already dangling before the apply, or goes back to what it named before the apply.

@@ -42,11 +42,12 @@ export function buildAlterTableStmt(
   // module (`SchemaChangeInfo.ddl` / `renameTable`'s `ddl`) and onto the public
   // schema-change event.
   //
-  // NOTE: rendered for EVERY arm, including the four that never announce anything (the tag
-  // arms, `set`/`drop maintained`) — `set maintained as <select>` therefore stringifies its
-  // whole SELECT body for a string nobody reads. Free today: ALTER is not a hot path and
-  // each statement builds once. If those arms ever start carrying a rendering cost that
-  // matters, render lazily and hand the arms a thunk instead of a string.
+  // NOTE: rendered for EVERY arm, including those that announce nothing (`set`/`drop
+  // maintained`, and the tag arms on a module without `alterTags`) — `set maintained as
+  // <select>` therefore stringifies its whole SELECT body for a string nobody reads. Free
+  // today: ALTER is not a hot path and each statement builds once. If those arms ever start
+  // carrying a rendering cost that matters, render lazily and hand the arms a thunk instead
+  // of a string.
   const { schemaName, name: tableName } = tableReference.tableSchema;
   const canonicalStmt: AST.AlterTableStmt = {
     type: 'alterTable',
@@ -199,8 +200,9 @@ export function buildAlterTableStmt(
     case 'dropTags': {
       // DROP TAGS removes tags by key, so there is NO reserved-tag value
       // validation here (dropping a reserved key is legitimate — it removes an
-      // override). Resolve the same target plumbing as setTags and let the
-      // SchemaManager raise NOTFOUND atomically when a listed key is absent.
+      // override — and a module's `alterTags` sees that drop too). Resolve the same
+      // target plumbing as setTags and let the SchemaManager raise NOTFOUND atomically
+      // when a listed key is absent.
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'dropTags',
         target: stmt.action.target,

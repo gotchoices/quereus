@@ -585,7 +585,11 @@ path only](#every-ddl-statement-announces-on-its-success-path-only)), not an ALT
 
 Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
 `drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).
-Both are catalog-only and no backend announces them.
+Both are catalog-only and no built-in backend announces them. The exception is a tag statement
+on a table whose module implements the optional `alterTags` hook: such a module may give tags a
+storage meaning that a replicating peer must replay, so the statement reports one event on
+either path, `alter`/`column` with `columnName` for a column target and `alter`/`table`
+otherwise.
 
 A declarative `apply schema` runs its generated migration DDL through the ordinary statement
 path, so each `alter table` the differ generates reports exactly as if you had typed it —
