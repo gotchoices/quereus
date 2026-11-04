@@ -33,6 +33,9 @@ export interface ColumnMeta {
 /**
  * A single range specification within an OR_RANGE constraint.
  * Each range has optional lower and upper bounds.
+ *
+ * A non-literal bound arrives with `value: undefined` plus planner-side fields this type
+ * does not declare. See `docs/module-authoring.md` § "Binding Capture".
  */
 export interface RangeSpec {
 	lower?: { op: '>=' | '>'; value: SqlValue };

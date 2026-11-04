@@ -721,7 +721,7 @@ select * from users where id = ?;
 
 This enables efficient parameterized queries and correlated subqueries.
 
-An `OR_RANGE` constraint can carry non-literal bounds. Such a bound in `ranges[i].lower` or `ranges[i].upper` has `value: undefined`, plus a `valueExpr` and a per-bound `bindingKind`. The constraint's own `bindingKind` summarizes its bounds, and is `'mixed'` when they differ. Only a `'parameter'` bound is fixed for the prepared statement's life.
+An `OR_RANGE` constraint can carry non-literal bounds. Such a bound in `ranges[i].lower` or `ranges[i].upper` has `value: undefined`, plus a `valueExpr` and a per-bound `bindingKind`. The constraint's own `bindingKind` summarizes its bounds, and is `'mixed'` when they differ. A `'parameter'` bound keeps one value for a whole execution of the statement, but can change when the prepared statement is rebound and run again, so don't carry its value across `query()` calls. A `'correlated'` bound can change per outer row, and its `correlated` flag is `true`.
 
 ## Transaction Support
 
