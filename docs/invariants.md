@@ -252,7 +252,7 @@ OPT-026 for the same seam in the opposite direction — replacing the context it
 ### OPT-024 — An unconsumed claimed filter is reattached
 
 - code: `packages/quereus/src/planner/rules/access/rule-select-access-path.ts` — `reattachUnconsumedConstraints`
-- guard: `packages/quereus/test/vtab/overclaiming-module.spec.ts` — `over-claiming module: planner reattaches unconsumed filters`, `non-seek claim: planner reattaches the filter it cannot consume`
+- guard: `packages/quereus/test/vtab/overclaiming-module.spec.ts` — `over-claiming module: planner reattaches unconsumed filters`, `non-seek claim: planner reattaches the filter it cannot consume`, `non-seek claim: a tautological is not null is not reattached`
 - guard: `packages/quereus-isolation/test/claimed-non-seek-filter.spec.ts` — `claimed non-seek filter under the isolation overlay`
 - doc: [Optimizer § The `handledFilters` contract](optimizer.md#the-handledfilters-contract)
 

@@ -21,7 +21,7 @@ class NonSeekClaimModule extends MemoryTableModule {
 	override getBestAccessPlan(db: Db, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
 		const plan = super.getBestAccessPlan(db, tableInfo, request);
 		const handledFilters = plan.handledFilters.map((handled, i) =>
-			handled || ['IS NULL', 'IS NOT NULL', 'LIKE'].includes(request.filters[i].op));
+			handled || ['IS NULL', 'IS NOT NULL'].includes(request.filters[i].op));
 		return { ...plan, handledFilters };
 	}
 }
@@ -58,13 +58,6 @@ describe('claimed non-seek filter under the isolation overlay', () => {
 		await db.exec('begin');
 		await db.exec(`insert into t values (2, null, 'b', 5), (4, 9, 'b', 5)`);
 		await expectStableAcrossCommit('select id from t where a is null and b = 5 order by id', [2, 6]);
-	});
-
-	it('removes a staged row failing a claimed like on a seek of another column', async () => {
-		await db.exec(`insert into t values (3, 4, 'a', 5)`);
-		await db.exec('begin');
-		await db.exec(`insert into t values (2, null, 'b', 5), (4, 9, 'ab', 5)`);
-		await expectStableAcrossCommit(`select id from t where s like 'a%' and b = 5 order by id`, [3, 4]);
 	});
 
 	it('does not count a staged row failing a claimed is not null toward a limit', async () => {

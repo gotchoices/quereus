@@ -10,7 +10,7 @@
  *
  * The memory module's `findRangeMatch` did exactly that for both the primary key and
  * secondary indexes. It now claims positionally (first lower, first upper), and the
- * access-path rule reattaches any claimed-but-unconsumed seek-family constraint as a
+ * access-path rule reattaches any claimed-but-unconsumed constraint as a
  * belt-and-braces residual (see `overclaiming-module.spec.ts`).
  */
 

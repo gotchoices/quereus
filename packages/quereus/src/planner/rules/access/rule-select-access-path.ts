@@ -365,6 +365,11 @@ function holdsForEveryRow(tableSchema: TableSchema, constraint: PlannerPredicate
  * honouring its claim produces no row the `Filter` rejects, so the rows it counted survive.
  * Skipped for an `EmptyResultNode` leaf, where filtering is dead weight.
  *
+ * NOTE: the `Filter` discounts `estimatedRows` again on top of the module's `rows`, which
+ * already priced the claim. No in-tree module claims a non-tautological non-seek filter, so
+ * only out-of-tree modules see this; if it flips a join strategy for one, stamp this `Filter`
+ * with selectivity 1.
+ *
  * NOTE: `MATCH` does not parse as an operator today, so it never gets here. If it ever does,
  * a reattached `MATCH` runs the engine's scalar evaluation, which may not know the module's
  * semantics. Decide then whether to exempt it, knowing an exemption brings the staged-row

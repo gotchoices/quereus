@@ -1,12 +1,11 @@
 /**
  * Guard for `reattachUnconsumedConstraints` in `rule-select-access-path`.
  *
- * `handledFilters[i] = true` is a module's promise that filter `i` is enforced
- * elsewhere, and the only "elsewhere" is `FilterInfo.constraints`. The rule turns at
- * most one constraint per column per role into a seek bound (the first `=`/`IN`, the
- * first lower bound, the first upper bound), and `rule-grow-retrieve` residualizes
- * only the *unhandled* constraints — so anything else a module claims is applied
- * nowhere and the query silently returns extra rows.
+ * `handledFilters[i] = true` makes `rule-grow-retrieve` leave filter `i` out of the
+ * residual. The rule turns at most one constraint per column per role into a seek bound
+ * (the first `=`/`IN`, the first lower bound, the first upper bound) and no non-seek
+ * constraint at all, so without the reattach anything else a module claims stays in the
+ * plan nowhere, and the query silently returns extra rows.
  *
  * `TestOverclaimModule` claims every pushed filter and enforces only what reaches it
  * in `FilterInfo`, which is exactly the failure mode. Correct results here therefore
