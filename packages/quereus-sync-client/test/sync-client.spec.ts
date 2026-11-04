@@ -935,6 +935,62 @@ describe('SyncClient', () => {
         expect(syncManager.updatePeerSyncStateCalls).to.deep.equal([]);
         expect(client.isSynced).to.be.false;
       });
+
+      /** Delivers `changeSets` with the apply held open; the returned function lets it finish. */
+      function deliverHeldOpen(syncManager: MockSyncManager, ws: MockWebSocket, type: 'changes' | 'push_changes', changeSets: ChangeSet[]): () => Promise<void> {
+        let finishApply!: () => void;
+        syncManager.applyChangesGate = new Promise(resolve => { finishApply = resolve; });
+        ws.simulateMessage({ type, changeSets: changeSets.map(serializeChangeSet) });
+        return async () => {
+          finishApply();
+          await new Promise(r => setTimeout(r, 20));
+        };
+      }
+
+      /** Replaces the client's socket, leaving the new one open with its handshake unanswered. */
+      function replaceSocket(client: SyncClient): MockWebSocket {
+        client.connect('ws://localhost:8080/sync', 'test-db').catch(() => { /* torn down with the test */ });
+        const replacement = MockWebSocket.lastInstance!;
+        replacement.simulateOpen();
+        replacement.sentMessages.length = 0;
+        return replacement;
+      }
+
+      it('a reply still applying when its socket is replaced sends nothing on the new socket', async () => {
+        const { client, ws, syncManager } = await connectedClient();
+        const finishApply = deliverHeldOpen(syncManager, ws, 'changes', [changeSet(site, 'tx5', hlc5)]);
+
+        const replacement = replaceSocket(client);
+        await finishApply();
+
+        expect(replacement.getSentMessages()).to.deep.equal([]);
+      });
+
+      it('an empty reply still applying when a new connection starts does not report synced', async () => {
+        const { client, ws, syncManager } = await connectedClient();
+        const finishApply = deliverHeldOpen(syncManager, ws, 'changes', []);
+
+        replaceSocket(client);
+        await finishApply();
+
+        expect(client.status.status).to.equal('syncing');
+      });
+
+      for (const [name, loseConnection] of [
+        ['disconnect()', (client: SyncClient) => { void client.disconnect(); }],
+        ['a socket close', (_client: SyncClient, ws: MockWebSocket) => { ws.simulateClose(); }],
+      ] as const) {
+        it(`a broadcast still applying after ${name} does not report synced`, async () => {
+          const { client, ws, syncManager } = await connectedClient();
+          await deliver(ws, 'changes', []);
+          const finishApply = deliverHeldOpen(syncManager, ws, 'push_changes', [changeSet(site, 'tx5', hlc5)]);
+
+          loseConnection(client, ws);
+          await finishApply();
+
+          expect(client.status.status).to.equal('disconnected');
+        });
+      }
     });
   });
 

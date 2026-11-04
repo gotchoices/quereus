@@ -145,7 +145,8 @@ export class SyncClient {
   // True once the server has answered a get_changes with nothing, meaning this
   // pull has reached the end of what the server holds. A `changes` reply carries
   // one bounded batch, so only this flag may report `synced`. Cleared wherever a
-  // new pull begins: connect() and the start of a snapshot transfer.
+  // new pull begins (connect(), the start of a snapshot transfer) or the connection
+  // goes away (disconnect(), onclose), so an apply finishing late reports nothing.
   private caughtUp = false;
 
   // Local change debouncing
@@ -288,6 +289,7 @@ export class SyncClient {
         };
 
         this.ws.onclose = () => {
+          this.caughtUp = false;
           // A transfer interrupted by a socket drop aborts here; the saved
           // checkpoint makes the reconnect below resume it via resume_snapshot.
           this.abortSnapshotTransfer(new Error('Connection closed during snapshot transfer'));
@@ -343,6 +345,7 @@ export class SyncClient {
    */
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    this.caughtUp = false;
 
     // Abort any in-flight snapshot transfer. Its promise settles (resolved with
     // the abort error — it never rejects), and the checkpoint saved by the
@@ -606,6 +609,7 @@ export class SyncClient {
     }
 
     const changeSets = serializedChangeSets.map(cs => deserializeChangeSet(cs));
+    const arrivedOn = this.ws;
 
     // Set before the first await, so it applies to the pull this reply arrived in. A
     // connect() or snapshot transfer that starts during the apply clears the flag for
@@ -636,11 +640,13 @@ export class SyncClient {
     // A reply carries one bounded batch and its size says nothing about what remains,
     // so ask again until a reply is empty. Only a real advance continues, so a server
     // repeating itself cannot loop this, and a reply that did not move the watermark
-    // ends a duplicate chain.
-    // NOTE: a get_changes the server answers with GET_CHANGES_ERROR ends the pull with
-    // the socket open, so the status stays syncing and the remainder waits for the next
-    // reconnect. If that shows up, retry on a backoff timer.
-    if (advanced) {
+    // ends a duplicate chain. A replacement socket runs its own pull from the handshake,
+    // and a request sent on it now could beat that handshake and be refused.
+    // NOTE: a get_changes the server answers with GET_CHANGES_ERROR, a failed apply or a
+    // throwing onRemoteChanges ends the pull with the socket open, so the status stays
+    // syncing and the remainder waits for the next reconnect. If that shows up, retry on
+    // a backoff timer.
+    if (advanced && this.ws === arrivedOn) {
       await this.requestChangesFromServer();
     }
 
@@ -657,6 +663,10 @@ export class SyncClient {
    * @returns true only when the watermark moved.
    */
   private async advanceReceivedWatermark(changeSets: ChangeSet[]): Promise<boolean> {
+    // NOTE: the compare and write are not atomic and messages are not serialized, so two
+    // chains on one socket (connect() then requestSnapshot()) can step the watermark
+    // back, which only re-fetches, or skip the range of a reply whose apply then fails.
+    // If chains ever overlap in normal use, serialize ordered replies.
     const serverSiteId = this.serverSiteId;
     const replyHLC = maxHLC(changeSets.map(cs => cs.hlc));
     if (!serverSiteId || !replyHLC) return false;

@@ -501,7 +501,10 @@ the coordinator's setting and a reply can overshoot it. An empty reply is reliab
 every server read starts strictly after `sinceHLC`, so it returns nothing only when nothing
 is left. The loop costs one extra round trip per catch-up and leaves the wire format
 unchanged. A non-empty reply that does not move the watermark sends nothing further, so a
-duplicate reply or a misbehaving server cannot loop.
+duplicate reply or a misbehaving server cannot loop. A reply still applying when its socket
+is replaced moves the watermark but sends nothing, because the new connection's handshake
+starts its own pull. An apply that finishes after the connection is gone does not report
+`synced`.
 
 A device pushes only what it wrote (`hlc.siteId` is its own), never what it received. It
 assumes one coordinator per database: everything it received came through that server, so
