@@ -35,3 +35,7 @@ Not checked separately: that this failure leaves the original table intact. The 
 ## Expected
 
 A re-key changes no row, and each row already passed its CHECK when it was written. The in-place re-key paths in the memory and store modules succeed on these tables without any context value, so the rebuild path should as well.
+
+## Being closed by another ticket
+
+The fix in `bug-rebuild-loses-rows-when-implicit-commit-fails` stops the rebuild's row copy from compiling CHECKs and defaults. A prototype of it re-keyed both failing shapes in the table above and kept their rows. That ticket deletes this one when its tests pass.
