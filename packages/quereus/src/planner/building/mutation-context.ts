@@ -153,13 +153,12 @@ export function registerMutationContextSymbols(
 export function registerNoEnvelopeContextSymbols(
 	scope: RegisteredScope,
 	tableSchema: TableSchema,
-	missingNotNull: (contextVar: MutationContextDefinition, tableLabel: string) => QuereusError,
+	missingNotNull: (contextVar: MutationContextDefinition) => QuereusError,
 ): ReadonlySet<string> {
 	const declared = tableSchema.mutationContext ?? [];
-	const tableLabel = `${tableSchema.schemaName}.${tableSchema.name}`;
 	for (const contextVar of declared) {
 		const reference: ReferenceCallback = contextVar.notNull
-			? () => { throw missingNotNull(contextVar, tableLabel); }
+			? () => { throw missingNotNull(contextVar); }
 			: (_exp, s) => new LiteralNode(s, { type: 'literal', value: null }, {
 				typeClass: 'scalar',
 				logicalType: contextVar.logicalType,

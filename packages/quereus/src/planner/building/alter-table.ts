@@ -17,9 +17,9 @@ import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
 import { buildCellCoercion } from '../../types/validation.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { astToString, expressionToString } from '../../emit/ast-stringify.js';
+import { astToString, expressionToString, quoteIdentifier } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
-import { validateAddColumnGeneratedRefs } from '../../schema/table.js';
+import { validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
@@ -275,13 +275,14 @@ export function buildAlterTableStmt(
 function addColumnReadsRequiredContextError(
   columnName: string,
   contextVarName: string,
-  tableLabel: string,
+  tableSchema: TableSchema,
 ): QuereusError {
+  const quotedTable = `${quoteIdentifier(tableSchema.schemaName)}.${quoteIdentifier(tableSchema.name)}`;
   return new QuereusError(
-    `cannot add column '${columnName}' to '${tableLabel}': its DEFAULT reads mutation context variable ` +
+    `cannot add column '${columnName}' to '${tableSchema.schemaName}.${tableSchema.name}': its DEFAULT reads mutation context variable ` +
     `'${contextVarName}', which is NOT NULL, and ALTER TABLE supplies no context to fill existing rows; ` +
     `add the column with a literal DEFAULT or none, then set this default with ` +
-    `\`alter table ${tableLabel} alter column ${columnName} set default (…)\``,
+    `\`alter table ${quotedTable} alter column ${quoteIdentifier(columnName)} set default (…)\``,
     StatusCode.ERROR,
   );
 }
@@ -347,7 +348,7 @@ function buildAddColumnBackfill(
     // above them with the bare names the variables claim left out.
     const contextScope = new RegisteredScope(ctx.scope);
     const contextVarNames = registerNoEnvelopeContextSymbols(contextScope, tableSchema,
-      (contextVar, tableLabel) => addColumnReadsRequiredContextError(columnDef.name, contextVar.name, tableLabel));
+      contextVar => addColumnReadsRequiredContextError(columnDef.name, contextVar.name, tableSchema));
     const rowScope = buildRowDefaultScope(contextScope, tableSchema.columns, rowAttrs, contextVarNames);
     // Schema-authored SQL, wrapped exactly as the three DML builders wrap theirs, so the
     // backfill expression resolves bare relation names against the altered table's own

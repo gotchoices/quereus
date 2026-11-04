@@ -29,6 +29,16 @@ The same CHECKs are accepted by `create table … with context (…)` and enforc
 
 The cause is the same at all three sites: the existing-row validation compiles the CHECK against the table's columns only, with no context variables in scope.
 
+The same cause has a second symptom, with no error about the name, when a bare name is both a column and a context variable. Measured on the source tree, on `create table t (a integer primary key, who integer null) with context (who integer null)` holding a row with `who = -1`:
+
+| Statement | Result |
+|---|---|
+| `alter table t add constraint k check (who > 0);` | Rejected: existing rows violate the constraint |
+| `alter table t add column c integer null default 1 check (who > 0);` | Rejected: violated by backfilled rows |
+| `alter table t add column c integer null default (new.who) check (who > 0);` | Rejected: `CHECK constraint failed` |
+
+Validation reads the bare `who` as the column, while every write reads it as the variable (§2.6.2), so ALTER checks a different predicate from the one writes enforce. Declaring the same CHECK in `CREATE TABLE` and inserting that row without an envelope succeeds, because the variable reads NULL. Whatever rule is accepted below should also pass the shadow-name set to these scopes, as the DEFAULT half does.
+
 ## The question the spec leaves open
 
 ALTER validates a new CHECK against rows that are already stored, because the optimizer treats a declared CHECK as a proven fact about every stored row (`test/logic/10.1.8-alter-add-check-existing-rows.sqllogic` explains why). Those rows were written under context envelopes that are not stored anywhere, so there is no true value of `who` for them. The spec says what a statement with no envelope reads (§2.6.2: a NULL-declared variable reads NULL, a NOT NULL one that is read is an error), but not whether ALTER's existing-row validation counts as such a statement.
