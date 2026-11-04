@@ -239,6 +239,19 @@ describe('minmax-index-boundary', () => {
 			expect(await planOps(db, 'select min(distinct c) from t')).to.include('LIMITOFFSET');
 			expect(await scalar('select min(distinct c) from t')).to.equal(10);
 		});
+
+		it('a derived table between the aggregate and the table', async () => {
+			// The absorb probe walks through the Project and the Alias a derived table
+			// builds, down to the Retrieve.
+			await createTable();
+			await db.exec('create index t_c_desc on t(c desc)');
+
+			const sql = 'select max(c) from (select c from t) x';
+			expect(await planOps(db, sql)).to.include('LIMITOFFSET');
+			expect(await scalar(sql)).to.equal(120);
+			expect(await rowsScanned(sql)).to.equal(BOUNDARY_ROWS);
+			expect(await withRuleDisabled(() => rowsScanned(sql))).to.equal(ROW_COUNT);
+		});
 	});
 
 	describe('declines, leaving the plan byte-identical', () => {
@@ -300,17 +313,6 @@ describe('minmax-index-boundary', () => {
 
 			const sql = 'select max(c + 1) from t';
 			expect(await planShape(sql)).to.deep.equal(await withRuleDisabled(() => planShape(sql)));
-		});
-
-		it('a derived table between the aggregate and the table', async () => {
-			// The absorb probe only walks Project/Filter down to a Retrieve; an Alias
-			// interrupts the chain, so the probe fails and nothing is committed.
-			await createTable();
-			await db.exec('create index t_c_desc on t(c desc)');
-
-			const sql = 'select max(c) from (select c from t) x';
-			expect(await planShape(sql)).to.deep.equal(await withRuleDisabled(() => planShape(sql)));
-			expect(await scalar(sql)).to.equal(120);
 		});
 
 		it('a user-defined aggregate that shadows the builtin min', async () => {

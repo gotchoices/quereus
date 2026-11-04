@@ -15,6 +15,9 @@
  *          └─ Filter(c is not null)     <- new, only when `c` is nullable
  *               └─ Retrieve(t)          <- equipped with an ordering access plan
  *
+ * Any Project, Filter or Alias already in the source stays above the Retrieve, so an
+ * aliased table or a derived table qualifies.
+ *
  * Keeping the aggregate is what makes the two hard cases free:
  *
  *  - Empty relation. An ungrouped aggregate over zero rows still emits exactly one

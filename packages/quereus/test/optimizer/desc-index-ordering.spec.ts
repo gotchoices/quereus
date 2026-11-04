@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import { planRows } from '../plan/_helpers.js';
 
 describe('DESC index — ordering and access path selection', () => {
 	let db: Database;
@@ -103,6 +104,27 @@ describe('DESC index — ordering and access path selection', () => {
 			rows.push(r as unknown as { id: number; score: number });
 		}
 		expect(rows.map(r => r.score)).to.deep.equal([30, 20, 10]);
+	});
+
+	it('plans an aliased table exactly like the unaliased one, apart from the Alias', async () => {
+		await db.exec("create table t (k text, r integer, x integer, primary key (k, r))");
+		await db.exec("create index t_r on t (r desc)");
+		await db.exec("insert into t values ('a', 1, 10), ('a', 3, 30), ('b', 2, 20)");
+
+		const shapeWithoutAlias = async (sql: string): Promise<string[]> =>
+			(await planRows(db, sql)).filter(r => r.op !== 'ALIAS').map(r => `${r.op}|${r.detail}`);
+		const unaliased = "select x from t order by r desc limit 1";
+		const aliased = "select x from t TV order by TV.r desc limit 1";
+
+		const plan = await shapeWithoutAlias(aliased);
+		expect(plan).to.deep.equal(await shapeWithoutAlias(unaliased));
+		expect(plan.some(row => row.startsWith('SORT|')), 'the index must serve the ordering').to.equal(false);
+
+		const rows: Array<{ x: number }> = [];
+		for await (const r of db.eval(aliased)) {
+			rows.push(r as unknown as { x: number });
+		}
+		expect(rows.map(r => r.x)).to.deep.equal([30]);
 	});
 });
 

@@ -32,6 +32,7 @@ import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { seqScanCost } from '../../cost/index.js';
 import { SortNode } from '../../nodes/sort.js';
 import { ProjectNode } from '../../nodes/project-node.js';
+import { AliasNode } from '../../nodes/alias-node.js';
 import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
 import { LimitOffsetNode } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
@@ -78,7 +79,7 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	const retrieveChild = findRetrieveChild(node);
 	if (!retrieveChild) {
 		// Special case: Sort can absorb its ordering into a Retrieve reachable
-		// through commuting unary operators (Project, Filter), provided the
+		// through commuting unary operators (Project, Filter, Alias), provided the
 		// access plan can satisfy the requested ordering. See
 		// trySortAbsorbViaIndexOrdering for details.
 		if (node instanceof SortNode) {
@@ -591,7 +592,7 @@ function fallbackIndexSupports(
 	// load-bearing marker — the Sort is gone either way.
 	//
 	// NOTE: accepted tradeoff — the Sort arm above also drops a Sort (`select * from t
-	// order by id` reaches it: no Project or Filter between Sort and Retrieve) yet
+	// order by id` reaches it: no Project, Filter or Alias between Sort and Retrieve) yet
 	// deliberately does NOT mark it, unlike `trySortAbsorbViaIndexOrdering`. Marking it is
 	// the conservative reading but costs a real optimization — the leaf under
 	// `join (select * from big order by v) z` would stop qualifying for an
@@ -601,6 +602,8 @@ function fallbackIndexSupports(
 	// top-level ordered scan), and the shapes that do have one are subquery ORDER BYs,
 	// which SQL does not guarantee through a join — the LIMIT case that would make one
 	// meaningful is already refused by the peel gate in rules/join/index-nested-loop.ts.
+	// An aliased `join (select * from big b order by b.v) z` takes the absorb path instead,
+	// so it is marked and gets no seek; it got none while its Sort stayed either.
 	// Revisit if a rewrite ever reorders a leaf whose ordering the query genuinely observes.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
@@ -687,9 +690,9 @@ export interface RowsWanted {
  *    between the scan and the limit at all — declines rather than being reasoned about.
  *
  * Only `FilterNode` discards rows in the region this walks: the chain between the Sort
- * and the Retrieve admits Project and Filter alone, and a module pipeline under
- * `Retrieve.source` is built from the same two. A row-discarding node type reaching that
- * region would need adding here.
+ * and the Retrieve admits Project, Filter and Alias alone, and a module pipeline under
+ * `Retrieve.source` is built from Project and Filter. A row-discarding node type reaching
+ * that region would need adding here.
  */
 function truncationIsSafe(
 	source: PlanNode,
@@ -809,12 +812,13 @@ function baselineScanCost(
 
 /**
  * Attempt to absorb a Sort whose Retrieve is reachable through a chain of
- * commuting unary operators (Project, Filter). When the table's access plan
- * can satisfy the required ordering — e.g., a composite index where leading
+ * commuting unary operators (Project, Filter, Alias). When the table's access
+ * plan can satisfy the required ordering — e.g., a composite index where leading
  * columns are equality-bound by an upstream Filter and trailing columns
  * provide the ORDER BY direction — the Sort can be elided entirely:
- * Retrieve produces rows in the requested order, and Project/Filter preserve
- * row order on the way back up.
+ * Retrieve produces rows in the requested order, and Project/Filter/Alias
+ * preserve row order on the way back up. An Alias renames the relation but keeps
+ * attribute ids, so sort keys above it still resolve to table columns.
  *
  * Two callers:
  *  - `ruleGrowRetrieve` itself, for a Sort the user wrote (or an earlier rule left);
@@ -838,11 +842,11 @@ export function trySortAbsorbViaIndexOrdering(
 	rowsWanted?: RowsWanted,
 ): PlanNode | null {
 	// Walk down through commuting unary operators to find the RetrieveNode.
-	const chain: (ProjectNode | FilterNode)[] = [];
+	const chain: (ProjectNode | FilterNode | AliasNode)[] = [];
 	let current: PlanNode = sort.source;
 	while (true) {
 		if (current instanceof RetrieveNode) break;
-		if (current instanceof ProjectNode || current instanceof FilterNode) {
+		if (current instanceof ProjectNode || current instanceof FilterNode || current instanceof AliasNode) {
 			chain.push(current);
 			current = current.source;
 			continue;

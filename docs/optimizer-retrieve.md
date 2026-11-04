@@ -124,6 +124,11 @@ is null. That second caller is why the helper must stay side-effect-free — it 
 recording anything on the `OptContext`. A caller that gets null must be able to discard its
 probe input and leave the plan byte-identical.
 
+The helper walks down from the `Sort` to the `Retrieve` through `Project`, `Filter` and `Alias`
+nodes, and returns null at any other node. All three preserve row order, and sort keys above an
+`Alias` still resolve to table columns because an `Alias` keeps attribute ids. So a table alias,
+an aliased view and a derived table all get the same access path as the bare table.
+
 The subtree is not the same thing as the scope. A subquery body is a `RelationalPlanNode`
 hanging beneath a *scalar* expression, so `where exists (select 1 from t where t.s = a.i)`
 puts the inner `t.s = a.i` inside the outer `Filter`'s subtree. The sweep (`walkPredicatesConstraining`)
