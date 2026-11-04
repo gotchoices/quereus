@@ -171,14 +171,14 @@ async function* dataSummary(jsonData: SqlValue): AsyncIterable<Row> {
 
 	if (Array.isArray(data)) {
 		yield ['type', 'array'];
-		yield ['length', data.length];
+		yield ['length', String(data.length)];
 		if (data.length > 0) {
 			yield ['first_element_type', typeof data[0]];
 		}
 	} else if (typeof data === 'object' && data !== null) {
 		yield ['type', 'object'];
 		const keys = Object.keys(data);
-		yield ['key_count', keys.length];
+		yield ['key_count', String(keys.length)];
 		if (keys.length > 0) {
 			yield ['first_key', keys[0]];
 		}

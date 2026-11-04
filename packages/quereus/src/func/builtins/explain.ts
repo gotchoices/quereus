@@ -100,7 +100,9 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 				{ name: 'properties', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'physical', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'est_cost', type: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true }, generated: true },
-				{ name: 'est_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true }
+				// REAL, not INTEGER: an estimate is a double, and a join's product of inputs leaves the
+				// safe-integer range at a few large cross joins, where INTEGER would require a bigint.
+				{ name: 'est_rows', type: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true }, generated: true }
 			],
 			keys: [],
 			rowConstraints: []

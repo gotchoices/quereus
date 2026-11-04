@@ -623,9 +623,9 @@ export class Statement {
 			return;
 		}
 		// QUEREUS_REPR_STRICT backstop seam: rows yielded to the caller. This is the only
-		// one of the four seams that sees an EXPRESSION producing a non-canonical value
-		// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
-		// sit upstream of it.
+		// one of the five seams that sees an EXPRESSION producing a non-canonical value
+		// (an arithmetic path that forgot to narrow) — the scan, table-valued function,
+		// write and UDF seams all sit upstream of it.
 		//
 		// R1 ONLY, for now — hence the empty declared-type array, which puts every cell
 		// on `assertRowConforms`'s untyped-position path. A result column's announced

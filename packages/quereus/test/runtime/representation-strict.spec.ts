@@ -9,6 +9,8 @@ import type { MaybePromise, Row, SqlValue } from '../../src/common/types.js';
 import { StatusCode } from '../../src/common/types.js';
 import { QuereusError } from '../../src/common/errors.js';
 import { FunctionFlags } from '../../src/common/constants.js';
+import { createTableValuedFunction } from '../../src/func/registration.js';
+import { INTEGER_RETURN } from '../../src/func/builtins/return-types.js';
 import type { ScalarFunctionSchema } from '../../src/schema/function.js';
 import {
 	assertCanonicalValue,
@@ -36,7 +38,7 @@ import { DATE_TYPE, TIMESTAMP_TYPE, TIMESPAN_TYPE } from '../../src/types/tempor
  *
  * - the checker's own rules, exercised by calling `assertConformsToType` directly.
  *   These do NOT read the flag, so they run on every suite pass and are the floor.
- * - the four runtime seams, which are guarded by a module-level const read once at
+ * - the five runtime seams, which are guarded by a module-level const read once at
  *   load. Those tests skip unless the env var is set, mirroring how
  *   `QUEREUS_FORK_STRICT` is exercised in `fork-contract.spec.ts`. Run them with
  *   `yarn test:repr-strict`.
@@ -300,6 +302,32 @@ describe('Physical representation (QUEREUS_REPR_STRICT)', () => {
 				rows.push(row.a, row.b);
 			}
 			expect(rows).to.deep.equal([5, 9007199254740993n]);
+		});
+
+		it('TVF seam: a fraction in a declared INTEGER column is caught and not reported as a call failure', async function () {
+			if (!strictMode) { this.skip(); }
+			db.registerFunction(createTableValuedFunction({
+				name: 'bad_series',
+				numArgs: 0,
+				returnType: {
+					typeClass: 'relation',
+					isReadOnly: true,
+					isSet: false,
+					columns: [{ name: 'value', type: INTEGER_RETURN }],
+					keys: [],
+					rowConstraints: [],
+				},
+			}, async function* () { yield [0.5]; }));
+
+			const err = await capture(async () => {
+				for await (const _ of db.eval('select value from bad_series()')) { /* drain */ }
+			});
+			expect(err, 'the TVF seam must reject the yielded row').to.be.instanceOf(RepresentationError);
+			const message = (err as Error).message;
+			expect(message, 'names the function').to.contain('bad_series(0)');
+			expect(message, 'names the column').to.match(/column 0 \(value\)/);
+			expect(message, 'names the declared type').to.contain('declared type INTEGER');
+			expect(message, 'is not re-reported as a call failure').to.not.contain('failed:');
 		});
 
 		it('write seam: a value reaching vtab.update non-canonically is caught before it is stored', async function () {

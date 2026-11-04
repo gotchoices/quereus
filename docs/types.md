@@ -173,10 +173,10 @@ same value would have had if written as a literal.
 
 #### Enforcement: `QUEREUS_REPR_STRICT`
 
-R1 and R2 are enforced by coercion only where the engine MINTS values. At the two ingress
+R1 and R2 are enforced by coercion only where the engine MINTS values. At the three ingress
 boundaries it deliberately does not coerce — rows out of a virtual-table module's
-`query()`, and values out of a user-defined function — the rules are a **contract**, and an
-opt-in strict mode verifies it. Set the environment variable `QUEREUS_REPR_STRICT=1` (or
+`query()`, values out of a user-defined scalar function, and rows out of a table-valued
+function — the rules are a **contract**, and an opt-in strict mode verifies it. Set the environment variable `QUEREUS_REPR_STRICT=1` (or
 run `yarn test:repr-strict`, which is `node test-runner.mjs --repr-strict`). This is the
 same shape as the two existing runtime harnesses, `QUEREUS_FORK_STRICT` and
 `QUEREUS_CONTEXT_STRICT` (see `runtime/strict-flags.ts` and `docs/runtime.md`).
@@ -191,17 +191,18 @@ write path guards its conversion skip with the same question — see § Where co
 happens. One definition, so the checker and the write path cannot drift apart on what
 "conforms" means.
 
-Four seams, each chosen so a violation is reported at the layer that CAUSED it:
+Five seams, each chosen so a violation is reported at the layer that CAUSED it:
 
 | seam | what is checked | against |
 |---|---|---|
 | virtual-table scan output (`runtime/emit/scan.ts`) | each row a module's `query()` yields | the table's declared column types — R1 + R2 |
+| table-valued function output (`runtime/emit/table-valued-function.ts`) | each row a table-valued function yields, after row-width normalization | its declared column types — R1 + R2; a function declaring no columns gets R1 only |
 | DML write (`runtime/emit/dml-executor.ts`) | the row about to reach `vtab.update`, after the pipeline's coercion pass | the declared column types — R1 + R2 |
 | UDF return (`runtime/emit/scalar-function.ts`) | a scalar function's returned value | its schema's declared return type — R1 + R2 |
 | statement row egress (`core/statement.ts`) | each row yielded to the caller | **R1 only** |
 
 The egress seam is the backstop for an *expression* producing a non-canonical value (an
-arithmetic path that forgot to narrow), which none of the other three sees. A result
+arithmetic path that forgot to narrow), which none of the other four sees. A result
 column's ANNOUNCED type — the planner's `ScalarType` inference, reachable through
 `Statement.getColumnDefs()` / `getColumnType()` — is now held to R2 as a matter of
 correctness: every computed-column inference (literals, arithmetic promotion, CASE and

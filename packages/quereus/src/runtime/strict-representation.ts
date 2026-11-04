@@ -9,15 +9,16 @@ import { valueToText } from '../util/value-text.js';
  * Off-by-default physical-representation assertions (`QUEREUS_REPR_STRICT`).
  *
  * The engine canonicalizes every value it MINTS itself (see
- * `util/numeric-canonical.ts` and docs/types.md § Physical representation). Two
+ * `util/numeric-canonical.ts` and docs/types.md § Physical representation). Three
  * ingress boundaries are deliberately left uncoerced because coercing them costs
  * per row where there is nothing to win:
  *
  * - rows returned by a virtual-table module's `query()`, including third-party
  *   modules the engine cannot vet;
- * - values returned by user-defined functions.
+ * - values returned by user-defined scalar functions;
+ * - rows yielded by table-valued functions, plugin-registered ones included.
  *
- * For those the contract is **declared and checked, not enforced**: a module or UDF
+ * For those the contract is **declared and checked, not enforced**: a module or function
  * is obliged to return canonical values, and this harness verifies it when the flag
  * is on. Same shape as the parallel-fork (`QUEREUS_FORK_STRICT`) and stale-context
  * (`QUEREUS_CONTEXT_STRICT`) harnesses in `strict-fork.ts`.
@@ -58,8 +59,8 @@ import { valueToText } from '../util/value-text.js';
 export type { DeclaredType };
 
 /** A violation of R1/R2. Distinct class so a seam inside a re-wrapping `catch`
- *  (the vtab scan) can rethrow it unchanged instead of burying it in a generic
- *  "error during query" message. */
+ *  (the vtab scan, a table-valued function call) can rethrow it unchanged instead of
+ *  burying it in a generic "error during query" message. */
 export class RepresentationError extends QuereusError {
 	constructor(message: string) {
 		super(message, StatusCode.INTERNAL);
