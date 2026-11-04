@@ -295,6 +295,13 @@ describe('dependency ordering', () => {
 		expect(orderDependenciesFirst(['a', 'b', 'd'], key, edges({ a: ['b', 'd'], b: ['a'] }))).to.deep.equal(['d', 'a', 'b']);
 	});
 
+	// A column added to `a` reads view `v`, and `v` reads a column added to `b`. Keeping the cycle in
+	// input order would run `v` before `b`, and creating `v` would then fail.
+	it('a preferred dependency outranks a cycle\'s input order', () => {
+		const inCycle = edges({ a: ['b', 'v'], b: ['a'] });
+		expect(orderDependenciesFirst(['a', 'b', 'v'], key, inCycle, [edges({ v: ['b'] })])).to.deep.equal(['b', 'v', 'a']);
+	});
+
 	it('a preferred dependency orders items, and is skipped when it would close a cycle', () => {
 		expect(orderDependenciesFirst(['v', 't'], key, edges({}), [edges({ v: ['t'] })])).to.deep.equal(['t', 'v']);
 		expect(orderDependenciesFirst(['v', 't'], key, edges({ t: ['v'] }), [edges({ v: ['t'] })])).to.deep.equal(['v', 't']);

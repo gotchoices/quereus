@@ -3316,6 +3316,9 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
  * A foreign key whose parent is a maintained create gives no edge. That leaves only later maintained
  * creates depending on a maintained create, so none is in a cycle and the rule above always holds.
  * The cost: a module that needs the parent first gets no help when the parent is maintained.
+ *
+ * NOTE: a table can move ahead of a table its CHECK or DEFAULT reads. Create does not plan those
+ * expressions today; if it or a module ever does, add those reads as edges here.
  */
 function orderTableCreates(creates: readonly MigrationCreate[], schemaName: string): MigrationCreate[] {
 	const keyOf = (create: MigrationCreate): string => {

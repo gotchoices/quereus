@@ -10,6 +10,7 @@
  * A preferred dependency orders items the same way, but gives way to the others: it is skipped
  * when the graph built so far already needs its target to follow the item that prefers it.
  * `preferredTiers` is strongest first, so a weaker preference cannot crowd out a stronger one.
+ * A cycle's input order is weakest of all: it gives way to a preferred dependency.
  *
  * `keyOf` and the dependency functions must spell a key the same way. A dependency on the item
  * itself, or on a key no item has, is ignored.
@@ -25,8 +26,9 @@ export function orderDependenciesFirst<T>(
 	if ([edges, ...preferred].flat().every(dependencies => dependencies.length === 0)) return [...items];
 
 	const acyclic = edges.map((dependencies, item) => dependencies.filter(d => !reaches(edges, d, item)));
-	chainCycleMembersInInputOrder(acyclic, edges);
+	const cycleInputOrder = cycleMembersInInputOrder(acyclic, edges);
 	for (const tier of preferred) addEdgesThatCloseNoCycle(acyclic, tier);
+	addEdgesThatCloseNoCycle(acyclic, cycleInputOrder);
 	const placed = new Set<number>();
 	const ordered: T[] = [];
 	// NOTE: rescans from the start for each placement. That is quadratic in the items, and only
@@ -74,24 +76,28 @@ function resolveEdges<T>(
 }
 
 /**
- * Gives each cycle member an edge to the previous member of its own cycle. Without this, a member
- * that also waits on an item outside the cycle falls behind the members after it.
+ * Per item (by position), the previous member of its own cycle. Without these edges, a member that
+ * also waits on an item outside the cycle falls behind the members after it.
  *
- * A cycle's members are exactly the items that lost an edge to `acyclic`. The new edges cannot close
- * a cycle: each cycle has lost all its internal edges and becomes one chain, and the edges left
- * between cycles form no cycle of their own.
+ * A cycle's members are exactly the items that lost an edge to `acyclic`, so call this before adding
+ * to `acyclic`. On their own these edges cannot close a cycle: each cycle has lost all its internal
+ * edges and becomes one chain, and the edges left between cycles form no cycle of their own.
+ *
+ * A preferred dependency can close one, through an item outside the cycle. It wins: it is a read the
+ * item may need, where a cycle's order is only a tie-break among edges already ignored.
  */
-function chainCycleMembersInInputOrder(acyclic: number[][], edges: readonly number[][]): void {
+function cycleMembersInInputOrder(acyclic: readonly number[][], edges: readonly number[][]): number[][] {
 	const lastMemberOfEachCycle: number[] = [];
-	acyclic.forEach((kept, item) => {
-		if (kept.length === edges[item].length) return;
+	return acyclic.map((kept, item) => {
+		if (kept.length === edges[item].length) return [];
 		const cycle = lastMemberOfEachCycle.findIndex(last => reaches(edges, item, last) && reaches(edges, last, item));
 		if (cycle === -1) {
 			lastMemberOfEachCycle.push(item);
-		} else {
-			kept.push(lastMemberOfEachCycle[cycle]);
-			lastMemberOfEachCycle[cycle] = item;
+			return [];
 		}
+		const previous = lastMemberOfEachCycle[cycle];
+		lastMemberOfEachCycle[cycle] = item;
+		return [previous];
 	});
 }
 
