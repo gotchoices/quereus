@@ -605,8 +605,8 @@ the planner's typed, validated {@link AccessPath} record (`resolveScanIndex` in
 | `accessPath.kind`            | Merge order chosen                                             |
 |------------------------------|---------------------------------------------------------------|
 | `fullScan` / `empty`         | primary key (see the full-scan contract below)                |
-| `index`, `role: 'primary'`   | primary key — **regardless of the index's name** (an alias like `_primary_1` still merges by PK) |
-| `index`, `role: 'secondary'` | `(indexKey…, pk…)`, using the descriptor's full `keyColumns`   |
+| `index`, `role: 'primary'`   | primary key — **regardless of the index's name** (an alias like `_primary_1` still merges by PK); reversed when the descriptor sets `reverse` |
+| `index`, `role: 'secondary'` | `(indexKey…, pk…)`, using the descriptor's full `keyColumns`; reversed when the descriptor sets `reverse` |
 | `unresolvedIndex`            | **INTERNAL error** (see below)                                |
 
 This holds **regardless of the plan kind**, not only for a plain unbounded or bounded-range
@@ -684,14 +684,14 @@ merged read path; a committed-snapshot (`readCommitted`) or no-overlay read bypa
 
 ### The Problem
 
-For merge iteration to work correctly, the overlay must iterate in the **same order** as the underlying module. Different modules may use different orderings:
+For merge iteration to work correctly, both inputs must be in one order. Different modules may use different orderings:
 
 | Module | Ordering |
 |--------|----------|
 | Memory vtab | Its layer BTrees' primary-key comparator (`createPrimaryKeyFunctions`): per-column logical type, declared collation, and `DESC` direction |
 | Store module | Binary-encoded keys (lexicographic byte order), with the same collation and direction folded into the bytes |
 
-If these differ, merge produces incorrect results.
+The underlying scan alone sets the merge order, because its rows are read lazily in whatever order the module emits them. The overlay's own order, a memory table's by default, plays no part. If an input departs from the merge order, the merge moves past a committed row before the staged row that shadows it comes up, and a read returns both.
 
 ### Solution: Module-Provided Comparator
 
@@ -710,7 +710,9 @@ interface IsolationCapableTable extends VirtualTable {
 }
 ```
 
-The isolation layer passes these comparators to the overlay module (if configurable) or validates that the overlay and underlying modules use compatible orderings.
+The isolation layer neither passes these comparators to the overlay module nor validates that the two modules' orderings match. On each merged read it collects the overlay's rows for the query's window and sorts them under the merge comparator, so the overlay can emit in any order, and a host-supplied `IsolationConfig.overlay` owes no particular one. For a scan with `reverse: true` on its index descriptor, the merge comparator is the negated forward comparator. The underlying's scan must agree with its own `comparePrimaryKey`; the layer does not check this.
+
+The cost is that the overlay is no longer read lazily: a merged scan under a `limit` reads every staged row in its window before yielding anything. The overlay holds one transaction's staged writes, and a seek is still narrowed by the overlay's own query.
 
 `comparePrimaryKey` is optional. When the underlying table does not expose it — every
 store-backed table today — `IsolatedTable` falls back to its own comparator, which walks the
@@ -727,8 +729,8 @@ For text columns with non-binary collation (`NOCASE`, `RTRIM`, or one registered
 - Collation names resolve against the **owning connection** (`db.getCollationResolver()`, and
   `db.getKeyNormalizerResolver()` for the secondary-index merge's modified-PK set), never
   a process-global registry — an application may replace `NOCASE`/`RTRIM` per database
-- The overlay uses the same comparator
-- Both iterate in the same order
+- The overlay's rows are sorted under the underlying's comparator for the merge, so the two need not iterate in the same order
+- The overlay's own key comparator must still agree with the underlying's on which keys are **equal**, or one stored row can correspond to two staged rows
 - A collation named on a **text** PK column must carry a `normalizer` if the table is ever
   scanned through a secondary index inside a transaction with pending writes
 

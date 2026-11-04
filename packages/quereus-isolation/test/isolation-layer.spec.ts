@@ -6677,6 +6677,115 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 		});
 	});
 
+	describe('underlying primary-key order differs from the overlay (merge ordering)', () => {
+		// Regression: the merge compares the two streams under the underlying's comparator, but
+		// took the overlay stream as the memory table emitted it. When the orders disagree, the
+		// merge moves past a committed row before the staged row shadowing it comes up, so a
+		// read returns both.
+
+		/** Ranks 'b' before 'aa', where the overlay's memory table ranks 'aa' before 'b'. */
+		function byLengthThenValue(a: SqlValue, b: SqlValue): number {
+			const x = String(a);
+			const y = String(b);
+			return x.length - y.length || (x < y ? -1 : x > y ? 1 : 0);
+		}
+
+		class LengthOrderedTable extends VirtualTable {
+			private readonly rows: Row[];
+
+			constructor(db: Database, private readonly mod: LengthOrderedModule, schema: TableSchema) {
+				super(db, mod, schema.schemaName, schema.name);
+				this.tableSchema = schema;
+				const key = `${schema.schemaName}.${schema.name}`.toLowerCase();
+				if (!mod.store.has(key)) mod.store.set(key, []);
+				this.rows = mod.store.get(key)!;
+			}
+
+			comparePrimaryKey(a: SqlValue[], b: SqlValue[]): number {
+				return byLengthThenValue(a[0], b[0]);
+			}
+
+			async disconnect(): Promise<void> { /* no-op */ }
+
+			async update(args: UpdateArgs): Promise<UpdateResult> {
+				if (args.operation === 'insert' && args.values) {
+					this.rows.push([...args.values] as Row);
+					return { status: 'ok', row: args.values };
+				}
+				return { status: 'ok' };
+			}
+
+			async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
+				const path = filterInfo.accessPath;
+				const reversed = path?.kind === 'index' && path.index.reverse === true;
+				this.mod.servedReversedWalk ||= reversed;
+				const direction = reversed ? -1 : 1;
+				yield* [...this.rows].sort((a, b) => direction * byLengthThenValue(a[0], b[0]));
+			}
+		}
+
+		class LengthOrderedModule implements VirtualTableModule<LengthOrderedTable, BaseModuleConfig> {
+			readonly store = new Map<string, Row[]>();
+			servedReversedWalk = false;
+
+			async create(cdb: Database, schema: TableSchema): Promise<LengthOrderedTable> {
+				return new LengthOrderedTable(cdb, this, schema);
+			}
+
+			async connect(cdb: Database, _pAux: unknown, _m: string, _s: string, _t: string, _o: BaseModuleConfig, schema?: TableSchema): Promise<LengthOrderedTable> {
+				return new LengthOrderedTable(cdb, this, schema!);
+			}
+
+			async destroy(): Promise<void> { /* store is per-instance */ }
+
+			getBestAccessPlan(_cdb: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+				const builder = AccessPlanBuilder.fullScan(request.estimatedRows ?? 100)
+					.setHandledFilters(new Array(request.filters.length).fill(false));
+				if (!request.requiredOrdering?.[0]?.desc) return builder.build();
+				// A reversed plan has to answer an ordering request. A full-scan plan that only
+				// names a descriptor stays a sequential scan, and `reverse` never reaches the merge.
+				const descriptor: IndexDescriptor = { ...primaryKeyDescriptor(tableInfo)!, name: '_primary_1', reverse: true };
+				return { ...builder.setOrdering(request.requiredOrdering).setIndexDescriptor(descriptor).build(), orderingIndexName: '_primary_1' };
+			}
+		}
+
+		let odb: Database;
+		let underlying: LengthOrderedModule;
+
+		beforeEach(async () => {
+			odb = new Database();
+			underlying = new LengthOrderedModule();
+			odb.registerModule('isolated', new IsolationModule({ underlying }));
+			await odb.exec(`create table t (k text primary key, v text) using isolated`);
+		});
+		afterEach(async () => { await odb.close(); });
+
+		async function values(sql: string): Promise<SqlValue[]> {
+			return (await asyncIterableToArray(odb.eval(sql))).map(r => r.v as SqlValue);
+		}
+
+		it('shadows each committed row when the underlying ranks keys opposite to the overlay', async () => {
+			await odb.exec(`insert into t values ('aa', 'committed-aa'), ('b', 'committed-b')`);
+
+			await odb.exec('begin');
+			await odb.exec(`update t set v = 'staged-aa' where k = 'aa'`);
+			await odb.exec(`update t set v = 'staged-b' where k = 'b'`);
+			expect(await values(`select v from t`)).to.deep.equal(['staged-b', 'staged-aa']);
+			await odb.exec('rollback');
+		});
+
+		it('shadows a committed row on a reversed primary-key walk', async () => {
+			await odb.exec(`insert into t values ('aa', 'committed-aa'), ('b', 'committed-b'), ('ccc', 'committed-ccc')`);
+
+			await odb.exec('begin');
+			await odb.exec(`update t set v = 'staged-b' where k = 'b'`);
+			expect(await values(`select v from t order by k desc`)).to.deep.equal(['committed-ccc', 'committed-aa', 'staged-b']);
+			await odb.exec('rollback');
+
+			expect(underlying.servedReversedWalk, 'the read must be a reversed walk, not a sort above a forward scan').to.be.true;
+		});
+	});
+
 	describe('overlay indexes and UNIQUE constraints scoped to live rows', () => {
 		// Regression: a tombstone (a deletion marker: the deleted row's PK, NULL in every
 		// other column) was enforced by the overlay's own UNIQUE structures as if it were a

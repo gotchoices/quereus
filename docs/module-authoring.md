@@ -391,13 +391,12 @@ interface IndexDescriptor {
 key however it is named. `validateAccessPlan` rejects a descriptor whose `name` disagrees with
 the plan's index name.
 
-Scan **direction** matters to the same order-sensitive consumers: a module whose `idxStr` already
-encodes direction (the in-memory vtab's `ordCons=DESC` convention) needs nothing extra, but a
-module that carries direction only in an opaque per-plan index name — minting a distinct name per
-scan direction rather than writing a direction marker anywhere text-visible — **must** set
-`reverse: true` on the descriptor for a reversed scan. Otherwise an emission-order consumer (the
-isolation overlay's merged read) has no way to learn the underlying stream is reversed and merges
-it against a forward comparator, scrambling row order.
+Scan **direction** matters to the same order-sensitive consumers: a module that walks an index in
+reverse **must** set `reverse: true` on the descriptor, whether or not its `idxStr` or a per-plan
+index name also records the direction. An emission-order consumer (the isolation overlay's merged
+read) learns direction only from `reverse`, for a primary-key plan and a secondary-index plan
+alike. Without it, the consumer merges a reversed stream against a forward comparator, which
+scrambles row order and can return a committed row alongside its staged replacement.
 
 **Multi-seek key order is a hard requirement, independent of `providesOrdering`.** A
 `multiSeek` access path (`plan=5`) must emit its rows in the scanned index's own key

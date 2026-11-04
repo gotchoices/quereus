@@ -12,8 +12,9 @@
  *   ever match (the values are mutually exclusive) and every uncommitted row would
  *   silently vanish from the answer.
  * - The merge must pair each staged row with the stored row it shadows. The
- *   primary-key merge (`mergeStreams`) requires both streams in ascending key order;
- *   the secondary-index merge sorts the overlay itself and tolerates more.
+ *   primary-key merge (`mergeStreams`) requires the stored rows in the underlying's
+ *   primary-key order, and both merges sort the staged rows to match; the secondary-index
+ *   merge also excludes shadowed rows by primary key and so tolerates more.
  *
  * The rewrite SORTS its seek keys before stamping them, so the underlying stream
  * arrives in index-key order whatever order the key source emitted. The literal-list
@@ -282,7 +283,7 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 		// — but these tests drive the memory backend; the store's own coverage of the same
 		// shape is in `quereus-store`'s `key-set-seek-store.spec.ts`.)
 		//
-		// `mergeStreams` requires both streams in ascending primary-key order. The
+		// `mergeStreams` requires the underlying stream in primary-key order. The
 		// literal form of the same plan (`where pk in (3, 1, 2)`) used to visit windows
 		// in list order and mis-pair the staged rows — fix/bug-isolation-multiseek-merge-order,
 		// covered by the "literal IN-list" describe block below, which pins the fix
@@ -438,7 +439,7 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 		// does NOT go through `emitKeySetSemiJoin`'s sort (that rewrite only fires for
 		// `pk in (select …)`). Before the fix, the memory backend visited a multi-seek's
 		// keys in that seek-argument order instead of the scanned structure's own key
-		// order, so `mergeStreams` (which requires ascending key order on both streams)
+		// order, so `mergeStreams` (which requires the underlying stream in key order)
 		// mis-paired the staged row against the wrong stored row. Each list below is
 		// deliberately out of ascending order.
 

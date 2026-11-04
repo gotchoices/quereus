@@ -45,10 +45,10 @@ export interface IndexDescriptor {
 	 *
 	 * This is the one place scan DIRECTION is modelled structurally, so an
 	 * emission-order consumer (the isolation overlay's merged read) can walk the
-	 * reversed stream correctly. A module whose `idxStr` already encodes direction
-	 * (the in-memory vtab's `ordCons=DESC`) need not set it; a module that carries
-	 * direction only in an opaque per-plan index name (lamina) MUST, or the overlay
-	 * merges a reversed underlying stream against a forward comparator.
+	 * reversed stream correctly. It is also the only place such a consumer looks: a
+	 * module that walks an index in reverse MUST set it, whatever its `idxStr` or
+	 * per-plan index name (lamina) also records, or the overlay merges a reversed
+	 * underlying stream against a forward comparator.
 	 */
 	readonly reverse?: boolean;
 }
@@ -57,12 +57,10 @@ export interface IndexDescriptor {
  * Which seek/scan strategy the planner chose over an {@link IndexDescriptor}.
  * One-to-one with the `plan=N` codes carried in `idxStr`.
  *
- * Scan DIRECTION is not part of the plan KIND. For the in-memory vtab it rides
- * `idxStr` (the `plan=1` / `plan=4` descending codes and the `ordCons=DESC`
- * parameter its scan-plan builder recognises). A module that carries direction
- * only in an opaque per-plan index name (lamina) instead sets
- * {@link IndexDescriptor.reverse} so an emission-order consumer can still learn
- * the scan is reversed.
+ * Scan DIRECTION is not part of the plan KIND. The in-memory vtab's runtime reads it
+ * from `idxStr` (the `plan=1` / `plan=4` descending codes and the `ordCons=DESC`
+ * parameter its scan-plan builder recognises), which no engine path emits today. An
+ * emission-order consumer learns direction only from {@link IndexDescriptor.reverse}.
  */
 export type IndexPlanKind =
 	| 'scan'             // plan=0 — ordered walk, no bounds

@@ -5,7 +5,7 @@ import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
-import type { MergeEntry, MergeConfig } from './merge-types.js';
+import type { MergeEntry, MergeConfig, SortKeyComparator } from './merge-types.js';
 import { makeFullScanFilterInfo, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
 import { type PkEquals, type PkKeyShape, EMPTY_PK_KEY_SHAPE, makePkKeyShape, pkEqualsFromShape, probeRowByPk } from './pk-probe.js';
 import { makePkKeySerializer } from './overlay-rows.js';
@@ -23,11 +23,15 @@ const EMPTY_PK_SHAPE_ENTRY: { shape: PkKeyShape; equals: PkEquals } = {
  */
 const MATCH_ALL_ROWS = (_row: Row): boolean => true;
 
+/** The order a reversed walk emits a key in, given the order a forward walk emits it in. */
+const reverseComparator = (compare: SortKeyComparator): SortKeyComparator =>
+	(a, b) => -compare(a, b);
+
 /**
- * Information about which index is being scanned.
+ * Information about which index is being scanned, and in which direction.
  */
 type IndexScanInfo =
-	| { type: 'primary' }
+	| { type: 'primary'; reverse: boolean }
 	| { type: 'secondary'; indexName: string; columnIndices: number[]; keyColumns: readonly IndexKeyColumn[]; reverse: boolean };
 
 /**
@@ -66,9 +70,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * it, so a collation registered with `db.registerCollation` participates instead of
 	 * silently degrading to BINARY.
 	 *
-	 * The overlay's key comparator and the underlying table's must agree, or a staged
-	 * row fails to shadow the base row it replaces; both now derive from this one
-	 * database registry.
+	 * The overlay's key comparator and the underlying table's must agree on which keys are
+	 * equal, or a staged row fails to shadow the base row it replaces; both now derive from
+	 * this one database registry. They need not agree on order: the merge sorts staged rows
+	 * under the underlying's order on every read.
 	 */
 	private readonly collationResolver: CollationResolver;
 
@@ -463,8 +468,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * Performs merged query combining overlay and underlying data.
 	 *
-	 * For primary key scans: uses position-based merge since both streams share
-	 * the same sort order and overlay entries align with underlying rows by PK.
+	 * For primary key scans: uses position-based merge. The underlying scan alone sets the
+	 * order, and the overlay's entries are sorted to match it, so they align with underlying
+	 * rows by PK.
 	 *
 	 * For secondary index scans: uses PK-exclusion approach because overlay entries
 	 * may have different index key values than the underlying rows they shadow
@@ -485,10 +491,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		// Primary key scan - use standard sort-key merge
-		const overlayFilterInfo = this.adaptFilterInfoForOverlay(filterInfo);
-		const overlayStream = this.queryOverlayAsMergeEntries(overlay, overlayFilterInfo, indexInfo);
-		const underlyingStream = this.underlyingTable.query!(filterInfo);
 		const mergeConfig = this.buildMergeConfig(indexInfo);
+		const overlayFilterInfo = this.adaptFilterInfoForOverlay(filterInfo);
+		const overlayStream = this.queryOverlayAsMergeEntries(
+			overlay, overlayFilterInfo, indexInfo, mergeConfig.compareSortKey ?? mergeConfig.comparePK);
+		const underlyingStream = this.underlyingTable.query!(filterInfo);
 		yield* mergeStreams(overlayStream, underlyingStream, mergeConfig);
 	}
 
@@ -611,7 +618,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * docs/design-isolation-layer.md.
 	 *
 	 * `role` is authoritative over `name`: a descriptor with `role: 'primary'` IS the table's
-	 * primary key however the module named it (an alias like `_primary_1`), so it merges by PK.
+	 * primary key however the module named it (an alias like `_primary_1`), so it merges by PK,
+	 * in the direction its `reverse` flag states.
 	 * An `unresolvedIndex` — a name the engine could not resolve to any index, with no
 	 * module-supplied descriptor — cannot yield a comparator, so we fail loudly rather than
 	 * silently merge by the wrong sort key.
@@ -628,20 +636,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		switch (path.kind) {
 			case 'fullScan':
 			case 'empty':
-				return { type: 'primary' };
-			case 'index':
+				return { type: 'primary', reverse: false };
+			case 'index': {
+				// A reversed scan (ORDER BY … DESC) emits the underlying stream in reverse of
+				// the descriptor's declared key order; the merge must walk its sort key
+				// reversed to interleave overlay rows correctly.
+				const reverse = path.index.reverse === true;
 				return path.index.role === 'primary'
-					? { type: 'primary' }
+					? { type: 'primary', reverse }
 					: {
 						type: 'secondary',
 						indexName: path.index.name,
 						columnIndices: path.index.keyColumns.map(c => c.columnIndex),
 						keyColumns: path.index.keyColumns,
-						// A reversed scan (ORDER BY … DESC) emits the underlying stream in
-						// reverse of the descriptor's declared key order; the merge must walk
-						// its sort key reversed to interleave overlay rows correctly.
-						reverse: path.index.reverse === true,
+						reverse,
 					};
+			}
 			case 'unresolvedIndex':
 				throw new QuereusError(
 					`IsolatedTable '${this.tableName}': the underlying module chose index ` +
@@ -862,9 +872,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Queries the overlay table and converts rows to MergeEntry format.
+	 * Queries the overlay table and converts rows to MergeEntry format, sorted by `compareSortKey`.
 	 *
-	 * Uses the same FilterInfo as the underlying query so both streams are in the same order.
+	 * Uses the same FilterInfo as the underlying query, which fixes the rows but not their
+	 * order: the merge follows the underlying's key order and walk direction, and the overlay
+	 * emits in its own. Sorting here keeps merge correctness independent of that order, as
+	 * {@link mergedSecondaryIndexQuery} does for its overlay rows.
 	 * For secondary index scans, the sort key includes both the index key and primary key.
 	 *
 	 * The window is re-applied here rather than trusted: `filterInfo` was negotiated with
@@ -883,7 +896,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private async *queryOverlayAsMergeEntries(
 		overlay: VirtualTable,
 		filterInfo: FilterInfo,
-		indexInfo: IndexScanInfo
+		indexInfo: IndexScanInfo,
+		compareSortKey: SortKeyComparator
 	): AsyncGenerator<MergeEntry> {
 		if (!overlay.query) {
 			return;
@@ -892,6 +906,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const pkIndices = this.getPrimaryKeyIndices();
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 		const matchesWindow = this.buildConstraintMatcher(filterInfo);
+		const entries: MergeEntry[] = [];
 
 		// Query overlay with the same filter constraints
 		for await (const overlayRow of overlay.query(filterInfo)) {
@@ -902,14 +917,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			const sortKey = this.buildSortKey(overlayRow, pkIndices, indexInfo);
 
 			if (isTombstone) {
-				yield createTombstone(pk, sortKey);
+				entries.push(createTombstone(pk, sortKey));
 			} else {
 				// Remove the tombstone column from the row before yielding
 				const dataRow = overlayRow.slice(0, tombstoneIndex);
 				if (matchesWindow !== MATCH_ALL_ROWS && !matchesWindow(dataRow)) continue;
-				yield createMergeEntry(dataRow, pk, sortKey);
+				entries.push(createMergeEntry(dataRow, pk, sortKey));
 			}
 		}
+
+		// NOTE: reads every staged row in the window before the merge yields anything, so a
+		// merged scan under a `limit` no longer stops the overlay read early. Fine while an
+		// overlay holds a single transaction's writes (cost not measured); if large overlays
+		// make this show up hot, restore the lazy read for a forward walk over an underlying
+		// with no `comparePrimaryKey`, whose fallback comparator matches a memory overlay's order.
+		entries.sort((a, b) => compareSortKey(a.sortKey, b.sortKey));
+		yield* entries;
 	}
 
 	/**
@@ -934,22 +957,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *
 	 * For primary key scans: compare by PK
 	 * For secondary index scans: compare by (indexKey, PK) using underlying's comparator
+	 * Either way, a reversed walk negates the sort key comparator.
 	 *
-	 * @param indexInfo Which index is being scanned. Defaults to primary key scan.
+	 * @param indexInfo Which index is being scanned, and in which direction.
 	 */
-	private buildMergeConfig(indexInfo: IndexScanInfo = { type: 'primary' }): MergeConfig {
+	private buildMergeConfig(indexInfo: IndexScanInfo): MergeConfig {
 		const pkIndices = this.getPrimaryKeyIndices();
 
 		const extractPK = (row: Row) => pkIndices.map(i => row[i]);
 		const comparePK = this.getComparePK();
 
 		if (indexInfo.type === 'primary') {
-			// Primary key scan - sort key equals PK
-			return {
-				extractPK,
-				comparePK,
-				// No need for separate sort key functions - defaults to PK
-			};
+			// Primary key scan - sort key equals PK, so the sort key functions default to the
+			// PK's unless a reversed walk needs the comparator negated.
+			return indexInfo.reverse
+				? { extractPK, comparePK, compareSortKey: reverseComparator(comparePK) }
+				: { extractPK, comparePK };
 		}
 
 		// Secondary index scan - sort key is (indexKey, PK)
@@ -976,7 +999,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// `compareSortKey(oKey, uKey) <= 0` walk yield overlay rows while they sort at or
 		// before the underlying row under the reversed order.
 		const compareSortKey = indexInfo.reverse
-			? (a: SqlValue[], b: SqlValue[]) => -forwardCompareSortKey(a, b)
+			? reverseComparator(forwardCompareSortKey)
 			: forwardCompareSortKey;
 
 		return {
