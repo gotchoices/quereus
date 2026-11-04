@@ -676,7 +676,7 @@ consults a deferred backing.
 Running the floor per source row would cost O(rows × body); so a full-rebuild plan is
 dirtied per row and rebuilt once per statement, and a residual plan's affected binding
 keys accumulate (deduped) and recompute once per distinct key at the same flush — inside
-the statement-atomicity savepoint (and on the `OR FAIL` throw path). Recompute-from-live-state
+the statement-atomicity savepoint (and on the FAIL throw path). Recompute-from-live-state
 is last-write-wins, so the flush-time recompute equals the last per-row recompute. This
 does not weaken MV-003: a deferred backing is never read mid-statement — the conflict
 probe consults only `'inverse-projection'` backings, which stay per-row-immediate. The

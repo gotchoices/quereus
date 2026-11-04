@@ -3,7 +3,7 @@ import { normalizeCollationName } from '../util/comparison.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { Expression } from '../parser/ast.js';
-import type { ConflictResolution } from '../common/constants.js';
+import { ConflictResolution } from '../common/constants.js';
 import { type ColumnDef, type TableConstraint } from '../parser/ast.js';
 import { RowOp, StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -1370,6 +1370,21 @@ export function resolvePkDefaultConflict(schema: TableSchema): ConflictResolutio
 		if (col?.defaultConflict !== undefined) return col.defaultConflict;
 	}
 	return undefined;
+}
+
+/**
+ * Whether any constraint on the table declares `ON CONFLICT FAIL`: the primary key, a
+ * column, or a CHECK, UNIQUE or FOREIGN KEY constraint. Answers "could a violation on
+ * this table resolve to FAIL when the statement has no OR clause", which decides how
+ * the DML executor brackets the statement with savepoints.
+ */
+export function tableDeclaresFailConflict(schema: TableSchema): boolean {
+	const declaresFail = (c: { defaultConflict?: ConflictResolution }): boolean => c.defaultConflict === ConflictResolution.FAIL;
+	return schema.primaryKeyDefaultConflict === ConflictResolution.FAIL
+		|| schema.columns.some(declaresFail)
+		|| (schema.checkConstraints ?? []).some(declaresFail)
+		|| (schema.uniqueConstraints ?? []).some(declaresFail)
+		|| (schema.foreignKeys ?? []).some(declaresFail);
 }
 
 /**

@@ -120,3 +120,204 @@ release savepoint sp1;
 commit;
 
 drop table t_spf;
+
+-- ===================================
+-- 6. Declared ON CONFLICT FAIL on NOT NULL — earlier rows remain
+-- ===================================
+-- With no OR clause the constraint's own action applies, and FAIL keeps the rows
+-- written before the violation just as `or fail` does.
+
+create table t_dnn (id integer primary key, x integer not null on conflict fail);
+
+insert into t_dnn values (5, 5), (6, null), (7, 7);
+-- error: NOT NULL
+
+select id from t_dnn order by id;
+→ [{"id":5}]
+
+-- Inside a transaction the rows stay pending and the transaction stays open.
+begin;
+insert into t_dnn values (8, 8), (9, null), (10, 10);
+-- error: NOT NULL
+
+select id from t_dnn order by id;
+→ [{"id":5},{"id":8}]
+
+rollback;
+
+select id from t_dnn order by id;
+→ [{"id":5}]
+
+drop table t_dnn;
+
+-- ===================================
+-- 7. Declared ON CONFLICT FAIL on CHECK — earlier rows remain
+-- ===================================
+
+create table t_dck (id integer primary key, n integer check (n > 0) on conflict fail);
+
+insert into t_dck values (1, 1), (2, -2), (3, 3);
+-- error: CHECK
+
+select id from t_dck order by id;
+→ [{"id":1}]
+
+drop table t_dck;
+
+-- ===================================
+-- 8. Declared ON CONFLICT FAIL on a primary key — earlier rows remain
+-- ===================================
+-- The module raises this one during the write, so the per-row savepoint is open.
+
+create table t_dpk (id integer primary key on conflict fail, x integer);
+insert into t_dpk values (1, 1);
+-- run
+
+insert into t_dpk values (5, 5), (1, 5), (6, 6);
+-- error: UNIQUE constraint failed
+
+select id from t_dpk order by id;
+→ [{"id":1},{"id":5}]
+
+begin;
+insert into t_dpk values (7, 7), (1, 7), (8, 8);
+-- error: UNIQUE constraint failed
+
+select id from t_dpk order by id;
+→ [{"id":1},{"id":5},{"id":7}]
+
+rollback;
+
+drop table t_dpk;
+
+-- ===================================
+-- 9. Declared ON CONFLICT FAIL on UNIQUE — earlier rows remain
+-- ===================================
+
+create table t_duq (id integer primary key, x integer unique on conflict fail);
+insert into t_duq values (1, 1);
+-- run
+
+begin;
+insert into t_duq values (5, 5), (6, 1), (7, 7);
+-- error: UNIQUE constraint failed
+
+select id from t_duq order by id;
+→ [{"id":1},{"id":5}]
+
+commit;
+
+select id from t_duq order by id;
+→ [{"id":1},{"id":5}]
+
+drop table t_duq;
+
+-- ===================================
+-- 10. A table that declares FAIL still undoes the statement for any other action
+-- ===================================
+-- `x` declares FAIL, but `y` and the primary key resolve to ABORT, so these failures
+-- undo the statement's earlier rows. `or abort` overrides the declared action too.
+
+create table t_dmix (
+	id integer primary key,
+	x integer not null on conflict fail,
+	y integer check (y > 0)
+);
+insert into t_dmix values (0, 0, 1);
+-- run
+
+begin;
+
+-- Raised by the source, before the row reaches the module.
+insert into t_dmix values (1, 1, 1), (2, 2, -2), (3, 3, 3);
+-- error: CHECK
+
+-- Raised by the module during the write.
+insert into t_dmix values (1, 1, 1), (0, 2, 2), (3, 3, 3);
+-- error: UNIQUE constraint failed
+
+insert or abort into t_dmix values (1, 1, 1), (2, null, 2), (3, 3, 3);
+-- error: NOT NULL
+
+select id from t_dmix order by id;
+→ [{"id":0}]
+
+commit;
+
+drop table t_dmix;
+
+-- ===================================
+-- 11. Declared FAIL on UPDATE — the same rows remain on every module
+-- ===================================
+-- A module without per-scan snapshot isolation reads every source row before writing
+-- any, and the source is what raises NOT NULL and CHECK. The rows before the violation
+-- must still be written, and a failure must take effect at its own row's position.
+
+create table t_dup (id integer primary key, x integer not null on conflict fail);
+insert into t_dup values (1, 1), (2, 2), (3, 3);
+-- run
+
+update t_dup set x = case when id = 2 then null else x + 10 end;
+-- error: NOT NULL
+
+select id, x from t_dup order by id;
+→ [{"id":1,"x":11},{"id":2,"x":2},{"id":3,"x":3}]
+
+drop table t_dup;
+
+-- Row 2 hits the declared FAIL during its write, and row 3 would hit an ABORT in the
+-- source. Row 2 comes first, so row 1 survives.
+create table t_dor (
+	id integer primary key,
+	x integer unique on conflict fail,
+	y integer check (y > 0)
+);
+insert into t_dor values (1, 1, 1), (2, 2, 2), (3, 3, 3);
+-- run
+
+update t_dor set
+	x = case when id = 3 then 3 else 11 end,
+	y = case when id = 3 then -1 else y end;
+-- error: UNIQUE constraint failed
+
+select id, x, y from t_dor order by id;
+→ [{"id":1,"x":11,"y":1},{"id":2,"x":2,"y":2},{"id":3,"x":3,"y":3}]
+
+drop table t_dor;
+
+-- ===================================
+-- 12. Declared FAIL does not let a kept row escape a parent-side RESTRICT
+-- ===================================
+-- Row 1 moves a key its child still references, then row 2 hits the declared FAIL. The
+-- engine batches this RESTRICT check to statement end, and it must still run when the
+-- FAIL stops the row loop, or row 1 would survive with its child orphaned. The check's
+-- failure is an ABORT, so it undoes the statement.
+
+pragma foreign_keys = true;
+
+create table t_fkp (id integer primary key, n integer check (n > 0) on conflict fail);
+create table t_fkc (id integer primary key, pid integer references t_fkp(id));
+insert into t_fkp values (1, 1), (2, 2);
+insert into t_fkc values (10, 1);
+-- run
+
+update t_fkp set id = id + 100, n = case when id = 2 then -1 else n end;
+-- error: FOREIGN KEY constraint failed
+
+select id, n from t_fkp order by id;
+→ [{"id":1,"n":1},{"id":2,"n":2}]
+
+-- With nothing referencing the moved key, the same statement keeps row 1.
+delete from t_fkc;
+-- run
+
+update t_fkp set id = id + 100, n = case when id = 2 then -1 else n end;
+-- error: CHECK
+
+select id, n from t_fkp order by id;
+→ [{"id":2,"n":2},{"id":101,"n":1}]
+
+drop table t_fkc;
+drop table t_fkp;
+
+pragma foreign_keys = false;

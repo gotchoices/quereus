@@ -63,6 +63,8 @@ create table products (
 
 The action precedence is: **statement-level OR clause > per-constraint default > ABORT**. So `INSERT OR ABORT INTO products ...` overrides every column-level directive above.
 
+A declared `ON CONFLICT FAIL` behaves like `OR FAIL`, on `INSERT`, `UPDATE` and `DELETE`: the rows written before the violation remain. The action is the one the failing row resolves to, so if another constraint on the same table resolves to `ABORT` and is the one violated, the statement's earlier rows are undone.
+
 **A row that conflicts on several constraints.** Each UNIQUE / PRIMARY KEY constraint is checked under its own action, so resolving the primary key by `REPLACE` does not exempt the row from the table's other UNIQUE constraints: with `id integer primary key on conflict replace, v text unique`, inserting a row whose `v` belongs to a *different* row fails, while `insert or replace` (REPLACE for every constraint) displaces both rows. The row displaced at the primary key counts as already removed, so the new row may reuse that row's own UNIQUE values (re-inserting `id = 1` with the `v` row 1 already had succeeds). *Differs from SQLite*, which defers the primary-key `REPLACE` until after the other constraints are checked and so reports a UNIQUE error against the row it was about to displace whenever that constraint's action is not `REPLACE`.
 
 **Note:** The `OR` clause and `ON CONFLICT DO ...` clause are mutually exclusive. Use `OR REPLACE` for simple full-row replacement, and `ON CONFLICT DO UPDATE` for surgical column-level updates.

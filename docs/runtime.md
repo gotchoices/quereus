@@ -967,9 +967,9 @@ handling. They are preserved across savepoints as part of the queued row data.
 
 ### Statement-Level Atomicity
 
-A multi-row `INSERT`/`UPDATE`/`DELETE` is atomic at the statement level: either
-all of its row effects apply or none do, mirroring SQLite's
-implicit-savepoint-per-statement semantics. In autocommit this is masked because
+Unless a violation resolves to FAIL, a multi-row `INSERT`/`UPDATE`/`DELETE` is
+atomic at the statement level: either all of its row effects apply or none do,
+mirroring SQLite's implicit-savepoint-per-statement semantics. In autocommit this is masked because
 `_finalizeImplicitTransaction` rolls back the whole implicit transaction on
 error; inside an explicit `begin … rollback` the guarantee comes from a
 statement-scope savepoint instead.
@@ -977,20 +977,36 @@ statement-scope savepoint instead.
 All three DML generators route through one shared higher-order async generator,
 `runWithStatementSavepoints` (`runtime/emit/dml-executor.ts`), which owns the
 savepoint lifecycle and calls back a per-row `processRow` closure for the
-operation-specific body:
+operation-specific body. It runs in one of three modes (`DmlSavepointMode`):
 
-- **non-FAIL** (ABORT default / IGNORE / REPLACE / ROLLBACK): a single
+- **`statement`** (ABORT default / IGNORE / REPLACE / ROLLBACK): a single
   statement-scope savepoint (`__stmt_atomic_N`) is opened before the row loop,
   released after it completes, and rolled-back-and-released on **any** throw
   escaping the loop — whether from the source iterator (a `ConstraintCheckNode`
   above the executor raising NOT NULL / CHECK / parent-side FK RESTRICT before a
   row is yielded) or from `processRow` (a vtab-returned constraint, or the
   runtime RESTRICT pre-check). This is what reverts rows 1..N-1 when row N fails.
-- **OR FAIL**: deliberately *skips* the statement wrap (FAIL keeps prior rows)
-  and instead opens a per-row savepoint (`__or_fail_N`), released on success and
-  rolled back on throw, so only the failing row's partial work (including a
+- **`row`** (`or fail`): deliberately *skips* the statement wrap (FAIL keeps prior
+  rows) and instead opens a per-row savepoint (`__or_fail_N`), released on success
+  and rolled back on throw, so only the failing row's partial work (including a
   row-time MV backing write that landed before a later maintenance throw) is
   undone.
+- **`statementAndRow`** (no `or` clause, and the table declares `on conflict fail`
+  on any constraint): opens both, because another constraint on the table may
+  resolve to ABORT and which action applies is only known when a row fails. A
+  `FailConflictError` keeps the earlier rows: the per-row savepoint has undone the
+  failing row, and the statement savepoint is released rather than rolled back. Any
+  other error rolls the statement savepoint back. A NOT NULL or CHECK violation
+  raised by the source iterator arrives with no per-row savepoint open, but that row
+  has written nothing. A statement with an `or` clause overrides the declared action,
+  so it uses one of the other two modes.
+
+An UPDATE or DELETE on a module without per-scan snapshot isolation drains its source
+before writing (see the read/write separation section below), so in
+`statementAndRow` mode an error during that drain is held back: the rows read before
+it are applied first, then it is raised from the loop. Every failure therefore takes
+effect at its own row's position, as it does when streaming, and the rows a declared
+FAIL keeps exist on every module.
 
 At the **end-of-statement boundary** — after the row loop completes and (for
 non-FAIL) **before** the statement savepoint releases — the generator drains its
@@ -1002,8 +1018,12 @@ Inside the statement savepoint, a failed rebuild rolls the whole statement back,
 a statement that aborts mid-loop never reaches the flush (so a dirtied-then-aborted
 MV leaves its backing untouched). FAIL mode still runs the flush after the loop, but
 having no statement savepoint, a flush failure there does not unwind the
-already-applied rows — consistent with FAIL's keep-prior-rows semantics. See
-`docs/incremental-maintenance.md` § end-of-statement flush.
+already-applied rows — consistent with FAIL's keep-prior-rows semantics. When a FAIL
+stops the loop, `row` and `statementAndRow` both run the flush before raising the
+error, so an MV does not lag the surviving rows. `statementAndRow` still has its
+statement savepoint at that point, so a flush failure there rolls the whole statement
+back and supersedes the FAIL. See `docs/incremental-maintenance.md` § end-of-statement
+flush.
 
 The savepoint helpers used are always the broadcast variants
 (`_createSavepointBroadcast` / `_releaseSavepointBroadcast` /
@@ -1121,8 +1141,9 @@ pre-mutation point at which to block; instead the helper runs the transitive RES
 keys off remain, so `select 1 from child where fk = ?` still answers correctly — and throws
 on a violation. `runWithStatementSavepoints` then rolls back the statement-scope savepoint
 (`__stmt_atomic_N`, opened before the row loop), unwinding both the substrate's eviction and
-the writing row. (Evictions only occur under REPLACE resolution, which is never `OR FAIL`,
-so the non-FAIL statement-savepoint branch always applies.) The surfaced error is the
+the writing row. (Evictions only occur under REPLACE resolution, which an `or fail`
+statement never has, so the statement savepoint is always open, and the RESTRICT error is
+never a `FailConflictError`.) The surfaced error is the
 `FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from '<child>'`
 form — not the plan-time `CHECK constraint failed: _fk_...` form — since the plan-time
 parent-side FK check is absent for internal evictions. Enforced on the key-based memory,
@@ -1169,8 +1190,12 @@ not lens-routed, its effective conflict resolution is default/ABORT or ROLLBACK,
 **every** inbound FK is a non-self-referential `restrict` for the op:
 
 - **FAIL / IGNORE / REPLACE** have per-row keep/skip semantics a statement-end check
-  cannot honor (FAIL keeps prior rows; the gate excludes it, so the flush always runs
-  under the statement-scope savepoint).
+  cannot honor (`or fail` keeps prior rows; the gate excludes it, so the flush always
+  runs under the statement-scope savepoint). The gate reads only the statement's `or`
+  clause, so a table that declares `on conflict fail` still batches: its `statementAndRow`
+  mode has the statement savepoint, and the flush also runs when a declared FAIL stops the
+  row loop, so the rows that FAIL would keep cannot skip the probe. A violation found there
+  is an ABORT, which undoes those rows.
 - **Any cascading / set-null / set-default inbound FK** forces the per-row transitive
   pre-walk, which must interleave with cascade execution (a cascade could delete a
   RESTRICT child's rows mid-statement).

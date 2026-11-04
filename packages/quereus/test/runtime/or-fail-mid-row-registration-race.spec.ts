@@ -195,9 +195,9 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 	});
 
 	it('broadcasts create/release/rollback-to to a sibling that registers mid-bracket', async () => {
-		// The sibling registers DURING __or_fail_0 (row 1). Subsequent rows'
-		// brackets (__or_fail_1, __or_fail_2) and the ROLLBACK TO sp1 must
-		// each reach the sibling via getAllConnections().
+		// The sibling registers DURING row 1's per-row savepoint. Subsequent
+		// rows' brackets and the ROLLBACK TO sp1 must each reach the sibling
+		// via getAllConnections().
 		await db.exec('create table parent (id integer primary key) using race_parent');
 
 		await db.exec('begin');
@@ -211,12 +211,12 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 		//   - begin (from registerConnection's `connection.begin()` call)
 		//   - create(0), create(1)   ← registerConnection's depth-replay
 		//                              loop with activeDepth = 2 (sp1 +
-		//                              __or_fail_0).
-		//   - release(1)             ← end of row 1's __or_fail_0 bracket
-		//   - create(1)              ← row 2's __or_fail_1 bracket open
-		//   - release(1)             ← row 2's __or_fail_1 bracket close
-		//   - create(1)              ← row 3's __or_fail_2 bracket open
-		//   - release(1)             ← row 3's __or_fail_2 bracket close
+		//                              row 1's per-row savepoint).
+		//   - release(1)             ← end of row 1's bracket
+		//   - create(1)              ← row 2's bracket open
+		//   - release(1)             ← row 2's bracket close
+		//   - create(1)              ← row 3's bracket open
+		//   - release(1)             ← row 3's bracket close
 		//
 		// The strict-race guarantee the broadcast secures: the three
 		// post-registration creates+releases (rows 2/3 broadcast create,

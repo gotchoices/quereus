@@ -288,7 +288,9 @@ covering structure answers it.
 > the generator also drains the deferred set on the FAIL throw path — before re-raising the conflict
 > error — so the floor backing reflects the surviving rows instead of lagging them (the failing row's
 > own per-row savepoint already reverted its writes, so the rebuild re-evaluates over just the
-> survivors). Without this, a `read(MV)` after an `OR FAIL` abort would diverge from the live body. The flush is a **worklist drain** over the
+> survivors). Without this, a `read(MV)` after an `OR FAIL` abort would diverge from the live body. A
+> declared `on conflict fail` drains on the same path, though it keeps its statement savepoint until
+> the drain ends, so a failed drain there undoes the statement. The flush is a **worklist drain** over the
 > producer→consumer DAG: each rebuild calls `applyFullRebuild` and routes the realized
 > `BackingRowChange[]` back through `maintainRowTime` with the *same* `deferred` set — an incremental
 > consumer applies inline, a full-rebuild consumer re-dirties into the drain. It proceeds in **rounds**
