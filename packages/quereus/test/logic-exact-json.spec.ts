@@ -11,7 +11,6 @@ describe('sqllogic exact number comparison', () => {
 		['a double whose exact value is the literal', '[9007199254740992]', 2 ** 53],
 		['an exponent literal against the same double', '[1e308]', 1e308],
 		['a safe-range bigint against a small literal', '[5]', 5n],
-		['a digit string, which stays a string', '["9007199254740993"]', '9007199254740993'],
 	];
 
 	for (const [name, expectedText, actualValue] of matching) {

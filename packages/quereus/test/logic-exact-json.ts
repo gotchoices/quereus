@@ -49,11 +49,8 @@ export function canonicalNumbers(value: unknown): unknown {
 	}
 	if (Array.isArray(value)) return value.map(canonicalNumbers);
 	if (value !== null && typeof value === 'object') {
-		const result: Record<string, unknown> = {};
-		for (const [key, entry] of Object.entries(value)) {
-			result[key] = canonicalNumbers(entry);
-		}
-		return result;
+		// fromEntries defines own properties; assigning a `__proto__` key would drop it from both sides of the comparison.
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, canonicalNumbers(entry)]));
 	}
 	return value;
 }
