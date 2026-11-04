@@ -41,3 +41,16 @@ All three apply, and a re-diff is empty.
 A new materialized view is rendered from `diff.tablesToCreate`, so it runs with the plain table creates, ahead of view creates and table alters. An existing table that becomes maintained does not have this problem: its `set maintained as` already runs after the alters.
 
 `bug-apply-schema-creates-views-before-added-columns` sorts plain view creates into the table-alter stages. A materialized view create could join the same sort, but things that read it must still come after it: a plain view's body, an added column's DEFAULT, and a foreign key. `apply-schema-creates-referenced-tables-first` also reorders this bucket and explicitly leaves materialized views out.
+
+## A maintained table written before its source
+
+A related form fails for a simpler reason. A `table … maintained as` create stays at its written position in the create list, unlike the `materialized view` form, which always follows every declared table. Written ahead of a new source, it fails on the memory module, though the other written order applies:
+
+```sql
+table mt { id integer primary key } maintained as select id from c;
+table c { id integer primary key }
+-- Failed to execute DDL: create table mt (id integer primary key) maintained as select id from c
+-- Table 'c' not found in schema path: main
+```
+
+`apply-schema-creates-referenced-tables-first` makes a maintained create follow every create written before it, so that it does not move ahead of its source. A fix here should replace those edges with the tables the body actually reads.
