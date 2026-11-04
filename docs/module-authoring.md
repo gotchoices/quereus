@@ -293,17 +293,28 @@ For the seek-family operators (`=`, `IN`, `<`, `<=`, `>`, `>=`, `OR_RANGE`) the 
 consumes at most one filter per column per role — the first `=`, the first lower bound,
 the first upper bound, **in `request.filters` order**. Claim positionally: mark the first
 match, leave redundant same-column same-role filters unhandled so they survive as a
-residual `Filter`. The planner defends itself against an over-claim by reattaching any
-seek-family filter it did not consume, so an over-claiming module costs a redundant
-filter, not a wrong answer.
+residual `Filter`. The planner reattaches any claimed filter it did not consume, so without
+a LIMIT an over-claiming module costs a redundant filter, not a wrong answer.
+
+Ops outside the seek family (`IS NULL`, `IS NOT NULL`, `LIKE`, `GLOB`, `MATCH`, `NOT IN`)
+never become seek bounds, so the engine re-checks a claim on one above your scan and the
+filter stays in the plan. The exception is `IS NOT NULL` on a `NOT NULL` column, which no
+row can fail. The re-check does not mean your scan is distrusted: under the isolation layer
+it is what removes staged rows, which your scan never sees.
+
+Such a claim still does two things. It feeds your own pricing, and it counts toward the
+licence to truncate: the engine keeps a plan that stops at `request.limit` only when that
+plan claimed every filter. So claim a non-seek filter only if your scan applies it. If you
+claim one you do not apply and stop at `limit + offset`, the re-check discards some of the
+rows you counted and the query returns too few.
 
 Three corollaries worth spelling out:
 
 - **Count distinct columns, not filters.** `a = 1 and a = 2` on a composite primary key
   `(a, b)` is *not* a full key match. Deduplicate by `columnIndex` before deciding that
   every key column is pinned.
-- **Only claim what you can seek.** A range on a non-leading key column, for instance,
-  is not turned into a bound; leave it unhandled.
+- **Claim a seek-family filter only if you can seek it.** A range on a non-leading key
+  column, for instance, is not turned into a bound; leave it unhandled.
 - **A range bound is seeked only on the leading seek column.** A range on a later seek
   column is usable only as the trailing bound of a prefix seek, and only when every
   preceding seek column is pinned by a *single-valued* equality (`a = 1`, or `a in (1)`

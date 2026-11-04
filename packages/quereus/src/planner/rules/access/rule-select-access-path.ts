@@ -327,19 +327,6 @@ function rebuildPipelineWithNewLeaf(
 }
 
 /**
- * The constraint operators this rule can turn into seek bounds, and therefore the
- * only ones {@link reattachUnconsumedConstraints} can recover when a module claims
- * a filter the rule never consumes.
- *
- * NOTE: ops outside this set (IS NULL / IS NOT NULL / LIKE / GLOB / MATCH / NOT IN) are never
- * pushed into FilterInfo by this rule, so a module claiming one is taken at its word.
- * Sound today: the only such claim is memory's tautological IS NOT NULL on a NOT NULL
- * column. If a module ever claims a non-tautological non-seek op, its predicate is lost
- * — widen this set, or make grow-retrieve refuse the claim.
- */
-const RECLAIMABLE_OPS: ReadonlySet<string> = new Set(['=', 'IN', '>', '>=', '<', '<=', 'OR_RANGE']);
-
-/**
  * The set of constraints a physical-node selection actually turned into a seek key,
  * a `FilterInfo.constraints` entry, or a collation-cover residual. Threaded (mutable)
  * through {@link selectPhysicalNodeFromPlan} / {@link selectPhysicalNodeLegacy} so
@@ -349,17 +336,39 @@ const RECLAIMABLE_OPS: ReadonlySet<string> = new Set(['=', 'IN', '>', '>=', '<',
 type ConsumedSet = Set<PlannerPredicateConstraint>;
 
 /**
- * `handledFilters[i] === true` is a module's promise that filter `i` will be enforced
- * somewhere else — and the only "somewhere else" available is `FilterInfo.constraints`
- * (the seek bounds this rule builds). This rule consumes at most one constraint per
- * column per role: the first `=`/`IN`, the first lower bound, the first upper bound.
- * A module that claims a redundant same-column same-role filter (`v > 10 and v > 30`)
- * therefore hands the planner a predicate that is seeked nowhere and — because
- * `rule-grow-retrieve` residualizes only *unhandled* constraints — filtered nowhere.
+ * True for a constraint no row can fail, so a `Filter` re-checking it could reject nothing:
+ * `is not null` on a column declared `not null`. Sound under the isolation layer too, since
+ * `not null` is enforced when a row is staged, and tombstones (whose non-key columns are
+ * null) never reach the emitted stream.
+ */
+function holdsForEveryRow(tableSchema: TableSchema, constraint: PlannerPredicateConstraint): boolean {
+	return constraint.op === 'IS NOT NULL' && tableSchema.columns[constraint.columnIndex].notNull;
+}
+
+/**
+ * Re-check above the scan every filter the module claimed and this rule did not consume.
  *
- * Reattach those as a residual `Filter` so an over-claiming module costs a redundant
- * predicate evaluation, never a wrong answer. Skipped for an `EmptyResultNode` leaf
- * (filtering an empty relation is dead weight) and restricted to {@link RECLAIMABLE_OPS}.
+ * `rule-grow-retrieve` residualizes only *unhandled* constraints, so a claimed filter that
+ * never became a seek key or bound would otherwise be enforced only by the module's own
+ * scan. That is too little in two ways:
+ *  - this rule consumes at most one constraint per column per role (the first `=`/`IN`, the
+ *    first lower bound, the first upper bound), so a redundant `v > 10 and v > 30` claimed
+ *    whole is seeked nowhere;
+ *  - a module honouring its claim only sees its own rows. The isolation layer merges staged
+ *    rows into that stream and checks them against `FilterInfo.constraints` alone, so a
+ *    staged row failing a claimed `is null` or `like` is emitted unless this `Filter`
+ *    removes it.
+ *
+ * A claim this rule cannot consume therefore never removes a filter. What it still buys is
+ * the module's pricing and the licence to truncate (`truncationIsSafe` in
+ * `rule-grow-retrieve`), which stays sound with this `Filter` under the LIMIT: a module
+ * honouring its claim produces no row the `Filter` rejects, so the rows it counted survive.
+ * Skipped for an `EmptyResultNode` leaf, where filtering is dead weight.
+ *
+ * NOTE: `MATCH` does not parse as an operator today, so it never gets here. If it ever does,
+ * a reattached `MATCH` runs the engine's scalar evaluation, which may not know the module's
+ * semantics. Decide then whether to exempt it, knowing an exemption brings the staged-row
+ * leak back for that operator.
  */
 function reattachUnconsumedConstraints(
 	tableRef: TableReferenceNode,
@@ -373,7 +382,7 @@ function reattachUnconsumedConstraints(
 	const lost = constraints.filter((c, i) =>
 		accessPlan.handledFilters[i] === true
 		&& !consumed.has(c)
-		&& RECLAIMABLE_OPS.has(c.op));
+		&& !holdsForEveryRow(tableRef.tableSchema, c));
 	if (lost.length === 0) return leaf;
 
 	const predicate = combineResidualExpressions(lost.map(c => c.sourceExpression));

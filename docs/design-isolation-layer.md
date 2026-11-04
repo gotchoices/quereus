@@ -559,7 +559,10 @@ When scanning via secondary index:
    requirement, not a refinement — the underlying claimed the window's filters *handled*, so
    no residual `Filter` survives above the merge to re-check what this matcher lets through
    or drops, and a plain text compare inverts such a column in both directions (`'PT1M'`
-   sorts above `'PT1H'`, `'PT180M'` below it).
+   sorts above `'PT1H'`, `'PT180M'` below it). A claimed filter that never became a seek key
+   or bound (`IS NULL`, `LIKE`) is outside that window, so the matcher never sees it. It
+   reaches staged rows through the `Filter` the engine reattaches above the merge
+   ([OPT-024](invariants.md#opt-024--an-unconsumed-claimed-filter-is-reattached)).
 2. Sort the kept overlay rows by the scan's `(indexKey…, pk…)` sort key — the full scan emits
    PK order, so the merge cannot rely on the overlay's emission order.
 3. Execute the index scan on the underlying table → committed rows in sort-key order.

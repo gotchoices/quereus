@@ -428,27 +428,34 @@ Virtual tables communicate their capabilities, allowing the optimizer to:
 
 #### The `handledFilters` contract
 
-> **Invariant:** [OPT-024](invariants.md#opt-024--an-unconsumed-seek-constraint-is-reattached)
+> **Invariant:** [OPT-024](invariants.md#opt-024--an-unconsumed-claimed-filter-is-reattached)
 
-`handledFilters[i] = true` is a promise that filter `i` is enforced somewhere other than
-the residual `Filter` — and the only channel available is `FilterInfo.constraints`, the
-seek bounds `rule-select-access-path` builds. `rule-grow-retrieve` residualizes exactly
-the constraints whose flag is `false`, so a claimed filter that never becomes a seek
-bound would be applied nowhere.
+`handledFilters[i] = true` is a promise that the module applies filter `i`.
+`rule-grow-retrieve` residualizes exactly the constraints whose flag is `false`, so a
+claimed filter stays in the plan only if `rule-select-access-path` turns it into a seek
+key or bound (`FilterInfo.constraints`) or reattaches it above the scan.
 
 A module may set `handledFilters[i] = true` only for a filter it will actually apply.
 For the seek-family operators (`=`, `IN`, `<`, `<=`, `>`, `>=`, `OR_RANGE`) the planner
 consumes at most one filter per column per role — the first `=`, the first lower bound,
 the first upper bound, **in `request.filters` order**. Claim positionally: mark the first
 match, leave redundant same-column same-role filters unhandled so they survive as a
-residual `Filter`. The planner defends itself against an over-claim by reattaching any
-seek-family filter it did not consume (`reattachUnconsumedConstraints`), so an
-over-claiming module costs a redundant filter, not a wrong answer.
+residual `Filter`. The planner reattaches any claimed filter it did not consume
+(`reattachUnconsumedConstraints`), so without a LIMIT an over-claiming module costs a
+redundant filter, not a wrong answer.
 
 Ops outside the seek family (`IS NULL`, `IS NOT NULL`, `LIKE`, `GLOB`, `MATCH`,
-`NOT IN`) are never pushed into `FilterInfo` by this rule, so a module claiming one is
-taken at its word — claim only when the predicate is tautological over the rows you
-return (the memory module's `IS NOT NULL` on a `NOT NULL` column).
+`NOT IN`) never become seek bounds, so a claim on one is always reattached and never
+removes the filter. The exception is `IS NOT NULL` on a `NOT NULL` column, which no row can
+fail (the memory module claims this one). The `Filter` is required even when the module
+applies the predicate faithfully, because the isolation layer merges staged rows into the
+module's stream and checks them only against `FilterInfo.constraints`.
+
+Such a claim still affects the module's pricing and the LIMIT licence. `truncationIsSafe`
+in `rule-grow-retrieve` treats a claimed filter as unable to reject a row the module
+produced, so a plan that stops at `request.limit` can run with the reattached `Filter` above
+its scan. That is sound for a module that applies the filter. A module that claims a filter
+it does not apply and also stops at `limit + offset` returns too few rows.
 
 #### The access-path seam: `FilterInfo.accessPath`
 

@@ -249,6 +249,11 @@ export interface BestAccessPlanRequest {
 	 * not claim would underproduce, and `min(c)` over a scan stopped at one row that
 	 * is then filtered out would answer NULL instead of the minimum.
 	 *
+	 * A `Filter` the engine reattaches for a filter this module claimed (OPT-024 in
+	 * docs/invariants.md) does not count as discarding: it can only reject rows the claim
+	 * says the module does not produce, so claiming a filter the scan does not apply and
+	 * then truncating to this limit underproduces.
+	 *
 	 * A module pricing against this must still charge the full row count for any plan
 	 * that does NOT provide the requested ordering — a Sort above it drains every row
 	 * regardless of the limit. Applying the bound to only some candidate plans biases

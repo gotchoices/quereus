@@ -249,20 +249,23 @@ stays populated for the readers that still walk it (binding collection, and the 
 sweep in `trySortAbsorbViaIndexOrdering`); it is dead only as an *execution* channel. See
 OPT-026 for the same seam in the opposite direction — replacing the context itself.
 
-### OPT-024 — An unconsumed seek constraint is reattached
+### OPT-024 — An unconsumed claimed filter is reattached
 
 - code: `packages/quereus/src/planner/rules/access/rule-select-access-path.ts` — `reattachUnconsumedConstraints`
-- guard: `packages/quereus/test/vtab/overclaiming-module.spec.ts` — `over-claiming module: planner reattaches unconsumed filters`
+- guard: `packages/quereus/test/vtab/overclaiming-module.spec.ts` — `over-claiming module: planner reattaches unconsumed filters`, `non-seek claim: planner reattaches the filter it cannot consume`
+- guard: `packages/quereus-isolation/test/claimed-non-seek-filter.spec.ts` — `claimed non-seek filter under the isolation overlay`
 - doc: [Optimizer § The `handledFilters` contract](optimizer.md#the-handledfilters-contract)
 
-`handledFilters[i] = true` promises the module enforces filter `i`, and the only channel is
-`FilterInfo.constraints` — the seek bounds `rule-select-access-path` builds. Since the rule
-consumes at most one filter per column per role, a module that over-claims would leave a
-filter enforced nowhere. So the rule reattaches, as a residual `Filter`, every seek-family
-constraint it claimed-but-did-not-consume. An over-claiming module therefore costs a
-redundant filter, never a wrong answer. Filters outside the seek family (`IS NULL`, `LIKE`,
-`NOT IN`, …) are never pushed into `FilterInfo`, so a module claiming one is taken at its
-word.
+`handledFilters[i] = true` makes `rule-grow-retrieve` leave filter `i` out of the residual,
+so the only enforcement left in the plan is the seek keys and bounds
+`rule-select-access-path` builds. The rule consumes at most one filter per column per role,
+and no non-seek filter (`IS NULL`, `LIKE`, …) at all. So it reattaches, as a residual
+`Filter`, every claimed constraint it did not consume, whatever its operator. The one
+exception is `IS NOT NULL` on a `NOT NULL` column, which no row can fail.
+
+The module's own scan cannot stand in for that `Filter`, even when the module applies the
+filter faithfully: the isolation layer merges staged rows into the scan's stream and checks
+them only against `FilterInfo.constraints`.
 
 ### OPT-025 — A predicate constrains only tables in its own relational input
 

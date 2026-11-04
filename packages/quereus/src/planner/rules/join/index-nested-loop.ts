@@ -615,7 +615,7 @@ function pinsOneValue(constraint: PredicateConstraint): boolean {
  * (join-key leftovers need none: the ON condition the caller keeps above the seek
  * covers them), or module-HANDLED, and a handled constraint is either consumed
  * into the seek's bounds or recovered by `selectPhysicalNode`'s
- * `reattachUnconsumedConstraints` — whose `RECLAIMABLE_OPS` set contains `'='`,
+ * `reattachUnconsumedConstraints`, which exempts only an always-true `is not null`,
  * so no equality can fall through it. A Filter only removes rows, so a constraint
  * enforced by a filter rather than by the index counts just the same. Then: if
  * some enforced key has EVERY column pinned by an equality whose collation
