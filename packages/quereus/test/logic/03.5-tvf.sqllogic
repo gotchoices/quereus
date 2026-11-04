@@ -99,8 +99,7 @@ select value from generate_series('abc', 4);
 select value from generate_series(x'00', 4);
 -- error: Cannot convert object to NUMERIC
 
--- Past 2^53 the values stay exact. Compared as text because the harness rounds a bigint
--- through Number() before comparing. The limit sits above the expected row count so that
+-- Past 2^53 the values stay exact. The limit sits above the expected row count so that
 -- a counter that stops advancing returns repeated values and fails, instead of hanging.
 select cast(value as text) as v from generate_series(9007199254740990, 9007199254740993) limit 6;
 → [{"v":"9007199254740990"},{"v":"9007199254740991"},{"v":"9007199254740992"},{"v":"9007199254740993"}]

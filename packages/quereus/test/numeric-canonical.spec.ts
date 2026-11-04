@@ -5,8 +5,8 @@
  * range (|v| > 2^53 − 1); every integer value inside that range is a JS number.
  *
  * Representation (`typeof`) assertions live here in a .spec.ts on purpose: .sqllogic
- * cannot express them — `normalizeBigInts` in test/logic.spec.ts converts actual
- * bigints to numbers before asserting (see backlog/debt-sqllogic-bigint-assertions-lossy).
+ * cannot express them — its comparison (test/logic-exact-json.ts) is on exact numeric
+ * value, so a bigint and a double holding the same value compare equal.
  *
  * The engine-backed suite below runs against the memory backend under `yarn test` and
  * against the LevelDB store backend under `yarn test:store` (QUEREUS_TEST_STORE), so the

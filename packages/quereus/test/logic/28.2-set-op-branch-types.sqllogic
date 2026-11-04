@@ -139,8 +139,9 @@ select j from sobt_j union select '"9"' union select '"abc"';
 -- the merge advertises NUMERIC — a type the mixed stream genuinely inhabits —
 -- rather than REAL, which the DML write pass would have believed and skipped
 -- conversion for. Small integers cannot discriminate (both internal forms
--- coincide) and the harness normalizes BigInt to Number before comparing rows,
--- so the stored-form assertions all go through `cast(v as text)`.
+-- coincide) and the harness compares numeric values without distinguishing a
+-- bigint from a double of the same value, so the stored-form assertions all go
+-- through `cast(v as text)`.
 -- ============================================================
 
 create table sobt_r (id integer primary key, v real);

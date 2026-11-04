@@ -387,10 +387,8 @@ DROP TABLE numeric_big;
 -- (`select 99999999999999999999999999` is exact), so the text path must
 -- agree rather than clamp to SQLite's INT64_MAX.
 --
--- Bigint results below are compared via cast(... as text), not the raw numeric
--- column: the test harness's JSON-diff path normalizes an actual bigint through
--- Number() before comparing, which rounds a wrong result and a correct one to the
--- same double — a raw-number assertion here would pass even if the fix regressed.
+-- Bigint results below are compared via cast(... as text), which pins the text
+-- rendering of the exact value as well as the value itself.
 
 select cast(v as text) as v from (select cast('9007199254740993' as integer) as v);
 → [{"v":"9007199254740993"}]

@@ -16,24 +16,10 @@ import {
 	STORE_BACKEND_CAPABILITIES,
 	type SqllogicCapability,
 } from './logic-capabilities.js';
+import { canonicalNumbers, parseExactJson } from './logic-exact-json.js';
 
 config.truncateThreshold = 1000;
 config.includeStack = true;
-
-/** Normalize BigInt values to Number for comparison with JSON-parsed expected results.
- *  JSON has no BigInt representation, so engine BigInt results must be compared as Numbers. */
-function normalizeBigInts(obj: any): any {
-	if (typeof obj === 'bigint') return Number(obj);
-	if (Array.isArray(obj)) return obj.map(normalizeBigInts);
-	if (obj !== null && typeof obj === 'object') {
-		const result: Record<string, any> = {};
-		for (const [key, value] of Object.entries(obj)) {
-			result[key] = normalizeBigInts(value);
-		}
-		return result;
-	}
-	return obj;
-}
 
 // ESM equivalent for __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -704,7 +690,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					// Parse expected results
 					let expectedResult: any;
 					try {
-						expectedResult = JSON.parse(expectedJson);
+						expectedResult = canonicalNumbers(parseExactJson(expectedJson));
 					} catch (jsonError: any) {
 						throw new Error(`[${file}:${lineNum}] Invalid expected JSON: ${jsonError.message} - JSON: ${expectedJson}`);
 					}
@@ -720,7 +706,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					// Compare each row
 					for (let i = 0; i < actualResult.length; i++) {
 						try {
-							expect(normalizeBigInts(actualResult[i])).to.deep.equal(expectedResult[i], `[${file}:${lineNum}] row ${i} mismatch.\nActual: ${safeJsonStringify(actualResult[i])}\nExpected: ${safeJsonStringify(expectedResult[i])}\nBlock:\n${sqlBlock}`);
+							expect(canonicalNumbers(actualResult[i])).to.deep.equal(expectedResult[i], `[${file}:${lineNum}] row ${i} mismatch.\nActual: ${safeJsonStringify(actualResult[i])}\nExpected: ${safeJsonStringify(expectedResult[i])}\nBlock:\n${sqlBlock}`);
 						} catch (matchError: any) {
 							const error = matchError instanceof Error ? matchError : new Error(String(matchError));
 							const diagnostics = generateDiagnostics(db, sqlBlock, error);
@@ -782,7 +768,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 							// Set bind parameters for the next query
 							const paramsJson = trimmedLine.substring(10).trim();
 							try {
-								currentParams = JSON.parse(paramsJson);
+								currentParams = parseExactJson(paramsJson) as any[];
 							} catch (jsonError: any) {
 								throw new Error(`[${file}:${lineNumber}] Invalid params JSON: ${jsonError.message} - JSON: ${paramsJson}`);
 							}
