@@ -5,8 +5,8 @@
 Which comparison a value gets when its declared logical type orders differently from its
 stored representation — the `semanticOrdering` / `collationAware` flags, the surfaces that
 route through the type's `compare`, the ones that route through `groupKey` identity
-instead, and how text converts before it is compared against a DATETIME. A satellite of
-[Quereus Type System](types.md).
+instead, and how text converts before it is compared against a DATE, TIME, DATETIME or
+TIMESTAMP. A satellite of [Quereus Type System](types.md).
 
 ## Semantic ordering
 
@@ -262,37 +262,58 @@ three execution shapes (the buffered frame walk, the streaming running
 accumulator, and the streaming sliding-frame scan) and all three fold through
 that one bound schema, so they cannot rank differently for the same query.
 
-## DATETIME against text
+## DATE, TIME, DATETIME and TIMESTAMP against text
 
-A DATETIME is a fixed instant stored in one spelling, bare UTC. Text order over that
-spelling is already its semantic order, so the type has no `semanticOrdering` flag. What
-it needs is for the text a query spells to reach that spelling before the comparison:
-`t = '2020-01-01T00:00:00Z'` finds the row that text created, and
-`t >= '2021-06-05T09:00:00+02:00'` compares the instant it names.
+> Comparing one of these types against text normalizes the text exactly as a write to that
+> column would. Text that does not parse compares as plain text. A comparison asks whether
+> the column's value equals what this text would have stored.
 
-The optional `normalizeComparand` hook on `LogicalType` provides this, and only DATETIME
-defines it. When one operand has the hook and the other is textual or ANY,
+Each of these types is stored in one form: a UTC date, a UTC time, bare UTC datetime text or
+an integer. Order over that form is already its semantic order, so none has a
+`semanticOrdering` flag. What they need is for the text a query spells to reach that form
+before the comparison. On a DATETIME, `t = '2020-01-01T00:00:00Z'` finds the row that text
+created and `t >= '2021-06-05T09:00:00+02:00'` compares the instant it names. On a TIMESTAMP,
+`ts = '2020-01-01T00:00:00Z'` finds `1577836800000`.
+
+The optional `normalizeComparand` hook on `LogicalType` provides this, and these four types
+define it, each sharing its text conversion with its `parse` so that a write and a
+comparison cannot drift. When one operand has the hook and the other is textual or ANY,
 `crossTypeCoercion` (`types/comparison-coercion.ts`) converts the other one. ANY is
 included because an untyped `?` announces it, and a bound parameter is the most common way
 an application hands in a timestamp.
 
 This is not `cast(x as datetime)`. Text that does not parse compares as plain text, so
-`t = 'garbage'` is false and `t < 'garbage'` is true for every row. Only text converts, so
-a number is not read as an epoch, although a write or a CAST reads it that way. Only the
+`t = 'garbage'` is false and `t < 'garbage'` is true for every row. A TIMESTAMP gives the
+same answers, because a number sorts before text. Only text converts, so a number is not
+read as an epoch, although a write or a CAST reads it that way. Only the
 planner's own casts behave like this: a user-written `cast('junk' as datetime)` is still
 NULL.
 
 Consequences worth knowing:
 
-- A date-only bound means that date's midnight, so `t between '2021-01-01' and '2022-01-01'`
-  includes a row at exactly midnight on 2022-01-01.
-- A literal folds to the stored spelling at plan time, so `=`, ranges, BETWEEN and IN lists
+- A DATE compared with text carrying a time compares the date part only, not that date's
+  midnight: for a stored `2024-01-15`, `d = '2024-01-15T12:00:00'` is true and
+  `d < '2024-01-15T12:00:00'` is false. An offset or `[zone]` moves the text to its UTC date
+  first, as a write does, so `d = '2024-01-15T23:00:00-05:00'` finds `2024-01-16`.
+- `date(col)` returns DATE, so `date(col) = <text>` follows the same rule. The literal folds
+  to a bare date before the sargable range rewrite reads it, so the filter and the evaluated
+  comparison agree.
+- Blank text against a TIMESTAMP is NULL, because a write of it stores NULL, so `ts = ''`,
+  `ts <> ''` and `ts not in ('')` match no rows, as they do for INTEGER. DATE, TIME and
+  DATETIME reject blank text on a write, so for them it stays text.
+- Integer-shaped text against a TIMESTAMP reads as that integer, trimmed and with no unit
+  interpretation, so `ts = ' 1000 '` finds `1000`. Datetime text reads as epoch milliseconds.
+- Time-only text carrying an offset or `[zone]` is rejected by a write to TIME, so
+  `t = '12:00:00-05:00'` compares as text and finds nothing.
+- A date-only bound against a DATETIME means that date's midnight, so
+  `t between '2021-01-01' and '2022-01-01'` includes a row at exactly midnight on 2022-01-01.
+- A literal folds to the stored form at plan time, so `=`, ranges, BETWEEN and IN lists
   still plan as index seeks. A parameter keeps the cast in its seek key.
 - A text operand that differs per row, such as a text column, parses per row. A parameter or
   literal that repeats one string is remembered at the comparison site and parses once.
-- `dt_col = text_col` no longer plans as a hash join, because the cast moves the pair out of
-  the join's equality keys and into its residual condition. Joins between two DATETIME
-  columns are unaffected.
+- `dt_col = text_col` does not plan as a hash join, because the cast moves the pair out of
+  the join's equality keys and into its residual condition. The same holds for the other
+  three types. Joins between two columns of one type are unaffected.
 - `nullif`, `greatest` and `least` rank by the converted key and still return the argument as
   written, so `greatest(t, '2021-06-05T11:00:00+02:00')` returns that literal's own spelling
   when it wins.
@@ -300,10 +321,10 @@ Consequences worth knowing:
   ([Change Scope](change-scope.md)).
 
 **One probe against many values** follows the rule in
-[types.md § Type Coercion in Comparisons](types.md#type-coercion-in-comparisons). A DATETIME
-probe converts each textual or ANY value independently, and a textual or ANY probe converts
-once, only when every non-NULL value is DATETIME. A probe against a list mixing DATETIME and
-text stays unconverted, because converting it would make
+[types.md § Type Coercion in Comparisons](types.md#type-coercion-in-comparisons). A probe of
+one of these types converts each textual or ANY value independently, and a textual or ANY
+probe converts once, only when every non-NULL value has that one type. A probe against a list
+mixing such a type and text stays unconverted, because converting it would make
 `text_col in (dt_col, '2020-01-01T00:00:00Z')` miss an exact text match that the `=`
 disjunction finds.
 

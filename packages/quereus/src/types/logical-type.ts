@@ -67,13 +67,16 @@ export interface LogicalType {
 	parse?(value: SqlValue): SqlValue;
 	/**
 	 * Convert an operand of a comparison against this type to the type's stored
-	 * spelling, returning anything it cannot convert unchanged. Defining this opts the
+	 * form, returning anything it cannot convert unchanged. Defining this opts the
 	 * type in: `crossTypeCoercion` then converts a textual or ANY operand compared
 	 * against the type (see `types/comparison-coercion.ts`).
 	 *
 	 * Deliberately not {@link parse}: a comparison must keep a value `parse` would
 	 * reject or reinterpret, so unparseable text compares as text and a number is not
 	 * read as an epoch.
+	 *
+	 * May return NULL for text a write would store as NULL (blank text against TIMESTAMP),
+	 * which makes the comparison UNKNOWN.
 	 */
 	normalizeComparand?(value: SqlValue): SqlValue;
 

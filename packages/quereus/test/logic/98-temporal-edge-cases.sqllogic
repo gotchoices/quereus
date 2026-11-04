@@ -481,10 +481,10 @@ SELECT ts FROM dt_filter WHERE ts < '2017-07-14T02:40:00Z';
 DROP TABLE dt_filter;
 
 -- ============================================================
--- DATE / TIME pushed-down filter: same RAW-comparison contract.
--- DATE and TIME share the identical isTemporal → BINARY compare
--- path; a non-canonical literal denoting the same value must NOT
--- match the bare stored canonical form.
+-- DATE / TIME pushed-down filter: the literal is normalized the same
+-- way, so one denoting the same date or time matches the bare stored
+-- form. The full rule is pinned by
+-- 15.1.5-date-time-timestamp-comparison-normalization.sqllogic.
 -- ============================================================
 
 CREATE TABLE d_filter (d DATE PRIMARY KEY);
@@ -493,7 +493,7 @@ INSERT INTO d_filter VALUES ('2024-01-20');
 -- run
 
 SELECT count(*) as c FROM d_filter WHERE d = '2024-01-15T10:30:00Z';
-→ [{"c":0}]
+→ [{"c":1}]
 
 SELECT count(*) as c FROM d_filter WHERE d = '2024-01-15';
 → [{"c":1}]
@@ -506,7 +506,7 @@ INSERT INTO t_filter VALUES ('12:00:00');
 -- run
 
 SELECT count(*) as c FROM t_filter WHERE t = '2024-01-15T10:30:00Z';
-→ [{"c":0}]
+→ [{"c":1}]
 
 SELECT count(*) as c FROM t_filter WHERE t = '10:30:00';
 → [{"c":1}]

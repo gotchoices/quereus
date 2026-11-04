@@ -56,20 +56,13 @@ so they canonicalize too; the other SQL functions, and these three with modifier
 retain their lenient behavior. They read an offset, `Z` or `[zone]` by the same rules,
 but return `NULL` for text those rules reject instead of raising an error.
 
-A comparison literal on the read/filter path is treated differently by type. A
-`DATETIME` comparison converts text to the stored spelling first, so a literal
-naming the same instant as a stored row matches it: see
-[DATETIME against text](types-ordering.md#datetime-against-text).
-
-For `DATE` and `TIME`, canonicalization applies **only to the stored value**. A
-literal in a predicate (`WHERE d = '…'`) is compared **raw** (BINARY,
-byte-for-byte) against the stored canonical value — it is not parsed or
-canonicalized first. So a non-canonical literal that denotes the *same date* as a
-stored row does **not** match: `WHERE d = '2024-01-15T10:30:00Z'` returns nothing
-against a row stored as the bare `'2024-01-15'`; only the bare canonical literal
-matches. To match reliably, write the literal in the column's canonical shape (or
-wrap it so it is stored/cast first). This raw-comparison contract is pinned by the
-`d_filter` / `t_filter` cases in `test/logic/98-temporal-edge-cases.sqllogic`.
+A comparison on the read/filter path converts text the same way: comparing a `DATE`,
+`TIME`, `DATETIME` or `TIMESTAMP` against text normalizes the text as a write to that
+column would, so `WHERE d = '2024-01-15T10:30:00Z'` finds a row stored as `'2024-01-15'`.
+Text that does not parse compares as text. Two consequences to watch for: a `DATE`
+compared with text carrying a time compares the date part only, and blank text against a
+`TIMESTAMP` is NULL. See
+[DATE, TIME, DATETIME and TIMESTAMP against text](types-ordering.md#date-time-datetime-and-timestamp-against-text).
 
 ### Strict Parsing (Epoch Functions)
 

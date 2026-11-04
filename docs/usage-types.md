@@ -92,7 +92,7 @@ for await (const event of db.eval(`
 - `timespan(value)` - Convert to TIMESPAN type
 - Special value: `datetime('now')` returns current timestamp
 
-A DATETIME is stored as bare UTC, and text compared against one is converted the same way, so `created_at = '2024-01-15T14:30:00Z'` finds the row above. See [DATETIME against text](types-ordering.md#datetime-against-text).
+A DATETIME is stored as bare UTC, and text compared against one is converted the same way, so `created_at = '2024-01-15T14:30:00Z'` finds the row above. DATE, TIME and TIMESTAMP convert text the same way. See [DATE, TIME, DATETIME and TIMESTAMP against text](types-ordering.md#date-time-datetime-and-timestamp-against-text).
 
 ## TIMESPAN Type
 

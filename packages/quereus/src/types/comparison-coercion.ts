@@ -72,7 +72,7 @@ export const isComparandSource = (type: LogicalType): boolean =>
  *
  *    The gate is deliberately `physicalType === OBJECT`, **not** `semanticOrdering`:
  *    TIMESPAN also carries semantic ordering but is physically text, and the runtime's
- *    `tryTemporalComparison` already reconciles it. DATETIME takes arm 2 below.
+ *    `tryTemporalComparison` already reconciles it. The other temporals take arm 2 below.
  *
  *    A conversion to JSON is lenient (see `types/cast-semantics.ts`): text that
  *    does not parse comes back unchanged, so `json_col = 'not json'` is false
@@ -86,9 +86,9 @@ export const isComparandSource = (type: LogicalType): boolean =>
  *    A NULL-typed operand is left alone: the comparison is UNKNOWN regardless, so
  *    the conversion would only add a runtime hop.
  *
- * 2. **A type with `normalizeComparand` vs textual or ANY.** DATETIME is stored in one
- *    spelling, so the text a query spells must convert to that spelling before binary
- *    comparison: `t = '2020-01-01T00:00:00Z'` has to find the row that literal created.
+ * 2. **A type with `normalizeComparand` vs textual or ANY.** DATE, TIME, DATETIME and
+ *    TIMESTAMP are stored in one form, so the text a query spells must convert to that form
+ *    before comparison: `t = '2020-01-01T00:00:00Z'` has to find the row that literal created.
  *    The conversion is the type's own hook rather than a cast (see
  *    `types/cast-semantics.ts` `comparandConverter`), so unparseable text and non-text values
  *    survive and compare as they would unconverted. A NULL-typed operand is left alone,
@@ -116,7 +116,7 @@ export function crossTypeCoercion(left: LogicalType, right: LogicalType): CrossT
 
 	// NOTE: wrapping a join key in this cast takes `dt_col = text_col` out of
 	// `extractEquiPairs` and into the join's residual, so it no longer plans as a hash
-	// join (same-type DATETIME joins are unaffected). Fine now; if joining DATETIME to
+	// join (same-type joins are unaffected). Fine now; if joining one of these types to
 	// text shows up as slow, canonicalize the key instead.
 	if (left.normalizeComparand && isComparandSource(right)) return { side: 'right', target: left };
 	if (right.normalizeComparand && isComparandSource(left)) return { side: 'left', target: right };
@@ -161,10 +161,10 @@ function textCoercionTarget(numeric: LogicalType): LogicalType {
  *
  * NOTE: the leftover gap is a textual probe against a list mixing numeric and
  * textual values (`text_col in (1, 'abc')`), which stays unconverted and so still
- * disagrees with the `=` disjunction on the numeric member. A list mixing DATETIME
- * and text has the same gap: hoisting would make `text_col in (dt_col, '…Z')` miss an
+ * disagrees with the `=` disjunction on the numeric member. A list mixing a normalizing
+ * type and text has the same gap: hoisting would make `text_col in (dt_col, '…Z')` miss an
  * exact text match that the `=` disjunction finds, so that probe stays unconverted and
- * disagrees on the DATETIME member instead. Closing it needs a per-value probe, which
+ * disagrees on the normalizing member instead. Closing it needs a per-value probe, which
  * `IN` cannot express — its members live in ONE key space
  * (a BTree keyed under one collation, `runtime/emit/subquery.ts`). If that shape
  * ever matters, desugar a mixed `IN` list into an `OR` of `=` comparisons at build

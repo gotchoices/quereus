@@ -57,6 +57,51 @@ const validatesAs = (parseText: (text: string) => unknown) => (v: SqlValue): boo
 };
 
 /**
+ * `normalizeComparand` for a type whose text form goes through `parseText`, the same
+ * function its `parse` uses, so that a write and a comparison cannot drift.
+ *
+ * NOTE: a text operand that differs per row (`text_col = dt_col`) parses per row, and the
+ * memo in `comparandConverter` cannot help: 23-32 us per row for DATETIME where a scan with
+ * no parse costs about 1.4 us, because its parser throws its way through up to three
+ * attempts. TIME's parser can throw more times before succeeding on bare time text, and has
+ * not been measured. If that shows up as slow, return early on text already in the canonical
+ * spelling.
+ */
+const normalizesTextAs = (parseText: (text: string) => SqlValue) => (v: SqlValue): SqlValue => {
+	if (typeof v !== 'string') return v;
+	try {
+		return parseText(v);
+	} catch {
+		// Not a failure: text the type rejects is a legal operand, compared as text.
+		return v;
+	}
+};
+
+const dateFromText = (text: string): string => parseDateTimeStringToUtcPlain(text).toPlainDate().toString();
+
+const timeFromText = (text: string): string => parseTimeStringToUtcPlain(text).toString();
+
+const dateTimeFromText = (text: string): string => parseDateTimeStringToUtcPlain(text).toString();
+
+/** Blank text is NULL, the same as INTEGER. Otherwise see {@link TIMESTAMP_TYPE}. */
+const timestampFromText = (text: string): number | bigint | null => {
+	const trimmed = text.trim();
+	if (trimmed === '') return null;
+	// Integer-shaped string → that integer verbatim (no unit interpretation).
+	// Past 2^53 rebuild from the digit string, not the rounded number — same
+	// safe-integer boundary as INTEGER_TYPE.parse.
+	if (/^[+-]?\d+$/.test(trimmed)) {
+		const parsed = Number(trimmed);
+		if (Number.isSafeInteger(parsed)) return parsed;
+		return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
+	}
+	// ISO 8601 datetime string → epoch milliseconds. Bare datetimes are
+	// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —
+	// same canonicalization DATE / DATETIME apply.
+	return parseDateTimeStringToUtcPlain(trimmed).toZonedDateTime('UTC').epochMilliseconds;
+};
+
+/**
  * DATE type - stores ISO 8601 date strings (YYYY-MM-DD)
  * Text input parses as a datetime, so the stored date is the UTC date
  */
@@ -71,7 +116,7 @@ export const DATE_TYPE: LogicalType = {
 		if (v === null) return null;
 		if (typeof v === 'string') {
 			try {
-				return parseDateTimeStringToUtcPlain(v).toPlainDate().toString();
+				return dateFromText(v);
 			} catch (e) {
 				throw new TypeError(`Cannot convert '${v}' to DATE: ${e instanceof Error ? e.message : String(e)}`);
 			}
@@ -83,6 +128,8 @@ export const DATE_TYPE: LogicalType = {
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to DATE`);
 	},
+
+	normalizeComparand: normalizesTextAs(dateFromText),
 
 	compare: (a, b) => compareNulls(a, b) ?? BINARY_COLLATION(a as string, b as string),
 
@@ -116,7 +163,7 @@ export const TIME_TYPE: LogicalType = {
 		if (v === null) return null;
 		if (typeof v === 'string') {
 			try {
-				return parseTimeStringToUtcPlain(v).toString(); // ISO 8601 format: HH:MM:SS or HH:MM:SS.sss
+				return timeFromText(v); // ISO 8601 format: HH:MM:SS or HH:MM:SS.sss
 			} catch (e) {
 				throw new TypeError(`Cannot convert '${v}' to TIME: ${e instanceof Error ? e.message : String(e)}`);
 			}
@@ -136,6 +183,8 @@ export const TIME_TYPE: LogicalType = {
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to TIME`);
 	},
+
+	normalizeComparand: normalizesTextAs(timeFromText),
 
 	compare: (a, b) => compareNulls(a, b) ?? BINARY_COLLATION(a as string, b as string),
 
@@ -157,7 +206,7 @@ export const DATETIME_TYPE: LogicalType = {
 		if (v === null) return null;
 		if (typeof v === 'string') {
 			try {
-				return parseDateTimeStringToUtcPlain(v).toString();
+				return dateTimeFromText(v);
 			} catch (e) {
 				throw new TypeError(`Cannot convert '${v}' to DATETIME: ${e instanceof Error ? e.message : String(e)}`);
 			}
@@ -170,19 +219,7 @@ export const DATETIME_TYPE: LogicalType = {
 		throw new TypeError(`Cannot convert ${typeof v} to DATETIME`);
 	},
 
-	// NOTE: a text operand that differs per row (`text_col = dt_col`) parses per row, and the
-	// memo in `comparandConverter` cannot help: 23-32 us per row where a scan with no parse
-	// costs about 1.4 us, because this parser throws its way through up to three attempts.
-	// If that shows up as slow, return early on text already in the canonical spelling.
-	normalizeComparand: (v) => {
-		if (typeof v !== 'string') return v;
-		try {
-			return parseDateTimeStringToUtcPlain(v).toString();
-		} catch {
-			// Not a failure: text naming no instant is a legal operand, compared as text.
-			return v;
-		}
-	},
+	normalizeComparand: normalizesTextAs(dateTimeFromText),
 
 	compare: (a, b) => compareNulls(a, b) ?? BINARY_COLLATION(a as string, b as string),
 
@@ -241,27 +278,16 @@ export const TIMESTAMP_TYPE: LogicalType = {
 			return canonicalizeInteger(v);
 		}
 		if (typeof v === 'string') {
-			const trimmed = v.trim();
-			if (trimmed === '') return null;
-			// Integer-shaped string → that integer verbatim (no unit interpretation).
-			// Past 2^53 rebuild from the digit string, not the rounded number — same
-			// safe-integer boundary as INTEGER_TYPE.parse.
-			if (/^[+-]?\d+$/.test(trimmed)) {
-				const parsed = Number(trimmed);
-				if (Number.isSafeInteger(parsed)) return parsed;
-				return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
-			}
-			// ISO 8601 datetime string → epoch milliseconds. Bare datetimes are
-			// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —
-			// same canonicalization DATE / DATETIME apply.
 			try {
-				return parseDateTimeStringToUtcPlain(trimmed).toZonedDateTime('UTC').epochMilliseconds;
+				return timestampFromText(v);
 			} catch (e) {
 				throw new TypeError(`Cannot convert '${v}' to TIMESTAMP: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to TIMESTAMP`);
 	},
+
+	normalizeComparand: normalizesTextAs(timestampFromText),
 
 	// NOTE: deliberately NOT `isNumeric`. TIMESTAMP is an instant, not a number —
 	// `abs(ts)` / `round(ts)` should not typecheck on it. The cost is that

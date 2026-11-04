@@ -155,8 +155,8 @@ const isObjectPhysical = (type: LogicalType): boolean => type.physicalType === P
  *    disagree about it.
  *
  * 1c. **A type with `normalizeComparand` vs textual or ANY.** The pairing `=` reconciles
- *    so that `t in (select text_col …)` finds a DATETIME by any spelling of its instant.
- *    Only the non-DATETIME side converts, under the same uniformity gate as 1b.
+ *    so that `t in (select text_col …)` finds a value by any text that would store it.
+ *    Only the textual or ANY side converts, under the same uniformity gate as 1b.
  *
  * 2. **Semantic normalization (symmetric).** When an operand declares a semantic-ordering
  *    logical type (see {@link hasSemanticOrdering}) the probe AND every RHS value are

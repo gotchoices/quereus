@@ -44,7 +44,7 @@ export function tryTemporalArithmetic(operator: string, v1: SqlValue, v2: SqlVal
  *
  * Note: DATE, TIME, and DATETIME values are stored in one ISO 8601 spelling that compares
  * correctly lexicographically, so they don't need special handling here. Text compared against
- * a DATETIME is converted to that spelling at plan time (`crossTypeCoercion`), not here.
+ * one of them is converted to that spelling at plan time (`crossTypeCoercion`), not here.
  *
  * NOTE: deliberately NOT given the emit-time specialization `buildNumericOpSpec`'s temporal
  * arm got. The shapes look alike, but the economics do not:

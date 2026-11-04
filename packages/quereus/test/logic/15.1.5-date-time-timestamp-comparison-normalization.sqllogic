@@ -1,0 +1,480 @@
+-- 15.1.5-date-time-timestamp-comparison-normalization.sqllogic
+--
+-- THE RULE (docs/types-ordering.md § DATE, TIME, DATETIME and TIMESTAMP against text):
+-- comparing a DATE, TIME or TIMESTAMP against text normalizes that text the way a write to
+-- the column would. A comparison asks whether the column's value equals what this text
+-- would have stored. Text the type rejects compares as plain text, and a number is not read
+-- as an epoch. 15.1.4 pins the same rule for DATETIME.
+--
+-- The seekable predicates run over three shapes because each reaches the comparison by a
+-- different route: a scan filter, a secondary-index seek and a primary-key seek. The
+-- remaining comparison sites share one coercion decision, so they run once.
+--
+-- Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`), whose seeks encode their keys differently.
+
+-- ============================================================
+-- 1. DATE
+-- ============================================================
+
+create table dn (id integer primary key, d date null);
+-- run
+create table di (id integer primary key, d date null);
+-- run
+create index di_d on di (d);
+-- run
+create table dp (d date primary key, id integer null);
+-- run
+insert into dn values (1, '2024-01-15'), (2, '2024-01-16');
+-- run
+insert into di values (1, '2024-01-15'), (2, '2024-01-16');
+-- run
+insert into dp values ('2024-01-15', 1), ('2024-01-16', 2);
+-- run
+
+-- Nothing stored changes.
+select id, d from dn order by id;
+→ [{"d":"2024-01-15","id":1},{"d":"2024-01-16","id":2}]
+
+-- Text with a time compares its date part only, not that date's midnight.
+select id from dn where d = '2024-01-15T12:00:00';
+→ [{"id":1}]
+select id from di where d = '2024-01-15T12:00:00';
+→ [{"id":1}]
+select id from dp where d = '2024-01-15T12:00:00';
+→ [{"id":1}]
+
+-- An offset moves the text to its UTC date, as a write does.
+select id from dn where d = '2024-01-15T23:00:00-05:00';
+→ [{"id":2}]
+select id from di where d = '2024-01-15T23:00:00-05:00';
+→ [{"id":2}]
+select id from dp where d = '2024-01-15T23:00:00-05:00';
+→ [{"id":2}]
+
+select id from dn where d < '2024-01-16T12:00:00';
+→ [{"id":1}]
+select id from di where d < '2024-01-16T12:00:00';
+→ [{"id":1}]
+select id from dp where d < '2024-01-16T12:00:00';
+→ [{"id":1}]
+
+select id from dn where d between '2024-01-15T23:00:00Z' and '2024-01-16T01:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+select id from di where d between '2024-01-15T23:00:00Z' and '2024-01-16T01:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+select id from dp where d between '2024-01-15T23:00:00Z' and '2024-01-16T01:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dn where d in ('2024-01-15T12:00:00', '2024-01-15T23:00:00-05:00') order by id;
+→ [{"id":1},{"id":2}]
+select id from di where d in ('2024-01-15T12:00:00', '2024-01-15T23:00:00-05:00') order by id;
+→ [{"id":1},{"id":2}]
+select id from dp where d in ('2024-01-15T12:00:00', '2024-01-15T23:00:00-05:00') order by id;
+→ [{"id":1},{"id":2}]
+
+-- Text a write rejects compares as text. Blank text is one: a write to DATE rejects it.
+select id from dn where d = 'junk';
+→ []
+select id from di where d = 'junk';
+→ []
+select id from dp where d = 'junk';
+→ []
+
+select id from dn where d <> '' order by id;
+→ [{"id":1},{"id":2}]
+select id from di where d <> '' order by id;
+→ [{"id":1},{"id":2}]
+select id from dp where d <> '' order by id;
+→ [{"id":1},{"id":2}]
+
+-- params: ["2024-01-15T12:00:00"]
+select id from dn where d = ?;
+→ [{"id":1}]
+-- params: ["2024-01-15T12:00:00"]
+select id from di where d = ?;
+→ [{"id":1}]
+-- params: ["2024-01-15T12:00:00"]
+select id from dp where d = ?;
+→ [{"id":1}]
+
+-- Only text normalizes: a number is not read as an epoch, though a write would.
+-- params: [5]
+select id from dn where d = ?;
+→ []
+-- params: [5]
+select id from di where d = ?;
+→ []
+-- params: [5]
+select id from dp where d = ?;
+→ []
+
+-- ============================================================
+-- 2. TIME
+-- ============================================================
+
+create table tn (id integer primary key, t time null);
+-- run
+create table ti (id integer primary key, t time null);
+-- run
+create index ti_t on ti (t);
+-- run
+create table tp (t time primary key, id integer null);
+-- run
+insert into tn values (1, '12:00:00'), (2, '13:00:00');
+-- run
+insert into ti values (1, '12:00:00'), (2, '13:00:00');
+-- run
+insert into tp values ('12:00:00', 1), ('13:00:00', 2);
+-- run
+
+select id from tn where t = '12:00';
+→ [{"id":1}]
+select id from ti where t = '12:00';
+→ [{"id":1}]
+select id from tp where t = '12:00';
+→ [{"id":1}]
+
+select id from tn where t = '12:00:00.000';
+→ [{"id":1}]
+select id from ti where t = '12:00:00.000';
+→ [{"id":1}]
+select id from tp where t = '12:00:00.000';
+→ [{"id":1}]
+
+select id from tn where t = '2024-01-15T14:00:00+02:00';
+→ [{"id":1}]
+select id from ti where t = '2024-01-15T14:00:00+02:00';
+→ [{"id":1}]
+select id from tp where t = '2024-01-15T14:00:00+02:00';
+→ [{"id":1}]
+
+select id from tn where t > '12:30';
+→ [{"id":2}]
+select id from ti where t > '12:30';
+→ [{"id":2}]
+select id from tp where t > '12:30';
+→ [{"id":2}]
+
+-- Time-only text with an offset is rejected by a write, so it compares as text.
+select id from tn where t = '12:00:00-05:00';
+→ []
+select id from ti where t = '12:00:00-05:00';
+→ []
+select id from tp where t = '12:00:00-05:00';
+→ []
+
+select id from tn where t = '';
+→ []
+
+-- params: ["12:00"]
+select id from tn where t = ?;
+→ [{"id":1}]
+-- params: ["12:00"]
+select id from ti where t = ?;
+→ [{"id":1}]
+-- params: ["12:00"]
+select id from tp where t = ?;
+→ [{"id":1}]
+
+-- ============================================================
+-- 3. TIMESTAMP: the stored value is an integer
+-- ============================================================
+
+create table mn (id integer primary key, m timestamp null);
+-- run
+create table mi (id integer primary key, m timestamp null);
+-- run
+create index mi_m on mi (m);
+-- run
+create table mp (m timestamp primary key, id integer null);
+-- run
+insert into mn values (1, 1000), (2, 1577836800000), (3, 9007199254740993);
+-- run
+insert into mi values (1, 1000), (2, 1577836800000), (3, 9007199254740993);
+-- run
+insert into mp values (1000, 1), (1577836800000, 2), (9007199254740993, 3);
+-- run
+
+select id from mn where m = '2020-01-01T00:00:00Z';
+→ [{"id":2}]
+select id from mi where m = '2020-01-01T00:00:00Z';
+→ [{"id":2}]
+select id from mp where m = '2020-01-01T00:00:00Z';
+→ [{"id":2}]
+
+-- Integer-shaped text reads as that integer, trimmed, as a write reads it.
+select id from mn where m = '1000';
+→ [{"id":1}]
+select id from mi where m = '1000';
+→ [{"id":1}]
+select id from mp where m = '1000';
+→ [{"id":1}]
+
+select id from mn where m = ' 1000 ';
+→ [{"id":1}]
+select id from mi where m = ' 1000 ';
+→ [{"id":1}]
+select id from mp where m = ' 1000 ';
+→ [{"id":1}]
+
+-- Past 2^53 the text keeps every digit.
+select id from mn where m = '9007199254740993';
+→ [{"id":3}]
+select id from mi where m = '9007199254740993';
+→ [{"id":3}]
+select id from mp where m = '9007199254740993';
+→ [{"id":3}]
+
+select id from mn where m > '2019-01-01T00:00:00Z' and m < '2021-01-01T00:00:00Z';
+→ [{"id":2}]
+select id from mi where m > '2019-01-01T00:00:00Z' and m < '2021-01-01T00:00:00Z';
+→ [{"id":2}]
+select id from mp where m > '2019-01-01T00:00:00Z' and m < '2021-01-01T00:00:00Z';
+→ [{"id":2}]
+
+select id from mn where m between '1000' and '2020-01-01T00:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+select id from mi where m between '1000' and '2020-01-01T00:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+select id from mp where m between '1000' and '2020-01-01T00:00:00Z' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from mn where m in ('1000', '2020-01-01T00:00:00Z') order by id;
+→ [{"id":1},{"id":2}]
+select id from mi where m in ('1000', '2020-01-01T00:00:00Z') order by id;
+→ [{"id":1},{"id":2}]
+select id from mp where m in ('1000', '2020-01-01T00:00:00Z') order by id;
+→ [{"id":1},{"id":2}]
+
+-- Unparseable text against an integer column. TIMESTAMP's `compare` would call it equal to
+-- everything, so these pin that a seek over an index or a primary key does not.
+select id from mn where m = 'junk';
+→ []
+select id from mi where m = 'junk';
+→ []
+select id from mp where m = 'junk';
+→ []
+
+select id from mn where m in ('junk');
+→ []
+select id from mi where m in ('junk');
+→ []
+select id from mp where m in ('junk');
+→ []
+
+select id from mn where m <> 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from mi where m <> 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from mp where m <> 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from mn where m < 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from mi where m < 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from mp where m < 'junk' order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from mn where m > 'junk';
+→ []
+select id from mi where m > 'junk';
+→ []
+select id from mp where m > 'junk';
+→ []
+
+-- Blank text is what a write of it would store, NULL, so the comparison is UNKNOWN.
+select id from mn where m = '';
+→ []
+select id from mi where m = '';
+→ []
+select id from mp where m = '';
+→ []
+
+select id from mn where m <> '';
+→ []
+select id from mi where m <> '   ';
+→ []
+select id from mp where m <> '';
+→ []
+
+select id from mn where m not in ('');
+→ []
+select id from mi where m not in ('');
+→ []
+select id from mp where m not in ('');
+→ []
+
+-- INTEGER already answers blank text this way.
+create table ib (id integer primary key, i integer null);
+-- run
+insert into ib values (1, 1);
+-- run
+select id from ib where i <> '';
+→ []
+
+-- params: [1000]
+select id from mn where m = ?;
+→ [{"id":1}]
+-- params: [1000]
+select id from mi where m = ?;
+→ [{"id":1}]
+-- params: [1000]
+select id from mp where m = ?;
+→ [{"id":1}]
+
+-- params: ["1000"]
+select id from mn where m = ?;
+→ [{"id":1}]
+-- params: ["1000"]
+select id from mi where m = ?;
+→ [{"id":1}]
+-- params: ["1000"]
+select id from mp where m = ?;
+→ [{"id":1}]
+
+-- params: ["2020-01-01T00:00:00Z"]
+select id from mi where m >= ? order by id;
+→ [{"id":2},{"id":3}]
+-- params: ["2020-01-01T00:00:00Z"]
+select id from mp where m >= ? order by id;
+→ [{"id":2},{"id":3}]
+
+-- params: ["junk"]
+select id from mn where m = ?;
+→ []
+-- params: ["junk"]
+select id from mi where m = ?;
+→ []
+-- params: ["junk"]
+select id from mp where m = ?;
+→ []
+
+-- params: [""]
+select id from mn where m <> ?;
+→ []
+-- params: [""]
+select id from mi where m = ?;
+→ []
+-- params: [""]
+select id from mp where m = ?;
+→ []
+
+-- params: [5.5]
+select id from mn where m = ?;
+→ []
+-- params: [5.5]
+select id from mi where m = ?;
+→ []
+-- params: [5.5]
+select id from mp where m = ?;
+→ []
+
+-- params: [true]
+select id from mn where m = ?;
+→ []
+-- params: [true]
+select id from mi where m = ?;
+→ []
+-- params: [true]
+select id from mp where m = ?;
+→ []
+
+-- ============================================================
+-- 4. The other comparison sites
+-- ============================================================
+
+create table txt (k integer primary key, s text null);
+-- run
+insert into txt values (1, '1000'), (2, 'junk');
+-- run
+
+select id from mn where m in (select s from txt);
+→ [{"id":1}]
+
+-- A text probe against a TIMESTAMP subquery converts the probe.
+select k from txt where s in (select m from mn);
+→ [{"k":1}]
+
+-- A member that converts to NULL makes a failed membership UNKNOWN, as `not in ('')` does.
+create table blanks (k integer primary key, s text null);
+-- run
+insert into blanks values (1, '');
+-- run
+select id from mn where m not in (select s from blanks);
+→ []
+
+select m.id, t.k from mn m join txt t on m.m = t.s;
+→ [{"id":1,"k":1}]
+
+select id, case m when '1000' then 'y' else 'n' end as c from mn order by id;
+→ [{"c":"y","id":1},{"c":"n","id":2},{"c":"n","id":3}]
+
+-- These return an argument, so a kept operand comes back as written.
+select greatest(m, 'junk') as g from mn where id = 1;
+→ [{"g":"junk"}]
+select nullif(m, 'junk') as n from mn where id = 1;
+→ [{"n":1000}]
+select nullif(m, '1000') as n from mn where id = 1;
+→ [{"n":null}]
+
+select dn.id, x.k from dn join (select 1 as k, '2024-01-15T12:00:00' as s) x on dn.d = x.s;
+→ [{"id":1,"k":1}]
+
+select id, case d when '2024-01-15T12:00:00' then 'y' else 'n' end as c from dn order by id;
+→ [{"c":"y","id":1},{"c":"n","id":2}]
+
+select id, nullif(t, '12:00') as n from tn order by id;
+→ [{"id":1,"n":null},{"id":2,"n":"13:00:00"}]
+
+-- A user-written cast keeps CAST's rule: text the type rejects has no result.
+select cast('junk' as date) as c;
+→ [{"c":null}]
+select cast('junk' as timestamp) as c;
+→ [{"c":null}]
+
+-- ============================================================
+-- 5. date(col) = <text>: the filter and the evaluated comparison agree
+-- ============================================================
+
+create table b (id integer primary key, t datetime null);
+-- run
+create table bi (id integer primary key, t datetime null);
+-- run
+create index bi_t on bi (t);
+-- run
+insert into b values (1, '2020-01-01T03:00:00'), (2, '2020-01-02T03:00:00');
+-- run
+insert into bi values (1, '2020-01-01T03:00:00'), (2, '2020-01-02T03:00:00');
+-- run
+
+select id, date(t) = '2020-01-01' as eq from b order by id;
+→ [{"eq":true,"id":1},{"eq":false,"id":2}]
+select id from b where date(t) = '2020-01-01';
+→ [{"id":1}]
+select id from bi where date(t) = '2020-01-01';
+→ [{"id":1}]
+
+select id, date(t) = '2020-01-01T10:00:00' as eq from b order by id;
+→ [{"eq":true,"id":1},{"eq":false,"id":2}]
+select id from b where date(t) = '2020-01-01T10:00:00';
+→ [{"id":1}]
+select id from bi where date(t) = '2020-01-01T10:00:00';
+→ [{"id":1}]
+
+-- This names 2020-01-02 in UTC, so it finds the second row, not the first.
+select id, date(t) = '2020-01-01T22:00:00-05:00' as eq from b order by id;
+→ [{"eq":false,"id":1},{"eq":true,"id":2}]
+select id from b where date(t) = '2020-01-01T22:00:00-05:00';
+→ [{"id":2}]
+select id from bi where date(t) = '2020-01-01T22:00:00-05:00';
+→ [{"id":2}]
+
+-- This names 2019-12-31 in UTC.
+select id, date(t) = '2020-01-01[Asia/Tokyo]' as eq from b order by id;
+→ [{"eq":false,"id":1},{"eq":false,"id":2}]
+select id from b where date(t) = '2020-01-01[Asia/Tokyo]';
+→ []
+select id from bi where date(t) = '2020-01-01[Asia/Tokyo]';
+→ []
