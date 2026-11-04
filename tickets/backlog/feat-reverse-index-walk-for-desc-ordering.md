@@ -69,6 +69,8 @@ composite ordering reversed. Nothing requests a backwards read today, so it is d
 — this ticket is what would wake it. It should land first, or as the first arm of this
 work.
 
+A second hazard, found by reading `scan-layer.ts` and not run because nothing requests a reverse walk today: the memory scan positions a prefix seek at the key `[prefix]`, which sorts just before every full key in that prefix group. That start is right for a forward walk only. Walking backwards from it lands in the previous group, the prefix check fails, and the scan ends with no rows. A reverse prefix walk has to start from the end of the group. This becomes reachable for `where k = ? order by r desc` over `(k, r)` once bug-memory-compound-index-unusable-on-leading-column makes equality on a leading column a prefix seek.
+
 ## Scope note
 
 This is a two-backend change plus an engine-side contract clarification, and the store
