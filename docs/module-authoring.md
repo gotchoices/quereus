@@ -836,8 +836,12 @@ cannot hand down the effective rows and forget the rollback states.
 *   Physical structures are still built from the module's OWN rows. Building an index over
     committed rows while validating over the merged view is deliberate and sound: an index entry
     with no live row behind it is harmless, because every reader resolves an entry back to its
-    live row and drops it when the row is gone. Both bundled modules document this at the build
-    site (`BaseLayer.addIndexToBase`, `StoreModule.buildIndexEntries`).
+    live row and drops it when the row is gone. The memory module documents this at its build
+    site (`BaseLayer.addIndexToBase`). This covers a row a *wrapper* staged a change to. A write
+    your own module buffers needs more if a later rollback must see the index agree: the store,
+    run without a wrapper, queues the entries those writes owe beside them in its op log
+    (`populateIndexStore`, [store.md](store.md)), because a second entry for an overwritten row
+    would otherwise surface twice from a range scan.
 *   Validate BEFORE creating any physical artifact, so a rejection leaves nothing behind.
 
 Every stream is re-callable because a single `ALTER` may validate more than once (one pass per

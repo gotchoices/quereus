@@ -689,8 +689,9 @@ tiers](module-capabilities.md#ddl-transactionality-tiers)); raising the bundled 
 degrade here should document it, as this section does.
 
 The store module (`packages/quereus-store`) reaches the same two rules by a different route
-(it validates over `StoreTable.iterateEffectiveEntries` and its index store is likewise
-written outside the coordinator). See `docs/module-authoring.md` § Transaction Support.
+(it validates over `StoreTable.iterateEffectiveEntries` and writes the entries for its committed
+rows outside the coordinator, while the entries its open transaction's writes owe stay buffered
+with those writes). See `docs/store.md` and `docs/module-authoring.md` § Transaction Support.
 
 ## **Current Limitations:**
 
