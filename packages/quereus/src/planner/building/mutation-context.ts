@@ -3,6 +3,7 @@ import type { PlanningContext } from '../planning-context.js';
 import type { MutationContextDefinition, TableSchema } from '../../schema/table.js';
 import { PlanNode, type Attribute, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { LiteralNode } from '../nodes/scalar.js';
 import type { RegisteredScope } from '../scopes/registered.js';
 import type { ReferenceCallback } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
@@ -106,6 +107,17 @@ export function buildMutationContextAttributes(
 	}));
 }
 
+/** Binds both spellings of a context variable, `<name>` and `context.<name>`, to `reference`. */
+function registerContextVariable(
+	scope: RegisteredScope,
+	contextVar: MutationContextDefinition,
+	reference: ReferenceCallback,
+): void {
+	const varNameLower = contextVar.name.toLowerCase();
+	scope.registerSymbol(varNameLower, reference);
+	scope.registerSymbol(`context.${varNameLower}`, reference);
+}
+
 /**
  * Registers `<name>` and `context.<name>` for every declared context variable in
  * `scope`. Callers register context symbols BEFORE column symbols so context
@@ -118,15 +130,45 @@ export function registerMutationContextSymbols(
 	contextAttributes: ReadonlyArray<MutationContextAttribute>,
 ): void {
 	contextAttributes.forEach((attr, contextVarIndex) => {
-		const varNameLower = attr.contextVar.name.toLowerCase();
-
 		const reference: ReferenceCallback = attr.supplied || !attr.contextVar.notNull
 			? (exp, s) => new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
 			: () => { throw missingContextValueError(attr); };
 
-		scope.registerSymbol(varNameLower, reference);
-		scope.registerSymbol(`context.${varNameLower}`, reference);
+		registerContextVariable(scope, attr.contextVar, reference);
 	});
+}
+
+/**
+ * Registers the declared context variables for a statement that has no `with context`
+ * clause and installs no context row at runtime, such as the ADD COLUMN backfill. The
+ * per-variable rule is {@link registerMutationContextSymbols}'s, adjusted for those two
+ * absences: a nullable variable is a typed NULL literal instead of a reference into a
+ * context row, and reading a NOT NULL one raises the caller's error, because
+ * {@link missingContextValueError}'s advice names a clause this statement cannot carry.
+ *
+ * The error is raised at reference time, so a declared variable the expression never
+ * reads does not matter. Returns the lower-cased names for `buildRowDefaultScope`'s
+ * shadow set, so the variables shadow same-named columns as they do on the INSERT path.
+ */
+export function registerNoEnvelopeContextSymbols(
+	scope: RegisteredScope,
+	tableSchema: TableSchema,
+	missingNotNull: (contextVar: MutationContextDefinition, tableLabel: string) => QuereusError,
+): ReadonlySet<string> {
+	const declared = tableSchema.mutationContext ?? [];
+	const tableLabel = `${tableSchema.schemaName}.${tableSchema.name}`;
+	for (const contextVar of declared) {
+		const reference: ReferenceCallback = contextVar.notNull
+			? () => { throw missingNotNull(contextVar, tableLabel); }
+			: (_exp, s) => new LiteralNode(s, { type: 'literal', value: null }, {
+				typeClass: 'scalar',
+				logicalType: contextVar.logicalType,
+				nullable: true,
+				isReadOnly: true,
+			});
+		registerContextVariable(scope, contextVar, reference);
+	}
+	return new Set(declared.map(contextVar => contextVar.name.toLowerCase()));
 }
 
 /**

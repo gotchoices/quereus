@@ -9,6 +9,8 @@ import { PlanNode, type VoidNode, type ScalarPlanNode, type Attribute, type RowD
 import type { TableReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
+import { registerNoEnvelopeContextSymbols } from './mutation-context.js';
+import { RegisteredScope } from '../scopes/registered.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
@@ -266,6 +268,25 @@ export function buildAlterTableStmt(
 }
 
 /**
+ * An ADD COLUMN DEFAULT read a NOT NULL mutation-context variable. ALTER has no `with
+ * context` clause to supply it, so the message names the two-statement route that does
+ * work: the stored default is only read later, by writes that can supply the variable.
+ */
+function addColumnReadsRequiredContextError(
+  columnName: string,
+  contextVarName: string,
+  tableLabel: string,
+): QuereusError {
+  return new QuereusError(
+    `cannot add column '${columnName}' to '${tableLabel}': its DEFAULT reads mutation context variable ` +
+    `'${contextVarName}', which is NOT NULL, and ALTER TABLE supplies no context to fill existing rows; ` +
+    `add the column with a literal DEFAULT or none, then set this default with ` +
+    `\`alter table ${tableLabel} alter column ${columnName} set default (…)\``,
+    StatusCode.ERROR,
+  );
+}
+
+/**
  * Compile the per-row backfill of an ADD COLUMN that carries a per-row value source:
  * a DEFAULT that does not fold to a literal (e.g. `new.<col>`), or a GENERATED ALWAYS
  * AS expression (whatever its VIRTUAL / STORED spelling — this engine materializes a
@@ -322,7 +343,12 @@ function buildAddColumnBackfill(
     // `schemaAuthoredContext` wrapper, same determinism validation.
     node = buildGeneratedColumnExpr(ctx, tableSchema, columnDef.name, generatedExpr, rowAttrs);
   } else {
-    const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
+    // Layered as INSERT layers its DEFAULT scope: context variables in the parent, the row
+    // above them with the bare names the variables claim left out.
+    const contextScope = new RegisteredScope(ctx.scope);
+    const contextVarNames = registerNoEnvelopeContextSymbols(contextScope, tableSchema,
+      (contextVar, tableLabel) => addColumnReadsRequiredContextError(columnDef.name, contextVar.name, tableLabel));
+    const rowScope = buildRowDefaultScope(contextScope, tableSchema.columns, rowAttrs, contextVarNames);
     // Schema-authored SQL, wrapped exactly as the three DML builders wrap theirs, so the
     // backfill expression resolves bare relation names against the altered table's own
     // schema — not whatever path the ALTER runs on. The CTE half of the wrapper is inert

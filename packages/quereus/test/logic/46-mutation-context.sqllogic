@@ -593,3 +593,17 @@ INSERT INTO upsert_ctx WITH CONTEXT cap = 100 VALUES (1, 2) ON CONFLICT (id) DO 
 SELECT id, v FROM upsert_ctx
 → [{"id":1,"v":2}]
 
+-- Test 26: ADD COLUMN supplies no envelope. Its DEFAULT backfill reads a NULL-declared
+-- variable as NULL, while later writes read the supplied value from the same DEFAULT.
+create table AcCtx (a integer primary key) with context (who integer null);
+insert into AcCtx values (1);
+alter table AcCtx add column c integer null default (who);
+insert into AcCtx (a) with context who = 7 values (2);
+select a, c from AcCtx order by a
+→ [{"a":1,"c":null},{"a":2,"c":7}]
+
+-- A NOT NULL variable read by the DEFAULT is rejected even with no rows to backfill.
+create table AcCtxReq (a integer primary key) with context (who integer);
+alter table AcCtxReq add column c integer null default (who);
+-- error: ALTER TABLE supplies no context
+
