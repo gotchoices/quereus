@@ -1419,8 +1419,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * this to skip building events; the DML executor's auto-event gate consults it too.
 	 *
 	 * The answer is sampled when asked, so do not keep it for a whole transaction.
-	 * Listeners subscribed directly to a module's own emitter are not counted. Returns
-	 * false, rather than throwing, on a closed database.
+	 * Listeners subscribed directly to a module's own emitter are not counted. Never
+	 * throws, so a module may ask during `close()`; the answer is false once `close()` finishes.
 	 *
 	 * See docs/module-events.md § For Modules with Native Events.
 	 */
