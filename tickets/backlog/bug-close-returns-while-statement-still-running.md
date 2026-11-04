@@ -16,6 +16,7 @@ tradeoffs: The likely trigger is shutting down during other work, the closed-dat
 
 - A statement already inside a module hook finishes after `close()` has returned. If the caller then closes the underlying store, that hook is writing to a closed store, and the module can add a catalog entry after the catalog was cleared.
 - An open row iterator keeps producing rows after close.
+- An `apply schema` with no statement left to refuse still finishes normally. If `close()` lands on the yield after the plan's last step and there is no seeding, the apply resolves as success on the closed database, and each module's `endSchemaBatch` runs with no error after `close()` has returned (observed by running it). If seed rows remain, it rejects with `Cannot apply seed data: table … not found after migration`, which does not mention the close (also observed).
 
 **Expected:** when `close()` resolves, nothing is still running against the database, and an open iterator reports that the database closed.
 

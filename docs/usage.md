@@ -845,7 +845,7 @@ console.log(path); // ['main', 'extensions', 'plugins']
 ### `db.close()`
 Closes the database connection and finalizes all open statements.
 
-`close()` does not wait for a statement already running. A statement queued behind it is refused with `Database is closed`, and so is the next step of a running `apply schema`, which then rejects and reports the schema as not restored (see [Yielding during an apply](schema-declarative.md#yielding-during-an-apply)).
+`close()` does not wait for a statement already running. A statement queued behind it is refused: `exec` with `Database is closed`, and a prepared statement (including `db.get`) with `Statement finalized`. The next step of a running `apply schema` is refused too, which normally makes the apply reject and report the schema as not restored (see [Yielding during an apply](schema-declarative.md#yielding-during-an-apply) for the exceptions).
 
 ## Statement API Reference
 

@@ -2,7 +2,7 @@
 export type EventLoopPacer = () => Promise<void>;
 
 /** One 60 Hz frame. */
-const DEFAULT_BUDGET_MS = 16;
+const BUDGET_MS = 16;
 
 /**
  * One event-loop turn. `setTimeout` is the one primitive on node, browsers and React Native.
@@ -16,7 +16,7 @@ export function yieldToEventLoop(): Promise<void> {
 }
 
 /**
- * Returns a pacer that yields only once the thread has been held for `budgetMs` since the last
+ * Returns a pacer that yields only once the thread has been held for {@link BUDGET_MS} since the last
  * yield, or since this call for the first one. A yield on every call is not viable: one
  * `setTimeout(0)` was measured at about 15 ms on Windows, which took a 400-table `apply schema`
  * from 9 ms to 5946 ms.
@@ -24,11 +24,11 @@ export function yieldToEventLoop(): Promise<void> {
  * A backward clock jump reads as a negative hold, which yields at once and restarts the count, so
  * it costs one early yield rather than suppressing yields until the clock catches up.
  */
-export function createEventLoopPacer(budgetMs = DEFAULT_BUDGET_MS): EventLoopPacer {
+export function createEventLoopPacer(): EventLoopPacer {
 	let heldSince = Date.now();
 	return async () => {
 		const held = Date.now() - heldSince;
-		if (held >= 0 && held < budgetMs) return;
+		if (held >= 0 && held < BUDGET_MS) return;
 		await yieldToEventLoop();
 		heldSince = Date.now();
 	};
