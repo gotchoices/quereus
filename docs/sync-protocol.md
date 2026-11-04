@@ -466,7 +466,7 @@ The client state machine:
 
 - **DISCONNECTED** → `connectSync(url, token)` → **CONNECTING**
 - **CONNECTING** → `onopen`, send handshake → **SYNCING**
-- **SYNCING** → `handshake_ack` → `get_changes`; changes received → `applyChanges()` → **SYNCED**
+- **SYNCING** → `handshake_ack` → `get_changes`; each non-empty `changes` reply → `applyChanges()` → next `get_changes`; an empty `changes` reply → **SYNCED**. Nothing else reports SYNCED, so a `push_changes` applied during the pull leaves the state at SYNCING
 - **SYNCED** stays put across `apply_result` / applied `push_changes`, and re-enters itself on a local change → `apply_changes`
 - Any of CONNECTING / SYNCING / SYNCED, on a WebSocket error or unintentional close → **RECONNECTING** → exponential backoff (1s, 2s, 4s … 60s) → DISCONNECTED and retry
 
@@ -491,6 +491,17 @@ ChangeSets, sends `apply_changes { requestId: apply-N, changes }`, and records
 client sets `lastSentHLC` to that HLC (forward-only) and persists it per peer. One read
 returns at most one `batchSize` batch, so when an ack moves the watermark the client reads
 and pushes again, ending when nothing is left past it.
+
+The pull loop has the same shape. One `changes` reply holds at most one `batchSize` batch,
+rounded up to a whole transaction, so the client applies it, moves the received watermark
+(forward-only) and sends `get_changes` again from there, one request at a time. An
+interrupted pull therefore resumes from the watermark. Only an empty reply ends the loop and
+reports `synced`. The size of a reply cannot serve as the stop signal, because `batchSize` is
+the coordinator's setting and a reply can overshoot it. An empty reply is reliable because
+every server read starts strictly after `sinceHLC`, so it returns nothing only when nothing
+is left. The loop costs one extra round trip per catch-up and leaves the wire format
+unchanged. A non-empty reply that does not move the watermark sends nothing further, so a
+duplicate reply or a misbehaving server cannot loop.
 
 A device pushes only what it wrote (`hlc.siteId` is its own), never what it received. It
 assumes one coordinator per database: everything it received came through that server, so
@@ -546,7 +557,8 @@ decided at handshake and finished *before* the incremental path (`get_changes`,
 local-change subscription, push) starts:
 
 - `requestSnapshot()`, explicit. Idempotent while a transfer is in flight: a second call
-  joins it, and exactly one `get_snapshot` goes on the wire.
+  joins it, and exactly one `get_snapshot` goes on the wire. When the transfer lands, the
+  call that started it sends `get_changes` from the snapshot's HLC.
 - An empty replica on first connect (`bootstrapOnEmpty`, default `true`). "Empty"
   requires **both** no peer sync state for this server and no change facts, whichever
   device wrote them — the first alone also matches a device holding real local data that

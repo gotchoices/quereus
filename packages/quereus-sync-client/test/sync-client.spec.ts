@@ -884,6 +884,58 @@ describe('SyncClient', () => {
       expect(getChanges.sinceHLC).to.equal(serializeHLCForTransport(hlc5));
       expect(getChanges.sinceHLC).to.not.equal(serializeHLCForTransport(hlc6));
     });
+
+    describe('pulling until caught up', () => {
+      const site = generateSiteId();
+      const hlc5: HLC = { wallTime: 5000n, counter: 1, siteId: site, opSeq: 0 };
+
+      /** A client on an open socket with its handshake-time messages cleared. */
+      async function connectedClient(syncManager = new MockSyncManager()): Promise<{ client: SyncClient; ws: MockWebSocket; syncManager: MockSyncManager }> {
+        const { client } = createClient({ syncManager });
+        const ws = await connectAndHandshake(client);
+        ws.sentMessages.length = 0;
+        return { client, ws, syncManager };
+      }
+
+      async function deliver(ws: MockWebSocket, type: 'changes' | 'push_changes', changeSets: ChangeSet[]): Promise<void> {
+        ws.simulateMessage({ type, changeSets: changeSets.map(serializeChangeSet) });
+        await new Promise(r => setTimeout(r, 20));
+      }
+
+      it('asks again after a non-empty reply, and only an empty reply reports synced', async () => {
+        const { client, ws } = await connectedClient();
+
+        await deliver(ws, 'changes', [changeSet(site, 'tx5', hlc5)]);
+        expect(ws.getSentMessages()).to.deep.equal([{ type: 'get_changes', sinceHLC: serializeHLCForTransport(hlc5) }]);
+        expect(client.isSynced).to.be.false;
+
+        ws.sentMessages.length = 0;
+        await deliver(ws, 'changes', []);
+        expect(ws.getSentMessages()).to.deep.equal([]);
+        expect(client.isSynced).to.be.true;
+      });
+
+      it('does not report synced for a broadcast that lands during the pull', async () => {
+        const { client, ws } = await connectedClient();
+
+        await deliver(ws, 'push_changes', [changeSet(site, 'tx5', hlc5)]);
+
+        expect(client.isSynced).to.be.false;
+      });
+
+      it('stops on a non-empty reply at or below the watermark, without moving it', async () => {
+        const syncManager = new MockSyncManager();
+        syncManager.peerSyncState = hlc5;
+        const { client, ws } = await connectedClient(syncManager);
+        syncManager.updatePeerSyncStateCalls.length = 0;
+
+        await deliver(ws, 'changes', [changeSet(site, 'tx5', hlc5)]);
+
+        expect(ws.getSentMessages()).to.deep.equal([]);
+        expect(syncManager.updatePeerSyncStateCalls).to.deep.equal([]);
+        expect(client.isSynced).to.be.false;
+      });
+    });
   });
 
   // ==========================================================================
@@ -1805,6 +1857,21 @@ describe('SyncClient', () => {
       await requestPromise;
       expect(client.isBootstrapping).to.be.false;
       expect(syncManager.appliedSnapshotChunks.length).to.equal(4);
+    });
+
+    it('requestSnapshot() catches up from the snapshot HLC once the transfer lands', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: false });
+      const ws = await connectAndHandshake(client, serverSite);
+      ws.sentMessages.length = 0;
+
+      const hlc = hlcAt(9000n, serverSite);
+      const requestPromise = client.requestSnapshot();
+      streamSnapshot(ws, snapshotChunks(serverSite, hlc));
+      await requestPromise;
+
+      expect(ws.getSentMessages().at(-1)).to.deep.equal({ type: 'get_changes', sinceHLC: serializeHLCForTransport(hlc) });
     });
 
     it('rejects requestSnapshot() when not connected', async () => {

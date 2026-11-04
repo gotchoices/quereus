@@ -115,7 +115,7 @@ interface SyncClientOptions {
 - `hasPendingSnapshot(): Promise<boolean>` - Whether an interrupted snapshot left the local database partial (usable before connecting; the next connect resumes the transfer)
 - `status: SyncStatus` - Current connection status (getter property)
 - `isConnected: boolean` - Whether the WebSocket is open (getter property)
-- `isSynced: boolean` - Whether the client is fully synced (getter property)
+- `isSynced: boolean` - Whether the client has fetched everything the server holds, which it knows only once a `get_changes` comes back empty (getter property)
 - `isBootstrapping: boolean` - Whether a snapshot transfer is in flight (getter property)
 
 ### Data written before sync was turned on
@@ -164,8 +164,8 @@ DISCONNECTED → CONNECTING → SYNCING → SYNCED
 - `disconnected`: Not connected
 - `connecting`: WebSocket connecting, handshake in progress
 - `bootstrapping`: A full snapshot is streaming in — the local database is partial; hold writes until it finishes
-- `syncing`: Connected, exchanging initial changes
-- `synced`: Fully synchronized, real-time updates active
+- `syncing`: Connected, fetching changes batch by batch
+- `synced`: A fetch came back empty, so the device holds everything the server had; real-time updates active
 - `error`: Connection error (will auto-reconnect if enabled, except after a fatal server error, a protocol version mismatch, or a refusal over unrecorded rows, which last until the next `connect()`)
 
 ## Protocol
@@ -177,7 +177,7 @@ The client implements the Quereus sync WebSocket protocol:
 | `handshake` | Client→Server | Authenticate with siteId and token |
 | `handshake_ack` | Server→Client | Confirm connection |
 | `get_changes` | Client→Server | Request changes since HLC |
-| `changes` | Server→Client | Initial/requested changes |
+| `changes` | Server→Client | One bounded batch of requested changes; the client requests again until a reply is empty, and only that reports `synced` |
 | `snapshot_required` | Server→Client | Our watermark predates pruned deletes; the client pushes all its unsent local changes, batch by batch, takes a full snapshot, then catches up |
 | `apply_changes` | Client→Server | Send changes this device wrote |
 | `apply_result` | Server→Client | Confirm changes applied |

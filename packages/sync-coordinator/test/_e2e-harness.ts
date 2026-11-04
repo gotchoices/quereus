@@ -172,9 +172,9 @@ export async function waitFor(
 
 /**
  * Wait until every client has finished its post-handshake flow. `isSynced` first
- * turns true on the reply to the catch-up `get_changes`, which goes out only after
- * any snapshot bootstrap has landed and just before the local-change subscription
- * starts, so both are settled by the time that reply can be delivered.
+ * turns true on the empty reply that ends the catch-up `get_changes` chain. The chain
+ * starts only after any snapshot bootstrap has landed and just before the local-change
+ * subscription starts, so both are settled by the time that reply can be delivered.
  */
 export async function waitForSynced(...clients: readonly SyncClient[]): Promise<void> {
   await waitFor(

@@ -25,6 +25,7 @@ import {
   type HLC,
   type SiteId,
   type AdoptedRows,
+  type ChangeSet,
   type ClientMessage,
   type GetSnapshotMessage,
   type ResumeSnapshotMessage,
@@ -141,6 +142,12 @@ export class SyncClient {
   // start one too; both would read the same range and every batch would go twice.
   private recoveryOwnsPush = false;
 
+  // True once the server has answered a get_changes with nothing, meaning this
+  // pull has reached the end of what the server holds. A `changes` reply carries
+  // one bounded batch, so only this flag may report `synced`. Cleared wherever a
+  // new pull begins: connect() and the start of a snapshot transfer.
+  private caughtUp = false;
+
   // Local change debouncing
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingLocalChangeCount = 0;
@@ -200,7 +207,7 @@ export class SyncClient {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
-  /** Whether the client is fully synced */
+  /** Whether the client has fetched everything the server holds and is receiving live changes */
   get isSynced(): boolean {
     return this._status.status === 'synced';
   }
@@ -242,6 +249,7 @@ export class SyncClient {
     this.connectionToken = token;
     this.intentionalDisconnect = false;
     this.stopReconnect = false;
+    this.caughtUp = false;
 
     // Clear any pending reconnect timer
     this.clearReconnectTimer();
@@ -380,7 +388,7 @@ export class SyncClient {
 
       case 'changes':
         // Ordered reply to an explicit get_changes: server-ordered, gap-free.
-        // Safe to advance the received watermark.
+        // Safe to advance the received watermark, and the pull continues from it.
         await this.handleChanges(message.changeSets || [], true);
         break;
 
@@ -570,18 +578,19 @@ export class SyncClient {
   }
 
   /**
-   * Apply received changesets to the local store, optionally advancing the
-   * received watermark (`lastSyncHLC`).
+   * Apply received changesets to the local store. An ordered reply also drives
+   * the pull: a non-empty one advances the received watermark (`lastSyncHLC`) and
+   * asks for the next batch, and an empty one ends the pull.
    *
-   * @param advanceWatermark Only the ordered `changes` reply is contiguous and
-   *   gap-free, so only it may advance the watermark. A `push_changes`
-   *   broadcast is applied (idempotently) but must leave the watermark unmoved,
-   *   so a broadcast the client never received is still redelivered by the next
+   * @param ordered Only the ordered `changes` reply is contiguous and gap-free,
+   *   so only it may advance the watermark. A `push_changes` broadcast is applied
+   *   (idempotently) but must leave the watermark unmoved, so a broadcast the
+   *   client never received is still redelivered by the next
    *   `get_changes sinceHLC=<watermark>`.
    */
   private async handleChanges(
     serializedChangeSets: SerializedChangeSet[],
-    advanceWatermark: boolean
+    ordered: boolean
   ): Promise<void> {
     // While a snapshot is streaming, incoming deltas are DROPPED, not applied:
     // applyChanges would interleave with the snapshot's clear-and-rewrite of
@@ -597,17 +606,19 @@ export class SyncClient {
     }
 
     const changeSets = serializedChangeSets.map(cs => deserializeChangeSet(cs));
+
+    // Set before the first await, so it applies to the pull this reply arrived in. A
+    // connect() or snapshot transfer that starts during the apply clears the flag for
+    // its new pull, and this reply must not overwrite that.
+    if (ordered && changeSets.length === 0) {
+      this.caughtUp = true;
+    }
+
     const result = await this.syncManager.applyChanges(changeSets);
 
-    // Advance peer sync state with the max HLC from received changes — but only
-    // on the ordered path, where contiguity guarantees nothing below maxHlc was
-    // missed.
-    if (advanceWatermark && changeSets.length > 0 && this.serverSiteId) {
-      const maxHlc = maxHLC(changeSets.map(cs => cs.hlc));
-      if (maxHlc) {
-        await this.syncManager.updatePeerSyncState(this.serverSiteId, maxHlc);
-      }
-    }
+    // Only on the ordered path, where contiguity guarantees nothing below the
+    // reply's max HLC was missed.
+    const advanced = ordered && await this.advanceReceivedWatermark(changeSets);
 
     // Emit events
     if (result.applied > 0 || result.conflicts > 0 || result.skipped > 0) {
@@ -621,10 +632,40 @@ export class SyncClient {
     }
 
     this.options.onRemoteChanges?.(result, changeSets);
+
+    // A reply carries one bounded batch and its size says nothing about what remains,
+    // so ask again until a reply is empty. Only a real advance continues, so a server
+    // repeating itself cannot loop this, and a reply that did not move the watermark
+    // ends a duplicate chain.
+    // NOTE: a get_changes the server answers with GET_CHANGES_ERROR ends the pull with
+    // the socket open, so the status stays syncing and the remainder waits for the next
+    // reconnect. If that shows up, retry on a backoff timer.
+    if (advanced) {
+      await this.requestChangesFromServer();
+    }
+
     // A stop that landed while this apply finished outranks it: the socket is gone.
-    if (!this.stopReconnect) {
+    if (this.caughtUp && !this.stopReconnect) {
       this.setStatus({ status: 'synced', lastSyncTime: Date.now() });
     }
+  }
+
+  /**
+   * Move the received watermark up to the max HLC of an ordered reply. Forward only:
+   * the store does not guard this, and a stale reply must not drag the watermark back.
+   *
+   * @returns true only when the watermark moved.
+   */
+  private async advanceReceivedWatermark(changeSets: ChangeSet[]): Promise<boolean> {
+    const serverSiteId = this.serverSiteId;
+    const replyHLC = maxHLC(changeSets.map(cs => cs.hlc));
+    if (!serverSiteId || !replyHLC) return false;
+
+    const current = await this.syncManager.getPeerSyncState(serverSiteId);
+    if (current && compareHLC(replyHLC, current) <= 0) return false;
+
+    await this.syncManager.updatePeerSyncState(serverSiteId, replyHLC);
+    return true;
   }
 
   private async handleApplyResult(message: {
@@ -781,10 +822,14 @@ export class SyncClient {
    * pending. It also skips the `unrecordedRows` check: the caller asked for a full
    * replace, so rows sync has never recorded are deleted the same way.
    *
+   * Resolves once the snapshot has landed and the catch-up `get_changes` for what
+   * came after it has gone out. The status reaches `synced` when that catch-up ends.
+   *
    * Idempotent while a transfer is in flight: a second call joins the same
-   * transfer instead of starting another stream. Rejects when not connected /
-   * handshaken, or when the transfer fails (the socket is then closed and the
-   * normal reconnect path resumes from the saved checkpoint).
+   * transfer instead of starting another stream, and whoever started it does the
+   * catch-up. Rejects when not connected / handshaken, or when the transfer fails
+   * (the socket is then closed and the normal reconnect path resumes from the
+   * saved checkpoint).
    */
   async requestSnapshot(): Promise<void> {
     if (this.snapshotTransferPromise) {
@@ -797,6 +842,7 @@ export class SyncClient {
     }
     const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
     if (error) throw error;
+    await this.requestChangesFromServer();
   }
 
   /**
@@ -1089,6 +1135,8 @@ export class SyncClient {
     if (this.snapshotTransferPromise) {
       return this.snapshotTransferPromise;
     }
+
+    this.caughtUp = false;
 
     // Cleanup rides on the returned promise rather than a `finally` INSIDE the
     // transfer body: the body can settle synchronously (a send that fails
