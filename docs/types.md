@@ -462,7 +462,7 @@ gate on it. Two consequences worth stating explicitly:
 - Validation: Must parse as a bare datetime, or as one carrying an offset, `Z`, or `[zone]`. A `[zone]` that cannot be resolved, including a valid name the runtime has no data for, is rejected unless an offset names the instant. When an offset and a `[zone]` disagree, the offset decides: `'2020-01-01T00:00:00-08:00[America/New_York]'` stores as `'2020-01-01T08:00:00'`.
 - Comparison: Lexicographic (by UTC wall-clock — see canonicalization below), after text operands convert to the stored spelling. See [DATETIME against text](types-ordering.md#datetime-against-text), which also covers shape checks such as `check (ts like '%Z')`.
 - Collations: None
-- Canonicalization: Inputs with an offset (`+HH:MM` / `Z`) or `[zone]` annotation are converted to UTC, and numeric inputs (Unix milliseconds) are canonicalized through UTC, before being stored as the bare PlainDateTime form. Equal instants compare equal regardless of input shape.
+- Canonicalization: Inputs with an offset (`+HH:MM` / `Z`) or `[zone]` annotation are converted to UTC, and numeric inputs (Unix milliseconds) are canonicalized through UTC, before being stored as the bare PlainDateTime form. Equal instants compare equal regardless of input shape. A `[zone]` input with no offset whose local time occurs twice when daylight saving ends takes the earlier instant, and one skipped when it starts moves forward by the length of the gap: `'2020-03-08T02:30:00[America/New_York]'` stores as `'2020-03-08T07:30:00'`.
 
 **TIMESPAN**
 - Physical: `PhysicalType.TEXT` (ISO 8601 duration string: "PT1H30M", "P1DT2H")

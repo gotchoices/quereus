@@ -553,6 +553,10 @@ select dt from zone_dt order by id;
 
 drop table zone_dt;
 
+-- Function forms with a modifier read text by the same rules, giving NULL where a column type raises an error.
+select datetime('2020-01-01T00:00:00-05:00[Nowhere/Fake]', '+0 days') as offset_wins, datetime('2020-01-01T00:00:00[Nowhere/Fake]', '+0 days') as bad_zone, date('2020-01-01T00:00:00[u-ca=hebrew]', '+0 days') as calendar, time('10:30:00-05:00', '+0 days') as time_offset;
+→ [{"offset_wins":"2020-01-01 05:00:00","bad_zone":null,"calendar":"2020-01-01","time_offset":null}]
+
 create table zone_reject (id integer primary key, dt datetime null, d date null, t time null);
 -- run
 

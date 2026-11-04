@@ -4,6 +4,7 @@ import { StatusCode, type SqlValue } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { quereusError } from '../../common/errors.js';
 import { BOOLEAN_RETURN_NOT_NULL, INTEGER_RETURN, REAL_RETURN, TEXT_RETURN } from './return-types.js';
+import { parseDateTimeStringToUtcPlain, parseTimeStringToUtcPlain } from '../../types/temporal-types.js';
 
 const log = createLogger('func:builtins:datetime');
 const warnLog = log.extend('warn');
@@ -125,7 +126,7 @@ const ISO_WITHOUT_OFFSET = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/
 
 /**
  * Attempts standard ISO 8601 parsing strategies in priority order:
- * offset datetime, plain datetime, plain date, plain time.
+ * offset datetime, plain datetime, then the column types' datetime and time parsers.
  */
 function parseISOString(s: string): Temporal.ZonedDateTime | null {
 	const normalised = s.replace(' ', 'T');
@@ -142,20 +143,14 @@ function parseISOString(s: string): Temporal.ZonedDateTime | null {
 		if (instant) return instantToUtcZoned(instant);
 	}
 
-	// Full ZonedDateTime (includes bracket timezone notation)
-	const zdt = tryParse(() => Temporal.ZonedDateTime.from(s));
-	if (zdt) return zdt;
-
-	// PlainDateTime
-	const pdt = tryParse(() => Temporal.PlainDateTime.from(normalised));
+	// Zones, annotations and date-only text follow the column types' rules, so that a
+	// zone naming no instant gives NULL here instead of its local clock reading.
+	const pdt = tryParse(() => parseDateTimeStringToUtcPlain(normalised));
 	if (pdt) return plainDateTimeToUtcZoned(pdt);
 
-	// PlainDate (YYYY-MM-DD)
-	const pd = tryParse(() => Temporal.PlainDate.from(s));
-	if (pd) return pd.toZonedDateTime('UTC');
-
-	// PlainTime → anchored to default date
-	const pt = tryParse(() => Temporal.PlainTime.from(s));
+	// Time-only text → anchored to default date
+	// NOTE: time-only text fails the datetime attempts twice, here and inside this parser; if that shows up as slow, split out the time-only step.
+	const pt = tryParse(() => parseTimeStringToUtcPlain(s));
 	if (pt) return plainTimeToDefaultZoned(pt);
 
 	return null;

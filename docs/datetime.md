@@ -26,7 +26,7 @@ The functions attempt to parse the initial time string argument (`timestring`) l
     *   `YYYY-MM-DD HH:MM:SS`
     *   `YYYY-MM-DDTHH:MM:SS.sss` (Fractional seconds)
     *   `YYYY-MM-DD HH:MM:SS.sss`
-    *   Formats with explicit UTC ('Z') or timezone offsets (`±HH:MM`)
+    *   Formats with explicit UTC ('Z'), timezone offsets (`±HH:MM`) or a named zone (`[America/New_York]`)
 *   **Time Only:**
     *   `HH:MM`
     *   `HH:MM:SS`
@@ -53,7 +53,8 @@ converted to UTC before the zone information is discarded. See
 [Temporal Types](types.md#temporal-types) for what each type rejects. The
 one-argument `date()`, `time()` and `datetime()` convert through the same `parse`,
 so they canonicalize too; the other SQL functions, and these three with modifiers,
-retain their lenient behavior.
+retain their lenient behavior. They read an offset, `Z` or `[zone]` by the same rules,
+but return `NULL` for text those rules reject instead of raising an error.
 
 A comparison literal on the read/filter path is treated differently by type. A
 `DATETIME` comparison converts text to the stored spelling first, so a literal

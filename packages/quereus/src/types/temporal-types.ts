@@ -21,7 +21,7 @@ const SIGN_BEFORE_ANNOTATION = /^[^[]*[+-]/;
  * `-05:00[Nowhere/Fake]` and the contradictory `-08:00[America/New_York]` both
  * fall to `Instant.from`, which takes the offset and ignores the annotation.
  */
-function parseDateTimeStringToUtcPlain(v: string): Temporal.PlainDateTime {
+export function parseDateTimeStringToUtcPlain(v: string): Temporal.PlainDateTime {
 	// ZonedDateTime first — requires explicit [zone], so the match is unambiguous.
 	// Through the instant, which also drops any calendar annotation.
 	try { return Temporal.ZonedDateTime.from(v).toInstant().toZonedDateTimeISO('UTC').toPlainDateTime(); } catch { /* fall through */ }
@@ -38,7 +38,7 @@ function parseDateTimeStringToUtcPlain(v: string): Temporal.PlainDateTime {
  * time-only text carrying a zone is refused. An offset is refused too, so that
  * one rule covers both.
  */
-function parseTimeStringToUtcPlain(v: string): Temporal.PlainTime {
+export function parseTimeStringToUtcPlain(v: string): Temporal.PlainTime {
 	try { return parseDateTimeStringToUtcPlain(v).toPlainTime(); } catch { /* fall through */ }
 	if (ZONE_ANNOTATION.test(v) || SIGN_BEFORE_ANNOTATION.test(v)) throw new RangeError('not a datetime or a bare time');
 	return Temporal.PlainTime.from(v);
@@ -103,7 +103,7 @@ export const DATE_TYPE: LogicalType = {
 
 /**
  * TIME type - stores ISO 8601 time strings (HH:MM:SS or HH:MM:SS.sss)
- * Uses Temporal.PlainTime for validation and parsing
+ * Datetime text stores its UTC time; time-only text must be bare
  */
 export const TIME_TYPE: LogicalType = {
 	name: 'TIME',
