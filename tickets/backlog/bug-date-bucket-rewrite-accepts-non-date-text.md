@@ -25,6 +25,9 @@ select id from b where date(t) = '2020-01-01T10:00:00';
 
 select id from b where date(t) = '2020-01-01T22:00:00-05:00';
 -- returns id 1; should also return no rows
+
+select id from b where date(t) = '2020-01-01[Asia/Tokyo]';
+-- returns id 1; should also return no rows: the bounds drop the zone annotation as well
 ```
 
 Expected behaviour: the filter and the evaluated comparison agree. The rewrite applies only when the constant is exactly a bare date, and otherwise declines, leaving the comparison as written. `date(t) = '2020-01-01'` still rewrites.

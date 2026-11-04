@@ -443,15 +443,15 @@ gate on it. Two consequences worth stating explicitly:
 **DATE**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "YYYY-MM-DD")
 - Values: ISO date strings
-- Validation: Must parse as a valid bare PlainDate, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a date can be extracted
+- Validation: Must parse as a bare date, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a date can be extracted. A `[zone]` that cannot be resolved, including a valid name the runtime has no data for, is rejected unless an offset names the instant.
 - Comparison: Lexicographic (ISO strings sort correctly)
 - Collations: None
-- Canonicalization: A datetime-shaped input is first converted to UTC (offset / `Z` / `[zone]` annotations honored), then the UTC date is stored. Numeric inputs (Unix milliseconds) are likewise canonicalized through UTC.
+- Canonicalization: A datetime-shaped input is first converted to UTC (offset / `Z` / `[zone]` annotations honored), then the UTC date is stored, which can differ from the date as written: `'2020-01-01[Asia/Tokyo]'` stores as `'2019-12-31'`. Numeric inputs (Unix milliseconds) are likewise canonicalized through UTC.
 
 **TIME**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "HH:MM:SS.sss")
 - Values: ISO time strings
-- Validation: Must parse as a valid bare PlainTime, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a time can be extracted
+- Validation: Must parse as bare time-only text, or as a datetime string (bare, offset, `Z`, or `[zone]`) from which a time can be extracted. Time-only text must be bare: without a date a named zone has no offset to apply, so `'10:30:00[America/New_York]'` is rejected, and `'10:30:00-05:00'` is rejected under the same rule. A `[zone]` that cannot be resolved, including a valid name the runtime has no data for, is rejected unless an offset names the instant.
 - Comparison: Lexicographic
 - Collations: None
 - Canonicalization: A datetime-shaped input is first converted to UTC, then the UTC wall-clock time is stored — `'2024-01-15T10:30:00+02:00'` stores as `'08:30:00'`, not `'10:30:00'`.
@@ -459,7 +459,7 @@ gate on it. Two consequences worth stating explicitly:
 **DATETIME**
 - Physical: `PhysicalType.TEXT` (ISO 8601 string: "YYYY-MM-DDTHH:MM:SS.sss")
 - Values: ISO datetime strings
-- Validation: Must parse as valid Temporal.PlainDateTime, Temporal.ZonedDateTime, or Temporal.Instant
+- Validation: Must parse as a bare datetime, or as one carrying an offset, `Z`, or `[zone]`. A `[zone]` that cannot be resolved, including a valid name the runtime has no data for, is rejected unless an offset names the instant. When an offset and a `[zone]` disagree, the offset decides: `'2020-01-01T00:00:00-08:00[America/New_York]'` stores as `'2020-01-01T08:00:00'`.
 - Comparison: Lexicographic (by UTC wall-clock — see canonicalization below), after text operands convert to the stored spelling. See [DATETIME against text](types-ordering.md#datetime-against-text), which also covers shape checks such as `check (ts like '%Z')`.
 - Collations: None
 - Canonicalization: Inputs with an offset (`+HH:MM` / `Z`) or `[zone]` annotation are converted to UTC, and numeric inputs (Unix milliseconds) are canonicalized through UTC, before being stored as the bare PlainDateTime form. Equal instants compare equal regardless of input shape.

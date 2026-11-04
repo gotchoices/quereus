@@ -49,22 +49,26 @@ canonical shape so that equal instants compare equal regardless of how they
 were written. For `DATETIME` the canonical form is the bare PlainDateTime
 string (`YYYY-MM-DDTHH:MM:SS[.sss]`) in **UTC** — an input with `Z`, a `±HH:MM`
 offset, a `[zone]` annotation, or a numeric Unix-millisecond value is
-converted to UTC before the zone information is discarded. The SQL functions
-listed above retain their existing lenient behavior; only the column-type
-`parse` performs this canonicalization.
+converted to UTC before the zone information is discarded. See
+[Temporal Types](types.md#temporal-types) for what each type rejects. The
+one-argument `date()`, `time()` and `datetime()` convert through the same `parse`,
+so they canonicalize too; the other SQL functions, and these three with modifiers,
+retain their lenient behavior.
 
-Canonicalization applies **only to the stored value**, not to a comparison
-literal on the read/filter path. A literal in a predicate (`WHERE ts = '…'`) is
-compared **raw** (BINARY, byte-for-byte) against the stored canonical value — it
-is not parsed or canonicalized first. So a non-canonical literal that denotes the
-*same instant* as a stored row does **not** match: `WHERE ts = '2017-07-14T02:40:00Z'`
-returns nothing against a row stored as the bare `'2017-07-14T02:40:00'`, even
-though both name the same time; only the bare canonical literal
-`'2017-07-14T02:40:00'` matches. Range predicates likewise order raw, so the bare
-form (a strict prefix of the `Z`-suffixed form) sorts below it. To match reliably,
-write the literal in the column's canonical shape (or wrap it so it is stored/cast
-first). This raw-comparison contract is pinned by the `dt_filter` / `d_filter` /
-`t_filter` cases in `test/logic/98-temporal-edge-cases.sqllogic`.
+A comparison literal on the read/filter path is treated differently by type. A
+`DATETIME` comparison converts text to the stored spelling first, so a literal
+naming the same instant as a stored row matches it: see
+[DATETIME against text](types-ordering.md#datetime-against-text).
+
+For `DATE` and `TIME`, canonicalization applies **only to the stored value**. A
+literal in a predicate (`WHERE d = '…'`) is compared **raw** (BINARY,
+byte-for-byte) against the stored canonical value — it is not parsed or
+canonicalized first. So a non-canonical literal that denotes the *same date* as a
+stored row does **not** match: `WHERE d = '2024-01-15T10:30:00Z'` returns nothing
+against a row stored as the bare `'2024-01-15'`; only the bare canonical literal
+matches. To match reliably, write the literal in the column's canonical shape (or
+wrap it so it is stored/cast first). This raw-comparison contract is pinned by the
+`d_filter` / `t_filter` cases in `test/logic/98-temporal-edge-cases.sqllogic`.
 
 ### Strict Parsing (Epoch Functions)
 

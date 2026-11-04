@@ -1,65 +1,79 @@
+import type { SqlValue } from '../common/types.js';
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { BINARY_COLLATION } from '../util/comparison.js';
 import { canonicalizeInteger } from '../util/numeric-canonical.js';
 import { Temporal } from 'temporal-polyfill';
 
+/** A time zone annotation (RFC 9557): bracketed with no `=`. Calendar and other tagged annotations always have one. */
+const ZONE_ANNOTATION = /\[!?[^=\]]*\]/;
+
+/** A sign ahead of any annotation. Text with no date has no other use for one, so it marks a UTC offset. */
+const SIGN_BEFORE_ANNOTATION = /^[^[]*[+-]/;
+
 /**
  * Parse any string ISO datetime form into a UTC PlainDateTime — the canonical
  * stored shape for DATETIME values. Zone-bearing inputs ([zone] annotation,
- * `Z` suffix, or `±HH:MM` offset) are converted to UTC; bare ISO datetimes
- * are treated as already-UTC wall-clock.
+ * `Z` suffix, or `±HH:MM` offset) are converted to UTC through the instant they
+ * name; bare ISO datetimes are treated as already-UTC wall-clock.
+ *
+ * Throws on a [zone] annotation that names no instant, rather than storing its
+ * local reading. An offset alongside the annotation is deliberately enough:
+ * `-05:00[Nowhere/Fake]` and the contradictory `-08:00[America/New_York]` both
+ * fall to `Instant.from`, which takes the offset and ignores the annotation.
  */
 function parseDateTimeStringToUtcPlain(v: string): Temporal.PlainDateTime {
 	// ZonedDateTime first — requires explicit [zone], so the match is unambiguous.
-	try { return Temporal.ZonedDateTime.from(v).toPlainDateTime(); } catch { /* fall through */ }
+	// Through the instant, which also drops any calendar annotation.
+	try { return Temporal.ZonedDateTime.from(v).toInstant().toZonedDateTimeISO('UTC').toPlainDateTime(); } catch { /* fall through */ }
 	// Instant.from handles `Z` suffix and bare offsets like `+00:00`.
 	try { return Temporal.Instant.from(v).toZonedDateTimeISO('UTC').toPlainDateTime(); } catch { /* fall through */ }
+	if (ZONE_ANNOTATION.test(v)) throw new RangeError('time zone annotation does not resolve to an instant');
 	// Bare PlainDateTime (no zone/offset) — assume UTC wall-clock.
-	return Temporal.PlainDateTime.from(v);
+	return Temporal.PlainDateTime.from(v).withCalendar('iso8601');
 }
 
 /**
+ * Parse TIME input: a datetime in any form the helper above accepts, or bare
+ * time-only text. Without a date a named zone has no offset to apply, so
+ * time-only text carrying a zone is refused. An offset is refused too, so that
+ * one rule covers both.
+ */
+function parseTimeStringToUtcPlain(v: string): Temporal.PlainTime {
+	try { return parseDateTimeStringToUtcPlain(v).toPlainTime(); } catch { /* fall through */ }
+	if (ZONE_ANNOTATION.test(v) || SIGN_BEFORE_ANNOTATION.test(v)) throw new RangeError('not a datetime or a bare time');
+	return Temporal.PlainTime.from(v);
+}
+
+/** `validate` for a string temporal type whose text form goes through `parseText`. */
+const validatesAs = (parseText: (text: string) => unknown) => (v: SqlValue): boolean => {
+	if (v === null) return true;
+	if (typeof v !== 'string') return false;
+	try {
+		parseText(v);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
  * DATE type - stores ISO 8601 date strings (YYYY-MM-DD)
- * Uses Temporal.PlainDate for validation and parsing
+ * Text input parses as a datetime, so the stored date is the UTC date
  */
 export const DATE_TYPE: LogicalType = {
 	name: 'DATE',
 	physicalType: PhysicalType.TEXT,
 	isTemporal: true,
 
-	validate: (v) => {
-		if (v === null) return true;
-		if (typeof v !== 'string') return false;
-		try {
-			// Full datetime parsing first so offset/zoned inputs canonicalize to UTC
-			// before the date is extracted. PlainDate.from would otherwise silently
-			// accept offset-bearing strings and return the wall-clock date.
-			parseDateTimeStringToUtcPlain(v);
-			return true;
-		} catch {
-			try {
-				Temporal.PlainDate.from(v);
-				return true;
-			} catch {
-				return false;
-			}
-		}
-	},
+	validate: validatesAs(parseDateTimeStringToUtcPlain),
 
 	parse: (v) => {
 		if (v === null) return null;
 		if (typeof v === 'string') {
 			try {
-				// Datetime-shaped inputs (with or without offset/zone) canonicalize
-				// through UTC. PlainDate.from is only consulted for bare date-only
-				// strings, which the helper rejects.
 				return parseDateTimeStringToUtcPlain(v).toPlainDate().toString();
-			} catch {
-				try {
-					return Temporal.PlainDate.from(v).toString(); // ISO 8601 format: YYYY-MM-DD
-				} catch (eDate) {
-					throw new TypeError(`Cannot convert '${v}' to DATE: ${eDate instanceof Error ? eDate.message : String(eDate)}`);
-				}
+			} catch (e) {
+				throw new TypeError(`Cannot convert '${v}' to DATE: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
 		if (typeof v === 'number') {
@@ -96,39 +110,15 @@ export const TIME_TYPE: LogicalType = {
 	physicalType: PhysicalType.TEXT,
 	isTemporal: true,
 
-	validate: (v) => {
-		if (v === null) return true;
-		if (typeof v !== 'string') return false;
-		try {
-			// Full datetime parsing first so offset/zoned inputs canonicalize to UTC
-			// before the time is extracted. PlainTime.from would otherwise silently
-			// accept offset-bearing strings and return the wall-clock time.
-			parseDateTimeStringToUtcPlain(v);
-			return true;
-		} catch {
-			try {
-				Temporal.PlainTime.from(v);
-				return true;
-			} catch {
-				return false;
-			}
-		}
-	},
+	validate: validatesAs(parseTimeStringToUtcPlain),
 
 	parse: (v) => {
 		if (v === null) return null;
 		if (typeof v === 'string') {
 			try {
-				// Datetime-shaped inputs (with or without offset/zone) canonicalize
-				// through UTC. PlainTime.from is only consulted for bare time-only
-				// strings, which the helper rejects.
-				return parseDateTimeStringToUtcPlain(v).toPlainTime().toString();
-			} catch {
-				try {
-					return Temporal.PlainTime.from(v).toString(); // ISO 8601 format: HH:MM:SS or HH:MM:SS.sss
-				} catch (eTime) {
-					throw new TypeError(`Cannot convert '${v}' to TIME: ${eTime instanceof Error ? eTime.message : String(eTime)}`);
-				}
+				return parseTimeStringToUtcPlain(v).toString(); // ISO 8601 format: HH:MM:SS or HH:MM:SS.sss
+			} catch (e) {
+				throw new TypeError(`Cannot convert '${v}' to TIME: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
 		if (typeof v === 'number') {
@@ -153,7 +143,7 @@ export const TIME_TYPE: LogicalType = {
 };
 
 /**
- * DATETIME type - stores ISO 8601 datetime strings (YYYY-MM-DDTHH:MM:SS or with timezone)
+ * DATETIME type - stores ISO 8601 datetime strings in bare UTC (YYYY-MM-DDTHH:MM:SS)
  * Uses Temporal.PlainDateTime for validation and parsing
  */
 export const DATETIME_TYPE: LogicalType = {
@@ -161,16 +151,7 @@ export const DATETIME_TYPE: LogicalType = {
 	physicalType: PhysicalType.TEXT,
 	isTemporal: true,
 
-	validate: (v) => {
-		if (v === null) return true;
-		if (typeof v !== 'string') return false;
-		try {
-			parseDateTimeStringToUtcPlain(v);
-			return true;
-		} catch {
-			return false;
-		}
-	},
+	validate: validatesAs(parseDateTimeStringToUtcPlain),
 
 	parse: (v) => {
 		if (v === null) return null;

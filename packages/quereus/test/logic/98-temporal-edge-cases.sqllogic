@@ -512,3 +512,65 @@ SELECT count(*) as c FROM t_filter WHERE t = '10:30:00';
 → [{"c":1}]
 
 DROP TABLE t_filter;
+
+-- ============================================================
+-- Named time zones (docs/types.md § Temporal Types): a [zone] annotation
+-- names an instant, so every column type stores the UTC reading of that
+-- instant rather than the zone's local clock reading.
+-- ============================================================
+
+create table zone_all (id integer primary key, dt datetime, d date, t time, ts timestamp);
+-- Offset and zone, crossing into the next UTC day.
+insert into zone_all values (1, '2020-01-01T22:00:00-05:00[America/New_York]', '2020-01-01T22:00:00-05:00[America/New_York]', '2020-01-01T22:00:00-05:00[America/New_York]', '2020-01-01T22:00:00-05:00[America/New_York]');
+-- No offset: the zone's rules supply it.
+insert into zone_all values (2, '2020-01-01T00:00:00[America/New_York]', '2020-01-01T00:00:00[America/New_York]', '2020-01-01T00:00:00[America/New_York]', '2020-01-01T00:00:00[America/New_York]');
+-- Date only: midnight in the zone, which is the previous UTC day.
+insert into zone_all values (3, '2020-01-01[Asia/Tokyo]', '2020-01-01[Asia/Tokyo]', '2020-01-01[Asia/Tokyo]', '2020-01-01[Asia/Tokyo]');
+-- run
+
+select id, dt, d, t, ts from zone_all order by id;
+→ [{"id":1,"dt":"2020-01-02T03:00:00","d":"2020-01-02","t":"03:00:00","ts":1577934000000},{"id":2,"dt":"2020-01-01T05:00:00","d":"2020-01-01","t":"05:00:00","ts":1577854800000},{"id":3,"dt":"2019-12-31T15:00:00","d":"2019-12-31","t":"15:00:00","ts":1577804400000}]
+
+-- A comparison literal spelling the same instant finds the row.
+select id from zone_all where dt = '2020-01-01T05:00:00Z';
+→ [{"id":2}]
+
+drop table zone_all;
+
+create table zone_dt (id integer primary key, dt datetime);
+-- The hour repeated when daylight saving time ends: two instants, two values.
+insert into zone_dt values (1, '2020-11-01T01:30:00-04:00[America/New_York]');
+insert into zone_dt values (2, '2020-11-01T01:30:00-05:00[America/New_York]');
+-- An offset names the instant alone, whatever the annotation says.
+insert into zone_dt values (3, '2020-01-01T00:00:00-05:00[Nowhere/Fake]');
+insert into zone_dt values (4, '2020-01-01T00:00:00-08:00[America/New_York]');
+-- A calendar annotation is not a zone: accepted, and absent from the stored text.
+insert into zone_dt values (5, '2020-01-01T00:00:00[u-ca=hebrew]');
+-- run
+
+select dt from zone_dt order by id;
+→ [{"dt":"2020-11-01T05:30:00"},{"dt":"2020-11-01T06:30:00"},{"dt":"2020-01-01T05:00:00"},{"dt":"2020-01-01T08:00:00"},{"dt":"2020-01-01T00:00:00"}]
+
+drop table zone_dt;
+
+create table zone_reject (id integer primary key, dt datetime null, d date null, t time null);
+-- run
+
+-- A zone that cannot be resolved, with no offset to name the instant instead.
+insert into zone_reject (id, dt) values (1, '2020-01-01T00:00:00[Nowhere/Fake]');
+-- error: Cannot convert
+
+insert into zone_reject (id, d) values (1, '2020-01-01T00:00:00[Nowhere/Fake]');
+-- error: Cannot convert
+
+insert into zone_reject (id, t) values (1, '2020-01-01T00:00:00[Nowhere/Fake]');
+-- error: Cannot convert
+
+-- Time-only text has no date, so a named zone has no offset to apply.
+insert into zone_reject (id, t) values (1, '10:30:00[America/New_York]');
+-- error: Cannot convert
+
+insert into zone_reject (id, t) values (1, '10:30:00-05:00');
+-- error: Cannot convert
+
+drop table zone_reject;
