@@ -851,6 +851,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		// Perform the UPDATE operation. `preCoerced`: the row is composed of
 		// stored cells plus assignments already converted above.
+		//
+		// NOTE: the explicit ABORT overrides a UNIQUE or PRIMARY KEY constraint's declared
+		// action on this write (see docs/sql-dml.md). This arm handles neither `evictedRows`
+		// nor a skipped row from a UNIQUE conflict; to honour declared actions here, it must
+		// run the eviction pipeline for REPLACE and raise violationError for FAIL and ROLLBACK.
 		const updateArgs: UpdateArgs = {
 			operation: 'update',
 			values: updatedRow,

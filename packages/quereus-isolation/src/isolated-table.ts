@@ -1184,6 +1184,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Resolve the effective PK-level action once so the wrapped overlay vtab
 		// agrees with the overlay's decision. Per-UC defaults are applied inside
 		// checkMergedUniqueConstraints, since each UC may declare its own action.
+		//
+		// NOTE: the overlay also enforces UNIQUE, under this PK action rather than the UC's
+		// own. Harmless while checkMergedUniqueConstraints catches the conflict first on
+		// every write path; if a path ever skips it, the overlay would report the wrong action.
 		const effectiveOR = args.onConflict ?? resolvePkDefaultConflict(this.tableSchema!);
 		const argsForOverlay: UpdateArgs = effectiveOR !== undefined
 			? { ...args, onConflict: effectiveOR }

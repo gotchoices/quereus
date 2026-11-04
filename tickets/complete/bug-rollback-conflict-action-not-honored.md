@@ -71,9 +71,43 @@ On the final tree: `yarn workspace @quereus/quereus test`, `yarn test:store` fil
 
 ## Known gaps and judgment calls
 
-- **The fallback has no dedicated test.** No module in this repository omits `onConflict`, so the path where a module omits it and the statement's `or` clause decides is not reached by a test. `translateConflictError` itself did not change. Pinning it would take a small custom module in a spec.
+- **The fallback for a module that omits `onConflict`.** `translateConflictError` itself did not change. The race spec's module omits the field, and review tightened that spec to assert the resulting error type.
 - **`on conflict fail` declared on a key is only half fixed, as the ticket expected.** It now raises `FailConflictError` but still loses the statement's earlier rows, because the per-row savepoint mode keys off the statement's `or` clause only. `bug-declared-fail-conflict-discards-earlier-rows` covers that.
-- **The `DO UPDATE` arm of an upsert is unchanged.** `executeUpsertUpdate` passes an explicit ABORT and still throws a plain `ConstraintError`. That a declared action does not govern this arm was read from the code, not run.
+- **The `DO UPDATE` arm of an upsert is unchanged.** `executeUpsertUpdate` passes an explicit ABORT and still throws a plain `ConstraintError`. Review ran this and documented it; see the findings below.
 - **The isolation layer gives its overlay the primary key's action.** A conflict the overlay reports would therefore carry the primary key's action rather than the UNIQUE constraint's own. The merged UNIQUE check runs first and caught every conflict in the cases above, so I did not find a way to reach this. It was tested for the cases listed, not proven unreachable.
 - **Beyond the ticket's file list.** I removed the third copy of the error mapping in `view-mutation.ts`. I corrected `docs/usage.md`, which said `exec` runs a batch atomically and contradicted the same file's Implicit Transactions section. I also added a sentence on the two conflict actions to the `exec` doc comment.
 - **`throwForAction` is gone rather than reused.** The mapping now lives in `common/errors.ts` as a function that returns the error, which lets the executor and `row-constraints.ts` share it. `errors.ts` now imports `constants.ts` at runtime; `constants.ts` has no imports, so this adds no cycle.
+
+## Review findings
+
+Reviewed `ticket(implement): bug-rollback-conflict-action-not-honored` from the diff first, then the handoff. A throwaway spec, since deleted, ran the probes marked "ran" below on the memory module only.
+
+**Checked, no defect**
+
+- `db.exec` finalization: `TransactionManager.commitTransaction` clears its state in a `finally`, so a failed commit that reaches the catch does not commit or roll back twice. The state stays correct for later statements in a batch that started with `begin`, and for an autocommit batch whose earlier statement already committed (ran).
+- Other entry points under a declared rollback: `stmt.run`, `stmt.get`, and an insert through a view (ran).
+- OR clause precedence: `insert or ignore` and `insert or replace` override a declared rollback on the primary key (ran).
+- Upsert target matching: a conflict on the named constraint takes `do nothing`, and a conflict on another constraint raises under that constraint's declared action (ran).
+- Deferred-style CHECK with a subquery under `db.exec`, with and without `or fail` (ran). It did not hit the commit-failure path, because both forms raised during the statement.
+- Every constraint result in memory, store and isolation reports its resolved action (read). Other `isConstraintViolation` callers, in `alter-migration.ts` and `flush.ts`, do not raise conflict errors and are unaffected (read). `enforceSecondaryUniqueOnMaintenance` always checks under ABORT and throws its own error (read).
+- Consumers of the error subclasses: only `_finalizeImplicitTransaction` reads them, and nothing matches on the error name `ConstraintError` (grep).
+- `errors.ts` importing `constants.ts` at runtime adds no cycle, and `constraintErrorForAction` is not exported from the package index.
+- Docs: `docs/usage.md`, `docs/module-authoring.md` and `docs/runtime.md` match the new behaviour.
+- Implementer's tests: the two `core-api-transactions.spec.ts` tests and section 11 of `47.2` each reproduce a defect in this ticket, and the changed race-spec assertion is correct. None were cut.
+
+**Found and fixed in this pass**
+
+- Undocumented behaviour, now confirmed by running it: a UNIQUE conflict from a `DO UPDATE` arm's own write raises a plain `ConstraintError` for declared `rollback`, `fail`, `ignore` and `replace`, while a plain `UPDATE` honours each one. `docs/sql-dml.md` said the arm validates "exactly as" a plain `UPDATE` and did not mention this exception. The fix-stage ticket chose to leave the code alone, so I kept that decision, added the exception to `docs/sql-dml.md`, and added a case to `47.2` that pins it on memory and store.
+- Handoff claim corrected: it said no test reaches the fallback for a module that omits `onConflict`. The module in `or-fail-mid-row-registration-race.spec.ts` omits it, but the test only asserted that some error was thrown. It now asserts `FailConflictError`.
+- Duplication: `checkCheckConstraints` kept a REPLACE branch that `constraintErrorForAction` already covers, so I removed the branch.
+
+**Tripwires parked**
+
+- `NOTE:` at the explicit ABORT in `executeUpsertUpdate` (`dml-executor.ts`): what honouring declared actions on the arm would require.
+- `NOTE:` at `effectiveOR` in `isolated-table.ts`: the overlay enforces UNIQUE under the primary key's action. This is harmless while the merged UNIQUE check runs first.
+
+**Major findings:** none, so no tickets were filed. `bug-declared-fail-conflict-discards-earlier-rows` already covers declared FAIL losing earlier rows, and it is on the board in `implement/`.
+
+**For a human to weigh:** the `DO UPDATE` exception is now written into the spec as current behaviour. If declared `rollback` or `fail` should govern that arm, this sentence and the `47.2` case are what would change.
+
+**Validation on the final tree:** `yarn workspace @quereus/quereus test` (10947 passing, 25 pending), `yarn lint`, `tsc -b tsconfig.build.json`, store-mode logic tests filtered to 47.x (9 passing), `@quereus/isolation` tests (445 passing), `@quereus/store` tests (1986 passing). The full `yarn test` across all workspaces was not re-run in review. The sync package, which the implement stage covered, was not re-run because no source it depends on changed apart from the two comment and one branch edits above.

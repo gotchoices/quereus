@@ -18,6 +18,7 @@
  * the user-savepoint layer.
  */
 import { expect } from 'chai';
+import { FailConflictError } from '../../src/common/errors.js';
 import { Database } from '../../src/core/database.js';
 import { type Row, type UpdateResult } from '../../src/common/types.js';
 import { VirtualTable, type UpdateArgs } from '../../src/vtab/table.js';
@@ -393,7 +394,8 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 		} catch (e) {
 			thrown = e;
 		}
-		expect(thrown, 'row 3 must surface as a constraint failure').to.exist;
+		// The module reports no `onConflict`, so the statement's OR clause must decide the error.
+		expect(thrown, 'row 3 must surface as an OR FAIL conflict').to.be.instanceOf(FailConflictError);
 
 		const sibling = module.sibling;
 		expect(sibling).to.exist;

@@ -374,12 +374,8 @@ async function checkCheckConstraints(
 				return { skip: true };
 			}
 
-			// REPLACE does NOT mask CHECK / FK violations — fall through to abort.
+			// REPLACE raises as ABORT: it does not mask CHECK / FK violations.
 			// (SQLite's OR REPLACE only relaxes UNIQUE/PK and NOT-NULL; CHECK still aborts.)
-			if (effectiveAction === ConflictResolution.REPLACE) {
-				throw new ConstraintError(baseMessage);
-			}
-
 			throw constraintErrorForAction(effectiveAction, baseMessage);
 		}
 	}

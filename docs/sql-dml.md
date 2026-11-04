@@ -124,6 +124,9 @@ parent), and parent-side foreign keys (a change to a referenced column with a li
 substitutes the default into the composed row. A CHECK carrying a subquery is auto-deferred
 and evaluated at `COMMIT`, again matching the plain `UPDATE`.
 
+A `UNIQUE` or `PRIMARY KEY` conflict caused by the arm's own write is the exception: it always
+acts as `ABORT`, whatever action the constraint declares. A plain `UPDATE` honours that action.
+
 Two things this does *not* change:
 
 - The statement's INSERT-shaped checks still run first, on the **proposed** row, before the

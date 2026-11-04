@@ -244,4 +244,16 @@ select id from dr_uq order by id;
 
 rollback;
 
+-- 12. A UNIQUE conflict from a DO UPDATE arm's own write acts as ABORT despite the
+--     declared action, so the transaction stays open with its earlier row.
+begin;
+   insert into dr_uq values (3, 3);
+   insert into dr_uq values (2, 9) on conflict (id) do update set x = 1;
+   -- error: UNIQUE constraint failed
+
+select id from dr_uq order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+rollback;
+
 drop table dr_uq;
