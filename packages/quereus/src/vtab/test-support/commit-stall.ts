@@ -1,5 +1,6 @@
 import type { Database } from '../../core/database.js';
 import type { VirtualTableConnection } from '../connection.js';
+import { yieldToEventLoop } from '../../util/event-loop.js';
 
 /** Handle returned by `CommittedReadConformanceOptions.stallCommit`. */
 export interface CommitStallHandle {
@@ -97,11 +98,9 @@ export function installCommitStall(db: Database): CommitStall {
  * Yield the event loop `macrotasks` times, so anything already pending has a fair
  * chance to run: a commit to reach the gate, or a read to settle. Used to pin
  * "this did NOT complete" without inventing a wall-clock timeout.
- *
- * `setTimeout` rather than `setImmediate` — the latter is Node-only.
  */
 export async function settleMacrotasks(macrotasks = 20): Promise<void> {
 	for (let i = 0; i < macrotasks; i++) {
-		await new Promise<void>(resolve => setTimeout(resolve, 0));
+		await yieldToEventLoop();
 	}
 }

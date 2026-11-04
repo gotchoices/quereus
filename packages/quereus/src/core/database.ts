@@ -774,6 +774,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *   `readCommittedSnapshot` (universal, not existential — one unqualified
 	 *   table makes the whole block serialize). Checked on the OPTIMIZED plan, so
 	 *   tables reached through views and materialized views are covered.
+	 * - No `apply schema` migration is running (see {@link _setSchemaMigrating}). It
+	 *   gives up the thread between its steps, so a read compiled then could see a
+	 *   table or column that a later failing step takes back, which is not a commit
+	 *   boundary. Same cost as an atomic `exec` batch: the read waits for the outcome.
 	 * - No table-valued function is called. A TVF reaches its data outside the
 	 *   `TableReferenceNode` gate above, and `TableFunctionCallNode` reports
 	 *   `readonly: true` unconditionally, so neither of the other checks can see
@@ -786,8 +790,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * committed snapshot and simply does not see the new transaction's writes,
 	 * which is the documented semantics.
 	 *
-	 * NOTE: deliberately no plan-time schema gate. `Statement.compile()` is
-	 * synchronous (cannot observe half-applied multi-step DDL), captured schema
+	 * NOTE: deliberately no plan-time schema gate beyond the migration check above.
+	 * `Statement.compile()` is synchronous, so it cannot observe one half-applied DDL
+	 * statement (a multi-step apply is what that check is for), captured schema
 	 * objects re-validate at execution start, and for the long window (the scan
 	 * itself) the `readCommittedSnapshot` obligation requires the module to keep
 	 * serving its pinned snapshot across concurrent DDL. A shared/exclusive gate
@@ -795,7 +800,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * onto this path — see backlog/debt-concurrent-reads-schema-gate.
 	 */
 	_isConcurrentReadEligible(block: BlockNode): boolean {
-		if (!this.isOpen) return false;
+		if (!this.isOpen || this._schemaMigrating) return false;
 		if (!this.transactionManager.getAutocommit() && !this.transactionManager.isImplicitTransaction()) {
 			return false;
 		}
@@ -973,6 +978,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Used as the innermost execution primitive.
 	 */
 	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[], signal?: AbortSignal): Promise<void> {
+		// `close()` takes no mutex, so a statement queued behind it, or the next step of a
+		// running `apply schema`, gets here after the database was torn down.
+		this.checkOpen();
 		// Pre-flight cancellation: reject before building/optimizing the plan.
 		throwIfAborted(signal);
 
@@ -2865,6 +2873,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  {@link _setSchemaUnwinding}. */
 	public _isSchemaUnwinding(): boolean {
 		return this._schemaUnwinding;
+	}
+
+	/** @internal Migrating-apply flag — see {@link _setSchemaMigrating}. */
+	private _schemaMigrating = false;
+
+	/** @internal Marks that an `apply schema` is running its migration steps, so the catalog
+	 *  may be one that never officially exists, and {@link _isConcurrentReadEligible} refuses.
+	 *  Unlike the flags beside it this one is read outside the statement mutex, because
+	 *  committed reads are routed without it. Returns the prior value so the caller restores
+	 *  it in a `finally`. Docs: `docs/schema-declarative.md` § Yielding during an apply. */
+	public _setSchemaMigrating(value: boolean): boolean {
+		const prior = this._schemaMigrating;
+		this._schemaMigrating = value;
+		return prior;
 	}
 
 	/** @internal Rebuild refusal flag — see {@link _setPrimaryKeyRebuildRefused}. */

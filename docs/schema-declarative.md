@@ -155,6 +155,21 @@ The undo cannot take back a commit, so a **primary-key change that needs a rebui
 
 The undo is ordinary DDL, so the restore is **tier-independent** (every `ddlTransactionality` tier, nothing new for module authors). After a failed step it runs inside the module batch, before `endSchemaBatch(error)` fires; after a refused commit that batch is closed, so it runs in a second one. Inside an explicit transaction a failed apply restores to the pre-apply point and leaves the transaction open — savepoint-like. Under `ddl_transaction_policy = 'strict'` a refused forward step is unwound like any other failure, with no new exposure. A restored failure announces no schema events; an unrestorable one keeps the events of the steps that landed. Outside the guarantee: **seeding** (`with seed` runs after the loop, so a malformed seed row aborts with the migration already applied) and a table's **constraint storage order** (a restored constraint is re-appended; the differ keys constraints by name and is unaffected). Executor detail: [Undo Plan § Restoring a failed apply](schema-undo-plan.md#restoring-a-failed-apply).
 
+## Yielding during an apply
+
+A long `apply schema` gives up the thread between migration steps, between undo statements and between seed rows, once it has held the thread for about one 60 Hz frame (16 ms). Timers, I/O callbacks and interface events can then run, including on a module whose hooks do no real waiting, where every `await` would otherwise settle without returning to the event loop. A short apply never yields.
+
+**This does not cancel anything.** After a `Promise.race` loses to a timeout, the apply keeps running and finishes or fails on its own, and statements issued meanwhile queue behind it. An `AbortSignal` passed to `exec` does not reach the apply's own statements, so it does not stop an apply either. There is no way to cancel an apply today.
+
+What other work sees during a yield:
+
+- **Ordinary statements** queue behind the execution mutex and run after the apply, against its final catalog. This has always been so.
+- **`readConcurrency: 'committed'` reads** also wait while the migration runs, because the catalog at that point may hold a table or column that a later failing step takes back. While seed rows run they do not wait: the catalog is final by then and the rows are uncommitted, so they are invisible. See [SQL Transactions § Concurrent committed reads](sql-txn.md#86-concurrent-committed-reads).
+- **`db.close()`** makes the apply reject at its next statement, with `Database is closed` in the message. Undo statements are refused the same way, so a migrating apply also reports the schema as not restored. Do not treat that as a clean rollback: a module that folds the apply into a batch discards it when `endSchemaBatch` receives the error, and a module with no batch hooks keeps the steps that ran.
+- **Synchronous catalog APIs** (`db.defineTable`, `db.registerModule`, direct `db.schemaManager` access) and option setters take no mutex, so a timer can call them mid-apply and they are not protected. If such a call changes the catalog, the restore check notices it, on the failure path only.
+
+Some work cannot yield, because yields only fall between statements. One slow step cannot be split (an `ALTER` backfilling 50 000 rows was measured holding the thread for 77 ms), and neither can a single module hook. Planning is synchronous (53 ms at 8000 tables), and logical (lens) deployment is synchronous and is not paced.
+
 ## Rename Detection
 
 Moved to [Rename Detection](schema-rename-detection.md#rename-detection).

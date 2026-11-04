@@ -16,6 +16,7 @@ import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { TableSchema } from '../../schema/table.js';
 import { quoteIdentifier } from '../../emit/ast-stringify.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
+import { createEventLoopPacer, type EventLoopPacer } from '../../util/event-loop.js';
 import { assertModuleCanRebuild } from './alter-table.js';
 import { rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 
@@ -67,6 +68,21 @@ function buildSeedConflictClause(tableSchema: TableSchema): string {
 	return pkCols.length > 0
 		? ` on conflict (${pkCols.join(', ')}) do nothing`
 		: ' on conflict do nothing';
+}
+
+/** Runs the insert for one seed row, naming the row in the error if it fails. */
+async function executeSeedRow(db: Database, tableName: string, sql: string): Promise<void> {
+	log('Executing seed SQL: %s', sql);
+	try {
+		await db._execWithinTransaction(sql);
+	} catch (e) {
+		log('Seed application failed for table %s: %O', tableName, e);
+		throw new QuereusError(
+			`Failed to apply seed data for table ${tableName}. SQL: ${sql}\nError: ${errorText(e)}`,
+			StatusCode.ERROR,
+			e instanceof Error ? e : undefined
+		);
+	}
 }
 
 /**
@@ -241,6 +257,9 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		const schemaName = applyStmt.schemaName || 'main';
 		log('APPLY SCHEMA %s', schemaName);
 
+		// Started here so that planning time counts toward the first yield.
+		const pace = createEventLoopPacer();
+
 		// Mark for the conditional retraction described on the function comment. Taken
 		// before anything can batch a schema event; a lifetime-monotonic stamp, so it is
 		// valid whether or not a transaction (and so batching) is open yet.
@@ -357,12 +376,14 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 				const refuseRebuild = !rebuildWouldBeOnlyEffect(rctx.db, schemaName, migrationStatements.length, applyStmt.withSeed);
 				if (refuseRebuild) refuseCertainRebuild(rctx.db, schemaName, diff);
 				const priorRefused = rctx.db._setPrimaryKeyRebuildRefused(refuseRebuild);
+				const priorMigrating = rctx.db._setSchemaMigrating(true);
 				try {
 					await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements, {
 						preApplyFingerprint: renderCatalogForRestoreCheck(actualCatalog),
 						eventWatermark,
-					});
+					}, pace);
 				} finally {
+					rctx.db._setSchemaMigrating(priorMigrating);
 					rctx.db._setPrimaryKeyRebuildRefused(priorRefused);
 				}
 			}
@@ -432,29 +453,17 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 				}
 				const conflictClause = buildSeedConflictClause(tableSchema);
 
-				// One idempotent insert per seed row, batched in a single exec.
-				// ON CONFLICT (<pk>) DO NOTHING: an existing row (matching the seed PK)
-				// is left untouched — so user edits survive a reopen reseed and no
-				// ON DELETE CASCADE fires for unchanged rows — while a malformed row
-				// (CHECK / NOT NULL / child-FK violation) still aborts.
-				const seedSql = rows.map(row => {
+				// One idempotent insert per seed row, each its own call so the apply can
+				// yield between rows. ON CONFLICT (<pk>) DO NOTHING: an existing row
+				// (matching the seed PK) is left untouched — so user edits survive a reopen
+				// reseed and no ON DELETE CASCADE fires for unchanged rows — while a malformed
+				// row (CHECK / NOT NULL / child-FK violation) still aborts.
+				for (const row of rows) {
 					const values = row.map(formatSeedValue).join(', ');
-					return `INSERT INTO ${qualifiedTableName} VALUES (${values})${conflictClause}`;
-				}).join('; ');
-
-				log('Executing seed SQL (length=%d): %s', seedSql.length, seedSql);
-				try {
-					await rctx.db._execWithinTransaction(seedSql);
-					log('Seed application succeeded for table %s', tableName);
-				} catch (e) {
-					log('Seed application failed for table %s: %O', tableName, e);
-					const errorMessage = e instanceof Error ? e.message : String(e);
-					throw new QuereusError(
-						`Failed to apply seed data for table ${tableName}. SQL: ${seedSql}\nError: ${errorMessage}`,
-						StatusCode.ERROR,
-						e instanceof Error ? e : undefined
-					);
+					await executeSeedRow(rctx.db, tableName, `INSERT INTO ${qualifiedTableName} VALUES (${values})${conflictClause}`);
+					await pace();
 				}
+				log('Seed application succeeded for table %s', tableName);
 			}
 		}
 
@@ -635,6 +644,18 @@ interface BatchEndRefusal {
  * reported. Without this the catalog would keep a migration the store never received, and the
  * next apply would diff clean and report success with nothing written.
  *
+ * ## Giving up the thread
+ *
+ * `pace` yields to the event loop between steps and between undo statements, so a module whose
+ * hooks do no real waiting cannot hold the thread for the whole apply. Nothing can damage the
+ * apply during a yield: statements queue behind the execution mutex it holds for its whole
+ * duration, committed reads are refused by `Database._setSchemaMigrating`, `close()` fails the
+ * next statement through the open check in `_executeSingleStatement`, and the journal is a local
+ * array whose SQL was rendered at plan time. The flags held across a yield are read only by
+ * statements, which are behind the mutex; the committed-read flag above is the exception, by
+ * design. Synchronous catalog APIs (`defineTable`, `registerModule`) take no mutex and are not
+ * kept out; the fingerprint check notices one that moved the catalog, on the failure path only.
+ *
  * ## Executing a step
  *
  * A step that carries its AST is executed on a spine clone of it — the differ rendered
@@ -675,11 +696,12 @@ async function runBatchedMigrationLoop(
 	schemaName: string,
 	migrationStatements: readonly MigrationStep[],
 	restore: RestoreContext,
+	pace: EventLoopPacer,
 ): Promise<void> {
 	const startedModules = await beginSchemaBatchAll(db, schemaName);
 	let steps: StepsOutcome;
 	try {
-		steps = await runStepsWithUndoJournal(db, schemaName, migrationStatements, restore.preApplyFingerprint);
+		steps = await runStepsWithUndoJournal(db, schemaName, migrationStatements, restore.preApplyFingerprint, pace);
 	} catch (e) {
 		// `runStepsWithUndoJournal` reports every step and undo failure as data, so this is a
 		// throw it did not anticipate: the batch must still end with SOME error, or a module
@@ -694,7 +716,7 @@ async function runBatchedMigrationLoop(
 	}
 	const refusals = await endSchemaBatchAll(startedModules, db, schemaName, undefined);
 	if (refusals.length === 0) return;
-	const notRestored = await unwindRefusedBatchEnd(db, schemaName, steps, refusals, restore.preApplyFingerprint);
+	const notRestored = await unwindRefusedBatchEnd(db, schemaName, steps, refusals, restore.preApplyFingerprint, pace);
 	throwFailedApply(db, restore, refusals[0].error, notRestored);
 }
 
@@ -732,6 +754,7 @@ async function unwindRefusedBatchEnd(
 	steps: CleanSteps,
 	firstRefusals: readonly BatchEndRefusal[],
 	preApplyFingerprint: string,
+	pace: EventLoopPacer,
 ): Promise<string | undefined> {
 	if (steps.poisonedBy !== undefined) return describeIrreversible(steps.poisonedBy);
 	// NOTE: an empty journal still opens this batch, so a module that committed and then refuses
@@ -744,7 +767,7 @@ async function unwindRefusedBatchEnd(
 	}
 	// NOTE: no guard for an unexpected throw, unlike the first batch: every fallible call in
 	// `unwindJournal` is inside a `try`. If that stops holding, this batch would stay open.
-	const undoFailure = await unwindJournal(db, schemaName, steps.journal, preApplyFingerprint);
+	const undoFailure = await unwindJournal(db, schemaName, steps.journal, preApplyFingerprint, pace);
 	const secondRefusals = await endSchemaBatchAll(reopened, db, schemaName, undefined);
 	if (undoFailure !== undefined) return undoFailure;
 	const refusedFirst = new Set(firstRefusals.map(r => r.name));
@@ -769,6 +792,7 @@ async function runStepsWithUndoJournal(
 	schemaName: string,
 	migrationStatements: readonly MigrationStep[],
 	preApplyFingerprint: string,
+	pace: EventLoopPacer,
 ): Promise<StepsOutcome> {
 	const journal: Array<readonly string[]> = [];
 	let poisonedBy: MigrationStep | undefined;
@@ -778,10 +802,11 @@ async function runStepsWithUndoJournal(
 		if (error) {
 			const notRestored = poisonedBy !== undefined
 				? describeIrreversible(poisonedBy, step)
-				: await unwindJournal(db, schemaName, journal, preApplyFingerprint);
+				: await unwindJournal(db, schemaName, journal, preApplyFingerprint, pace);
 			return { clean: false, failure: { error, notRestored } };
 		}
 		if (poisonedBy === undefined && step.undo !== undefined && step.undo.length > 0) journal.push(step.undo);
+		await pace();
 	}
 	return { clean: true, journal, poisonedBy };
 }
@@ -825,8 +850,9 @@ async function unwindJournal(
 	schemaName: string,
 	journal: ReadonlyArray<readonly string[]>,
 	preApplyFingerprint: string,
+	pace: EventLoopPacer,
 ): Promise<string | undefined> {
-	const undoFailure = await runJournalInReverse(db, journal);
+	const undoFailure = await runJournalInReverse(db, journal, pace);
 	if (undoFailure !== undefined) return undoFailure;
 	let afterUnwind: string;
 	try {
@@ -846,7 +872,7 @@ async function unwindJournal(
  * plan can create a table naming a column or table a later step adds, and undoing in exact
  * reverse removes that target while the referring table still exists.
  */
-async function runJournalInReverse(db: Database, journal: ReadonlyArray<readonly string[]>): Promise<string | undefined> {
+async function runJournalInReverse(db: Database, journal: ReadonlyArray<readonly string[]>, pace: EventLoopPacer): Promise<string | undefined> {
 	const priorUnwinding = db._setSchemaUnwinding(true);
 	try {
 		for (let i = journal.length - 1; i >= 0; i--) {
@@ -858,6 +884,7 @@ async function runJournalInReverse(db: Database, journal: ReadonlyArray<readonly
 					log('Undo failed for DDL: %s: %O', sql, e);
 					return `${NOT_RESTORED}: undo statement \`${sql}\` failed (${errorText(e)}).`;
 				}
+				await pace();
 			}
 		}
 		return undefined;
