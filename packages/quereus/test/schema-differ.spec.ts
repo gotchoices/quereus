@@ -1264,6 +1264,54 @@ describe('generateMigrationPlan / generateMigrationDDL parity', () => {
 	});
 });
 
+describe('generateMigrationPlan: table create order', () => {
+	function createdTables(declaration: string): string[] {
+		const diff = computeSchemaDiff(parseDeclaredSchema(declaration), makeCatalog());
+		return generateMigrationPlan(diff, 'main').flatMap(step => step.ast?.type === 'createTable' ? [step.ast.table.name] : []);
+	}
+
+	it('a foreign key parent goes first; a cycle and another schema\'s parent keep declaration order', () => {
+		expect(createdTables(`declare schema main {
+			table c { id integer primary key, p integer null references p(id) }
+			table p { id integer primary key }
+		}`)).to.deep.equal(['p', 'c']);
+		expect(createdTables(`declare schema main {
+			table c { id integer primary key, p integer null, constraint c_p foreign key (p) references p(id) }
+			table p { id integer primary key }
+		}`)).to.deep.equal(['p', 'c']);
+		expect(createdTables(`declare schema main {
+			table a { id integer primary key, b integer null references b(id) }
+			table b { id integer primary key, a integer null references a(id) }
+		}`)).to.deep.equal(['a', 'b']);
+		expect(createdTables(`declare schema main {
+			table c { id integer primary key, p integer null references other.p(id) }
+			table p { id integer primary key }
+		}`)).to.deep.equal(['c', 'p']);
+	});
+
+	// `mt` reads `c`, which moves behind `p`. If `mt` kept its place ahead of `p` it would run before `c`.
+	it('a maintained create stays after every create written before it', () => {
+		expect(createdTables(`declare schema main {
+			table c { id integer primary key, p integer null references p(id) }
+			table mt { id integer primary key } maintained as select id from c;
+			table p { id integer primary key }
+		}`)).to.deep.equal(['p', 'c', 'mt']);
+	});
+
+	it('a maintained child follows its parent; a maintained parent does not affect the order', () => {
+		expect(createdTables(`declare schema main {
+			table s { id integer primary key }
+			table mt { id integer primary key, p integer not null references p(id) } maintained as select id, id as p from s;
+			table p { id integer primary key }
+		}`)).to.deep.equal(['s', 'p', 'mt']);
+		expect(createdTables(`declare schema main {
+			table s { id integer primary key }
+			table c { id integer primary key, m integer null references mt(id) }
+			table mt { id integer primary key } maintained as select id from s;
+		}`)).to.deep.equal(['s', 'c', 'mt']);
+	});
+});
+
 /**
  * `apply schema` executes a create step's paired AST while `diff schema` previews its
  * `sql`. That swap is only sound while the two MEAN the same statement: a renderer that

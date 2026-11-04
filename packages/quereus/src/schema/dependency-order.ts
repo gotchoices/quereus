@@ -3,8 +3,9 @@
  * dependencies are all placed goes next, so an order that already satisfies every dependency
  * comes back unchanged.
  *
- * Items in a cycle cannot all follow each other, so the edges between them are ignored: they
- * keep their relative order, and everything outside the cycle is still ordered around them.
+ * Items in a cycle cannot all follow each other, so the edges between them are replaced by their
+ * input order: they keep their relative order, and everything outside the cycle is still ordered
+ * around them.
  *
  * A preferred dependency orders items the same way, but gives way to the others: it is skipped
  * when the graph built so far already needs its target to follow the item that prefers it.
@@ -24,6 +25,7 @@ export function orderDependenciesFirst<T>(
 	if ([edges, ...preferred].flat().every(dependencies => dependencies.length === 0)) return [...items];
 
 	const acyclic = edges.map((dependencies, item) => dependencies.filter(d => !reaches(edges, d, item)));
+	chainCycleMembersInInputOrder(acyclic, edges);
 	for (const tier of preferred) addEdgesThatCloseNoCycle(acyclic, tier);
 	const placed = new Set<number>();
 	const ordered: T[] = [];
@@ -68,6 +70,28 @@ function resolveEdges<T>(
 			if (target !== undefined && target !== position) resolved.add(target);
 		}
 		return [...resolved];
+	});
+}
+
+/**
+ * Gives each cycle member an edge to the previous member of its own cycle. Without this, a member
+ * that also waits on an item outside the cycle falls behind the members after it.
+ *
+ * A cycle's members are exactly the items that lost an edge to `acyclic`. The new edges cannot close
+ * a cycle: each cycle has lost all its internal edges and becomes one chain, and the edges left
+ * between cycles form no cycle of their own.
+ */
+function chainCycleMembersInInputOrder(acyclic: number[][], edges: readonly number[][]): void {
+	const lastMemberOfEachCycle: number[] = [];
+	acyclic.forEach((kept, item) => {
+		if (kept.length === edges[item].length) return;
+		const cycle = lastMemberOfEachCycle.findIndex(last => reaches(edges, item, last) && reaches(edges, last, item));
+		if (cycle === -1) {
+			lastMemberOfEachCycle.push(item);
+		} else {
+			kept.push(lastMemberOfEachCycle[cycle]);
+			lastMemberOfEachCycle[cycle] = item;
+		}
 	});
 }
 

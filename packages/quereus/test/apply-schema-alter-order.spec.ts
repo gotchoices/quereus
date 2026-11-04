@@ -291,6 +291,8 @@ describe('dependency ordering', () => {
 	it('keeps a cycle in input order and orders everything else around it', () => {
 		const inCycle = { x: ['a'], a: ['b'], b: ['a'] };
 		expect(orderDependenciesFirst(['x', 'a', 'c', 'b'], key, edges(inCycle))).to.deep.equal(['a', 'x', 'c', 'b']);
+		// `a` also waits on `d`, outside the cycle; `b` must not overtake it while it waits.
+		expect(orderDependenciesFirst(['a', 'b', 'd'], key, edges({ a: ['b', 'd'], b: ['a'] }))).to.deep.equal(['d', 'a', 'b']);
 	});
 
 	it('a preferred dependency orders items, and is skipped when it would close a cycle', () => {

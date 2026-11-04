@@ -3234,7 +3234,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	// Create new items. A fresh maintained table rides `tablesToCreate` (rendered
 	// as the `create materialized view` sugar) and re-materializes as part of its
 	// create.
-	pushCreates(diff.tablesToCreate, 'table');
+	pushCreates(orderTableCreates(diff.tablesToCreate, schemaName ?? 'main'), 'table');
 	// View creates do NOT go here: they are sorted in with stage 2 of the table alters.
 	// Index and assertion creates do NOT either — they run last, after the table
 	// alters and the maintained re-attaches. See the pushes at the end of this function.
@@ -3302,6 +3302,71 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	}
 
 	return statements;
+}
+
+/**
+ * The table creates with each one after the tables its foreign keys name, so a module that checks
+ * or resolves a foreign key as the child is created sees the parent first. Otherwise declaration
+ * order holds, and tables in a cycle keep it.
+ *
+ * A maintained create plans its body as it runs, and that body can read any table written ahead of
+ * it, so it stays after all of them. Otherwise a table moved ahead of its parent could overtake the
+ * source of a body that applies today.
+ *
+ * A foreign key whose parent is a maintained create gives no edge. That leaves only later maintained
+ * creates depending on a maintained create, so none is in a cycle and the rule above always holds.
+ * The cost: a module that needs the parent first gets no help when the parent is maintained.
+ */
+function orderTableCreates(creates: readonly MigrationCreate[], schemaName: string): MigrationCreate[] {
+	const keyOf = (create: MigrationCreate): string => {
+		const target = createdTableTarget(create.ast);
+		return target ? objectRefKey(target.schema ?? schemaName, target.name) : create.sql;
+	};
+	const plainTables = new Set(creates.filter(create => !isMaintainedCreate(create.ast)).map(keyOf));
+	const ahead = createsAheadOfMaintained(creates, keyOf);
+	return orderDependenciesFirst(creates, keyOf, create => [
+		...(ahead.get(create) ?? []),
+		...foreignKeyParents(create.ast, schemaName).filter(parent => plainTables.has(parent)),
+	]);
+}
+
+/**
+ * Per maintained create, the keys of the creates back to and including the previous maintained
+ * create. That one follows everything further ahead, so the result is the same as naming every
+ * create ahead, without an edge per pair: the sort walks the graph per edge, and naming them all
+ * took 41 s to plan 500 maintained creates.
+ */
+function createsAheadOfMaintained(creates: readonly MigrationCreate[], keyOf: (create: MigrationCreate) => string): Map<MigrationCreate, string[]> {
+	const ahead = new Map<MigrationCreate, string[]>();
+	let sincePreviousMaintained: string[] = [];
+	for (const create of creates) {
+		if (isMaintainedCreate(create.ast)) {
+			ahead.set(create, sincePreviousMaintained);
+			sincePreviousMaintained = [];
+		}
+		sincePreviousMaintained.push(keyOf(create));
+	}
+	return ahead;
+}
+
+const isMaintainedCreate = (ast: AST.Statement): boolean =>
+	ast.type === 'createMaterializedView' || (ast.type === 'createTable' && ast.maintained !== undefined);
+
+/** What a table create creates, in either of its forms. */
+function createdTableTarget(ast: AST.Statement): AST.IdentifierExpr | undefined {
+	switch (ast.type) {
+		case 'createTable': return ast.table;
+		case 'createMaterializedView': return ast.view;
+		default: return undefined;
+	}
+}
+
+/** The keys of the tables a table create's foreign keys name, resolved as `extractForeignKeys` does. */
+function foreignKeyParents(ast: AST.Statement, schemaName: string): string[] {
+	if (ast.type !== 'createTable') return [];
+	const ownSchema = ast.table.schema ?? schemaName;
+	return [...ast.columns.flatMap(column => column.constraints), ...ast.constraints]
+		.flatMap(({ foreignKey }) => foreignKey ? [objectRefKey(foreignKey.schema ?? ownSchema, foreignKey.table)] : []);
 }
 
 /** The parts of {@link generateMigrationPlan} a table-alter step is pushed through. */
