@@ -42,6 +42,8 @@ Within the creates phase (item 3 of § Migration Order), table creates are order
 - **Cycles.** Tables in a cycle (`a → b → a`) keep their relative declaration order, and the rest of the order is still respected around them. Forward references inside a cycle keep working as they do today.
 - **Maintained tables.** A maintained-table create in the bucket (`create materialized view` sugar) has no FK edges and keeps its position relative to its neighbors. Ordering MV creates after their body's sources is not part of this ticket.
 
+`orderDependenciesFirst` in `packages/quereus/src/schema/dependency-order.ts` already has these stable and cycle rules, and the table alters use it. Migration Order now lives in `docs/schema-declarative.md`.
+
 `generateMigrationPlan` is the ordering authority and `generateMigrationDDL` wraps it, so `diff schema` previews the same order `apply schema` runs. Each create step's undo is the `drop … if exists` of what it made, so the undo journal needs no change: the unwind still runs the steps in reverse.
 
 ## Tests

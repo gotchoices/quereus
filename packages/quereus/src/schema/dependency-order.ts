@@ -1,7 +1,7 @@
 /**
- * `items` reordered so each comes after the items it depends on, moving as little as that
- * allows. The earliest item whose dependencies are all placed goes next, so an order that
- * already satisfies every dependency comes back unchanged.
+ * `items` reordered so each comes after the items it depends on. The earliest item whose
+ * dependencies are all placed goes next, so an order that already satisfies every dependency
+ * comes back unchanged.
  *
  * Items in a cycle cannot all follow each other, so the edges between them are ignored: they
  * keep their relative order, and everything outside the cycle is still ordered around them.

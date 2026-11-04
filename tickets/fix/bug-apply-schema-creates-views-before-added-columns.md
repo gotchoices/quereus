@@ -31,3 +31,5 @@ The run that produced this (memory, HEAD c78d2229a) also declared a table constr
 `apply-schema-creates-indexes-before-added-columns` fixed the same ordering problem for indexes and deliberately left views in place ("views keep their column-rename reconciliation").
 
 Expected: the declaration applies and `select d from v` works.
+
+Moving view creates after the table alters must not break the reverse dependency. An added column's DEFAULT can read a view the same plan creates (`create view w …`, then `ADD COLUMN z … default (select m from w)`). This applies today and is pinned by `applies a DEFAULT reading a view the same plan creates` in `packages/quereus/test/apply-schema-alter-order.spec.ts`. The alters now run in stages across tables (`pushTableAlters`), and Migration Order now lives in `docs/schema-declarative.md`.

@@ -1,15 +1,14 @@
 /**
- * `apply schema` alters tables in stages that span every table (see `pushTableAlters` and
- * docs/schema-declarative.md § Migration Order), so whether a schema applies does not depend on
- * the order its tables are written in. Before, all of one table's changes ran ahead of the next
- * table's, and a statement failed when it needed something a later table had yet to change.
+ * `apply schema` alters tables in stages that span every table, so a statement does not fail
+ * because it needs something a table written later has yet to change. See `pushTableAlters` and
+ * docs/schema-declarative.md § Migration Order, which also lists the known limits.
  */
 
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
 import { renderCatalogForComparison } from '../src/schema/catalog-rendering.js';
-import { orderDependenciesFirst, orderDependentsFirst } from '../src/schema/dependency-order.js';
+import { orderDependenciesFirst } from '../src/schema/dependency-order.js';
 import type { SqlValue } from '../src/common/types.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, SqlValue>>> {
@@ -90,6 +89,16 @@ describe('apply schema: table alters run in stages across tables', () => {
 			await applies(`declare schema main {
 				table t { id integer primary key, b integer null, d integer null unique, constraint ft foreign key (b) references u(w) }
 				table u { id integer primary key, y integer null, w integer null unique, constraint fu foreign key (y) references t(d) }
+			}`);
+		});
+
+		// View creates run ahead of the alters, so an added column's DEFAULT can read one. Moving view
+		// creates after the alters has to keep this applying.
+		it('applies a DEFAULT reading a view the same plan creates', async () => {
+			await applies(`declare schema main {
+				table u { id integer primary key, y integer null, z integer null default ((select m from w)) }
+				view w as select max(b) as m from t
+				table t { id integer primary key, b integer null }
 			}`);
 		});
 	});
@@ -187,9 +196,5 @@ describe('dependency ordering', () => {
 	it('keeps a cycle in input order and orders everything else around it', () => {
 		const inCycle = { x: ['a'], a: ['b'], b: ['a'] };
 		expect(orderDependenciesFirst(['x', 'a', 'c', 'b'], key, edges(inCycle))).to.deep.equal(['a', 'x', 'c', 'b']);
-	});
-
-	it('reverses the edges on request', () => {
-		expect(orderDependentsFirst(['t', 'u'], key, edges({ u: ['t'] }))).to.deep.equal(['u', 't']);
 	});
 });

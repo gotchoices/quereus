@@ -2378,10 +2378,9 @@ function computeTableAlterDiff(
 	// (see {@link withResolvedAddColumnCollation}) — keeps the migration both
 	// self-contained (lands the same collation under any executing session default)
 	// and idempotent (matches the catalog column the engine's ADD COLUMN now creates).
-	for (const col of declaredTable.tableStmt.columns) {
-		if (!colRenames.pairs.has(col.name.toLowerCase())) {
-			diff.columnsToAdd.push(columnDefToString(withResolvedAddColumnCollation(col, defaultCollation)));
-		}
+	const addedColumnDefs = declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase()));
+	for (const col of addedColumnDefs) {
+		diff.columnsToAdd.push(columnDefToString(withResolvedAddColumnCollation(col, defaultCollation)));
 	}
 
 	// Find columns to drop (skip those consumed by a rename)
@@ -2404,7 +2403,7 @@ function computeTableAlterDiff(
 		}
 	}
 
-	recordCrossTableReads(diff, declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase())), actualTable, tableRenames, schemaName);
+	recordCrossTableReads(diff, addedColumnDefs, actualTable, tableRenames, schemaName);
 
 	// Apply require-hint to columns within this table
 	if (policy === 'require-hint') {
@@ -2509,7 +2508,7 @@ function computeTableAlterDiff(
 		reconcile: d => reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn),
 		declaredNames: [...declaredNamedConstraints.keys()],
 		namedDrops: constraintsToDrop,
-		addedColumns: declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase())).map(c => c.name),
+		addedColumns: addedColumnDefs.map(c => c.name),
 		droppedColumns: new Set(diff.columnsToDrop.map(c => c.toLowerCase())),
 		// A backing-module move recreates the table, so its alter diff is discarded.
 		refuseUndroppable: !diff.maintainedModuleMigration,
@@ -2596,8 +2595,9 @@ function computeTableAlterDiff(
  *
  * NOTE: an edge is per table, not per column. `t.d references u(z)` needing a new `u.z`, beside
  * `u.z references t(id)` naming an existing `t.id`, reads as a cycle and keeps declaration order,
- * though `u` first would work. If that shows up, skip the edge when an FK's parent column list
- * names only columns the parent already has.
+ * though `u` first would work. Skipping the edge whenever the parent already has the named column
+ * is not enough: `add column z text default 'ABC' references t(d)` validates under `t.d`'s collation
+ * as it stands, so it still has to follow `t`'s SET COLLATE.
  */
 function recordCrossTableReads(
 	diff: TableAlterDiff,
