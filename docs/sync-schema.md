@@ -447,7 +447,11 @@ Two caveats:
 
 **The tag / maintained arms** (`SET TAGS`, `ADD TAGS`, `DROP TAGS`,
 `SET`/`DROP MAINTAINED`) still do not replicate. These are catalog-only and emit no
-schema event, so no migration is ever recorded for them.
+schema event, so no migration is ever recorded for them. The one exception is a tag
+statement on a table whose module implements
+[`alterTags`](module-authoring-schema-changes.md#altertags-metadata-tag-edits): it announces
+`alter` with `ddl` like any other arm, so it is recorded and replays. The store module does
+not implement the hook.
 
 **Backfilled values are not data facts.** `add column sku text default 'x'` writes every
 existing row inside `module.alterTable` (`migrateRows`), which emits no data events — so

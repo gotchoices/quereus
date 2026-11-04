@@ -26,7 +26,8 @@ import type { RuntimeContext } from '../types.js';
  * ## The rule
  *
  * **Every DDL statement emitter opens this scope around its `run()` body** — including the
- * ones that raise no schema event today (`create view`, the assertion verbs, the tag arms).
+ * ones that raise no schema event today (`create view`, the assertion verbs, the tag arms on a
+ * module without `alterTags`).
  * The point is that the invariant holds by construction: if one of those ever starts
  * announcing, it cannot reintroduce the class. Check it against the DDL block of
  * `runtime/register.ts`.

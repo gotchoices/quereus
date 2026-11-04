@@ -208,7 +208,9 @@ if (change.ddl !== undefined) {
 
 Its `switch` is exhaustive over the arm union, so a new arm fails your build rather than
 announcing the wrong shape. `RENAME TO` is not an arm of that union — it goes through
-`renameTable` and reports `alter`/`table` with `oldObjectName` set to the pre-rename name.
+`renameTable` and reports `alter`/`table` with `oldObjectName` set to the pre-rename name. Nor is
+a tag edit: an `alterTags` implementation derives its shape from the exported
+`tagChangeEventShape(change)`.
 
 #### A failed DDL statement announces nothing, even from a native emitter
 
@@ -265,7 +267,7 @@ One event per statement, on its success path only, in the same shape a natively-
 
 Two `ALTER TABLE` arm families are **excluded** on both paths, so no asymmetry is introduced:
 
-- the metadata-tag arms (`SET TAGS`, `ADD TAGS`, `DROP TAGS`) — catalog-only; they never reach `module.alterTable`, and no backend announces them
+- the metadata-tag arms (`SET TAGS`, `ADD TAGS`, `DROP TAGS`) — catalog-only; they never reach `module.alterTable`, and no built-in backend announces them. The exception is a table whose module implements [`alterTags`](module-authoring-schema-changes.md#altertags-metadata-tag-edits): that statement reports one event carrying `ddl` on either path
 - the materialized-view lifecycle arms (`SET MAINTAINED`, `DROP MAINTAINED`) — these raise only *internal* catalog notifications (`materialized_view_added` / `_modified` / `_removed`)
 
 The `ALTER TABLE` arms are the exception to the auto path's usual silence about statement text: they **do** carry `ddl` (the planner renders the statement's canonical, schema-qualified SQL once at plan-build time and every arm passes it through), so a table alteration replicates from a module with no emitter of its own. The `CREATE`/`DROP TABLE` and `CREATE`/`DROP INDEX` auto events carry none — the fallback has only the schema/object names at those emit sites — so a module that needs *those* replicated should implement its own emitter and render the DDL itself, as the memory and store modules do.

@@ -78,8 +78,8 @@ export function alterEventShape(change: SchemaChangeInfo, before?: AlterEventSha
  * The announcement shape of a tag statement that went through the module's `alterTags`:
  * `alter`/`column` naming the column for a column target, `alter`/`table` otherwise (a
  * constraint target reports like DROP CONSTRAINT). The caller supplies the rest and owns the
- * emit-iff-`change.ddl` gate.
- * Shared with the engine's auto-event path, so both producers report the same facts.
+ * emit-iff-`change.ddl` gate. Shared with the engine's auto-event path, so both producers
+ * report the same facts.
  */
 export function tagChangeEventShape(change: Pick<TagChangeInfo, 'target'>): AlterEventShape & { type: 'alter'; objectType: 'table' | 'column' } {
 	return change.target.kind === 'column'

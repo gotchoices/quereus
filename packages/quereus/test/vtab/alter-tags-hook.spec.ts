@@ -7,7 +7,6 @@
 
 import assert from 'node:assert/strict';
 import { Database, MemoryTableModule, QuereusError, StatusCode, type DatabaseSchemaChangeEvent, type TagChangeInfo, type TagChangeTarget, type TagEdit } from '../../src/index.js';
-import type { Database as DatabaseType } from '../../src/core/database.js';
 import type { TableSchema } from '../../src/schema/table.js';
 
 /** A tag the engine's own computation could never produce: its presence proves whose answer was registered. */
@@ -21,17 +20,17 @@ interface RecordedCall {
 
 /**
  * Answers every tag edit with a schema carrying only {@link MARKER} at the target, and no
- * `statistics`, as a module building its return from its own stored view would. `failWith`
- * makes it refuse instead.
+ * `statistics` or generated-column graph, as a module building its return from its own stored
+ * view would. `failWith` makes it refuse instead.
  */
 class TagHookModule extends MemoryTableModule {
 	readonly calls: RecordedCall[] = [];
 	failWith: QuereusError | undefined;
 
-	async alterTags(db: DatabaseType, schemaName: string, tableName: string, change: TagChangeInfo): Promise<TableSchema> {
+	async alterTags(db: Database, schemaName: string, tableName: string, change: TagChangeInfo): Promise<TableSchema> {
 		this.calls.push({ schemaName, tableName, change });
 		if (this.failWith) throw this.failWith;
-		const { statistics: _statistics, ...live } = db.schemaManager.getTable(schemaName, tableName)!;
+		const { statistics: _statistics, generatedColumnDependencies: _dependencies, generatedColumnTopoOrder: _order, ...live } = db.schemaManager.getTable(schemaName, tableName)!;
 		return withMarker(live, change);
 	}
 }
@@ -174,6 +173,33 @@ describe('VirtualTableModule.alterTags', () => {
 		await db.exec("alter table t set tags (k = 'x')");
 
 		assert.deepEqual(db.schemaManager.getTable('main', 't')!.statistics, measured);
+	});
+
+	it('re-derives the generated-column graph the answer omits', async () => {
+		await db.exec('create table g (id integer primary key, a integer, b integer generated always as (a + 1) stored) using hooked');
+		const measured = db.schemaManager.getTable('main', 'g')!.generatedColumnTopoOrder;
+		assert.ok(measured, 'create derived the graph');
+
+		await db.exec("alter table g set tags (k = 'x')");
+
+		assert.deepEqual(db.schemaManager.getTable('main', 'g')!.generatedColumnTopoOrder, measured);
+	});
+
+	it('fires table_modified from the live schema to the registered one, so cached plans replan', async () => {
+		const before = db.schemaManager.getTable('main', 't');
+		const modified: [unknown, unknown][] = [];
+		const unsubscribe = db.schemaManager.getChangeNotifier().addListener(e => {
+			if (e.type === 'table_modified') modified.push([e.oldObject, e.newObject]);
+		});
+		try {
+			await db.exec("alter table t set tags (k = 'x')");
+
+			assert.equal(modified.length, 1);
+			assert.equal(modified[0][0], before);
+			assert.equal(modified[0][1], db.schemaManager.getTable('main', 't'));
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	describe('announces through the auto-event gate when the module has no emitter', () => {
