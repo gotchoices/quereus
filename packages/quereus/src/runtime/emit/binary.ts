@@ -65,20 +65,18 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
-/** Handle arithmetic when at least one operand is bigint. Both operands are coerced through
- *  SQL arithmetic affinity first (string/bool/blob → number, or bigint for text past the
- *  safe range), so the arms below test what the operands read as, not what they arrived as.
+/** Handle arithmetic when at least one operand reads as bigint. Callers have already coerced
+ *  both operands through SQL arithmetic affinity (string/bool/blob → number, or bigint for
+ *  text past the safe range).
  *  Both bigint → use bigint arithmetic directly.
  *  Mixed (one bigint, one number):
  *    - integer-valued number → promote to BigInt, stay in bigint domain
  *    - fractional number → demote bigint to Number, use float arithmetic */
 function mixedBigIntArithmetic(
-	v1: SqlValue, v2: SqlValue,
+	v1n: number | bigint, v2n: number | bigint,
 	inner: (v1: number, v2: number) => number,
 	innerBigInt: (v1: bigint, v2: bigint) => bigint
 ): SqlValue {
-	const v1n = coerceToNumberForArithmetic(v1);
-	const v2n = coerceToNumberForArithmetic(v2);
 	if (typeof v1n === 'bigint' && typeof v2n === 'bigint') {
 		try {
 			// Narrow a result that lands inside the safe-integer range back to number
@@ -250,7 +248,7 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		run = function runNumericOnly(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 !== null && v2 !== null) {
 				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
+					return mixedBigIntArithmetic(coerceToNumberForArithmetic(v1), coerceToNumberForArithmetic(v2), inner, innerBigInt);
 				} else {
 					// No try/catch: `inner` over plain numbers cannot throw (division by
 					// zero yields Infinity/NaN, caught by the finite check below); only

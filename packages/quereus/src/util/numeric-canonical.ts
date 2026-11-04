@@ -17,8 +17,8 @@ import type { SqlValue } from '../common/types.js';
  * 2^53 itself is representable but 2^53 + 1 is not, so arithmetic at the boundary
  * stops round-tripping. 9007199254740992 is therefore a `bigint`.
  *
- * Canonicalization happens where values are BORN (literal lexing, type parse,
- * parameter bind, bigint arithmetic/aggregation results) — not per-row on read
+ * Canonicalization happens where values are BORN (literal lexing, type parse, text
+ * read as a number, parameter bind, bigint arithmetic/aggregation results) — not per-row on read
  * paths. Rows from virtual-table `query()`, UDF return values and rows yielded by
  * table-valued functions are held to R1 by contract, not by coercion here.
  */

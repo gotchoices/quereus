@@ -125,7 +125,7 @@ export function aggregateCoercesArguments(functionName: string): boolean {
  * aggregate coerces at all (see {@link aggregateCoercesArguments}) use this directly.
  */
 export function coerceAggregateValue(value: SqlValue): SqlValue {
-	return typeof value === 'string' && value.trim() !== '' ? tryCoerceToNumber(value) : value;
+	return tryCoerceToNumber(value);
 }
 
 /**

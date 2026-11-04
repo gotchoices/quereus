@@ -1134,6 +1134,7 @@ SQL requires different coercion strategies for different contexts. Quereus coerc
 - Non-numeric strings become 0 (SQL standard behavior)
 - Text holding a whole number past the safe-integer range stays exact as a `bigint`, through `parseNumericText`, the one text-to-number rule that unary operators and `sum` share
 - Example: `'abc' + 0` → 0, `'123' + 0` → 123, `'9007199254740993' + 0` → 9007199254740993n
+- Such a `bigint` follows the integer rules, including truncating division with a whole-number divisor: `'9007199254740993' / 1000000000000000` → 9, as `9007199254740993 / 1000000000000000` does, while safe-range text divides as a double
 - Used in: +, -, *, /, % operators
 
 **Aggregate Context** (`coerceForAggregate`):
