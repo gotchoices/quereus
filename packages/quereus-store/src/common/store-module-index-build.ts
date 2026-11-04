@@ -32,46 +32,27 @@ import {
 import { buildDataKey, buildFullScanBounds, buildIndexKey } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
 import type { StoreTable } from './store-table.js';
+import type { DerivedOp } from './transaction.js';
 // NOTE: this one constant is the only thing tying this file to the module chain (the graph
 // stays acyclic — the base layer is a leaf). If these helpers ever need to be usable without
 // loading the chain, move `DEFAULT_MAX_BATCH_BYTES` to a constants leaf and have the base
 // import it from there instead.
 import { DEFAULT_MAX_BATCH_BYTES } from './store-module-base.js';
 
+/** Encodes a row's entry in one secondary index; undefined for a row a partial index omits. */
+type IndexEntryEncoder = (row: Row) => { key: Uint8Array; value: Uint8Array } | undefined;
+
 /**
- * Build index entries for all existing rows in a table.
- *
- * `dataEntries` is the row stream to index. Callers choose its visibility:
- * `createIndex` passes the table's EFFECTIVE stream (committed + pending, so
- * an open transaction's rows are indexed too), while `rebuildSecondaryIndexes`
- * passes the raw committed stream — it runs immediately after an ALTER has
- * re-encoded the data store in place, and any pending ops still address the
- * pre-ALTER key bytes.
- *
- * For UNIQUE indexes, performs an in-pass duplicate check (honoring partial
- * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
- * CONSTRAINT before any entries are written. Mirrors the memory module's
- * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
- * atomically. `skipDuplicateCheck` suppresses it: `createIndex` sets it when a
- * wrapper module supplied the rows to judge, having already validated them (see
- * {@link validateUniqueIndexOverRows}). Judging `dataEntries` too would reject a
- * committed duplicate the wrapper's transaction has already deleted.
- *
- * `normalizers` MUST be the owning connection's `db.getKeyNormalizerResolver()` —
- * the same resolver `StoreTable.encodeOptions` carries. A rebuild that resolved
- * collations any other way would re-encode the PK suffix under different bytes than
- * the table writes at maintenance time, silently corrupting the index.
+ * The entry encoding every physical write to a new index shares ({@link buildIndexEntries},
+ * {@link populateIndexStore}). `normalizers` MUST be the owning connection's
+ * `db.getKeyNormalizerResolver()`; see {@link buildIndexEntries}.
  */
-export async function buildIndexEntries(
-	dataEntries: AsyncIterable<KVEntry>,
-	indexStore: KVStore,
+function indexEntryEncoder(
 	tableSchema: TableSchema,
 	indexSchema: TableIndexSchema,
 	keyCollation: string,
 	normalizers: KeyNormalizerResolver,
-	skipDuplicateCheck = false,
-	maxBatchBytes: number = DEFAULT_MAX_BATCH_BYTES,
-): Promise<void> {
+): IndexEntryEncoder {
 	// Both halves key per-column: each index COLUMN under its own key collation
 	// (`resolveIndexKeyCollations` — index COLLATE ?? table column collation ?? BINARY)
 	// and the PK SUFFIX under each PK column's own key collation, so the suffix bytes
@@ -90,10 +71,109 @@ export async function buildIndexEntries(
 	const pkTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
 	const indexTransforms = resolveIndexKeyTransforms(indexSchema, tableSchema.columns);
 	const indexDirections = indexSchema.columns.map(col => !!col.desc);
-
 	const predicate: CompiledPredicate | undefined = indexSchema.predicate
 		? compilePredicate(indexSchema.predicate, tableSchema.columns, tableSchema.name)
 		: undefined;
+
+	return row => {
+		// Partial index: skip rows whose predicate is not unambiguously TRUE.
+		if (predicate && predicate.evaluate(row) !== true) return undefined;
+		const pkValues = tableSchema.primaryKeyDefinition.map(pk => row[pk.index]);
+		const indexValues = indexSchema.columns.map(col => row[col.index]);
+		return {
+			key: buildIndexKey(
+				{ values: indexValues, directions: indexDirections, collations: indexCollations, transforms: indexTransforms },
+				{ values: pkValues, directions: pkDirections, collations: pkCollations, transforms: pkTransforms },
+				encodeOptions,
+			),
+			// Index value = the row's encoded DATA key, so an index scan resolves each
+			// entry back to its base row via a direct data-store read (see
+			// `StoreTable.scanIndex`). Encoded under the same PK directions + per-column
+			// PK collations + key transforms as `buildDataKey` / `updateSecondaryIndexes`,
+			// so the value byte-matches the data store's key for this row.
+			value: buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations, pkTransforms),
+		};
+	};
+}
+
+/**
+ * Fill a new index on `table` so it holds what an index maintained since before the open
+ * transaction would hold: a physical entry per COMMITTED row, plus the ops the transaction's
+ * buffered writes owe it, queued at their historical log positions
+ * (`TransactionCoordinator.queueDerivedOps`). Commit, rollback and rollback-to then each leave
+ * the index exact.
+ *
+ * Writing the buffered rows' entries straight into the store instead would strand one state or
+ * the other: an entry per effective row leaves a row the transaction deleted or overwrote
+ * unindexed once a rollback restores it (a later duplicate of it is accepted silently), and an
+ * entry per row of every state leaves a second entry for an overwritten row, which a range or
+ * ordered index scan yields twice.
+ *
+ * `skipDuplicateCheck` may be false only when the committed rows are all this statement has to
+ * judge, which is {@link buildIndexEntries}' in-pass check; see `StoreModuleIndex.createIndex`.
+ */
+export async function populateIndexStore(
+	table: StoreTable,
+	indexStore: KVStore,
+	tableSchema: TableSchema,
+	indexSchema: TableIndexSchema,
+	normalizers: KeyNormalizerResolver,
+	skipDuplicateCheck: boolean,
+): Promise<void> {
+	const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+	await buildIndexEntries(
+		table.iterateCommittedEntries(buildFullScanBounds()),
+		indexStore,
+		tableSchema,
+		indexSchema,
+		keyCollation,
+		normalizers,
+		skipDuplicateCheck,
+		table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
+	);
+	const entryOf = indexEntryEncoder(tableSchema, indexSchema, keyCollation, normalizers);
+	await table.queueIndexOpsForBufferedWrites(indexSchema.name, (before, after) => {
+		const ops: DerivedOp[] = [];
+		const replaced = before && entryOf(deserializeRow(before));
+		if (replaced) ops.push({ key: replaced.key });
+		const written = after && entryOf(deserializeRow(after));
+		if (written) ops.push(written);
+		return ops;
+	});
+}
+
+/**
+ * Build index entries for all existing rows in a table.
+ *
+ * `dataEntries` is the row stream to index, always this module's committed rows:
+ * {@link populateIndexStore} covers the open transaction's writes through the coordinator, and
+ * `rebuildSecondaryIndexes` runs immediately after an ALTER has re-encoded the data store in
+ * place, its flush having left nothing pending.
+ *
+ * For UNIQUE indexes, performs an in-pass duplicate check (honoring partial
+ * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
+ * CONSTRAINT before any entries are written. Mirrors the memory module's
+ * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
+ * atomically. `skipDuplicateCheck` suppresses it: `createIndex` sets it when it has already
+ * judged the rows up front (see {@link validateUniqueIndexOverRows}). Judging `dataEntries` too
+ * would reject a committed duplicate the transaction has already deleted.
+ *
+ * `normalizers` MUST be the owning connection's `db.getKeyNormalizerResolver()` —
+ * the same resolver `StoreTable.encodeOptions` carries. A rebuild that resolved
+ * collations any other way would re-encode the PK suffix under different bytes than
+ * the table writes at maintenance time, silently corrupting the index.
+ */
+export async function buildIndexEntries(
+	dataEntries: AsyncIterable<KVEntry>,
+	indexStore: KVStore,
+	tableSchema: TableSchema,
+	indexSchema: TableIndexSchema,
+	keyCollation: string,
+	normalizers: KeyNormalizerResolver,
+	skipDuplicateCheck = false,
+	maxBatchBytes: number = DEFAULT_MAX_BATCH_BYTES,
+): Promise<void> {
+	const entryOf = indexEntryEncoder(tableSchema, indexSchema, keyCollation, normalizers);
 	// NOTE: `seen` holds one signature per DISTINCT indexed key for the WHOLE build and
 	// is NOT bounded by the maxBatchBytes chunking below (that bounds only the write
 	// batch). A very large UNIQUE index still spikes memory on this set. Bounding it
@@ -119,15 +199,8 @@ export async function buildIndexEntries(
 
 	for await (const entry of dataEntries) {
 		const row = deserializeRow(entry.value);
-
-		// Partial index: skip rows whose predicate is not unambiguously TRUE.
-		if (predicate && predicate.evaluate(row) !== true) continue;
-
-		// Extract PK values
-		const pkValues = tableSchema.primaryKeyDefinition.map(pk => row[pk.index]);
-
-		// Extract index column values
-		const indexValues = indexSchema.columns.map(col => row[col.index]);
+		const indexEntry = entryOf(row);
+		if (!indexEntry) continue;
 
 		if (seen) {
 			// The signature returns null when any indexed column is NULL —
@@ -147,19 +220,7 @@ export async function buildIndexEntries(
 			}
 		}
 
-		// Build and store index key
-		const indexKey = buildIndexKey(
-			{ values: indexValues, directions: indexDirections, collations: indexCollations, transforms: indexTransforms },
-			{ values: pkValues, directions: pkDirections, collations: pkCollations, transforms: pkTransforms },
-			encodeOptions,
-		);
-		// Index value = the row's encoded DATA key, so an index scan resolves each
-		// entry back to its base row via a direct data-store read (see
-		// `StoreTable.scanIndex`). Encoded under the same PK directions + per-column
-		// PK collations + key transforms as `buildDataKey` / `updateSecondaryIndexes`,
-		// so the value byte-matches the data store's key for this row.
-		const dataKey = buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations, pkTransforms);
-		batch.put(indexKey, dataKey);
+		batch.put(indexEntry.key, indexEntry.value);
 
 		// Bound heap: once the accumulated serialized key bytes cross the budget, flush
 		// the batch and start a fresh one. Both callers ITERATE the data store and WRITE
@@ -168,7 +229,7 @@ export async function buildIndexEntries(
 		// failure in `createIndex` is torn down by its try/catch (the whole fresh index
 		// store is deleted); in `rebuildSecondaryIndexes` it leaves a partial-but-
 		// recoverable index (re-run the rebuild — clear + rebuild is idempotent).
-		batchBytes += indexKey.length + dataKey.length;
+		batchBytes += indexEntry.key.length + indexEntry.value.length;
 		if (batchBytes >= maxBatchBytes) {
 			await batch.write();
 			batch = indexStore.batch();
@@ -229,10 +290,10 @@ export async function validateUniqueOverExistingRows(
 
 /**
  * Index-shaped twin of {@link validateUniqueOverExistingRows}, used by
- * `StoreModuleIndex.createIndex` when a wrapper module supplies the rows to judge. Dedupes on the
- * index's own columns under the index column's COLLATE (falling back to the table
+ * `StoreModuleIndex.createIndex` when it has rows to judge beyond the committed ones. Dedupes on
+ * the index's own columns under the index column's COLLATE (falling back to the table
  * column's), so it enforces exactly what `buildIndexEntries`' suppressed in-pass check
- * would have — over the wrapper's rows instead of this module's committed ones.
+ * would have — over each judged stream instead of this module's committed rows.
  */
 export async function validateUniqueIndexOverRows(
 	rows: AsyncIterable<Row>,
@@ -279,10 +340,11 @@ export function effectiveDdlRows(table: StoreTable, rows?: IssuerRowSources): As
 export interface RollbackState {
 	readonly rows: EffectiveRowSource;
 	/**
-	 * Whether the `set not null` NULL → DEFAULT backfill (`StoreTable.mapRowsAtIndex`) rewrites
-	 * these rows: true for the committed rows, false for a wrapper's savepoint frame, which no
-	 * rewrite of this module reaches. A NULL in a state the backfill reaches is filled; one it
-	 * does not reach refuses, DEFAULT or not.
+	 * Whether the `set not null` NULL → DEFAULT backfill (`StoreTable.mapRowsAtIndex`) settles
+	 * these rows: true for the committed rows, which it rewrites, and for a savepoint this
+	 * module's own buffer holds, which its flush ends so the state can no longer be restored.
+	 * False for a wrapper's savepoint frame, which no rewrite of this module reaches. A NULL in a
+	 * state the backfill settles is filled; one it does not refuses, DEFAULT or not.
 	 */
 	readonly backfilled: boolean;
 }
@@ -295,14 +357,20 @@ export interface RollbackState {
  * Behind the isolation wrapper (`rows` supplied) the store holds only committed rows while the
  * wrapper stages everything pending, so the committed stream IS the whole-rollback state and
  * the savepoint states are the wrapper's (`IssuerRowSources.savepoints`). Unwrapped, the
- * module's own buffered deletes and savepoints live in the coordinator's op log, a different
- * site: its row-rewriting ALTER arms flush that log before mutating (nothing left to restore),
- * and its non-committing arms are left to `bug-bare-store-ddl-ignores-buffered-rollback-states`,
- * which extends this list with the coordinator's savepoint prefixes — until then the bare
- * module judges no rollback state.
+ * module's own buffered writes and savepoints live in the coordinator's op log, so the states
+ * are the committed rows and each savepoint's prefix of that log
+ * (`StoreTableBase.bufferedRollbackScans`), and there are none when nothing is buffered for this
+ * table.
+ *
+ * A non-empty list is also how `createIndex` knows it has rows to judge beyond the committed
+ * ones. An arm that flushes the log before mutating takes {@link judgeRollbackStatesBeforeFlush}
+ * instead, since the flush leaves nothing to restore.
  */
-export function rollbackStates(table: StoreTable, rows: IssuerRowSources | undefined): RollbackState[] {
-	if (!rows) return [];
+export async function rollbackStates(table: StoreTable, rows: IssuerRowSources | undefined): Promise<RollbackState[]> {
+	if (!rows) {
+		const scans = await table.bufferedRollbackScans();
+		return scans.map(scan => ({ rows: () => rowsFromEntries(scan()), backfilled: true }));
+	}
 	return [
 		{ rows: () => rowsFromEntries(table.iterateCommittedEntries(buildFullScanBounds())), backfilled: true },
 		...rows.savepoints.map(frame => ({ rows: frame, backfilled: false })),
@@ -315,13 +383,28 @@ export function rollbackStates(table: StoreTable, rows: IssuerRowSources | undef
  * such a throw as `BUSY` (`judgeRestorableStates`). `ddl` names the statement as the user wrote
  * it for the refusal; runs AFTER the effective pass so a visible violation keeps its own status.
  */
-export function judgeRollbackStates(
+export async function judgeRollbackStates(
 	table: StoreTable,
 	rows: IssuerRowSources | undefined,
 	probe: (state: RollbackState) => Promise<void>,
 	ddl: string,
 ): Promise<void> {
-	return judgeRestorableStates(rollbackStates(table, rows), probe, ddl, table.tableName);
+	await judgeRestorableStates(await rollbackStates(table, rows), probe, ddl, table.tableName);
+}
+
+/**
+ * {@link judgeRollbackStates} for an arm that always flushes the coordinator's buffer before it
+ * mutates (`StoreModuleBase.ddlCommitPendingOps`). Unwrapped, that flush makes every buffered
+ * write durable and ends the savepoints, so no state a probe could fault can ever be restored,
+ * and refusing over one would reject a statement that is safe. Only a wrapper's states remain.
+ */
+export async function judgeRollbackStatesBeforeFlush(
+	table: StoreTable,
+	rows: IssuerRowSources | undefined,
+	probe: (state: RollbackState) => Promise<void>,
+	ddl: string,
+): Promise<void> {
+	if (rows) await judgeRollbackStates(table, rows, probe, ddl);
 }
 
 /**

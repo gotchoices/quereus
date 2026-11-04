@@ -31,7 +31,7 @@ import {
 import type { IterateOptions, KVEntry, KVStore } from './kv-store.js';
 import { bytesToHex, compareBytes } from './bytes.js';
 import type { DataChangeEvent, StoreEventEmitter } from './events.js';
-import type { PendingStoreOps, TransactionCoordinator } from './transaction.js';
+import type { DeriveOps, OrderedPendingOps, PendingStoreOps, TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import {
 	buildDataKey,
@@ -911,7 +911,7 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * store handle (`store`) — every data op is queued under that exact handle, so
 	 * a sibling table's pending ops (a different data-store handle) never bleed in.
 	 */
-	protected async *iterateEffective(
+	protected iterateEffective(
 		store: KVStore,
 		bounds: IterateOptions,
 		reverse = false,
@@ -919,6 +919,16 @@ export abstract class StoreTableBase extends VirtualTable {
 		const pending = this.coordinator?.isInTransaction()
 			? this.coordinator.getOrderedPendingOps(store)
 			: null;
+		return this.mergeWithPending(store, pending, bounds, reverse);
+	}
+
+	/** The two-way merge behind {@link iterateEffective}, over an explicit pending view. */
+	private async *mergeWithPending(
+		store: KVStore,
+		pending: OrderedPendingOps | null,
+		bounds: IterateOptions,
+		reverse = false,
+	): AsyncIterable<KVEntry> {
 		const iterOptions: IterateOptions = reverse ? { ...bounds, reverse } : bounds;
 
 		if (!pending || (pending.puts.length === 0 && pending.deletes.size === 0)) {
@@ -1088,12 +1098,56 @@ export abstract class StoreTableBase extends VirtualTable {
 	/**
 	 * COMMITTED-only ordered entry scan within `bounds`: the data store as a whole-transaction
 	 * `rollback` would leave it, this module's buffered ops ignored. The whole-rollback state a
-	 * row-validating DDL judges for `BUSY` (`rollbackStates` in store-module-index-build.ts).
-	 * Opens the data store first, like {@link iterateEffectiveEntries}.
+	 * row-validating DDL judges for `BUSY` (`rollbackStates` in store-module-index-build.ts), and
+	 * what a new index physically holds (`populateIndexStore` there). Opens the data store first,
+	 * like {@link iterateEffectiveEntries}.
 	 */
 	async *iterateCommittedEntries(bounds: IterateOptions): AsyncIterable<KVEntry> {
 		const store = await this.ensureStore();
 		yield* store.iterate(bounds);
+	}
+
+	/**
+	 * Full entry scans of every state a rollback could return this table's data store to while
+	 * the coordinator buffers writes for it: the committed entries, then the entries as each open
+	 * savepoint would restore them, outermost first.
+	 *
+	 * Empty when nothing is buffered for this store: every one of those states is then the
+	 * effective stream itself, so scanning them again could only repeat its answer.
+	 *
+	 * NOTE: one full scan per open savepoint, per structure judged. Fine while savepoint stacks are
+	 * shallow; if a deep stack makes this slow, skip a savepoint with no write to this store since
+	 * the previous one, since its state is identical.
+	 */
+	async bufferedRollbackScans(): Promise<Array<() => AsyncIterable<KVEntry>>> {
+		const store = await this.ensureStore();
+		const coordinator = this.coordinator;
+		if (!coordinator?.isInTransaction()) return [];
+		const buffered = coordinator.getPendingOpsForStore(store);
+		if (buffered.puts.size === 0 && buffered.deletes.size === 0) return [];
+		const bounds = buildFullScanBounds();
+		return [
+			() => store.iterate(bounds),
+			...coordinator.getOrderedPendingOpsAtSavepoints(store)
+				.map(view => () => this.mergeWithPending(store, view, bounds)),
+		];
+	}
+
+	/**
+	 * Queue against index `indexName` the ops it owes for the writes this transaction has already
+	 * buffered for this table (`TransactionCoordinator.queueDerivedOps`). Goes through
+	 * {@link ensureIndexStore} so the ops sit under the same handle the read and maintenance paths
+	 * use. A no-op outside a transaction.
+	 */
+	async queueIndexOpsForBufferedWrites(indexName: string, derive: DeriveOps): Promise<void> {
+		if (!this.coordinator?.isInTransaction()) return;
+		await this.coordinator.queueDerivedOps(await this.ensureStore(), await this.ensureIndexStore(indexName), derive);
+	}
+
+	/** Forget every op queued against index `indexName`, whose store is being torn down. */
+	discardQueuedIndexOps(indexName: string): void {
+		const indexStore = this.indexStores.get(indexName);
+		if (indexStore) this.coordinator?.discardOpsFor(indexStore);
 	}
 
 	/** Buffer a privileged row-count delta, applied at coordinator commit (host writes). */

@@ -576,7 +576,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
 			// writes no rows, and the validation scan already reads effectively, so
 			// the transaction survives a CONSTRAINT rejection. Every state a rollback
-			// could restore is judged next (BUSY): a committed duplicate the wrapper's
+			// could restore is judged next (BUSY): a committed duplicate the
 			// transaction deleted would come back under the constraint on rollback.
 			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
 			const keyNormalizers = db.getKeyNormalizerResolver();

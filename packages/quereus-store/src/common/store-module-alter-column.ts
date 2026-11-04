@@ -32,7 +32,12 @@ import { StoreTable } from './store-table.js';
 import { storeSemanticKeyTransform } from './pk-key-resolution.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
 import { StoreModuleIndex } from './store-module-index.js';
-import { effectiveDdlRows, judgeRollbackStates, validateUniqueOverExistingRows } from './store-module-index-build.js';
+import {
+	effectiveDdlRows,
+	judgeRollbackStates,
+	judgeRollbackStatesBeforeFlush,
+	validateUniqueOverExistingRows,
+} from './store-module-index-build.js';
 
 /**
  * Result of an {@link alterColumnChange} attribute sub-branch: the rewritten
@@ -157,7 +162,9 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// COLUMN can make rows that were distinct collide, both judged here BEFORE any
 		// mutation/persist so the first collision throws CONSTRAINT and leaves the table
 		// unchanged and writable (matches the ADD CONSTRAINT rollback shape) — then judged
-		// again over every state a rollback could restore (`judgeRollbackStates`, BUSY):
+		// again over every state a wrapper could restore (`judgeRollbackStatesBeforeFlush`, BUSY;
+		// a covering constraint means an index covers the column, so this path always reaches a
+		// flush below):
 		//  - SET COLLATE / a key-transform change: the comparators change ('a'/'A' collide
 		//    under NOCASE). Re-scan under the NEW collation (`updatedSchema` carries it).
 		//  - a value-REWRITING change (`valueConvert`: SET DATA TYPE, or a SET NOT NULL
@@ -189,7 +196,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			for (const uc of coveringConstraints) {
 				// Fresh generator per constraint and per state — an async generator is single-shot.
 				await validateUniqueOverExistingRows(judged(effectiveDdlRows(table, rows)), updatedSchema, uc, keyNormalizers);
-				await judgeRollbackStates(
+				await judgeRollbackStatesBeforeFlush(
 					table, rows,
 					state => validateUniqueOverExistingRows(judged(state.rows()), updatedSchema, uc, keyNormalizers),
 					ddl,
@@ -346,6 +353,10 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
  * one; a NULL in a wrapper savepoint frame refuses as BUSY either way, since no rewrite of this
  * store reaches it. The overlay-resident pending rows are the isolation layer's job (its
  * overlay migration); this store only owns its committed rows.
+ *
+ * Run directly, a NULL no row the transaction sees holds can sit in the committed rows or an open
+ * savepoint's. Without a DEFAULT that refuses as BUSY. With one it takes the backfill, whose flush
+ * makes the buffered writes durable and ends the savepoints, so the NULL can no longer come back.
  */
 async function alterColumnSetNotNull(
 	table: StoreTable,
@@ -447,7 +458,7 @@ async function alterColumnSetDataType(
 		// Throw-only pass over the rows this transaction can SEE (the wrapper's stream behind
 		// isolation, else this store's own effective rows), so an unconvertible value it
 		// inserted rejects the ALTER (MISMATCH) with the transaction still intact — then over
-		// every state a rollback could restore (BUSY): the rewrite below reaches the committed
+		// every state a wrapper could restore (BUSY): the rewrite below reaches the committed
 		// rows, and a rolled-back row would otherwise sit unconverted under the new type. The
 		// rewrite itself is DEFERRED: the caller flushes + `mapRowsAtIndex`es this closure only
 		// after its remaining throw-only checks pass.
@@ -458,7 +469,7 @@ async function alterColumnSetDataType(
 			}
 		};
 		await everyValueConverts(effectiveDdlRows(table, rows));
-		await judgeRollbackStates(table, rows, state => everyValueConverts(state.rows()), ddl);
+		await judgeRollbackStatesBeforeFlush(table, rows, state => everyValueConverts(state.rows()), ddl);
 		valueConvert = (v) => v === null ? v : convert(v);
 	}
 	return { newCol: { ...oldCol, logicalType: newLogicalType }, collationChanged: false, valueConvert };

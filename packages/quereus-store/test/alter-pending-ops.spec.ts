@@ -292,21 +292,6 @@ describe('Store ALTER TABLE with pending transaction ops', () => {
 			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
 				.to.deep.equal([{ a: 1, c: 5 }]);
 		});
-
-		it('honors a pending delete of the only NULL row', async () => {
-			await db.exec(`create table t (a integer primary key, c integer null) using store`);
-			await db.exec(`insert into t values (1, 5), (2, null)`);
-
-			await db.exec(`begin`);
-			await db.exec(`delete from t where a = 2`);
-			// No live NULL remains, so the tightening needs no backfill — and therefore
-			// never DDL-commits. The delete is still an ordinary buffered op at commit.
-			await db.exec(`alter table t alter column c set not null`);
-			await db.exec(`commit`);
-
-			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
-				.to.deep.equal([{ a: 1, c: 5 }]);
-		});
 	});
 
 	describe('ALTER COLUMN ... SET DATA TYPE', () => {

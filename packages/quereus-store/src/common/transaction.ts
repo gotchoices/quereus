@@ -65,10 +65,41 @@ const EMPTY_ORDERED: OrderedPendingOps = Object.freeze({
   deletes: new Set<string>(),
 });
 
+/** One op a structure derived from a store's rows owes for a write; a delete when `value` is absent. */
+export interface DerivedOp {
+  key: Uint8Array;
+  value?: Uint8Array;
+}
+
+/**
+ * The ops a derived structure owes for one write to its source store: the source value at the
+ * written key before and after the write, `undefined` where no row exists on that side.
+ */
+export type DeriveOps = (before: Uint8Array | undefined, after: Uint8Array | undefined) => DerivedOp[];
+
 /** Savepoint snapshot recording position in the operation/event arrays. */
 interface SavepointSnapshot {
   opIndex: number;
   eventIndex: number;
+}
+
+/** Get or create `store`'s bucket in `index`. */
+function bucketIn(index: Map<KVStore, PendingBucket>, store: KVStore): PendingBucket {
+  let bucket = index.get(store);
+  if (!bucket) {
+    bucket = { puts: new Map(), deletes: new Set() };
+    index.set(store, bucket);
+  }
+  return bucket;
+}
+
+/** Sorted, point-in-time copy of a bucket (see {@link OrderedPendingOps}). */
+function orderedView(bucket: PendingBucket | undefined): OrderedPendingOps {
+  if (!bucket || (bucket.puts.size === 0 && bucket.deletes.size === 0)) {
+    return EMPTY_ORDERED;
+  }
+  const puts = Array.from(bucket.puts.values()).sort((a, b) => compareBytes(a.key, b.key));
+  return { puts, deletes: new Set(bucket.deletes) };
 }
 
 /** Callback for transaction lifecycle events. */
@@ -418,19 +449,15 @@ export class TransactionCoordinator {
 
   /** Get or create the mutable index bucket for a store handle. */
   private bucketFor(store: KVStore): PendingBucket {
-    let bucket = this.pendingIndex.get(store);
-    if (!bucket) {
-      bucket = { puts: new Map(), deletes: new Set() };
-      this.pendingIndex.set(store, bucket);
-    }
-    return bucket;
+    return bucketIn(this.pendingIndex, store);
   }
 
-  /** Rebuild the per-store index by replaying the (truncated) op log. */
-  private rebuildPendingIndex(): void {
-    this.pendingIndex = new Map();
-    for (const op of this.pendingOps) {
-      const bucket = this.bucketFor(op.store);
+  /** The per-store last-write-wins index of the log's first `opCount` ops. */
+  private replayOps(opCount: number): Map<KVStore, PendingBucket> {
+    const index = new Map<KVStore, PendingBucket>();
+    for (let i = 0; i < opCount; i++) {
+      const op = this.pendingOps[i];
+      const bucket = bucketIn(index, op.store);
       const hex = bytesToHex(op.key);
       if (op.type === 'put') {
         bucket.puts.set(hex, { key: op.key, value: op.value! });
@@ -440,6 +467,62 @@ export class TransactionCoordinator {
         bucket.puts.delete(hex);
       }
     }
+    return index;
+  }
+
+  /** Rebuild the per-store index by replaying the (truncated) op log. */
+  private rebuildPendingIndex(): void {
+    this.pendingIndex = this.replayOps(this.pendingOps.length);
+  }
+
+  /**
+   * Replace each logged op with `expand(op)`, keeping every savepoint at the same logical
+   * position: after the ops it followed and before the ops it preceded.
+   */
+  private rewriteLog(expand: (op: PendingOp) => PendingOp[]): void {
+    const log: PendingOp[] = [];
+    let depth = 0;
+    for (let i = 0; i <= this.pendingOps.length; i++) {
+      while (depth < this.savepointStack.length && this.savepointStack[depth].opIndex === i) {
+        this.savepointStack[depth++].opIndex = log.length;
+      }
+      if (i < this.pendingOps.length) log.push(...expand(this.pendingOps[i]));
+    }
+    this.pendingOps = log;
+    this.rebuildPendingIndex();
+  }
+
+  /**
+   * Give `target`, a structure derived from `source`'s rows and built mid-transaction from the
+   * committed rows, the ops it would hold had it existed when the transaction began.
+   *
+   * Each derived op lands right after the `source` op it belongs to rather than at the end of
+   * the log, so it falls before any savepoint taken after that write. A `rollbackToSavepoint`
+   * then truncates exactly the derived ops of the writes it undoes.
+   */
+  async queueDerivedOps(source: KVStore, target: KVStore, derive: DeriveOps): Promise<void> {
+    const latest = new Map<string, Uint8Array | undefined>();
+    const derived = new Map<PendingOp, PendingOp[]>();
+    for (const op of this.pendingOps) {
+      if (op.store !== source) continue;
+      const hex = bytesToHex(op.key);
+      const before = latest.has(hex) ? latest.get(hex) : await source.get(op.key);
+      latest.set(hex, op.value);
+      derived.set(op, derive(before, op.value).map(({ key, value }): PendingOp => (
+        value === undefined
+          ? { type: 'delete', store: target, key }
+          : { type: 'put', store: target, key, value }
+      )));
+    }
+    if (derived.size > 0) this.rewriteLog(op => [op, ...(derived.get(op) ?? [])]);
+  }
+
+  /**
+   * Forget every op queued against `store`. For a structure a failed statement is tearing down:
+   * a surviving op would make the eventual commit write into a closed store and throw.
+   */
+  discardOpsFor(store: KVStore): void {
+    if (this.pendingIndex.has(store)) this.rewriteLog(op => (op.store === store ? [] : [op]));
   }
 
   /**
@@ -460,11 +543,15 @@ export class TransactionCoordinator {
    * with a long-lived merge scan.
    */
   getOrderedPendingOps(store: KVStore): OrderedPendingOps {
-    const bucket = this.pendingIndex.get(store);
-    if (!bucket || (bucket.puts.size === 0 && bucket.deletes.size === 0)) {
-      return EMPTY_ORDERED;
-    }
-    const puts = Array.from(bucket.puts.values()).sort((a, b) => compareBytes(a.key, b.key));
-    return { puts, deletes: new Set(bucket.deletes) };
+    return orderedView(this.pendingIndex.get(store));
+  }
+
+  /**
+   * {@link getOrderedPendingOps} as of each open savepoint, outermost first: what
+   * {@link rollbackToSavepoint} at that depth would leave buffered for `store`. Replays the log
+   * prefix per savepoint, the same O(ops) that rollback-to itself pays.
+   */
+  getOrderedPendingOpsAtSavepoints(store: KVStore): OrderedPendingOps[] {
+    return this.savepointStack.map(({ opIndex }) => orderedView(this.replayOps(opIndex).get(store)));
   }
 }

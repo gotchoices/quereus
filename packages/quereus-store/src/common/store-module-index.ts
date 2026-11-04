@@ -28,13 +28,20 @@ import {
 	appendIndexToTableSchema,
 	generateDropIndexDDL,
 	generateIndexDDL,
+	judgeRestorableStates,
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
 import { findReusableIndexForUnique, implicitUniqueIndexName } from './implicit-unique-index.js';
 import { buildFullScanBounds, buildIndexStoreName } from './key-builder.js';
 import { StoreModuleSchemaSync } from './store-module-schema-sync.js';
 import { DEFAULT_MAX_BATCH_BYTES } from './store-module-base.js';
-import { buildIndexEntries, judgeRollbackStates, validateUniqueIndexOverRows } from './store-module-index-build.js';
+import {
+	buildIndexEntries,
+	effectiveDdlRows,
+	populateIndexStore,
+	rollbackStates,
+	validateUniqueIndexOverRows,
+} from './store-module-index-build.js';
 
 /**
  * Map of `lowercased implicit index name → actual name` for every NON-DERIVED
@@ -82,13 +89,14 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 *
 	 * `rows` — {@link IssuerRowSources} supplied by a wrapper module (the isolation layer) —
 	 * replaces this module's own rows as the set the UNIQUE duplicate check judges for
-	 * legality (`rows.effective`, CONSTRAINT); the committed rows and each of
-	 * `rows.savepoints` are then judged on their own, a duplicate refusing as BUSY — a committed
-	 * duplicate the wrapper's transaction deleted would come back under the index on rollback
-	 * (`judgeRollbackStates`). When present the checks run UP FRONT, before `getIndexStore`
-	 * opens the index-store directory, so a rejection leaves no directory behind; and
-	 * `buildIndexEntries` then populates the physical index from this module's own (committed)
-	 * rows with its in-pass dup check disabled — those rows were already judged.
+	 * legality (`rows.effective`, CONSTRAINT). Each state a rollback could restore is then
+	 * judged on its own (`rollbackStates`: a wrapper's, or this module's buffered ones), a
+	 * duplicate refusing as BUSY, because a duplicate the transaction deleted would come back
+	 * under the index on rollback. Those checks run UP FRONT, before `getIndexStore` opens the
+	 * index-store directory, so a rejection leaves no directory behind; the build's in-pass dup
+	 * check is then disabled, since it would judge the committed rows a second time, for
+	 * CONSTRAINT. With no such state the committed rows are all there is to judge, and the
+	 * in-pass check alone does it, in the one scan the build makes anyway.
 	 */
 	async createIndex(
 		db: Database,
@@ -122,7 +130,6 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		);
 
 		const tableSchema = table.getSchema();
-		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 
 		// Reject an index whose key collations cannot key (comparator-only or
 		// unregistered names) BEFORE the physical store is created — the same DDL-time
@@ -132,32 +139,24 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// it after the store exists).
 		table.assertIndexKeyCollationsCanKey(indexSchema);
 
-		// Wrapper-supplied rows are the judged set. Validate BEFORE `getIndexStore` so a
-		// rejection leaves no index-store directory behind, and disable the in-pass dup
-		// check below (which would judge this module's committed rows for CONSTRAINT —
-		// they are judged here for BUSY instead, with every savepoint state).
-		if (indexSchema.unique) {
-			const keyNormalizers = db.getKeyNormalizerResolver();
-			if (rows) await validateUniqueIndexOverRows(rows.effective(), tableSchema, indexSchema, keyNormalizers);
-			await judgeRollbackStates(
-				table, rows,
+		const keyNormalizers = db.getKeyNormalizerResolver();
+		const restorable = indexSchema.unique ? await rollbackStates(table, rows) : [];
+		if (restorable.length > 0) {
+			await validateUniqueIndexOverRows(effectiveDdlRows(table, rows), tableSchema, indexSchema, keyNormalizers);
+			await judgeRestorableStates(
+				restorable,
 				state => validateUniqueIndexOverRows(state.rows(), tableSchema, indexSchema, keyNormalizers),
 				`create unique index ${indexSchema.name}`,
+				table.tableName,
 			);
 		}
 
 		// Create the index store
 		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
 
-		// Build index entries for every row the table can currently SEE — committed
-		// rows merged with this transaction's pending writes (`iterateEffectiveEntries`).
-		// The committed-only stream would leave a row inserted earlier in an open
-		// transaction unindexed, and `StoreTable.findUniqueConflictViaIndex` trusts the
-		// index to hold every live row: a `CREATE UNIQUE INDEX` would miss a pending
-		// duplicate, and a later insert colliding with that pending row would be
-		// silently ACCEPTED. Entries written here for rows that a subsequent ROLLBACK
-		// discards are harmless: both readers resolve each entry to its live row and
-		// drop it when the row is gone or no longer matches (see `scanIndex`).
+		// `StoreTable.findUniqueConflictViaIndex` trusts the index to hold every live row, in
+		// whichever state the open transaction ends, so the population has to cover the
+		// committed rows and this transaction's writes alike (`populateIndexStore`).
 		//
 		// EVERYTHING from here on is unwound on failure, so a refused CREATE INDEX is a
 		// clean no-op. The index store is FRESHLY created above and the engine unwinds
@@ -176,16 +175,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// `progress` records how far the statement got; the catch runs the exact inverse.
 		const progress: SchemaDdlProgress = { schemaSwapped: false, catalogWritten: false };
 		try {
-			await buildIndexEntries(
-				table.iterateEffectiveEntries(buildFullScanBounds()),
-				indexStore,
-				tableSchema,
-				indexSchema,
-				keyCollation,
-				db.getKeyNormalizerResolver(),
-				rows !== undefined,
-				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
-			);
+			await populateIndexStore(table, indexStore, tableSchema, indexSchema, keyNormalizers, restorable.length > 0);
 
 			// Refresh the connected table's cached schema so subsequent DML
 			// maintains the new index (the engine's schema registry is updated
@@ -248,15 +238,15 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 					this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, failedSchema),
 			);
 			// The index store this arm created: torn down on every failure, including the
-			// build's own. Mirrors dropIndex's teardown.
-			// NOTE: no `ddlCommitPendingOps()` before this one (unlike dropIndex's, and unlike
-			// the reconcile's), because `buildIndexEntries` writes the index store through its
-			// own batches OUTSIDE the coordinator and nothing else can have queued ops against
-			// a store created moments ago in this same statement — so there is nothing to
-			// replay into the closed store. If the build is ever routed through the
-			// coordinator, this teardown needs the flush the other two take.
-			await this.guardedUnwindStep('tear down the index store', subject, () =>
-				this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name));
+			// build's own. Mirrors dropIndex's teardown, except that the ops `populateIndexStore`
+			// queued against it are discarded rather than flushed (dropIndex and the reconcile
+			// take `ddlCommitPendingOps()`): only this statement can have queued any against a
+			// store created moments ago, and a statement that failed must not commit the caller's
+			// transaction.
+			await this.guardedUnwindStep('tear down the index store', subject, () => {
+				table.discardQueuedIndexOps(indexSchema.name);
+				return this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name);
+			});
 			throw createError;
 		}
 	}
@@ -589,13 +579,12 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * materialized copy works — `findReusableIndexForUnique` skips a constraint's own
 	 * `_uc_*`, so a materialized input yields the same name set.
 	 *
-	 * NOTE: the build populates from THIS module's own effective rows (committed + this
-	 * transaction's pending), never a wrapper's — mirroring `createIndex`. Under the
-	 * isolation layer the wrapper's rows are what ADD CONSTRAINT's validation judged;
-	 * the physical index legitimately fills from this module's committed rows and an
-	 * entry with no live row behind it is harmless (both readers resolve to the live
-	 * row). Duplicates were already rejected by `validateUniqueOverExistingRows` (ADD)
-	 * or cannot exist (RENAME leaves data unchanged), so the in-pass check is skipped.
+	 * NOTE: the build populates from THIS module's own rows (`populateIndexStore`), never a
+	 * wrapper's — mirroring `createIndex`. Under the isolation layer the wrapper's rows are
+	 * what ADD CONSTRAINT's validation judged, and the physical index legitimately fills from
+	 * this module's committed rows. Duplicates were already rejected by
+	 * `validateUniqueOverExistingRows` (ADD) or cannot exist (RENAME leaves data unchanged),
+	 * so the in-pass check is skipped.
 	 */
 	protected async reconcileImplicitUniqueIndexStores(
 		db: Database,
@@ -618,8 +607,8 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// write into the closed store and throw — so flush first, the same DDL-commit
 		// posture the row-rewriting ALTER arms take and what this module's declared
 		// `ddlTransactionality: 'auto-commit'` promises. Only when something is actually
-		// doomed: a pure BUILD writes index entries outside the coordinator and deletes
-		// nothing, so it must not force-commit the caller's transaction.
+		// doomed: a pure BUILD closes no store, so it must not force-commit the caller's
+		// transaction.
 		const doomed = [...oldNames].filter(([lower]) => !newNames.has(lower));
 		if (doomed.length > 0) {
 			await this.ddlCommitPendingOps();
@@ -628,7 +617,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			}
 		}
 
-		// Build each newly-materialized implicit index's store from effective rows.
+		// Build each newly-materialized implicit index's store.
 		for (const [lower, name] of newNames) {
 			if (oldNames.has(lower)) continue;
 			const indexSchema = (newMaterialized.indexes ?? []).find(ix => ix.name === name);
@@ -642,18 +631,9 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			// build has no in-pass dup check (skipDuplicateCheck below) so the only failure is a
 			// genuine IO error — the same non-atomicity `rebuildSecondaryIndexes` documents; a
 			// re-run / reopen rebuilds. Add a try/catch teardown if this ever bites.
-			const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 			const indexStore = await this.provider.getIndexStore(schemaName, tableName, name);
-			await buildIndexEntries(
-				table.iterateEffectiveEntries(buildFullScanBounds()),
-				indexStore,
-				newSchema,
-				indexSchema,
-				keyCollation,
-				db.getKeyNormalizerResolver(),
-				true, // dup rejection already owned by the arm (ADD validates; RENAME is data-preserving)
-				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
-			);
+			// Dup rejection is already owned by the arm (ADD validates; RENAME is data-preserving).
+			await populateIndexStore(table, indexStore, newSchema, indexSchema, db.getKeyNormalizerResolver(), true);
 		}
 	}
 
