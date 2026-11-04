@@ -253,7 +253,6 @@ OPT-026 for the same seam in the opposite direction — replacing the context it
 
 - code: `packages/quereus/src/planner/rules/access/rule-select-access-path.ts` — `reattachUnconsumedConstraints`
 - guard: `packages/quereus/test/vtab/overclaiming-module.spec.ts` — `over-claiming module: planner reattaches unconsumed filters`, `non-seek claim: planner reattaches the filter it cannot consume`, `non-seek claim: a tautological is not null is not reattached`
-- guard: `packages/quereus-isolation/test/claimed-non-seek-filter.spec.ts` — `claimed non-seek filter under the isolation overlay`
 - doc: [Optimizer § The `handledFilters` contract](optimizer.md#the-handledfilters-contract)
 
 `handledFilters[i] = true` makes `rule-grow-retrieve` leave filter `i` out of the residual,
@@ -266,6 +265,7 @@ exception is `IS NOT NULL` on a `NOT NULL` column, which no row can fail.
 The module's own scan cannot stand in for that `Filter`, even when the module applies the
 filter faithfully: the isolation layer merges staged rows into the scan's stream and checks
 them only against `FilterInfo.constraints`.
+`packages/quereus-isolation/test/claimed-non-seek-filter.spec.ts` pins this.
 
 ### OPT-025 — A predicate constrains only tables in its own relational input
 
