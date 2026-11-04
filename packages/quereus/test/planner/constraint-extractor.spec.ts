@@ -664,6 +664,79 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].op).to.equal('OR_RANGE');
 			expect(result.allConstraints[0].ranges).to.have.length(3);
 		});
+
+		describe('binding kinds', () => {
+			const a = () => colRef(101, 'a', 1);
+
+			function collapse(expr: ScalarPlanNode, tables = [TABLE_A]): PredicateConstraint {
+				const result = extractConstraints(expr, tables);
+				expect(result.allConstraints).to.have.length(1);
+				expect(result.allConstraints[0].op).to.equal('OR_RANGE');
+				return result.allConstraints[0];
+			}
+
+			it('all-parameter bounds → parameter', () => {
+				const c = collapse(orNode(binOp('<', a(), paramRef(':lo')), binOp('>', a(), paramRef(':hi'))));
+				expect(c.ranges![0].upper!.bindingKind).to.equal('parameter');
+				expect(c.ranges![1].lower!.bindingKind).to.equal('parameter');
+				expect(c.bindingKind).to.equal('parameter');
+				expect(c.correlated).to.equal(false);
+			});
+
+			it('literal and parameter bounds → mixed', () => {
+				const c = collapse(orNode(binOp('<', a(), lit(10)), binOp('>', a(), paramRef(':hi'))));
+				expect(c.ranges![0].upper!.bindingKind).to.equal('literal');
+				expect(c.ranges![1].lower!.bindingKind).to.equal('parameter');
+				expect(c.bindingKind).to.equal('mixed');
+				expect(c.correlated).to.equal(false);
+			});
+
+			it('a correlated bound marks that bound and the constraint', () => {
+				const c = collapse(orNode(binOp('<', a(), colRef(200, 'x', 0)), binOp('>', a(), lit(5))), [TABLE_A, TABLE_B]);
+				expect(c.ranges![0].upper!.bindingKind).to.equal('correlated');
+				expect(c.ranges![0].upper!.correlated).to.equal(true);
+				expect(c.ranges![1].lower!.bindingKind).to.equal('literal');
+				expect(c.bindingKind).to.equal('mixed');
+				expect(c.correlated).to.equal(true);
+			});
+
+			it('equality branch gives both of its bounds the same kind', () => {
+				const c = collapse(orNode(binOp('=', a(), paramRef(':p')), binOp('>', a(), lit(5))));
+				expect(c.ranges![0].lower!.bindingKind).to.equal('parameter');
+				expect(c.ranges![0].upper!.bindingKind).to.equal('parameter');
+				expect(c.ranges![1].lower!.bindingKind).to.equal('literal');
+				expect(c.bindingKind).to.equal('mixed');
+				expect(c.correlated).to.equal(false);
+			});
+
+			it('all-literal bounds including BETWEEN → literal', () => {
+				const c = collapse(orNode(betweenNode(a(), lit(1), lit(5)), binOp('=', a(), lit(10))));
+				for (const range of c.ranges!) {
+					expect(range.lower!.bindingKind).to.equal('literal');
+					expect(range.upper!.bindingKind).to.equal('literal');
+				}
+				expect(c.bindingKind).to.equal('literal');
+				expect(c.correlated).to.equal(false);
+			});
+		});
+
+		describe('branch with two bounds on one side stays residual', () => {
+			it('(a>7 AND a>5) OR a<1', () => {
+				const col = colRef(101, 'a', 1);
+				const expr = orNode(andNode(binOp('>', col, lit(7)), binOp('>', col, lit(5))), binOp('<', col, lit(1)));
+				const result = extractConstraints(expr, [TABLE_A]);
+				expect(result.allConstraints).to.have.length(0);
+				expect(result.residualPredicate).to.exist;
+			});
+
+			it('(a=8 AND a>5) OR a<1', () => {
+				const col = colRef(101, 'a', 1);
+				const expr = orNode(andNode(binOp('=', col, lit(8)), binOp('>', col, lit(5))), binOp('<', col, lit(1)));
+				const result = extractConstraints(expr, [TABLE_A]);
+				expect(result.allConstraints).to.have.length(0);
+				expect(result.residualPredicate).to.exist;
+			});
+		});
 	});
 
 	// ===================================================================

@@ -768,7 +768,8 @@ if (shouldCache(node, context)) {
 
 - **OR predicate extraction across different indexes** remains a residual filter. The
   same-column collapses (OR-of-equalities ⇒ `IN`, OR-of-ranges ⇒ `OR_RANGE`) are
-  implemented and gated on matching disjunct collation. Tracked by
+  implemented and gated on matching disjunct collation. An OR branch with two bounds
+  on the same side (`(a > 7 and a > 5) or a < 1`) also stays residual. Tracked by
   `tickets/plan/2-or-to-union-rewriting.md`.
 - **Prefix-equality + trailing-range seeks on composite indexes** are not supported.
   Tracked by `tickets/plan/2-composite-index-advanced-seeks.md`.

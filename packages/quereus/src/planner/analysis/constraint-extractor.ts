@@ -29,13 +29,24 @@ const log = createLogger('planner:analysis:constraint-extractor');
 
 // ConstraintOp is imported from vtab/best-access-plan.ts
 
+/** How a constraint's value side is supplied. */
+export type BindingKind = 'literal' | 'parameter' | 'correlated' | 'expression' | 'mixed';
+
+/** The value-side metadata an OR_RANGE bound inherits from its branch constraint. */
+interface RangeBoundBinding {
+	value: SqlValue;
+	valueExpr?: ScalarPlanNode;
+	bindingKind?: BindingKind;
+	correlated?: boolean;
+}
+
 /**
  * A single range specification within an OR_RANGE constraint.
- * Extends the vtab-level RangeSpec with planner-specific valueExpr fields.
+ * Extends the vtab-level RangeSpec with planner-specific per-bound binding fields.
  */
 export interface RangeSpec extends VtabRangeSpec {
-	lower?: { op: '>=' | '>'; value: SqlValue; valueExpr?: ScalarPlanNode };
-	upper?: { op: '<=' | '<'; value: SqlValue; valueExpr?: ScalarPlanNode };
+	lower?: { op: '>=' | '>' } & RangeBoundBinding;
+	upper?: { op: '<=' | '<' } & RangeBoundBinding;
 }
 
 /**
@@ -60,7 +71,7 @@ export interface PredicateConstraint extends VtabPredicateConstraint {
 	 */
 	valueExpr?: ScalarPlanNode | ScalarPlanNode[];
 	/** Binding kind describing how value is supplied */
-	bindingKind?: 'literal' | 'parameter' | 'correlated' | 'expression' | 'mixed';
+	bindingKind?: BindingKind;
 	/**
 	 * True when the value binding references a column outside the constrained
 	 * table — i.e. the binding varies per outer row (correlated). Orthogonal to
@@ -483,6 +494,7 @@ function extractBetweenConstraints(
       op: '>=',
       value: lowVal,
       usable: true,
+      bindingKind: 'literal',
       sourceExpression: expr,
       targetRelation: tableInfo.relationKey
     },
@@ -492,6 +504,7 @@ function extractBetweenConstraints(
       op: '<=',
       value: upVal,
       usable: true,
+      bindingKind: 'literal',
       sourceExpression: expr,
       targetRelation: tableInfo.relationKey
     }
@@ -835,6 +848,56 @@ function collapseBranchesToIn(
 }
 
 /**
+ * Build the range spec for one OR branch, or null when the branch cannot be
+ * expressed as one lower and one upper bound. A second constraint on a filled
+ * slot declines rather than choosing the tighter bound: the OR is consumed by
+ * the seek, so a dropped bound would return extra rows, and a placeholder's
+ * value isn't known at plan time.
+ */
+function branchToRangeSpec(constraints: readonly PredicateConstraint[]): RangeSpec | null {
+	const spec: RangeSpec = {};
+	for (const c of constraints) {
+		const binding: RangeBoundBinding = {
+			value: c.value as SqlValue,
+			valueExpr: c.valueExpr && !Array.isArray(c.valueExpr) ? c.valueExpr : undefined,
+			bindingKind: c.bindingKind,
+			correlated: c.correlated,
+		};
+		if (c.op === '=') {
+			if (spec.lower || spec.upper) return null;
+			// Equality: treat as >= v AND <= v
+			spec.lower = { op: '>=', ...binding };
+			spec.upper = { op: '<=', ...binding };
+		} else if (c.op === '>' || c.op === '>=') {
+			if (spec.lower) return null;
+			spec.lower = { op: c.op, ...binding };
+		} else if (c.op === '<' || c.op === '<=') {
+			if (spec.upper) return null;
+			spec.upper = { op: c.op, ...binding };
+		} else {
+			// Non-range, non-equality op → can't collapse
+			return null;
+		}
+	}
+	return spec;
+}
+
+/** Summarize the bounds of an OR_RANGE into its constraint-level binding fields. */
+function summarizeRangeBindings(ranges: readonly RangeSpec[]): Pick<PredicateConstraint, 'bindingKind' | 'correlated'> {
+	const bounds: RangeBoundBinding[] = [];
+	for (const { lower, upper } of ranges) {
+		if (lower) bounds.push(lower);
+		if (upper) bounds.push(upper);
+	}
+	const firstKind = bounds[0]?.bindingKind;
+	return {
+		// A bound with no kind must not read as literal, so it forces 'mixed'.
+		bindingKind: firstKind && bounds.every(b => b.bindingKind === firstKind) ? firstKind : 'mixed',
+		correlated: bounds.some(b => b.correlated === true),
+	};
+}
+
+/**
  * Collapse OR branches that are all range/equality constraints on the same column
  * into a single OR_RANGE constraint with multiple range specs.
  */
@@ -868,27 +931,8 @@ function tryCollapseToOrRange(
 			return null;
 		}
 
-		// Build range spec from branch constraints
-		const spec: RangeSpec = {};
-		for (const c of b.constraints) {
-			const dynExpr = c.valueExpr && !Array.isArray(c.valueExpr) ? c.valueExpr : undefined;
-			if (c.op === '=') {
-				// Equality: treat as >= v AND <= v
-				spec.lower = { op: '>=', value: c.value as SqlValue, valueExpr: dynExpr };
-				spec.upper = { op: '<=', value: c.value as SqlValue, valueExpr: dynExpr };
-			} else if (c.op === '>' || c.op === '>=') {
-				spec.lower = { op: c.op, value: c.value as SqlValue, valueExpr: dynExpr };
-			} else if (c.op === '<' || c.op === '<=') {
-				spec.upper = { op: c.op, value: c.value as SqlValue, valueExpr: dynExpr };
-			} else {
-				// Non-range, non-equality op → can't collapse
-				return null;
-			}
-		}
-
-		// Each branch must define at least one bound
-		if (!spec.lower && !spec.upper) return null;
-
+		const spec = branchToRangeSpec(b.constraints);
+		if (!spec) return null;
 		rangeSpecs.push(spec);
 	}
 
@@ -904,7 +948,7 @@ function tryCollapseToOrRange(
 		usable: true,
 		sourceExpression: sourceExpr,
 		targetRelation: targetRelation,
-		bindingKind: 'literal',
+		...summarizeRangeBindings(rangeSpecs),
 		ranges: rangeSpecs,
 	};
 
