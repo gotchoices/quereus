@@ -460,6 +460,7 @@ export class StoreTable extends StoreTableConstraints {
 							constraint: 'unique',
 							message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 							existingRow,
+							onConflict: pkEffective,
 						};
 					}
 				}
@@ -562,6 +563,7 @@ export class StoreTable extends StoreTableConstraints {
 								constraint: 'unique',
 								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 								existingRow: existingAtNewRow,
+								onConflict: pkEffective,
 							};
 						}
 						replacedAtNewPk = existingAtNewRow;

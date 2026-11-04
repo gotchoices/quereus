@@ -1,5 +1,6 @@
 import type { RuntimeContext } from '../runtime/types.js';
 import type { JSONValue } from './json-types.js';
+import type { ConflictResolution } from './constants.js';
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -209,10 +210,15 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  * resolves a secondary UNIQUE conflict by REPLACE (the memory and store backends
  * run every secondary UNIQUE check under its own action after a PK REPLACE, as
  * SQLite does); the executor handles both on one result.
+ *
+ * On the constraint arm, `onConflict` is the action the module resolved for this
+ * conflict (statement OR > per-constraint default > ABORT). The executor raises its
+ * error from it, so a declared `on conflict rollback` or `on conflict fail` governs the
+ * statement. A module that omits it gets the statement's OR clause alone.
  */
 export type UpdateResult =
 	| { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] }
-	| { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row };
+	| { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row; onConflict?: ConflictResolution };
 
 /**
  * Type guard to check if an UpdateResult indicates success.
@@ -224,7 +230,7 @@ export function isUpdateOk(result: UpdateResult): result is { status: 'ok'; row?
 /**
  * Type guard to check if an UpdateResult indicates a constraint violation.
  */
-export function isConstraintViolation(result: UpdateResult): result is { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row } {
+export function isConstraintViolation(result: UpdateResult): result is Extract<UpdateResult, { status: 'constraint' }> {
 	return result.status === 'constraint';
 }
 

@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database, QuereusError, MisuseError, TransactionActiveError, StatusCode, createScalarFunction, isAbortError } from '../src/index.js';
+import { FailConflictError, RollbackConflictError } from '../src/common/errors.js';
 
 describe('Transaction API', () => {
 	let db: Database;
@@ -297,6 +298,25 @@ describe('Transaction API', () => {
 			void expect(row).to.exist;
 			void expect(row?.val).to.equal('c');
 		});
+
+		it('exec of insert or rollback inside begin ends the transaction and discards its rows', async () => {
+			await db.exec('begin');
+			await db.exec("insert into t values (3, 'c')");
+
+			const err = await rejection(db.exec("insert or rollback into t values (1, 'duplicate')"));
+
+			void expect(err).to.be.instanceOf(RollbackConflictError);
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2]);
+		});
+
+		it('exec of a multi-row insert or fail in autocommit keeps the rows before the violation', async () => {
+			const err = await rejection(db.exec("insert or fail into t values (5, 'e'), (1, 'duplicate'), (6, 'f')"));
+
+			void expect(err).to.be.instanceOf(FailConflictError);
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2, 5]);
+		});
 	});
 
 	describe("exec({ transaction: true })", () => {
@@ -445,10 +465,9 @@ describe('Transaction API', () => {
 		});
 
 		it('rolls the whole batch back when OR ROLLBACK ends the transaction from inside a statement', async () => {
-			// The one failure shape that ends the batch's transaction BEFORE the batch's
-			// own catch runs: `_finalizeImplicitTransaction` honours OR ROLLBACK by rolling
-			// back whatever transaction is active, explicit ones included. The catch must
-			// notice it is no longer in a transaction and not roll back a second time.
+			// `_execBatchAsTransaction` does not call `_finalizeImplicitTransaction`: its own
+			// catch rolls the batch back on any error, so OR ROLLBACK needs no special handling
+			// here and leaves the database out of the transaction like every other failure.
 			const err = await rejection(db.exec(
 				"insert into t values (3, 'c'); insert or rollback into t values (1, 'duplicate');",
 				undefined,

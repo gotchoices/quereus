@@ -9,7 +9,7 @@ import { isAsyncIterable } from '../utils.js';
 import { createRowSlot } from '../context-helpers.js';
 import type { RowDescriptor, TableDescriptor } from '../../planner/nodes/plan-node.js';
 import { ConflictResolution } from '../../common/constants.js';
-import { ConstraintError, FailConflictError, RollbackConflictError } from '../../common/errors.js';
+import { constraintErrorForAction } from '../../common/errors.js';
 import { isTruthy } from '../../util/comparison.js';
 
 
@@ -204,11 +204,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 							if (value === null || isTruthy(value)) continue;
 							const action = envelope?.rowCheckOnConflict ?? ConflictResolution.ABORT;
 							if (action === ConflictResolution.IGNORE) continue outer; // skip the whole logical row
-							const message = rowChecks[i].message;
-							if (action === ConflictResolution.FAIL) throw new FailConflictError(message);
-							if (action === ConflictResolution.ROLLBACK) throw new RollbackConflictError(message);
-							// ABORT — and REPLACE, which never masks a CHECK (SQLite parity).
-							throw new ConstraintError(message);
+							// REPLACE raises as ABORT: it never masks a CHECK (SQLite parity).
+							throw constraintErrorForAction(action, rowChecks[i].message);
 						}
 					}
 					ordinal += 1;

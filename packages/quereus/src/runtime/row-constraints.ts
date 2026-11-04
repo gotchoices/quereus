@@ -1,7 +1,7 @@
 import type { ConstraintCheck } from '../planner/nodes/constraint-check-node.js';
 import type { RuntimeContext } from './types.js';
 import type { Row, SqlValue, OutputValue } from '../common/types.js';
-import { ConstraintError, FailConflictError, RollbackConflictError } from '../common/errors.js';
+import { ConstraintError, constraintErrorForAction } from '../common/errors.js';
 import type { RowConstraintSchema, TableSchema } from '../schema/table.js';
 import type { RowDescriptor } from '../planner/nodes/plan-node.js';
 import { RowOpFlag } from '../schema/table.js';
@@ -125,22 +125,6 @@ function pickAction(
 	constraintDefault: ConflictResolution | undefined,
 ): ConflictResolution {
 	return stmtOR ?? constraintDefault ?? ConflictResolution.ABORT;
-}
-
-/**
- * Throws an appropriate ConstraintError subclass based on the effective
- * conflict action. ABORT/REPLACE/IGNORE callers must not reach this — IGNORE
- * is handled by skipping the row, REPLACE by substitution / passthrough, and
- * ABORT throws a plain ConstraintError.
- */
-function throwForAction(action: ConflictResolution, message: string): never {
-	if (action === ConflictResolution.FAIL) {
-		throw new FailConflictError(message);
-	}
-	if (action === ConflictResolution.ROLLBACK) {
-		throw new RollbackConflictError(message);
-	}
-	throw new ConstraintError(message);
 }
 
 function generateDefaultConstraintName(tableSchema: TableSchema, constraint: RowConstraintSchema): string {
@@ -290,7 +274,7 @@ async function checkNotNullConstraints(
 		}
 
 		// ABORT / FAIL / ROLLBACK
-		throwForAction(action, message);
+		throw constraintErrorForAction(action, message);
 	}
 
 	return { skip: false, replacedRow: mutableRow };
@@ -396,7 +380,7 @@ async function checkCheckConstraints(
 				throw new ConstraintError(baseMessage);
 			}
 
-			throwForAction(effectiveAction, baseMessage);
+			throw constraintErrorForAction(effectiveAction, baseMessage);
 		}
 	}
 	return { skip: false };

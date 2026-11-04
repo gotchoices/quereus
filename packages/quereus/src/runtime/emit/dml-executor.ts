@@ -2,8 +2,8 @@ import type { DmlExecutorNode } from '../../planner/nodes/dml-executor-node.js';
 import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError, throwIfAborted } from '../../common/errors.js';
-import { StatusCode, type Row, type SqlValue, type SubProgram, isConstraintViolation } from '../../common/types.js';
+import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError, constraintErrorForAction, throwIfAborted } from '../../common/errors.js';
+import { StatusCode, type Row, type SqlValue, type SubProgram, type UpdateResult, isConstraintViolation } from '../../common/types.js';
 import { getVTable, disconnectVTable } from '../utils.js';
 import { ConflictResolution } from '../../common/constants.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -43,6 +43,11 @@ import type { BackingRowChange } from '../../vtab/backing-host.js';
  * (e.g. FK cascade during the parent insert).
  */
 let stmtSavepointCounter = 0;
+
+/** The error for a violation a module returned, raised under the action the module resolved. */
+function violationError(result: Extract<UpdateResult, { status: 'constraint' }>): ConstraintError {
+	return constraintErrorForAction(result.onConflict, result.message ?? `${result.constraint} constraint failed`);
+}
 
 /**
  * Runtime UPSERT clause with pre-resolved evaluator callbacks.
@@ -889,6 +894,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	 * based on the active statement-level conflict resolution. FAIL and
 	 * RollbackConflictError pass through unchanged. The iterator-level
 	 * cleanup uses the subclass to decide commit-vs-rollback semantics.
+	 *
+	 * Only the fallback: {@link violationError} already raised the subclass when the
+	 * module reported its resolved action. This covers a module that omits the field
+	 * and plain ConstraintErrors thrown inside `processRow`, such as the RESTRICT pre-check.
 	 */
 	function translateConflictError(
 		err: unknown,
@@ -1272,8 +1281,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					return updateResult.flatRow;
 				}
 			}
-			// No UPSERT clause matched — propagate; caller wraps for FAIL/ROLLBACK.
-			throw new ConstraintError(result.message ?? `${result.constraint} constraint failed`, StatusCode.CONSTRAINT);
+			// No UPSERT clause matched — raise under the action the module resolved.
+			throw violationError(result);
 		}
 
 		// Skip if row was not inserted (e.g., IGNORE mode at vtab level)
@@ -1485,9 +1494,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		countUpdateCall(ctx);
 		const result = await vtab.update!(args);
 
-		// Handle constraint violations — caller translates for FAIL/ROLLBACK.
 		if (isConstraintViolation(result)) {
-			throw new ConstraintError(result.message ?? `${result.constraint} constraint failed`, StatusCode.CONSTRAINT);
+			throw violationError(result);
 		}
 
 		// Skip if row was not updated (row not found returns ok with no row)
@@ -1653,7 +1661,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		// Handle constraint violations (unlikely for DELETE, but be consistent).
 		if (isConstraintViolation(result)) {
-			throw new ConstraintError(result.message ?? `${result.constraint} constraint failed`, StatusCode.CONSTRAINT);
+			throw violationError(result);
 		}
 
 		// Skip if row was not deleted (row not found returns ok with no row)

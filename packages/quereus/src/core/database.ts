@@ -1061,7 +1061,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * `exec` batch. Statements running inside an explicit transaction (user
 	 * `BEGIN`) are NOT auto-committed per-statement; they remain part of the
 	 * surrounding explicit transaction until the user issues `COMMIT` or
-	 * `ROLLBACK`.
+	 * `ROLLBACK`. Two conflict actions change this: `ROLLBACK` also ends an explicit
+	 * transaction, and `FAIL` commits an implicit one to keep the rows before its
+	 * violation (see `docs/sql-dml.md`).
 	 *
 	 * `options.readConcurrency` is IGNORED here: `exec` returns no rows, so a
 	 * concurrent committed read through it would have no consumer, and its
@@ -1119,22 +1121,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/**
 	 * Runs each statement in its own implicit-transaction scope: matches SQLite
 	 * autocommit semantics so a later statement's failure (e.g. OR ABORT) does NOT
-	 * roll back prior statements that already successfully committed. The
-	 * `isImplicitTransaction()` gate skips this for statements running inside an
-	 * explicit `BEGIN…COMMIT` block, including statements that follow a mid-batch
-	 * `BEGIN`. Caller holds the execution mutex.
+	 * roll back prior statements that already successfully committed. Finalization
+	 * goes through {@link _finalizeImplicitTransaction}, the same rules the
+	 * `Statement` paths use: statements inside an explicit `BEGIN…COMMIT` block,
+	 * including ones that follow a mid-batch `BEGIN`, stay open unless OR ROLLBACK
+	 * ends the transaction, and OR FAIL commits the rows that preceded its violation.
+	 * Caller holds the execution mutex.
+	 *
+	 * A commit that fails has already cleared the transaction manager's state, so the
+	 * catch does not roll back a second time. A commit failing under OR FAIL replaces
+	 * the conflict error, as it does on the `Statement` paths.
 	 */
 	private async _execBatchAutocommit(batch: AST.Statement[], params?: SqlParameters, signal?: AbortSignal): Promise<void> {
 		for (const statementAst of batch) {
 			try {
 				await this._executeSingleStatement(statementAst, params, signal);
-				if (this.transactionManager.isImplicitTransaction()) {
-					await this._commitTransaction();
-				}
+				await this._finalizeImplicitTransaction(true);
 			} catch (err) {
-				if (this.transactionManager.isImplicitTransaction()) {
-					await this._rollbackTransaction();
-				}
+				await this._finalizeImplicitTransaction(false, err);
 				throw err;
 			}
 		}

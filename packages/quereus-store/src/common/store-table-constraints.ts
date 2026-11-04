@@ -292,6 +292,7 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${schema.name} (${colNames})`,
 				existingRow: conflict.row,
+				onConflict: effective,
 			};
 		}
 		return null;

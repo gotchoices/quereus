@@ -1,4 +1,5 @@
 import { StatusCode } from './types.js';
+import { ConflictResolution } from './constants.js';
 
 /**
  * Base class for Quereus specific errors
@@ -68,6 +69,17 @@ export class RollbackConflictError extends ConstraintError {
 		this.name = 'RollbackConflictError';
 		Object.setPrototypeOf(this, RollbackConflictError.prototype);
 	}
+}
+
+/**
+ * The error a constraint violation raises under the conflict action it resolved to.
+ * Only FAIL and ROLLBACK need their own subclass, because finalization reads it to
+ * decide commit-versus-rollback; every other action is a plain ConstraintError.
+ */
+export function constraintErrorForAction(action: ConflictResolution | undefined, message: string): ConstraintError {
+	if (action === ConflictResolution.FAIL) return new FailConflictError(message);
+	if (action === ConflictResolution.ROLLBACK) return new RollbackConflictError(message);
+	return new ConstraintError(message);
 }
 
 /**

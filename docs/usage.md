@@ -708,7 +708,7 @@ db.getOption('foreign_keys');                    // returns OptionValue
 ### `db.exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void>`
 Executes one or more SQL statements separated by semicolons. Primarily intended for DDL, transaction control, or DML without results. Supports optional parameters and an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
-**Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), `exec()` automatically wraps the entire batch of statements in an implicit transaction. All statements commit together on success, or all rollback on error. This provides batch-level atomicity.
+**Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), each statement in the batch runs in its own implicit transaction: it commits on success and rolls back on error, and a later statement's failure does not undo earlier ones. Conflict actions change this: `ROLLBACK` also ends an explicit transaction, and `insert or fail` commits the rows before its violation (see [Conflict Resolution](sql-dml.md#conflict-resolution-or-clause)). Pass `{ transaction: true }` for an all-or-nothing batch.
 
 ### `db.prepare(sql: string): Statement`
 Prepares an SQL statement for execution, returning a `Statement` object. This is the entry point for using the `Statement` API (`run`, `get`, `all`, `bind`, etc.).

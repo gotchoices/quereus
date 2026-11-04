@@ -1239,6 +1239,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 								constraint: 'unique',
 								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 								existingRow: existingRow.slice(0, tombstoneIndex) as Row,
+								onConflict: effective,
 							};
 						}
 						// A PK REPLACE still owes every secondary UNIQUE its own action against
@@ -1655,6 +1656,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${this.tableName} PK.`,
 				existingRow: underlyingRow,
+				onConflict: effective,
 			}
 		};
 	}
@@ -1914,6 +1916,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${schema!.name} (${colNames})`,
 				existingRow: conflict.row,
+				onConflict: effective,
 			};
 		}
 		return null;

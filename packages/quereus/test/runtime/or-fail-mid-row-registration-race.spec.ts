@@ -329,8 +329,8 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 		// inside the implicit transaction, and the broadcast must reach a
 		// connection that registers mid-row. Engine-level CHECK throws
 		// above the executor (see prior test), so the failing row never
-		// opens its own bracket and the implicit transaction rollback is
-		// the cleanup path.
+		// opens its own bracket, and OR FAIL commits the implicit transaction
+		// to keep the rows before the violation.
 		await db.exec(`
 			create table parent (id integer primary key, n integer check (n > 0))
 			using race_parent
@@ -353,7 +353,7 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 		//   release(0)                   ← row 1 success
 		//   create(0), release(0)        ← row 2 success
 		//   (no row-3 bracket: CHECK throws above the executor)
-		//   rollback                     ← implicit-tx rollback on error
+		//   commit                       ← OR FAIL keeps rows 1 and 2
 		//
 		// The strict invariant: rows after registration (here, row 2) see
 		// their bracket-open create AND bracket-close release on the
@@ -365,11 +365,11 @@ describe('OR FAIL per-row savepoint broadcast — mid-row registration race', ()
 			.map(e => (e as { depth: number }).depth);
 		const releases = sibling!.trace.filter(e => e.op === 'release')
 			.map(e => (e as { depth: number }).depth);
-		const hasRollback = sibling!.trace.some(e => e.op === 'rollback');
+		const finalization = sibling!.trace.filter(e => e.op === 'commit' || e.op === 'rollback').map(e => e.op);
 
 		expect(creates).to.deep.equal([0, 0]);
 		expect(releases).to.deep.equal([0, 0]);
-		expect(hasRollback, 'implicit-tx rollback must reach the sibling on error').to.equal(true);
+		expect(finalization, 'the OR FAIL implicit-tx commit must reach the sibling').to.deep.equal(['commit']);
 	});
 
 	it('in-executor error path: vtab-level constraint broadcasts rollbackTo+release on the failing row\'s bracket', async () => {

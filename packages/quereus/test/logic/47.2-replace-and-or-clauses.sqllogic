@@ -162,3 +162,86 @@ select count(*) as cnt from ck2;
 → [{"cnt":1}]
 
 drop table ck2;
+
+-- ===================================
+-- 11. Declared ON CONFLICT ROLLBACK on a key — a duplicate key ends the enclosing
+--     transaction, for INSERT and UPDATE, exactly as INSERT OR ROLLBACK does
+-- ===================================
+
+create table dr_col (id integer primary key on conflict rollback, x integer);
+insert into dr_col values (1, 1), (2, 2);
+-- run
+
+begin;
+   insert into dr_col values (3, 3);
+   insert into dr_col values (1, 5);
+   -- error: UNIQUE constraint failed
+
+select id from dr_col order by id;
+→ [{"id":1},{"id":2}]
+
+begin;
+   insert into dr_col values (3, 3);
+   update dr_col set id = 1 where id = 2;
+   -- error: UNIQUE constraint failed
+
+select id from dr_col order by id;
+→ [{"id":1},{"id":2}]
+
+drop table dr_col;
+
+create table dr_tbl (id integer, x integer, primary key (id) on conflict rollback);
+insert into dr_tbl values (1, 1), (2, 2);
+-- run
+
+begin;
+   insert into dr_tbl values (3, 3);
+   insert into dr_tbl values (1, 5);
+   -- error: UNIQUE constraint failed
+
+select id from dr_tbl order by id;
+→ [{"id":1},{"id":2}]
+
+begin;
+   insert into dr_tbl values (3, 3);
+   update dr_tbl set id = 1 where id = 2;
+   -- error: UNIQUE constraint failed
+
+select id from dr_tbl order by id;
+→ [{"id":1},{"id":2}]
+
+drop table dr_tbl;
+
+create table dr_uq (id integer primary key, x integer unique on conflict rollback);
+insert into dr_uq values (1, 1), (2, 2);
+-- run
+
+begin;
+   insert into dr_uq values (3, 3);
+   insert into dr_uq values (4, 1);
+   -- error: UNIQUE constraint failed
+
+select id from dr_uq order by id;
+→ [{"id":1},{"id":2}]
+
+begin;
+   insert into dr_uq values (3, 3);
+   update dr_uq set x = 1 where id = 2;
+   -- error: UNIQUE constraint failed
+
+select id from dr_uq order by id;
+→ [{"id":1},{"id":2}]
+
+-- The statement's OR clause outranks the declared action: OR ABORT keeps the
+-- transaction open with its earlier row.
+begin;
+   insert into dr_uq values (3, 3);
+   insert or abort into dr_uq values (4, 1);
+   -- error: UNIQUE constraint failed
+
+select id from dr_uq order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+rollback;
+
+drop table dr_uq;

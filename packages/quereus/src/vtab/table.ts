@@ -175,8 +175,11 @@ export abstract class VirtualTable {
 	 *   is not the table's column count makes the executor fall back to `args.values`.
 	 *   For DELETE, only the presence of `row` is consulted, never its contents (the OLD
 	 *   image comes from the source scan), so a PK-only placeholder is acceptable.
-	 * - `{ status: 'constraint', constraint, message?, existingRow? }` - Constraint violation.
+	 * - `{ status: 'constraint', constraint, message?, existingRow?, onConflict? }` - Constraint violation.
 	 *   For 'unique' constraints, existingRow contains the conflicting row (enables UPSERT).
+	 *   `onConflict` reports the action the module resolved for this conflict (statement OR >
+	 *   per-constraint default > ABORT): FAIL and ROLLBACK then take effect as declared. A module
+	 *   that omits it gets the statement's OR clause alone, so a declared action acts as ABORT.
 	 *
 	 * Modules should return constraint violations rather than throwing ConstraintError for
 	 * expected violations (unique, check, not_null). This allows the engine to handle

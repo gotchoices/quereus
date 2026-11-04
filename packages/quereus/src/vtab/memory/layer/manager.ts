@@ -1115,7 +1115,7 @@ export class MemoryTableManager {
 		if (pkAction === ConflictResolution.IGNORE) {
 			return { status: 'ok', row: undefined };
 		}
-		return { status: 'constraint', constraint: 'unique', message, existingRow };
+		return { status: 'constraint', constraint: 'unique', message, existingRow, onConflict: pkAction };
 	}
 
 	private async performUpdate(
@@ -1494,7 +1494,8 @@ export class MemoryTableManager {
 				status: 'constraint',
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${this._tableName} (${colNames})`,
-				existingRow: conflictingRow
+				existingRow: conflictingRow,
+				onConflict,
 			};
 		}
 
@@ -1577,7 +1578,8 @@ export class MemoryTableManager {
 				status: 'constraint',
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${this._tableName} (${colNames})`,
-				existingRow: conflictingRow
+				existingRow: conflictingRow,
+				onConflict,
 			};
 		}
 
@@ -1647,7 +1649,8 @@ export class MemoryTableManager {
 				status: 'constraint',
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${this._tableName} (${colNames})`,
-				existingRow: existingRow
+				existingRow: existingRow,
+				onConflict,
 			};
 		}
 
