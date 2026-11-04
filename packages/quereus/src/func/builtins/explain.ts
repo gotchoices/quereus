@@ -224,9 +224,10 @@ interface SchedulerProgramEntry {
 // NOTE: a TVF body runs *inside* the statement that called it — under the
 // same exec mutex the caller already holds (Database._acquireExecMutex).
 // It must reach plan/emit/execute in-process (db.getPlan, db.prepare,
-// Statement.iterateRowsWithTrace) and never issue a nested top-level query
-// via db.eval/db.exec, which deadlocks waiting on a mutex the outer
-// statement cannot release until this generator returns.
+// Statement._iterateRowsNestedWithTrace) and never issue a nested top-level
+// query via db.eval/db.exec/Statement.iterateRowsWithTrace, which deadlocks
+// waiting on a mutex the outer statement cannot release until this generator
+// returns.
 //
 // Shared by scheduler_program() and execution_trace(), which must report the
 // same (full, sub-program) instruction listing — execution_trace() joins its
@@ -508,7 +509,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 
 				// Execute the query with tracing to collect actual instruction events
 				const results: Row[] = [];
-				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
+				for await (const row of stmt._iterateRowsNestedWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
 
@@ -672,7 +673,7 @@ export const rowTraceFunc = createIntegratedTableValuedFunction(
 
 				// Execute the query with tracing to collect row-level events
 				const results: Row[] = [];
-				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
+				for await (const row of stmt._iterateRowsNestedWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
 

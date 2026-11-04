@@ -24,7 +24,10 @@ export interface VirtualTableConnection {
 	/** Begins a transaction on this connection */
 	begin(): MaybePromise<void>;
 
-	/** Commits the current transaction */
+	/**
+	 * Commits the current transaction. Runs under the execution mutex, so awaiting a
+	 * statement on the same database here hangs it; schedule that work without awaiting it.
+	 */
 	commit(): MaybePromise<void>;
 
 	/** Rolls back the current transaction */

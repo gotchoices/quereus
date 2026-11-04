@@ -150,6 +150,8 @@ class MyTable extends VirtualTable {
 }
 ```
 
+**`commit()` runs under the execution mutex.** Every statement holds the mutex until its transaction has finished, commit included, so the next statement cannot start until `commit()` returns. A `commit()` that awaits a statement on the same database therefore hangs permanently: the statement waits for the mutex and the mutex waits for `commit()`. The engine cannot detect this and throw, because a re-entrant statement looks the same as an unrelated caller who should queue. Schedule that work without awaiting it, and let it run once the mutex is free. `db._isExecuting()` reports whether the mutex is held, for code that can be reached both inside and outside a statement.
+
 **`DatabaseInternal` methods:**
 
 | Method | Description |

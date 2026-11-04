@@ -54,7 +54,6 @@ import { emptyBoundParams, getParameterTypes, normalizeBoundParams } from './par
 import { rowToObject } from './utils.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
-import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { Latches } from '../util/latches.js';
 import {
 	DatabaseEventEmitter,
@@ -872,6 +871,46 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		}
 	}
 
+	/**
+	 * @internal Runs a statement's iteration under the execution mutex, held from before
+	 * the first row until its implicit transaction has finished, commit included. A closed
+	 * database or an aborted signal is refused before the mutex is taken, and a generator
+	 * that is never started runs none of this, so neither case can touch a transaction.
+	 */
+	async *_iterateSerialized<T>(body: () => AsyncIterable<T>, signal?: AbortSignal): AsyncGenerator<T> {
+		this.checkOpen();
+		throwIfAborted(signal);
+		const releaseMutex = await this._acquireExecMutex();
+		try {
+			yield* this._iterateFinalizing(body);
+		} finally {
+			// NOTE: this release follows awaits in `finally` blocks, so it relies on
+			// spec-conformant return() handling; hosts that drop it are refused by
+			// ensureAsyncGeneratorCleanupSupported() before any statement runs.
+			releaseMutex();
+		}
+	}
+
+	/**
+	 * @internal Runs `body`, then finalizes the implicit transaction once it ends. The
+	 * row source unwinds first. An early `return()` skips the `catch`, so stopping a
+	 * statement early commits it. A failing commit or rollback replaces any error
+	 * `body` threw. Caller holds the execution mutex.
+	 */
+	async *_iterateFinalizing<T>(body: () => AsyncIterable<T>): AsyncGenerator<T> {
+		let failed = false;
+		let failure: unknown;
+		try {
+			yield* body();
+		} catch (e) {
+			failed = true;
+			failure = e;
+			throw e;
+		} finally {
+			await this._finalizeImplicitTransaction(!failed, failure);
+		}
+	}
+
 	// ============================================================================
 	// Transaction Control - Delegated to TransactionManager
 	// ============================================================================
@@ -941,9 +980,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * roll back the active transaction (implicit or explicit) per SQLite
 	 * semantics. FailConflictError commits prior rows even though the
 	 * statement aborted (per OR FAIL semantics).
+	 *
+	 * Caller holds the execution mutex, and throws otherwise. Nothing records who
+	 * opened a transaction: holding the mutex is what makes an open implicit
+	 * transaction the caller's own, because every statement finalizes before it
+	 * releases the mutex. Outside the mutex this could end another statement's
+	 * transaction, including one that is partway through committing.
 	 * @internal
 	 */
 	async _finalizeImplicitTransaction(success: boolean, error?: unknown): Promise<void> {
+		if (this.execMutexDepth === 0) {
+			throw new QuereusError('Implicit transaction finalized without holding the execution mutex', StatusCode.INTERNAL);
+		}
+
 		// OR ROLLBACK: roll back any active transaction (implicit or explicit).
 		if (!success && error instanceof RollbackConflictError) {
 			if (this.transactionManager.isInTransaction()) {
@@ -1228,15 +1277,6 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	async _execAstWithinTransaction(batch: AST.Statement[], params?: SqlParameters): Promise<void> {
 		if (batch.length === 0) return;
 		await this._executeStatementBatch(batch, params);
-	}
-
-	/**
-	 * Execute a function with mutex held.
-	 * Transaction management is handled by the executor if needed.
-	 * @internal
-	 */
-	async _runWithMutex<T>(executor: () => Promise<T>): Promise<T> {
-		return this._withMutex(executor);
 	}
 
 	/**
@@ -2286,7 +2326,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * or if an error occurs.
 	 *
 	 * Transactions are started lazily (just-in-time) when the first DML or DDL
-	 * operation occurs. The mutex is held for the entire iteration.
+	 * operation occurs. The mutex is held for the entire iteration, including the
+	 * commit that ends it; a failed commit rejects `next()` or `return()`.
 	 *
 	 * @param sql The SQL query string to execute.
 	 * @param params Optional parameters to bind (array for positional, object for named).
@@ -2315,9 +2356,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// delegating generator, so an unconsumed iterator holds no resources.
 			return this._evalRoutedGenerator(sql, params, options);
 		}
-		return wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
-			this._finalizeImplicitTransaction(commit, error)
-		);
+		return this._evalSerialized(sql, params, options?.signal);
+	}
+
+	private _evalSerialized(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+		return this._iterateSerialized(() => this._evalGenerator(sql, params, signal), signal);
 	}
 
 	/**
@@ -2326,7 +2369,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * (never touching the implicit-transaction lifecycle — the writer owns any
 	 * open one); everything else — multi-statement batches included — delegates
 	 * to the serialized path with identical semantics. `yield*` forwards
-	 * `return()`/`throw()` into the wrapped serialized iterator, so its
+	 * `return()`/`throw()` into the serialized generator, so its
 	 * transaction-finalize cleanup still runs on early exit.
 	 */
 	private async *_evalRoutedGenerator(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Record<string, SqlValue>> {
@@ -2350,9 +2393,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			}
 			if (!eligible) {
 				await candidate.finalize();
-				yield* wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
-					this._finalizeImplicitTransaction(commit, error)
-				);
+				yield* this._evalSerialized(sql, params, options?.signal);
 				return;
 			}
 			stmt = candidate;
@@ -2369,25 +2410,18 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * Internal generator for eval() that yields result rows.
-	 * Transaction finalization is handled by the wrapper returned by eval().
+	 * Internal generator for eval() that prepares the statement, yields its result
+	 * rows and finalizes it. Runs inside {@link _iterateSerialized}.
 	 * @internal
 	 */
 	private async *_evalGenerator(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
-		this.checkOpen();
-		// Pre-flight cancellation before acquiring the mutex / preparing.
-		throwIfAborted(signal);
-
-		const releaseMutex = await this._acquireExecMutex();
-		let stmt: Statement | null = null;
+		// Prepare WITH the parameters so the plan is typed from their values, not
+		// from emptiness: `getColumnNames()` below compiles, and a statement compiled
+		// before its first bind plans every parameter as ANY (see
+		// Statement.establishParameterTypes).
+		const stmt = this.prepare(sql, params);
 
 		try {
-			// Prepare WITH the parameters so the plan is typed from their values, not
-			// from emptiness: `getColumnNames()` below compiles, and a statement compiled
-			// before its first bind plans every parameter as ANY (see
-			// Statement.establishParameterTypes).
-			stmt = this.prepare(sql, params);
-
 			if (stmt.astBatch.length === 0) {
 				return;
 			}
@@ -2420,11 +2454,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				}
 			}
 		} finally {
-			// NOTE: the release after this await relies on spec-conformant
-			// return() handling; hosts that drop it are refused by
-			// ensureAsyncGeneratorCleanupSupported() before any statement runs.
-			if (stmt) { await stmt.finalize(); }
-			releaseMutex();
+			await stmt.finalize();
 		}
 	}
 
@@ -2948,6 +2978,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * assertion COMMIT eval), once per commit, with all matching watches in
 	 * a single {@link WatchEvent}. Handler errors are caught and logged —
 	 * they do not roll the commit back (assertions own that contract).
+	 *
+	 * The commit awaits the handler while holding the execution mutex, so a
+	 * handler that awaits a statement on this database hangs it. Start such a
+	 * statement without awaiting it; see `docs/change-scope.md`.
 	 *
 	 * Validation is synchronous:
 	 * - Throws if `scope.unboundParameters` is non-empty (caller must

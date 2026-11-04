@@ -23,7 +23,6 @@ import type { BuildTimeDependencyTracker, SchemaDependency } from '../planner/pl
 import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
-import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { combineAbortSignals } from '../util/abort-signal.js';
 import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
@@ -722,7 +721,8 @@ export class Statement {
 
 	/**
 	 * Iterates over result rows. Handles JIT transaction management - commits
-	 * implicit transactions on successful completion, rolls back on error.
+	 * implicit transactions on successful completion, rolls back on error. The
+	 * execution mutex is held until that has finished.
 	 *
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
 	 *   cooperative cancellation — checked on the first pull and at every row
@@ -734,44 +734,58 @@ export class Statement {
 			// writer owns any open implicit transaction (see _iterateConcurrent).
 			return this._iterateConcurrent(params, options);
 		}
-		return wrapAsyncIterator(this._iterateRowsGenerator(params, options?.signal), (commit, error) =>
-			this.db._finalizeImplicitTransaction(commit, error)
-		);
+		return this._iterateRowsSerialized(params, options?.signal);
 	}
 
-	/**
-	 * Internal generator for iterateRows() that holds the exec mutex for the whole
-	 * iteration, so two public iterations over the same db can't interleave the
-	 * implicit-transaction lifecycle. Mirrors {@link _allGenerator}, but yields raw
-	 * `Row` (no `rowToObject`). Transaction finalization is handled by the wrapper
-	 * returned by iterateRows().
-	 *
-	 * NOTE: on normal completion wrapAsyncIterator runs the transaction-finalize
-	 * cleanup after this generator's finally (mutex release), so the implicit-txn
-	 * commit lands just outside the mutex — same ordering as all()/`_allGenerator`.
-	 * @internal
-	 */
-	private async *_iterateRowsGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Row> {
-		// Pre-flight cancellation before acquiring the mutex, mirroring _allGenerator/eval().
-		throwIfAborted(signal);
-		const releaseMutex = await this.db._acquireExecMutex();
+	private _iterateRowsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Row> {
+		return this.db._iterateSerialized(() => this._iterateRowsRaw(params, signal), signal);
+	}
 
-		try {
-			yield* this._iterateRowsRaw(params, signal);
-		} finally {
-			releaseMutex();
+	private _iterateObjectsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+		return this.db._iterateSerialized(() => this._iterateObjectsRaw(params, signal), signal);
+	}
+
+	private async *_iterateObjectsRaw(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+		const names = this.getColumnNames();
+		for await (const row of this._iterateRowsRaw(params, signal)) {
+			yield rowToObject(row, names);
 		}
 	}
 
 	/**
 	 * Iterates over result rows while forcing instruction tracing for this execution.
 	 * Metrics are disabled for trace runs to ensure the tracing scheduler mode is used.
+	 *
+	 * Takes the execution mutex, so code already running inside a statement, such as a
+	 * table-valued function body, must call {@link _iterateRowsNestedWithTrace} instead.
 	 */
 	iterateRowsWithTrace(params: SqlParameters | SqlValue[] | undefined, tracer: InstructionTracer): AsyncIterableIterator<Row> {
-		return wrapAsyncIterator(
-			this._iterateRowsRawInternal(params, { tracer, enableMetrics: false }),
-			(commit, error) => this.db._finalizeImplicitTransaction(commit, error)
-		);
+		return this.db._iterateSerialized(() => this._iterateRowsTraced(params, tracer));
+	}
+
+	/**
+	 * {@link iterateRowsWithTrace} for a statement run inside another statement, whose
+	 * caller already holds the execution mutex. An implicit transaction open at the start
+	 * belongs to the enclosing statement, which finalizes it; with none open, any
+	 * transaction this statement starts is its own. Left on the type surface because
+	 * table-valued functions outside this package need it (see
+	 * `createIntegratedTableValuedFunction`).
+	 *
+	 * NOTE: when an enclosing implicit transaction is open and this statement fails, the
+	 * trace functions swallow the error, so its partial writes stay in the enclosing
+	 * transaction. Rare and diagnostic-only; if it matters, wrap this run in a savepoint.
+	 */
+	async *_iterateRowsNestedWithTrace(params: SqlParameters | SqlValue[] | undefined, tracer: InstructionTracer): AsyncGenerator<Row> {
+		const body = () => this._iterateRowsTraced(params, tracer);
+		if (this.db._isImplicitTransaction()) {
+			yield* body();
+		} else {
+			yield* this.db._iterateFinalizing(body);
+		}
+	}
+
+	private _iterateRowsTraced(params: SqlParameters | SqlValue[] | undefined, tracer: InstructionTracer): AsyncIterable<Row> {
+		return this._iterateRowsRawInternal(params, { tracer, enableMetrics: false });
 	}
 
 	getColumnNames(): string[] {
@@ -883,21 +897,9 @@ export class Statement {
 			return;
 		}
 
-		await this.db._runWithMutex(async () => {
-			let success = false;
-			let runError: unknown;
-			try {
-				for await (const _ of this._iterateRowsRaw(params, options?.signal)) {
-					/* Consume all rows */
-				}
-				success = true;
-			} catch (e) {
-				runError = e;
-				throw e;
-			} finally {
-				await this.db._finalizeImplicitTransaction(success, runError);
-			}
-		});
+		for await (const _ of this._iterateRowsSerialized(params, options?.signal)) {
+			/* Consume all rows */
+		}
 	}
 
 	/**
@@ -923,32 +925,17 @@ export class Statement {
 			return undefined;
 		}
 
-		return this.db._runWithMutex(async () => {
-			let result: Record<string, SqlValue> | undefined;
-			let success = false;
-			let getError: unknown;
-
-			try {
-				const names = this.getColumnNames();
-				for await (const row of this._iterateRowsRaw(params, options?.signal)) {
-					result = rowToObject(row, names);
-					break; // Only need the first row
-				}
-				success = true;
-				return result;
-			} catch (e) {
-				getError = e;
-				throw e;
-			} finally {
-				await this.db._finalizeImplicitTransaction(success, getError);
-			}
-		});
+		// The early return closes the generator, which commits; a failed commit rejects here.
+		for await (const row of this._iterateObjectsSerialized(params, options?.signal)) {
+			return row;
+		}
+		return undefined;
 	}
 
 	/**
 	 * Executes the prepared statement, binds parameters, and retrieves all result rows.
 	 * Transactions are started lazily (just-in-time) when needed.
-	 * The mutex is held for the entire iteration.
+	 * The mutex is held for the entire iteration, including the commit that ends it.
 	 *
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
 	 *   cooperative cancellation — checked before acquiring the mutex and at every
@@ -961,13 +948,11 @@ export class Statement {
 			return this._allConcurrentGenerator(params, options);
 		}
 
-		return wrapAsyncIterator(this._allGenerator(params, options?.signal), (commit, error) =>
-			this.db._finalizeImplicitTransaction(commit, error)
-		);
+		return this._iterateObjectsSerialized(params, options?.signal);
 	}
 
 	/**
-	 * @internal Committed-read counterpart of {@link _allGenerator}: maps the
+	 * @internal Committed-read counterpart of {@link _iterateObjectsRaw}: maps the
 	 * mutex-free row stream to objects. No transaction finalization — see
 	 * {@link _iterateConcurrent}.
 	 */
@@ -975,26 +960,6 @@ export class Statement {
 		const names = this.getColumnNames();
 		for await (const row of this._iterateConcurrent(params, options)) {
 			yield rowToObject(row, names);
-		}
-	}
-
-	/**
-	 * Internal generator for all() that holds the mutex.
-	 * Transaction finalization is handled by the wrapper returned by all().
-	 * @internal
-	 */
-	private async *_allGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
-		// Pre-flight cancellation before acquiring the mutex, mirroring eval().
-		throwIfAborted(signal);
-		const releaseMutex = await this.db._acquireExecMutex();
-
-		try {
-			const names = this.getColumnNames();
-			for await (const row of this._iterateRowsRaw(params, signal)) {
-				yield rowToObject(row, names);
-			}
-		} finally {
-			releaseMutex();
 		}
 	}
 

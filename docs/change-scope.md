@@ -392,10 +392,12 @@ received over a network.
 - **Empty match → no fire.** If every `TableWatch` would have an empty
   hits set (e.g. a `rows(pk=[7])` watch when only id=8 changed), the
   handler is not called at all.
-- **Re-entrancy is safe.** A handler that calls `database.watch` or
-  `subscription.unsubscribe` during a fire is legal; the kernel
-  iterates a snapshot of subscriptions per commit, so the new/removed
-  subscription takes effect on the next commit, not the current one.
+- **Changing subscriptions from a handler is safe.** A handler that calls
+  `database.watch` or `subscription.unsubscribe` during a fire is legal;
+  the kernel iterates a snapshot of subscriptions per commit, so the
+  new/removed subscription takes effect on the next commit, not the
+  current one. Awaiting a statement is not safe: see
+  [Handlers run under the execution mutex](#handlers-run-under-the-execution-mutex).
 
 ### `hits` semantics
 
@@ -444,6 +446,16 @@ Asymmetric with assertions: assertions enforce (a violation rolls the
 commit back); watchers observe. A handler that throws — synchronously
 or via a rejected Promise — has its error logged and swallowed. The
 commit has already succeeded by the time the handler runs.
+
+### Handlers run under the execution mutex
+
+The commit awaits any promise a handler returns, and the writing
+statement holds the execution mutex until its commit finishes. A handler
+that awaits a statement on the same database therefore hangs that
+database permanently: the statement waits for the mutex and the mutex
+waits for the handler. To query after a change, start the query without
+awaiting it, so that it queues and runs once the commit has finished and
+the mutex is free.
 
 ### Schema-change invalidation
 
