@@ -978,11 +978,14 @@ export interface DeclaredAssertion extends AstNode {
 	assertionStmt: CreateAssertionStmt;
 }
 
-/** Placeholder for domain/collation/import items to keep parser forward-compatible */
+/**
+ * An item the parser has no grammar for (domain, collation, import, or any other
+ * unrecognized leading word), kept so the block still parses. `text` is its source
+ * text, which the SQL writer emits verbatim.
+ */
 export interface DeclareIgnoredItem extends AstNode {
 	type: 'declareIgnored';
-	kind: 'domain' | 'collation' | 'import';
-	text: string; // original text snippet for hashing/canonicalization if needed
+	text: string;
 }
 
 export interface DiffSchemaStmt extends AstNode {

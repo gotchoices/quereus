@@ -38,7 +38,7 @@ declare schema schema_name
     created_at text not null default (datetime('now'))
   }
   
-  -- Or with explicit USING clause
+  -- Or with explicit USING clause (see "Module clause placement" below)
   table sessions (
     id text primary key,
     user_id integer not null,
@@ -95,6 +95,27 @@ declare schema schema_name
 }
 ```
 
+#### Module clause placement
+
+A table item names its module with `using <module> [(<args>)]`, either directly after
+the body, as in `create table`, or directly before it:
+
+```sql
+declare schema main {
+  table t1 (id integer primary key) using memory (x = 'a') with tags (t = 1);
+  table t2 using memory { id integer primary key }
+  table t3 using memory () (id integer primary key)
+}
+```
+
+A `(` directly after a leading module name is always its argument list. So
+`table t using memory (id integer primary key)` is a parse error: `using m (a, b)`
+could equally be arguments or untyped columns. Use the trailing form, an empty
+argument list (`using m () (…)`), or braces (`using m { … }`).
+
+Naming a module on both sides of the body, or after a `maintained` or `with` clause,
+is a parse error. The SQL writer always emits the trailing form.
+
 #### Item keywords and bare aliases
 
 Items in a declaration block need no separator, so the leading keyword of an item
@@ -127,7 +148,8 @@ declare schema main {
 
 An item kind the parser doesn't model yet (`domain`, `collation`, `import`) is
 skipped up to the next `;`, the closing `}`, or the next item keyword — separate
-those items with `;` when their body could itself contain an item keyword.
+those items with `;` when their body could itself contain an item keyword. Its
+source text is kept, and the SQL writer emits it verbatim.
 
 ### Diffing and Applying
 

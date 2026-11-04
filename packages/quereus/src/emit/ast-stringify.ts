@@ -1214,7 +1214,7 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
 	}
 
-	const usingClause = mvModuleClauseToString(stmt);
+	const usingClause = moduleClauseToString(stmt);
 	if (usingClause) parts.push(usingClause);
 
 	// A trailing `with defaults (…)` rides inside the body string (selectToString).
@@ -1224,19 +1224,6 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
 
 	return parts.join(' ');
-}
-
-/** `using <module>(args)` clause for a materialized view, or '' when absent. */
-function mvModuleClauseToString(stmt: AST.CreateMaterializedViewStmt): string {
-	if (!stmt.moduleName) return '';
-	let s = `using ${quoteIdentifier(stmt.moduleName)}`;
-	if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
-		const args = Object.entries(stmt.moduleArgs).map(([k, v]) =>
-			`${quoteIdentifier(k)} = ${JSON.stringify(v)}`
-		);
-		s += ` (${args.join(', ')})`;
-	}
-	return s;
 }
 
 export function refreshMaterializedViewToString(stmt: AST.RefreshMaterializedViewStmt): string {
@@ -1441,26 +1428,14 @@ function declareItemToString(it: AST.DeclareItem): string {
 		case 'declaredMaterializedView': return declaredMaterializedViewToString(it);
 		case 'declaredSeed': return declaredSeedToString(it);
 		case 'declaredAssertion': return declaredAssertionToString(it);
-		case 'declareIgnored': return it.text || '-- ignored';
+		// Items are written on one line, so a text-less item must not become a `--` comment.
+		case 'declareIgnored': return it.text || '/* ignored */';
 	}
 }
 
 function declaredTableToString(it: AST.DeclaredTable): string {
 	const stmt = it.tableStmt;
-	const parts: string[] = ['table', quoteIdentifier(stmt.table.name)];
-
-	const using = moduleClauseToString(stmt);
-	if (using) parts.push(using);
-
-	parts.push(tableBodyDefsToString(stmt));
-
-	const ctx = contextClauseToString(stmt.contextDefinitions);
-	if (ctx) parts.push(ctx);
-
-	const tagStr = tagsClauseToString(stmt.tags);
-	if (tagStr) parts.push(tagStr.trimStart());
-
-	return parts.join(' ');
+	return ['table', quoteIdentifier(stmt.table.name), ...tableDefinitionParts(stmt)].join(' ');
 }
 
 function declaredIndexToString(it: AST.DeclaredIndex): string {
@@ -1500,7 +1475,7 @@ function declaredMaterializedViewToString(it: AST.DeclaredMaterializedView): str
 		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
 	}
 
-	const usingClause = mvModuleClauseToString(stmt);
+	const usingClause = moduleClauseToString(stmt);
 	if (usingClause) parts.push(usingClause);
 
 	// A trailing `with defaults (…)` rides inside the body string (selectToString).
@@ -1857,16 +1832,32 @@ function tableBodyDefsToString(stmt: AST.CreateTableStmt): string {
 	return `(${definitions.join(', ')})`;
 }
 
-function moduleClauseToString(stmt: AST.CreateTableStmt): string {
+function moduleClauseToString(stmt: Pick<AST.CreateTableStmt, 'moduleName' | 'moduleArgs'>): string {
 	if (!stmt.moduleName) return '';
 	let s = `using ${quoteIdentifier(stmt.moduleName)}`;
 	if (stmt.moduleArgs && Object.keys(stmt.moduleArgs).length > 0) {
 		const args = Object.entries(stmt.moduleArgs).map(([key, value]) =>
-			`${quoteIdentifier(key)} = ${JSON.stringify(value)}`
+			`${quoteIdentifier(key)} = ${sqlValueToSqlLiteral(value)}`
 		).join(', ');
 		s += ` (${args})`;
 	}
 	return s;
+}
+
+/**
+ * Everything after a table's name, shared by `create table` and declared table items.
+ * `using` follows the body because a `(` straight after a module name always reads as
+ * its argument list.
+ */
+function tableDefinitionParts(stmt: AST.CreateTableStmt): string[] {
+	const clauses = [
+		tableBodyDefsToString(stmt),
+		moduleClauseToString(stmt),
+		maintainedClauseToString(stmt.maintained),
+		contextClauseToString(stmt.contextDefinitions),
+		tagsClauseToString(stmt.tags).trimStart(),
+	];
+	return clauses.filter(clause => clause !== '');
 }
 
 export function contextClauseToString(vars: readonly AST.MutationContextVar[] | undefined): string {
@@ -1888,20 +1879,7 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const tableName = quoteIdentifier(stmt.table.name);
 	const schemaName = stmt.table.schema ? quoteIdentifier(stmt.table.schema) : undefined;
 	parts.push(schemaName ? `${schemaName}.${tableName}` : tableName);
-
-	parts.push(tableBodyDefsToString(stmt));
-
-	const using = moduleClauseToString(stmt);
-	if (using) parts.push(using);
-
-	const maintained = maintainedClauseToString(stmt.maintained);
-	if (maintained) parts.push(maintained);
-
-	const ctx = contextClauseToString(stmt.contextDefinitions);
-	if (ctx) parts.push(ctx);
-
-	const tagStr = tagsClauseToString(stmt.tags);
-	if (tagStr) parts.push(tagStr.trimStart());
+	parts.push(...tableDefinitionParts(stmt));
 
 	return parts.join(' ');
 }

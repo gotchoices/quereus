@@ -24,8 +24,8 @@ declare logical schema App {
 ```sql
 -- The storage — ordinary module-backed tables. Quereus calls this the "basis".
 declare schema Store {
-  table CarCore  (id int primary key, make text)    using mem();
-  table CarSpeed (id int primary key, topSpeed int) using mem();
+  table CarCore  (id int primary key, make text)    using memory;
+  table CarSpeed (id int primary key, topSpeed int) using memory;
 }
 ```
 
@@ -477,8 +477,8 @@ declare logical schema X {
 
 -- Basis: a physical schema — module-backed tables plus index materialized views.
 declare schema Y {
-  table CarCore (id int primary key, ...) using mem();
-  table CarPerf (id int primary key, speed int, ...) using mem();
+  table CarCore (id int primary key, ...) using memory;
+  table CarPerf (id int primary key, speed int, ...) using memory;
   create materialized view ix_carperf_speed as
     select speed, id from CarPerf order by speed;   -- clustered index over CarPerf
 }

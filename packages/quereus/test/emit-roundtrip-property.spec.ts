@@ -356,6 +356,22 @@ function makeTableConstraintArb(columnNames: string[]): fc.Arbitrary<AST.TableCo
 // CREATE TABLE
 // ------------------------------------------------------------------------
 
+/** A module argument value the parser reads back unchanged. Strings may hold either quote character. */
+const moduleArgValueArb: fc.Arbitrary<number | string | null> = fc.oneof(
+	fc.integer({ min: -1000, max: 1000 }),
+	fc.stringMatching(/^[a-zA-Z0-9 _"']{0,8}$/),
+	fc.constant(null),
+);
+
+/** `using <module> [(<args>)]`, or no clause at all. */
+const moduleClauseArb: fc.Arbitrary<Pick<AST.CreateTableStmt, 'moduleName' | 'moduleArgs'>> = fc.option(
+	fc.record({
+		moduleName: identArb,
+		moduleArgs: fc.option(fc.dictionary(identArb, moduleArgValueArb, { minKeys: 1, maxKeys: 2 }), { nil: undefined }),
+	}),
+	{ nil: undefined },
+).map(clause => clause ?? {});
+
 const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,                                  // table name
 	uniqueIdents(3),                            // column names (3 fixed so table constraints have something to reference)
@@ -367,12 +383,14 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	return fc.tuple(
 		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
-	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
+		moduleClauseArb,
+	).map(([c0, c1, c2, constraints, moduleClause]): AST.CreateTableStmt => ({
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists,
 		columns: [c0, c1, c2],
 		constraints,
+		...moduleClause,
 	}));
 });
 
@@ -682,6 +700,15 @@ const createAssertionArb: fc.Arbitrary<AST.CreateAssertionStmt> = fc.record({
 // DECLARE SCHEMA (items round-trip)
 // ------------------------------------------------------------------------
 
+/** `maintained [(<columns>)] as <body>`, or no clause at all. */
+const maintainedClauseArb: fc.Arbitrary<AST.MaintainedClause | undefined> = fc.option(
+	fc.record({
+		columns: fc.option(uniqueIdents(2), { nil: undefined }),
+		select: simpleSelectArb,
+	}),
+	{ nil: undefined },
+);
+
 /**
  * Declared-table inner CreateTableStmt. The declarative grammar forces
  * `ifNotExists` to false (no `IF NOT EXISTS` at the item level), so we pin it
@@ -697,12 +724,16 @@ const declaredTableInnerArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	return fc.tuple(
 		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
-	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
+		moduleClauseArb,
+		maintainedClauseArb,
+	).map(([c0, c1, c2, constraints, moduleClause, maintained]): AST.CreateTableStmt => ({
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists: false,
 		columns: [c0, c1, c2],
 		constraints,
+		...moduleClause,
+		maintained,
 	}));
 });
 

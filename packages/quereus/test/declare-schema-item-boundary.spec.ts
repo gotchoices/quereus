@@ -14,7 +14,7 @@ import { expect } from 'chai';
 import { parse } from '../src/parser/index.js';
 import { astToString } from '../src/emit/ast-stringify.js';
 import type {
-	DeclareSchemaStmt, DeclaredView, DeclaredMaterializedView, DeclaredSeed, DeclaredTable,
+	DeclareSchemaStmt, DeclareIgnoredItem, DeclaredView, DeclaredMaterializedView, DeclaredSeed, DeclaredTable,
 	SelectStmt, TableSource, SubquerySource, FunctionSource, DeclareLensStmt,
 	Expression, ColumnExpr, ExistsExpr, SubqueryExpr,
 } from '../src/parser/ast.js';
@@ -373,6 +373,77 @@ describe('declare schema item boundaries', () => {
 				}`
 			);
 			expect(itemKinds(stmt)).to.deep.equal(['declaredTable', 'declareIgnored']);
+		});
+	});
+
+	describe('unrecognized items survive a stringify round trip', () => {
+
+		const roundTrip = (body: string): DeclareSchemaStmt =>
+			parseDeclared(astToString(parse(`declare schema main { ${body} }`)));
+
+		const items = [
+			'domain d1 as text',
+			'collation c1 using x',
+			`import schema auth from 'https://example.com/auth.sql' version '^2'`,
+			'domain d1 as decimal(10, 2)',
+			'collation c1 using x { y }',
+			// The retained text keeps this newline, so the comment ends before the emitted `;`.
+			'domain d1 -- note\n as text',
+		];
+
+		for (const item of items) {
+			it(`keeps \`${item}\` and the table after it`, () => {
+				const stmt = roundTrip(`${item}; table t1 { id integer primary key }`);
+				expect(itemKinds(stmt)).to.deep.equal(['declareIgnored', 'declaredTable']);
+				expect((stmt.items[0] as DeclareIgnoredItem).text).to.equal(item);
+				expect((stmt.items[1] as DeclaredTable).tableStmt.table.name).to.equal('t1');
+			});
+		}
+
+		it('keeps an ignored item that comes last', () => {
+			const stmt = roundTrip('table t1 { id integer primary key } domain d1 as text');
+			expect(itemKinds(stmt)).to.deep.equal(['declaredTable', 'declareIgnored']);
+			expect((stmt.items[0] as DeclaredTable).tableStmt.table.name).to.equal('t1');
+		});
+
+		it('keeps a block holding only ignored items', () => {
+			const stmt = roundTrip('domain d1 as text; collation c1 using x');
+			expect(itemKinds(stmt)).to.deep.equal(['declareIgnored', 'declareIgnored']);
+		});
+
+		it('emits a text-less item as a comment that does not swallow the block end', () => {
+			const emitted = astToString({
+				type: 'declareSchema',
+				schemaName: 'main',
+				items: [{ type: 'declareIgnored', text: '' }],
+			} as DeclareSchemaStmt);
+			expect(parseDeclared(emitted).items).to.deep.equal([]);
+		});
+	});
+
+	describe('table module clause', () => {
+
+		it('reads a trailing `using` with arguments and tags as one item', () => {
+			const stmt = parseDeclared(
+				`declare schema main {
+					table t1 (id integer primary key) using memory (x = 'a', 'b') with tags (t = 1)
+				}`
+			);
+			expect(itemKinds(stmt)).to.deep.equal(['declaredTable']);
+			const { moduleName, moduleArgs, tags } = (stmt.items[0] as DeclaredTable).tableStmt;
+			expect(moduleName).to.equal('memory');
+			expect(moduleArgs).to.deep.equal({ x: 'a', 0: 'b' });
+			expect(tags).to.deep.equal({ t: 1 });
+		});
+
+		it('rejects `using` on both sides of the body', () => {
+			expect(() => parse(`declare schema main { table t1 using a (b = 1) (id integer primary key) using c }`))
+				.to.throw(/USING/);
+		});
+
+		it('rejects `using` after the `with` clauses', () => {
+			expect(() => parse(`declare schema main { table t1 (id integer primary key) with tags (t = 1) using memory }`))
+				.to.throw(/USING/);
 		});
 	});
 

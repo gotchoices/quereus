@@ -620,7 +620,9 @@ declare_lens_stmt  = "declare" "lens" "for" schema_name "over" schema_name
 
 schema_option      = identifier "=" string_literal ;
 
-schema_item        = "table" table_name ( "{" | "(" ) column_def { "," ( column_def | table_constraint ) } ( "}" | ")" )
+/* A table item takes at most one "using" clause, on either side of its body. */
+schema_item        = "table" table_name [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ]
+                     ( "{" | "(" ) column_def { "," ( column_def | table_constraint ) } ( "}" | ")" )
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] ";"
                    | "index" index_name "on" table_name "(" indexed_column { "," indexed_column } ")" ";"
                    | "view" view_name [ "(" column_name { "," column_name } ")" ] "as" select_stmt ";"

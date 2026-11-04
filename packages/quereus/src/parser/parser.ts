@@ -59,6 +59,7 @@ const LENS_OVERRIDE_KEYWORDS: ReadonlySet<string> = new Set(['VIEW']);
  * If only the parser is updated, SQL round-trips and persisted schemas will silently lose the new syntax.
  */
 export class Parser {
+	private source = '';
 	private tokens: Token[] = [];
 	private current = 0;
 	// Counter for positional parameters
@@ -81,6 +82,7 @@ export class Parser {
 	 * @returns this parser instance for chaining
 	 */
 	initialize(sql: string): Parser {
+		this.source = sql;
 		const lexer = new Lexer(sql);
 		this.tokens = lexer.scanTokens();
 		this.current = 0;
@@ -2683,33 +2685,7 @@ export class Parser {
 			throw this.error(this.peek(), "Expected '(' or 'AS' after table name.");
 		}
 
-		let moduleName: string | undefined;
-		const moduleArgs: Record<string, SqlValue> = {};
-        if (this.matchKeyword('USING')) {
-			moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
-            if (this.match(TokenType.LPAREN)) {
-				let positionalIndex = 0;
-                if (!this.check(TokenType.RPAREN)) {
-                    do {
-						// Check if this is a positional argument (string/number literal) or named argument (identifier=value)
-						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
-							// Positional argument
-							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
-						} else if (this.check(TokenType.IDENTIFIER)) {
-							// Could be named argument or identifier value
-							const nameValue = this.nameValueItem('module argument');
-							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
-								? getSyncLiteral(nameValue.value)
-								: (nameValue.value && nameValue.value.type === 'identifier' ? nameValue.value.name : nameValue.name);
-						} else {
-							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
-						}
-                    } while (this.match(TokenType.COMMA));
-                }
-                this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
-            }
-		}
+		const moduleClause = this.parseModuleClause();
 
 		// Optional `maintained as <body … with defaults (…)>` clause — the declared-shape
 		// maintained-table form. `maintained` is contextual (an IDENTIFIER lexeme match), and
@@ -2744,13 +2720,41 @@ export class Parser {
 			ifNotExists,
 			columns,
 			constraints,
-			moduleName,
-			moduleArgs,
+			moduleName: moduleClause?.moduleName,
+			moduleArgs: moduleClause?.moduleArgs ?? {},
 			contextDefinitions,
 			tags,
 			maintained,
 			loc: _createLoc(startToken, this.previous()),
 		};
+	}
+
+	/**
+	 * Parses the optional `using <module> [(<args>)]` clause of a table or materialized
+	 * view; undefined when absent. A bare `flag` argument takes its own name as its value.
+	 * `moduleArgs` is undefined for an empty list, so `using m ()` and `using m` parse alike.
+	 */
+	private parseModuleClause(): { moduleName: string; moduleArgs?: Record<string, SqlValue> } | undefined {
+		if (!this.matchKeyword('USING')) return undefined;
+		const moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
+		if (!this.match(TokenType.LPAREN)) return { moduleName };
+
+		const moduleArgs: Record<string, SqlValue> = {};
+		let positionalIndex = 0;
+		if (!this.check(TokenType.RPAREN)) {
+			do {
+				if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
+					moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(this.advance());
+				} else if (this.check(TokenType.IDENTIFIER)) {
+					const { name, value } = this.nameValueItem('module argument');
+					moduleArgs[name] = value?.type === 'literal' ? getSyncLiteral(value) : (value?.name ?? name);
+				} else {
+					throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
+				}
+			} while (this.match(TokenType.COMMA));
+		}
+		this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
+		return { moduleName, moduleArgs: Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined };
 	}
 
 	/**
@@ -3029,30 +3033,7 @@ export class Parser {
 		}
 
 		// Optional backing-module clause (`using mem(...)`) before the body.
-		let moduleName: string | undefined;
-		const moduleArgs: Record<string, SqlValue> = {};
-		if (this.matchKeyword('USING')) {
-			moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
-			if (this.match(TokenType.LPAREN)) {
-				let positionalIndex = 0;
-				if (!this.check(TokenType.RPAREN)) {
-					do {
-						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
-							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
-						} else if (this.check(TokenType.IDENTIFIER)) {
-							const nameValue = this.nameValueItem('module argument');
-							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
-								? getSyncLiteral(nameValue.value)
-								: (nameValue.value && nameValue.value.type === 'identifier' ? nameValue.value.name : nameValue.name);
-						} else {
-							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
-						}
-					} while (this.match(TokenType.COMMA));
-				}
-				this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
-			}
-		}
+		const moduleClause = this.parseModuleClause();
 
 		this.consumeKeyword('AS', "Expected 'AS' before view body in CREATE MATERIALIZED VIEW.");
 
@@ -3080,8 +3061,8 @@ export class Parser {
 			ifNotExists,
 			columns,
 			select,
-			moduleName,
-			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			moduleName: moduleClause?.moduleName,
+			moduleArgs: moduleClause?.moduleArgs,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
@@ -3692,7 +3673,7 @@ export class Parser {
 		const start = this.peek();
 		this.skipToDeclareItemBoundary();
 		const endTok = this.previous();
-		return { type: 'declareIgnored', kind: 'domain', text: this.sourceSlice(start.startOffset, endTok.endOffset) };
+		return { type: 'declareIgnored', text: this.source.slice(start.startOffset, endTok.endOffset) };
 	}
 
 	/**
@@ -3783,38 +3764,10 @@ export class Parser {
 
 	private declareTableItem(): AST.DeclaredTable {
 		const tableName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, 'Expected table name in declaration.');
-		let moduleName: string | undefined;
-		let moduleArgs: Record<string, SqlValue> | undefined;
 		const columns: AST.ColumnDef[] = [];
 		const constraints: AST.TableConstraint[] = [];
 
-		// Optional USING module
-		if (this.match(TokenType.USING)) {
-			if (this.check(TokenType.IDENTIFIER)) {
-				moduleName = this.getIdentifierValue(this.advance());
-			}
-			if (this.match(TokenType.LPAREN)) {
-				moduleArgs = {};
-				let positionalIndex = 0;
-				if (!this.check(TokenType.RPAREN)) {
-					do {
-						// Check if this is a positional argument (string/number literal) or named argument (identifier=value)
-						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
-							// Positional argument
-							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
-						} else if (this.check(TokenType.IDENTIFIER)) {
-							// Could be named argument or identifier value
-							const nv = this.nameValueItem('module argument');
-							moduleArgs[nv.name] = nv.value && nv.value.type === 'literal' ? getSyncLiteral(nv.value) : (nv.value && nv.value.type === 'identifier' ? nv.value.name : null);
-						} else {
-							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
-						}
-					} while (this.match(TokenType.COMMA));
-				}
-				this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
-			}
-		}
+		const leadingModule = this.parseModuleClause();
 
 		// Column list can be in parens (...) or braces {...}
 		const useBraces = this.check(TokenType.LBRACE);
@@ -3841,9 +3794,10 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after table definition.");
 		}
 
+		const moduleClause = leadingModule ?? this.parseModuleClause();
+
 		// Optional `maintained as <body … with defaults (…)>` — the declared-shape
-		// maintained-table form, carried through the CreateTableStmt reuse. (Differ
-		// transition handling is a follow-up; the clause parses and round-trips.)
+		// maintained-table form, carried through the CreateTableStmt reuse.
 		const maintained = this.parseMaintainedClause();
 
 		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
@@ -3866,6 +3820,11 @@ export class Parser {
 			}
 		}
 
+		// Past this point a `using` would be read as an unrecognized item and its module lost.
+		if (this.peekKeyword('USING')) {
+			throw this.error(this.peek(), "Misplaced USING: a table names its module once, directly before or directly after its body.");
+		}
+
 		// Build the CREATE TABLE AST node for this declared table
 		const tableStmt: AST.CreateTableStmt = {
 			type: 'createTable',
@@ -3873,8 +3832,8 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			constraints,
-			moduleName,
-			moduleArgs,
+			moduleName: moduleClause?.moduleName,
+			moduleArgs: moduleClause?.moduleArgs,
 			contextDefinitions,
 			tags,
 			maintained
@@ -3966,30 +3925,7 @@ export class Parser {
 
 		// Optional backing-module clause (`using mem(...)`) before the body — same
 		// shape as the top-level CREATE MATERIALIZED VIEW form.
-		let moduleName: string | undefined;
-		const moduleArgs: Record<string, SqlValue> = {};
-		if (this.matchKeyword('USING')) {
-			moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
-			if (this.match(TokenType.LPAREN)) {
-				let positionalIndex = 0;
-				if (!this.check(TokenType.RPAREN)) {
-					do {
-						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
-							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
-						} else if (this.check(TokenType.IDENTIFIER)) {
-							const nameValue = this.nameValueItem('module argument');
-							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
-								? getSyncLiteral(nameValue.value)
-								: (nameValue.value && nameValue.value.type === 'identifier' ? nameValue.value.name : nameValue.name);
-						} else {
-							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
-						}
-					} while (this.match(TokenType.COMMA));
-				}
-				this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
-			}
-		}
+		const moduleClause = this.parseModuleClause();
 
 		this.consumeKeyword('AS', "Expected AS before view body in materialized view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
@@ -4013,8 +3949,8 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			select,
-			moduleName,
-			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			moduleName: moduleClause?.moduleName,
+			moduleArgs: moduleClause?.moduleArgs,
 			tags
 		};
 
@@ -4157,12 +4093,6 @@ export class Parser {
 		if (this.match(TokenType.TRUE)) return true;
 		if (this.match(TokenType.FALSE)) return false;
 		throw new ParseError(this.peek(), `Expected 'true' or 'false' for option value.`);
-	}
-
-	private sourceSlice(_start: number, _end: number): string {
-		// Lexer tokens include offsets; this.tokens array belongs to this parser, but we don't have direct source here.
-		// Return an empty string as placeholder; canonicalization is future work.
-		return '';
 	}
 
 	private nameValueItem(context: string): { name: string, value?: AST.IdentifierExpr | AST.LiteralExpr } {
