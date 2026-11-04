@@ -55,3 +55,7 @@ Lookups on these columns with a spelling other than the stored one keep returnin
 ## Reversibility
 
 Easy to reverse. Only query results change; no stored value or index is rewritten.
+
+## Decided by the maintainer 2026-11-04
+
+The proposed rule above is accepted as written, for DATE, TIME and TIMESTAMP. The change in results shown above is intended, so call it out in the release notes.
