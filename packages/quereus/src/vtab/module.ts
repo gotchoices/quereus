@@ -65,7 +65,7 @@ export type EffectiveRowSource = () => AsyncIterable<Row>;
  * … set collate` / `set data type` / `set not null`) must judge on behalf of the connection
  * issuing it, supplied by a wrapper module (today: the isolation layer) that stages that
  * connection's writes outside the target module, where the target module cannot reach them.
- * See docs/module-authoring.md § When the pending rows live outside your module.
+ * See docs/module-authoring-transactions.md § When the pending rows live outside your module.
  *
  * A bundle rather than two optional parameters so a wrapper cannot hand down the effective rows
  * and forget the rollback states: the type makes both halves mandatory. Omitted by the engine's

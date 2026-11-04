@@ -201,7 +201,7 @@ connection registered under the old table name (rather than only the ones it cre
 therefore deletes the sole path from the staged overlay to storage, and the commit reports success
 having written nothing. `StoreModule.renameTable` therefore evicts on class identity (`instanceof
 StoreConnection`) *and* an exact qualified-name match, never on the name alone. See **Evicting
-connections on `renameTable`** in [`module-authoring.md`](module-authoring.md) — the same rule binds
+connections on `renameTable`** in [`module-authoring-transactions.md`](module-authoring-transactions.md#connection-registration) — the same rule binds
 any module that means to be wrappable.
 
 #### Mid-transaction rename on a store-backed table is a partial commit

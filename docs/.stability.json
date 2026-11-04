@@ -16,6 +16,7 @@
 		"docs/memory-table.md": "Stable",
 		"docs/migration.md": "Experimental",
 		"docs/module-authoring-schema-changes.md": "Stable",
+		"docs/module-authoring-transactions.md": "Stable",
 		"docs/module-authoring.md": "Stable",
 		"docs/module-capabilities.md": "Stable",
 		"docs/module-committed-reads.md": "Experimental",

@@ -1423,7 +1423,7 @@ interface VirtualTableConnection {
   disconnect(): MaybePromise<void>;
 }
 
-// Internal database methods for transaction coordination (see module-authoring.md)
+// Internal database methods for transaction coordination (see module-authoring-transactions.md)
 interface DatabaseInternal {
   registerConnection(connection: VirtualTableConnection): Promise<void>;
   unregisterConnection(connectionId: string): void;

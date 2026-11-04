@@ -276,7 +276,7 @@ forced even when the transaction itself sees no NULL — while an unconvertible 
 no `DEFAULT`, or a post-conversion UNIQUE collision refuses. Behind a wrapper module that stages
 the transaction's rows outside the manager (the isolation layer), the wrapper hands down the
 effective rows *and* the savepoint states as one bundle (`IssuerRowSources`, see
-[module-authoring.md](module-authoring.md#when-the-pending-rows-live-outside-your-module-issuerrowsources));
+[module-authoring-transactions.md](module-authoring-transactions.md#when-the-pending-rows-live-outside-your-module-issuerrowsources));
 the manager's base is then exactly the committed rows, and a wrapper's frame is judged as-is for
 `SET NOT NULL` because no rewrite of the manager reaches it. The cross-backend cases are pinned
 in `41.2.4-ddl-rollback-states.sqllogic`.
@@ -332,8 +332,7 @@ manager — the isolation layer, whose per-connection overlay this manager canno
 writes never reach `pendingTransactionLayer`, so the manager's own effective rows degenerate to
 the committed base. The wrapper therefore supplies the rows to judge through the optional
 `EffectiveRowSource` parameter on `createIndex` / `alterTable`, and every validation site above
-prefers it over `effectiveDdlRows()`. See [module-authoring.md](module-authoring.md) § "When the
-pending rows live outside your module". `validateRekeyedPrimaryKey` consumes it too, but as only
+prefers it over `effectiveDdlRows()`. See [module-authoring-transactions.md](module-authoring-transactions.md#when-the-pending-rows-live-outside-your-module-issuerrowsources). `validateRekeyedPrimaryKey` consumes it too, but as only
 *half* of what it judges — see rule 3 below: legality is decided over the supplied rows, physical
 representability over this manager's own layers.
 
@@ -691,7 +690,7 @@ degrade here should document it, as this section does.
 The store module (`packages/quereus-store`) reaches the same two rules by a different route
 (it validates over `StoreTable.iterateEffectiveEntries` and writes the entries for its committed
 rows outside the coordinator, while the entries its open transaction's writes owe stay buffered
-with those writes). See `docs/store.md` and `docs/module-authoring.md` § Transaction Support.
+with those writes). See `docs/store.md` and `docs/module-authoring-transactions.md` § DDL inside an open transaction.
 
 ## **Current Limitations:**
 
