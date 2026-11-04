@@ -896,6 +896,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * row source unwinds first. An early `return()` skips the `catch`, so stopping a
 	 * statement early commits it. A failing commit or rollback replaces any error
 	 * `body` threw. Caller holds the execution mutex.
+	 *
+	 * NOTE: a separate generator so the nested trace path can share it, which costs one
+	 * more `yield*` layer per row (one 300k-row series: 616 to 681 ns/row against the old
+	 * wrapper). If that shows up in scan profiles, inline it into `_iterateSerialized`.
 	 */
 	async *_iterateFinalizing<T>(body: () => AsyncIterable<T>): AsyncGenerator<T> {
 		let failed = false;

@@ -728,6 +728,8 @@ const user = await db.get("select * from users where id = ?", [1]);
 ### `db.eval(sql: string, params?: SqlParameters, options?: StatementOptions): AsyncIterable<Record<string, SqlValue>>`
 A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
+The statement holds the execution mutex until its implicit transaction has finished, so the commit belongs to the iteration: a failing commit rejects the `next()` that ends it, or the `return()` that a `break` triggers, and a `for await` loop throws either way. `stmt.iterateRows` and `stmt.all` behave the same.
+
 ### `db.beginTransaction()`, `db.commit()`, `db.rollback()`
 Standard transaction control methods. Each queues behind any statement already running and takes its decision when its turn comes: `beginTransaction()` throws `TransactionActiveError` only if a transaction is genuinely open at that point (it does **not** refuse merely because another caller's autocommit write is in flight, which also reads as "in a transaction" while it lasts), and `commit()` / `rollback()` throw `No transaction active` when nothing is open by then, rather than silently doing nothing. To make a group of statements indivisible, prefer [`db.exec(..., { transaction: true })`](#atomic-batches) over `beginTransaction()` + `exec` + `commit` on a `Database` other callers share.
 
@@ -1056,7 +1058,10 @@ await stmt.finalize();
 The handler fires once per successful commit and receives every
 `MatchedWatch` for that transaction in a single event. Handler
 errors are logged but do not roll the commit back (assertions enforce;
-watchers observe). See [change-scope.md](change-scope.md) for the
+watchers observe). A handler that awaits a statement on the same database
+hangs it, because the commit awaits the handler while holding the
+[execution mutex](change-scope.md#handlers-run-under-the-execution-mutex);
+start such a statement without awaiting it. See [change-scope.md](change-scope.md) for the
 full firing semantics, schema-change invalidation policy, and the
 list of v1 limitations.
 

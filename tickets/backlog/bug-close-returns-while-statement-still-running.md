@@ -1,7 +1,7 @@
 description: Closing a database does not wait for work already running on it, so a statement can keep running against a database the caller believes is shut, which matters most when the caller then closes the storage underneath it.
 files:
   - packages/quereus/src/core/database.ts # close(): takes no mutex and awaits only committed reads
-  - packages/quereus/src/core/statement.ts # _iterateRowsGenerator holds the mutex for a whole iteration, which is why waiting on the mutex is not a safe fix
+  - packages/quereus/src/core/statement.ts # a serialized iteration holds the mutex from first pull to commit (Database._iterateSerialized), which is why waiting on the mutex is not a safe fix
 repro: verified
 severity: wrong-result
 likelihood: unusual

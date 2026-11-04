@@ -767,13 +767,15 @@ export class Statement {
 	 * {@link iterateRowsWithTrace} for a statement run inside another statement, whose
 	 * caller already holds the execution mutex. An implicit transaction open at the start
 	 * belongs to the enclosing statement, which finalizes it; with none open, any
-	 * transaction this statement starts is its own. Left on the type surface because
-	 * table-valued functions outside this package need it (see
-	 * `createIntegratedTableValuedFunction`).
+	 * transaction this statement starts is its own.
+	 *
+	 * @internal
 	 *
 	 * NOTE: when an enclosing implicit transaction is open and this statement fails, the
-	 * trace functions swallow the error, so its partial writes stay in the enclosing
-	 * transaction. Rare and diagnostic-only; if it matters, wrap this run in a savepoint.
+	 * trace functions swallow the error and the enclosing statement commits. The failed
+	 * statement's own savepoints have undone its writes, except the rows OR FAIL keeps, but
+	 * OR ROLLBACK does not end the enclosing transaction. If that ever matters for a trace
+	 * run, surface the error from the trace functions.
 	 */
 	async *_iterateRowsNestedWithTrace(params: SqlParameters | SqlValue[] | undefined, tracer: InstructionTracer): AsyncGenerator<Row> {
 		const body = () => this._iterateRowsTraced(params, tracer);
