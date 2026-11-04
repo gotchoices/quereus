@@ -31,6 +31,71 @@ export interface DeferredConstraintRow {
 
 type DeferredConstraintBuckets = Map<string, Map<string, DeferredConstraintRow[]>>;
 
+/** A DML source row and the deferred checks queued while it was pulled. */
+export interface RowWithHeldChecks {
+	row: Row;
+	checks: DeferredConstraintBuckets;
+}
+
+/**
+ * Ties each DML source row's deferred checks to that row's savepoint, for a statement
+ * that keeps earlier rows when a later one fails.
+ *
+ * The source queues a row's checks as the row is pulled, before the executor opens the
+ * row's savepoint, so rolling that savepoint back would leave them queued and COMMIT
+ * would evaluate them for a row that was never written. {@link pull} sets them aside
+ * instead, and {@link joinRowSavepoint} queues them once the savepoint is open. The two
+ * generators are separate so a drain can sit between them; the checks of rows it read
+ * past the failing one are then never queued.
+ *
+ * NOTE: allocates one layer Map per source row, and a drain keeps them all until it is
+ * replayed. Only tables that declare FAIL pay this; if a bulk write to one shows up as
+ * slow, share one empty Map across the rows that queued nothing.
+ */
+export class RowScopedDeferredChecks {
+	private current: DeferredConstraintBuckets | undefined;
+
+	constructor(private readonly queue: DeferredConstraintQueue) { }
+
+	async *pull(rows: AsyncIterable<Row>): AsyncGenerator<RowWithHeldChecks> {
+		const it = rows[Symbol.asyncIterator]();
+		try {
+			while (true) {
+				this.queue.beginLayer();
+				let next: IteratorResult<Row>;
+				try {
+					next = await it.next();
+				} catch (e) {
+					// The row that raised this is never written, so its checks go with it.
+					this.queue.rollbackLayer();
+					throw e;
+				}
+				if (next.done) {
+					this.queue.releaseLayer();
+					return;
+				}
+				yield { row: next.value, checks: this.queue.detachLayer() };
+			}
+		} finally {
+			if (it.return) await it.return();
+		}
+	}
+
+	async *feed(rows: AsyncIterable<RowWithHeldChecks>): AsyncGenerator<Row> {
+		for await (const { row, checks } of rows) {
+			this.current = checks;
+			yield row;
+		}
+	}
+
+	/** Queue the checks of the row last fed. Call with that row's savepoint open. */
+	joinRowSavepoint(): void {
+		if (!this.current) return;
+		this.queue.adoptChecks(this.current);
+		this.current = undefined;
+	}
+}
+
 export class DeferredConstraintQueue {
 	private readonly entries: DeferredConstraintBuckets = new Map();
 	private layers: DeferredConstraintBuckets[] = [];
@@ -140,6 +205,16 @@ export class DeferredConstraintQueue {
 		if (!top) return;
 		const target = this.getActiveStore();
 		this.merge(target, top);
+	}
+
+	/** Remove the top layer without merging it, for a later {@link adoptChecks}. */
+	detachLayer(): DeferredConstraintBuckets {
+		return this.layers.pop() ?? new Map();
+	}
+
+	/** Queue checks a {@link detachLayer} set aside, in the current top layer. */
+	adoptChecks(checks: DeferredConstraintBuckets): void {
+		this.merge(this.getActiveStore(), checks);
 	}
 
 	clear(): void {

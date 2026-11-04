@@ -320,4 +320,137 @@ select id, n from t_fkp order by id;
 drop table t_fkc;
 drop table t_fkp;
 
+-- A row the FAIL reverts leaves its parent key in place, so the children that still
+-- reference that key are no violation. Row 2's module-raised FAIL reverts its move.
+create table t_fkp2 (id integer primary key, x integer unique on conflict fail);
+create table t_fkc2 (id integer primary key, pid integer references t_fkp2(id));
+insert into t_fkp2 values (1, 1), (2, 2);
+insert into t_fkc2 values (10, 2);
+-- run
+
+update t_fkp2 set id = id + 100, x = 11;
+-- error: UNIQUE constraint failed
+
+select id, x from t_fkp2 order by id;
+→ [{"id":2,"x":2},{"id":101,"x":11}]
+
+drop table t_fkc2;
+drop table t_fkp2;
+
+-- ===================================
+-- 13. A row undone by FAIL leaves no deferred check behind
+-- ===================================
+-- A foreign key or a CHECK with a subquery waits for COMMIT, and the source queues it
+-- before the row is written. If a FAIL undoes the row, COMMIT must not evaluate it.
+
+create table t_ddp (id integer primary key);
+create table t_ddc (id integer primary key on conflict fail, pid integer null references t_ddp(id));
+insert into t_ddc values (1, null);
+-- run
+
+-- Autocommit: the implicit commit keeps row 5.
+insert into t_ddc values (5, null), (1, 999), (6, null);
+-- error: UNIQUE constraint failed
+
+select id from t_ddc order by id;
+→ [{"id":1},{"id":5}]
+
+begin;
+insert into t_ddc values (7, null), (1, 999);
+-- error: UNIQUE constraint failed
+commit;
+
+select id from t_ddc order by id;
+→ [{"id":1},{"id":5},{"id":7}]
+
+-- A kept row's own deferred check still runs: a commit with the orphan fails.
+begin;
+insert into t_ddc values (8, 999), (1, null);
+-- error: UNIQUE constraint failed
+commit;
+-- error: _fk_t_ddc_pid
+
+select id from t_ddc order by id;
+→ [{"id":1},{"id":5},{"id":7}]
+
+drop table t_ddc;
+drop table t_ddp;
+
 pragma foreign_keys = false;
+
+create table t_ddr (v integer primary key);
+insert into t_ddr values (1);
+create table t_ddk (
+	id integer primary key,
+	a integer check (a in (select v from t_ddr)),
+	x integer unique on conflict fail,
+	b integer check (b > 0) on conflict fail
+);
+insert into t_ddk values (1, 1, 1, 1), (2, 1, 2, 2), (3, 1, 3, 3);
+-- run
+
+-- The source raises the FAIL at row 2, after queueing that row's check on `a`.
+begin;
+insert into t_ddk values (4, 1, 4, 4), (5, 99, 5, -5);
+-- error: CHECK
+commit;
+
+-- Row 2 fails in the module, and row 3 has a failing check that a draining module reads
+-- before writing anything. Neither row is written, so COMMIT accepts both checks.
+begin;
+update t_ddk set x = 11, a = case when id = 1 then a else 99 end where id < 4;
+-- error: UNIQUE constraint failed
+commit;
+
+select id, a, x from t_ddk order by id;
+→ [{"id":1,"a":1,"x":11},{"id":2,"a":1,"x":2},{"id":3,"a":1,"x":3},{"id":4,"a":1,"x":4}]
+
+drop table t_ddk;
+drop table t_ddr;
+
+-- ===================================
+-- 14. An ABORT that undoes the statement takes its deferred checks with it
+-- ===================================
+-- On a module that drains its source before writing, reading every row queues their
+-- checks. They must roll back with the statement.
+
+create table t_dar (v integer primary key);
+insert into t_dar values (1);
+create table t_dak (id integer primary key, a integer check (a in (select v from t_dar)), x integer unique);
+insert into t_dak values (1, 1, 1), (2, 1, 2);
+-- run
+
+begin;
+update t_dak set x = 11, a = 99;
+-- error: UNIQUE constraint failed
+commit;
+
+select id, a, x from t_dak order by id;
+→ [{"id":1,"a":1,"x":1},{"id":2,"a":1,"x":2}]
+
+drop table t_dak;
+drop table t_dar;
+
+-- ===================================
+-- 15. Declared FAIL leaves user savepoints aligned
+-- ===================================
+
+create table t_dsp (id integer primary key, x integer not null on conflict fail);
+
+begin;
+savepoint sp1;
+insert into t_dsp values (1, 1), (2, null);
+-- error: NOT NULL
+
+select id from t_dsp;
+→ [{"id":1}]
+
+rollback to savepoint sp1;
+insert into t_dsp values (3, 3);
+release savepoint sp1;
+commit;
+
+select id from t_dsp;
+→ [{"id":3}]
+
+drop table t_dsp;

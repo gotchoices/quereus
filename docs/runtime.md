@@ -1008,8 +1008,15 @@ it are applied first, then it is raised from the loop. Every failure therefore t
 effect at its own row's position, as it does when streaming, and the rows a declared
 FAIL keeps exist on every module.
 
-At the **end-of-statement boundary** — after the row loop completes and (for
-non-FAIL) **before** the statement savepoint releases — the generator drains its
+A row undone by a FAIL must leave nothing for later checks to find. The source queues
+a row's deferred checks as the row is pulled, before its savepoint opens, so in
+`statementAndRow` mode `RowScopedDeferredChecks` sets them aside and queues them once
+the savepoint is open; otherwise COMMIT would evaluate a check for a row that was never
+written. A row adds its keys to the batched RESTRICT probe only after it completes, so
+the probe does not report children of a parent key the row failed to move.
+
+At the **end-of-statement boundary** — after the row loop completes and **before**
+any statement savepoint releases — the generator drains its
 per-statement *deferred full-rebuild set* via `Database._flushDeferredRebuilds`.
 Only the full-rebuild materialized-view arm is deferred there (the bounded-delta
 arms apply per row inside `processRow`); each source row that touched a
@@ -1053,9 +1060,11 @@ capability flag, `VirtualTableModule.scanSnapshotIsolation` (default **false**):
   layer), so `runUpdate`/`runDelete` **stream** the source, paying no buffering
   cost. This is the common path.
 - **Not snapshot-isolated (default)** — `runUpdate`/`runDelete` fully **drain**
-  the source match set into an array (`drainSourceRows`), closing the scan cursor,
+  the source match set into an array (`drainBeforeWriting`), closing the scan cursor,
   **before** applying any write. The read phase now precedes the write phase in
-  full, matching SQLite's "figure out which rows to change, then change them".
+  full, matching SQLite's "figure out which rows to change, then change them". The
+  drain runs on the row loop's first pull, inside the statement savepoint, because
+  reading a row queues its deferred checks and those must roll back with the statement.
 
 The false default is correctness-first: any durable / third-party store is correct
 out of the box (it buffers) and opts into streaming only once it can prove per-scan

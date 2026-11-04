@@ -34,6 +34,7 @@ import {
 } from '../row-constraints.js';
 import type { BackingConnectionCache, ResidualKeyBatch } from '../../core/database-materialized-views.js';
 import { poisonResidualDeltaAccumulations } from '../../core/database-materialized-views-apply.js';
+import { RowScopedDeferredChecks } from '../deferred-constraint-queue.js';
 import type { BackingRowChange } from '../../vtab/backing-host.js';
 
 /**
@@ -187,60 +188,51 @@ function moduleHasScanSnapshotIsolation(ctx: RuntimeContext, tableSchema: TableS
  * that avoids the physical Halloween hazard for modules WITHOUT per-scan
  * snapshot isolation: a predicate DELETE/UPDATE must finish reading which rows
  * to change before it starts changing them, or the first write invalidates the
- * cursor path the scan is still walking. Reads are side-effect-free, so draining
- * before the statement savepoint opens is safe.
+ * cursor path the scan is still walking.
+ *
+ * The drain runs on the first pull, which `runWithStatementSavepoints` makes with its
+ * statement savepoint open. Reading a row is not free of side effects: the source
+ * queues that row's deferred checks, and they must roll back with the statement.
+ *
+ * Under `statementAndRow` a drain failure is held back until the rows before it have
+ * been yielded. The source raises NOT NULL and CHECK violations, so a declared FAIL can
+ * land here, and the rows it keeps must be written by then. This also makes every
+ * failure take effect at its own row's position, as it does when streaming: a FAIL at
+ * row 2 still wins over an ABORT the drain met at row 3.
  */
-async function drainSourceRows(rows: AsyncIterable<Row>, buffered: Row[]): Promise<void> {
-	for await (const row of rows) {
-		buffered.push(row);
+async function* drainBeforeWriting<T>(rows: AsyncIterable<T>, savepointMode: DmlSavepointMode): AsyncGenerator<T> {
+	const buffered: T[] = [];
+	let failure: { error: unknown } | undefined;
+	try {
+		for await (const row of rows) {
+			buffered.push(row);
+		}
+	} catch (error) {
+		if (savepointMode !== 'statementAndRow') throw error;
+		failure = { error };
 	}
+	yield* buffered;
+	if (failure) throw failure.error;
 }
 
-/** Feed `rows` to the row loop, then raise the error that ended their drain. */
-async function* replayThenThrow(rows: readonly Row[], error: unknown): AsyncIterable<Row> {
-	yield* rows;
-	throw error;
+/** The rows a DML statement's row loop consumes. */
+interface DmlRowSource {
+	rows: AsyncIterable<Row>;
+	/** Set under `statementAndRow`, where a failed row's deferred checks must not survive it. */
+	rowChecks?: RowScopedDeferredChecks;
 }
 
 /**
- * Resolve the row source a predicate UPDATE/DELETE feeds to
- * `runWithStatementSavepoints`: stream it verbatim when the target module has
- * per-scan snapshot isolation, otherwise drain it up front (read/write phase
- * separation — see {@link drainSourceRows}).
- *
- * The drain is consumed HERE, outside `runWithStatementSavepoints`' try/finally,
- * so a scan or abort error mid-drain would otherwise skip the target vtab's
- * `disconnect()` that finally guarantees. Guard it: on a drain failure, disconnect
- * the already-connected target vtab before propagating, matching the streaming
- * path (where the source is consumed inside that try/finally).
- *
- * Under `statementAndRow` a drain failure is instead held back until the rows before
- * it have been applied. The source raises NOT NULL and CHECK violations, so a declared
- * FAIL can land here, and the rows it keeps must exist by then. Replaying also makes
- * every failure take effect at its own row's position, as it does when streaming: a
- * FAIL at row 2 still wins over an ABORT the drain met at row 3.
+ * Build the row source for `runWithStatementSavepoints`, with `drain` set when the
+ * statement must finish reading before it writes (see {@link drainBeforeWriting}).
  */
-async function resolveDmlSourceRows(
-	ctx: RuntimeContext,
-	vtab: VirtualTable,
-	tableSchema: TableSchema,
-	rows: AsyncIterable<Row>,
-	savepointMode: DmlSavepointMode,
-): Promise<AsyncIterable<Row> | Iterable<Row>> {
-	if (moduleHasScanSnapshotIsolation(ctx, tableSchema)) {
-		return rows;
+function resolveDmlRowSource(ctx: RuntimeContext, rows: AsyncIterable<Row>, savepointMode: DmlSavepointMode, drain: boolean): DmlRowSource {
+	if (savepointMode !== 'statementAndRow') {
+		return { rows: drain ? drainBeforeWriting(rows, savepointMode) : rows };
 	}
-	const buffered: Row[] = [];
-	try {
-		await drainSourceRows(rows, buffered);
-	} catch (e) {
-		if (savepointMode === 'statementAndRow') {
-			return replayThenThrow(buffered, e);
-		}
-		await disconnectVTable(ctx, vtab);
-		throw e;
-	}
-	return buffered;
+	const rowChecks = new RowScopedDeferredChecks(ctx.db.getDeferredConstraints());
+	const pulled = rowChecks.pull(rows);
+	return { rows: rowChecks.feed(drain ? drainBeforeWriting(pulled, savepointMode) : pulled), rowChecks };
 }
 
 /**
@@ -970,8 +962,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	 * all three generators. Owns the savepoint lifecycle that makes a multi-row
 	 * mutation atomic inside an explicit transaction, plus the per-row savepoint
 	 * that keeps prior rows while undoing only the failing row under FAIL. See
-	 * {@link DmlSavepointMode}. INSERT/UPDATE/DELETE reduce to a `processRow` closure carrying the
-	 * operation-specific body (vtab.update + bookkeeping + FK actions + events).
+	 * {@link DmlSavepointMode}. INSERT/UPDATE/DELETE reduce to a `processRow`
+	 * closure carrying the operation-specific body (vtab.update + bookkeeping +
+	 * FK actions + events).
 	 *
 	 * - `statement` (ABORT default / IGNORE / REPLACE / ROLLBACK): one
 	 *   statement-scope savepoint, released after the loop completes and
@@ -988,7 +981,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	 * - `statementAndRow` (declared FAIL): both. A FailConflictError takes the
 	 *   `row` outcome and releases the statement savepoint; any other failure
 	 *   takes the `statement` outcome. A violation raised by the source iterator
-	 *   has no per-row savepoint open, but that row has written nothing yet.
+	 *   has no per-row savepoint open, but that row has written nothing yet, and
+	 *   {@link RowScopedDeferredChecks} keeps its deferred checks out of the queue.
 	 *
 	 * Always uses the broadcast savepoint helpers so per-connection savepoint
 	 * stacks stay in lockstep with the TransactionManager's stack — including a
@@ -1000,12 +994,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	async function* runWithStatementSavepoints(
 		ctx: RuntimeContext,
 		vtab: VirtualTable,
-		// AsyncIterable when streaming the source scan (INSERT, and
-		// snapshot-isolated UPDATE/DELETE targets); a buffered Row[] when a
-		// non-snapshot-isolated UPDATE/DELETE has drained its source up front to
-		// separate the read phase from the write phase. `for await ... of`
-		// consumes either — the savepoint/FAIL-mode logic below is unchanged.
-		rows: AsyncIterable<Row> | Iterable<Row>,
+		source: DmlRowSource,
 		processRow: (flatRow: Row) => Promise<Row | undefined>,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
@@ -1033,7 +1022,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// statement still finishes normally, then raises this.
 			let keptRowsFailure: { error: unknown } | undefined;
 			try {
-				for await (const flatRow of rows) {
+				for await (const flatRow of source.rows) {
 					// Cooperative cancellation checkpoint for scan-less / output-less
 					// mutations. A bulk INSERT/UPDATE/DELETE whose source is not a table
 					// scan (e.g. INSERT … VALUES, or INSERT … SELECT from a TVF / CTE with
@@ -1054,6 +1043,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						savepointName = `__or_fail_${stmtSavepointCounter++}`;
 						await ctx.db._createSavepointBroadcast(savepointName);
 					}
+					source.rowChecks?.joinRowSavepoint();
 
 					let rowToYield: Row | undefined;
 					let succeeded = false;
@@ -1177,7 +1167,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// each row is *pulled*, so the ordinal is set BEFORE pulling — see
 		// `stampMutationOrdinal`.
 		yield* runWithStatementSavepoints(
-			ctx, vtab, stampMutationOrdinal(ctx, rows),
+			ctx, vtab, resolveDmlRowSource(ctx, stampMutationOrdinal(ctx, rows), savepointMode, false),
 			(flatRow) => processInsertRow(
 				ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds, residualBatch,
 			),
@@ -1467,9 +1457,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// `UPDATE big SET ... WHERE rare` matching millions buffers them all. That is
 		// the accepted cost of correctness (such a module cannot safely stream-update
 		// anyway); memory tables set scanSnapshotIsolation and keep streaming.
-		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows, savepointMode);
 		yield* runWithStatementSavepoints(
-			ctx, vtab, sourceRows,
+			ctx, vtab, resolveDmlRowSource(ctx, rows, savepointMode, !moduleHasScanSnapshotIsolation(ctx, tableSchema)),
 			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
 			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'update', fkRestrictBatch) : undefined,
@@ -1514,20 +1503,15 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement = buildUpdateStatement(tableSchema, newRow, keyValues, contextRow);
 		}
 
-		// Parent-side RESTRICT enforcement. Batched statements accumulate the
-		// OLD referenced keys (probed once per FK at the end-of-statement
-		// boundary — same pre-vtab observation point per row, so a row the vtab
-		// later reports not-found contributes identically to the per-row path).
-		// Otherwise: defense-in-depth per-row pre-walk — the plan-time
-		// `NOT EXISTS` check is the primary path, but some vtab modules evaluate
-		// the embedded subquery differently from a plain row scan. Pre-walk the
-		// transitive cascade closure so RESTRICTs at any depth fire BEFORE
-		// vtab.update — needed for rowid-mode backends (lamina) where
-		// post-mutation OLD-value scans dereference through the just-mutated
-		// parent and find zero rows.
-		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
-		} else {
+		// Parent-side RESTRICT enforcement, unless the statement batches it (see the
+		// accumulation at the end of this function). Defense-in-depth per-row
+		// pre-walk — the plan-time `NOT EXISTS` check is the primary path, but some
+		// vtab modules evaluate the embedded subquery differently from a plain row
+		// scan. Pre-walk the transitive cascade closure so RESTRICTs at any depth
+		// fire BEFORE vtab.update — needed for rowid-mode backends (lamina) where
+		// post-mutation OLD-value scans dereference through the just-mutated parent
+		// and find zero rows.
+		if (!fkRestrictBatch) {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
 		}
 
@@ -1618,6 +1602,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			emitAutoUpdateEvents(ctx, oldRow, storedRow);
 		}
 
+		// Only now, so a row a declared FAIL reverts leaves no key behind: its parent
+		// key is still in place, and the end-of-statement probe must not report the
+		// children that still reference it.
+		if (fkRestrictBatch) {
+			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
+		}
+
 		return withStoredNewSection(flatRow, storedRow, newRow, numCols);
 	}
 
@@ -1648,9 +1639,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// the target module guarantees per-scan snapshot isolation, drain the source
 		// match set (closing the scan cursor) before applying any DELETE, so the
 		// first delete cannot invalidate the cursor path the scan is still walking.
-		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows, savepointMode);
 		yield* runWithStatementSavepoints(
-			ctx, vtab, sourceRows,
+			ctx, vtab, resolveDmlRowSource(ctx, rows, savepointMode, !moduleHasScanSnapshotIsolation(ctx, tableSchema)),
 			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
 			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'delete', fkRestrictBatch) : undefined,
@@ -1693,11 +1683,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement = buildDeleteStatement(tableSchema, keyValues, contextRow);
 		}
 
-		// Parent-side RESTRICT enforcement: batched key accumulation, or the
-		// per-row defense-in-depth pre-walk — see comment on the UPDATE path above.
-		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
-		} else {
+		// Parent-side RESTRICT enforcement: the per-row defense-in-depth pre-walk, or
+		// batched key accumulation at the end of this function — see the UPDATE path.
+		if (!fkRestrictBatch) {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
 		}
 
@@ -1741,6 +1729,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {
 			emitAutoDataEvent(ctx, tableSchema, 'delete', keyValues, [...oldRow]);
+		}
+
+		if (fkRestrictBatch) {
+			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
 		}
 
 		return flatRow;
