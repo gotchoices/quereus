@@ -49,6 +49,11 @@ export const cardinalityFeedbackFunc = createIntegratedTableValuedFunction(
 	},
 	async function* (db: Database): AsyncIterable<Row> {
 		for (const entry of db._cardinalityFeedback.snapshot().sort(byTable)) {
+			// NOTE: catalog_rows relays `getStatistics`' rowCount, documented as "exact or estimated"
+			// and, unlike a `getRowCount` answer, not validated as a whole number. A module reporting
+			// a fractional estimate would trip QUEREUS_REPR_STRICT here (and at baseline_rows, which
+			// can inherit it); if one legitimately does, round where statistics are ingested rather
+			// than loosening these declarations.
 			yield [
 				entry.schemaName,
 				entry.tableName,

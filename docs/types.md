@@ -176,9 +176,10 @@ same value would have had if written as a literal.
 R1 and R2 are enforced by coercion only where the engine MINTS values. At the three ingress
 boundaries it deliberately does not coerce — rows out of a virtual-table module's
 `query()`, values out of a user-defined scalar function, and rows out of a table-valued
-function — the rules are a **contract**, and an opt-in strict mode verifies it. Set the environment variable `QUEREUS_REPR_STRICT=1` (or
-run `yarn test:repr-strict`, which is `node test-runner.mjs --repr-strict`). This is the
-same shape as the two existing runtime harnesses, `QUEREUS_FORK_STRICT` and
+function — the rules are a **contract**, and an opt-in strict mode verifies it. Set the
+environment variable `QUEREUS_REPR_STRICT=1` (or run `yarn test:repr-strict`, which is
+`node test-runner.mjs --repr-strict`). This is the same shape as the two existing runtime
+harnesses, `QUEREUS_FORK_STRICT` and
 `QUEREUS_CONTEXT_STRICT` (see `runtime/strict-flags.ts` and `docs/runtime.md`).
 
 The flag is read once at module load. With it off, every check is a single already-false
@@ -245,6 +246,9 @@ it in tests.
 - Aggregate and window function results are not checked at their own seam; they reach the
   egress seam, where only R1 applies.
 - Values inside a JSON document are not walked; only the top-level `SqlValue` is checked.
+- `yarn check` runs this mode over `packages/quereus` only. Table-valued functions in other
+  packages (`quereus_basis_lifecycle` in `@quereus/sync`, the sample plugins) are checked only
+  when those packages' suites are run with the flag set by hand.
 - `@quereus/store`'s exported `decodeValue` / `decodeCompositeKey` return `BigInt(...)` for
   every integer-valued key, which violates R1 for small integers. They are key decoders and
   are not used to reconstruct rows, so no seam sees them — tracked as

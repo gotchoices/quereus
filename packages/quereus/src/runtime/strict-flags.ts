@@ -30,10 +30,9 @@ export const CONTEXT_STRICT = readFlag('QUEREUS_CONTEXT_STRICT');
 /**
  * `QUEREUS_REPR_STRICT` — physical-representation assertions. Verifies at five
  * runtime seams (vtab scan output, table-valued function output, DML write, UDF
- * return, statement row egress)
- * that every value is in the JavaScript form its declared type promises — R1
- * (canonical numeric form) and R2 (per-declared-type value space) of
- * docs/types.md § Physical representation. Off, the checks are a single
- * already-false branch. See strict-representation.ts.
+ * return, statement row egress) that every value is in the JavaScript form its
+ * declared type promises — R1 (canonical numeric form) and R2 (per-declared-type
+ * value space) of docs/types.md § Physical representation. Off, the checks are a
+ * single already-false branch. See strict-representation.ts.
  */
 export const REPR_STRICT = readFlag('QUEREUS_REPR_STRICT');

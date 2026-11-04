@@ -19,8 +19,8 @@ import type { SqlValue } from '../common/types.js';
  *
  * Canonicalization happens where values are BORN (literal lexing, type parse,
  * parameter bind, bigint arithmetic/aggregation results) — not per-row on read
- * paths. Rows from virtual-table `query()` and UDF return values are held to R1 by
- * contract, not by coercion here.
+ * paths. Rows from virtual-table `query()`, UDF return values and rows yielded by
+ * table-valued functions are held to R1 by contract, not by coercion here.
  */
 
 // Compare against bigint constants, never via Number(v): Number(hugeBigint) is

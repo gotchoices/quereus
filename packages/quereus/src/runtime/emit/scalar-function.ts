@@ -48,7 +48,7 @@ export function buildScalarFunctionRun(
 	}
 
 	// QUEREUS_REPR_STRICT seam: the value a function RETURNS, checked against its
-	// schema's declared return type. A UDF's output is one of the two boundaries the
+	// schema's declared return type. A UDF's output is one of the boundaries the
 	// engine deliberately does not coerce (docs/types.md § Physical representation), so
 	// this is where a drifting implementation is caught. Resolved only when the flag is
 	// on — a normal emit does no type lookup for it.

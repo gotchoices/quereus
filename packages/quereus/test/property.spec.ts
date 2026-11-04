@@ -183,7 +183,7 @@ describe('Property-Based Tests', () => {
 	// (docs/types.md § Physical representation). Round-trip one value per builtin type
 	// through insert → select and hold every returned cell to its column's declared type
 	// with the engine's own checker — the same function `QUEREUS_REPR_STRICT` wires into
-	// the four runtime seams, so this property is meaningful with the flag on or off.
+	// the runtime seams, so this property is meaningful with the flag on or off.
 	describe('Per-declared-type representation (R2)', () => {
 		/** Column name → declared type, in the order the table declares them. */
 		const COLUMNS: ReadonlyArray<{ name: string; sql: string; type: LogicalType; arb: fc.Arbitrary<SqlValue> }> = [
