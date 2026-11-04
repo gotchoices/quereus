@@ -2194,6 +2194,21 @@ function shadowHoldsRowsError(tableSchema: TableSchema, qualifiedShadow: string,
 }
 
 /**
+ * The failure when the swap has landed and a user index could not be re-created. Every index from
+ * that one on is missing, and a missing UNIQUE index stops enforcing silently, so the error names
+ * them all and says the key already changed.
+ */
+function indexesMissingError(tableSchema: TableSchema, missing: IndexSchema[], cause: unknown): QuereusError {
+	return new QuereusError(
+		`ALTER PRIMARY KEY on table '${tableSchema.name}' changed the key and kept the rows, but these indexes `
+			+ `are now missing and must be re-created (${missing.map(idx => idx.name).join(', ')}): `
+			+ `${cause instanceof Error ? cause.message : String(cause)}.`,
+		StatusCode.ERROR,
+		cause instanceof Error ? cause : undefined,
+	);
+}
+
+/**
  * Generic rebuild via shadow table SQL, for a module without a native
  * `alterPrimaryKey`.
  *
@@ -2226,7 +2241,8 @@ function shadowHoldsRowsError(tableSchema: TableSchema, qualifiedShadow: string,
  *
  *  - up to and including the DROP: the original is intact and the shadow is dropped;
  *  - the RENAME: the table is gone, the shadow holds the rows, and the error says so;
- *  - re-creating an index: the new key and the rows, with that index missing;
+ *  - re-creating an index: the new key and the rows, with that index and the later ones missing,
+ *    and the error names them;
  *  - the statement's own commit: the new key and the rows, under an error.
  *
  * The statements are engine scaffolding, not statements the application issued, so the
@@ -2308,9 +2324,11 @@ async function rebuildViaShadowTable(
 			// NOTE: accepted tradeoff — the statement's own commit still follows the swap. With
 			// nothing staged only a module failing an empty commit can fail it, and then the
 			// statement reports an error although the key changed, and the discarded batch
-			// delivers no `alter` event. The rows are safe and re-issuing the statement runs
-			// another rebuild, which delivers the event, so this stands; revisit if such a module
-			// appears behind a syncing peer, which misses the key change until someone re-issues.
+			// delivers no `alter` event; a failed index re-creation below discards it the same way.
+			// The rows are safe, so this stands. Re-issuing the statement runs another rebuild,
+			// which delivers the event, but with the new key as `oldKeyColumns` because the catalog
+			// has already changed, so a syncing peer does not re-file its bookkeeping for those
+			// rows; revisit if such a module appears behind a syncing peer.
 			await rctx.db._commitTransaction();
 			await rctx.db._ensureTransaction();
 			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from
@@ -2357,8 +2375,13 @@ async function rebuildViaShadowTable(
 			// table shares. `runAlterPrimaryKey` refused up front if the module cannot
 			// createIndex, so a failure here is exceptional; it propagates rather than
 			// silently dropping the index.
-			for (const idx of rebuildUserIndexes(tableSchema)) {
-				await rctx.db._execWithinTransaction(generateIndexDDL(idx, tableSchema));
+			const indexes = rebuildUserIndexes(tableSchema);
+			for (const [position, idx] of indexes.entries()) {
+				try {
+					await rctx.db._execWithinTransaction(generateIndexDDL(idx, tableSchema));
+				} catch (e) {
+					throw indexesMissingError(tableSchema, indexes.slice(position), e);
+				}
 			}
 		} catch (e) {
 			if (shadowHoldsTheRows) throw shadowHoldsRowsError(tableSchema, qualifiedShadow, e);

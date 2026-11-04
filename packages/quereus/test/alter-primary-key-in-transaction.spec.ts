@@ -432,10 +432,11 @@ describe('ALTER PRIMARY KEY mid-transaction keeps the transaction\'s writes (mem
 /**
  * The other half of the same data-loss family, for a module that CANNOT re-key in place and so
  * takes the engine's shadow-table rebuild. There the loss is worse than a lost pending write:
- * the rebuild's DROP + RENAME survives ROLLBACK while its row copy does not, so a rollback
- * keeps the new empty table and discards the copy of the rows it replaced — destroying rows
- * committed BEFORE the transaction began. No outcome is correct (see `rebuildViaShadowTable`),
- * so `runAlterPrimaryKey` refuses the rebuild while an explicit transaction is open.
+ * the rebuild's DROP + RENAME survives ROLLBACK, so left uncommitted its row copy would be lost
+ * to a rollback — destroying rows committed BEFORE the transaction began — and committed it would
+ * commit the user's earlier writes behind their back. No outcome is correct (see
+ * `rebuildViaShadowTable`), so `runAlterPrimaryKey` refuses the rebuild while an explicit
+ * transaction is open.
  */
 describe('ALTER PRIMARY KEY rebuild fallback is refused inside an explicit transaction', () => {
 	let db: Database;

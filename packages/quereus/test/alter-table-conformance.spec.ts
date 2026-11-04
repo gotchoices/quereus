@@ -993,6 +993,28 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 			expect(await pkColumns(db), 'the new key took effect').to.deep.equal(['code']);
 			expect(await rows(db, `select id, code from t`), 'rows back under the real name').to.deep.equal(ROW);
 		});
+
+		it('a failed index re-creation says the key changed and names every index left missing', async () => {
+			const module = makeNoAlterModule({ withRenameTable: true, withCreateIndex: true });
+			const createIndex = module.createIndex!.bind(module);
+			let indexFails = false;
+			module.createIndex = async (...args) => {
+				if (indexFails) throw new Error('forced index failure');
+				await createIndex(...args);
+			};
+			db = new Database();
+			db.registerModule('noalter', module);
+			await seedT();
+			await db.exec(`create index first_idx on t (code); create index second_idx on t (id)`);
+
+			indexFails = true;
+			const err = await failure(`alter table t alter primary key (code)`);
+
+			expect(err.message).to.contain('first_idx').and.to.contain('second_idx').and.to.contain('changed');
+			expect(err.cause, 'carried as the cause').to.have.property('message').that.contains('forced index failure');
+			expect(await pkColumns(db), 'the key did change').to.deep.equal(['code']);
+			expect(await rows(db, `select id, code from t`), 'rows kept').to.deep.equal(ROW);
+		});
 	});
 
 	it('the canonical DDL before and after a rebuild differs ONLY in the PRIMARY KEY clause', async () => {

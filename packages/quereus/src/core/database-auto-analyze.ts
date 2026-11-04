@@ -263,6 +263,11 @@ export class AutoAnalyzeManager {
 			// `knownRowCountOrDrop` evicts one the next time it is consulted — but if a
 			// host ever attaches and detaches schemas in a loop, drop entries whose
 			// schema segment matches the detached name.
+			//
+			// NOTE: a rename fires no `table_removed` either, so the old name's entry outlives
+			// it the same way. That includes one `<table>__rekey_<ms>` entry per primary-key
+			// rebuild, whose row copy commits while the shadow table still exists. Equally
+			// harmless; if rebuilds ever run in a loop, drop the old name's entry on rename.
 			if (event.type === 'table_removed') {
 				const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
 				this.dropEntry(key);

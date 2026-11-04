@@ -113,4 +113,4 @@ The commit before the drop is safe where it can run. A direct `ALTER` owns its i
 
 Committing right after the rebuild instead, which would keep a multi-step apply undoable, stays rejected: a nested statement would be committing a transaction its outer statement owns, and the commit would run deferred checks and assertions against a half-migrated schema.
 
-The statement's own commit still follows the swap, with nothing staged. Only a module failing an empty commit can fail it, and the statement then reports an error although the key changed and the rows are safe. No `alter` event is delivered, because the batch is discarded; re-issuing the statement runs another rebuild, which delivers one.
+The statement's own commit still follows the swap, with nothing staged. Only a module failing an empty commit can fail it, and the statement then reports an error although the key changed and the rows are safe. No `alter` event is delivered, because the batch is discarded. Re-issuing the statement runs another rebuild, which delivers one, but its `oldKeyColumns` names the new key, because the catalog has already changed.
