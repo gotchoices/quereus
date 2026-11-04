@@ -706,6 +706,9 @@ async function rekeyOneTable(
 	if (!ctx.hasSchemaOracle) {
 		return rekeyRelayBookkeeping(ctx, change.schema, change.table, newKeyColumns, change.columns, batch);
 	}
+	// NOTE: a peer with a schema oracle but no engine (`ctx.db` unset) falls through to the
+	// table variant, which cannot scan and declines. Every cell record carries its value, so
+	// the records variant would re-file such a peer too; wire it here if that shape ever ships.
 	if (oldKeyColumns === undefined) {
 		console.warn(
 			`[Sync] ${change.schema}.${change.table}: replicated primary key change ran but the key it retired was not `

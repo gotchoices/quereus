@@ -102,6 +102,8 @@ interface SchemaMigration {
   schema: string;
   table: string;                     // The object's name AFTER the migration
   fromTable?: string;                // `rename_table` only: the name before the rename
+  columns?: string[];                // `alter primary key` only: the table's column names in
+                                     // order, so a relay can read a before-image (sync.md § Tombstones)
   ddl: string;                       // The DDL statement
   hlc: HLC;
   schemaVersion: number;             // Monotonic per (object kind, object name) from 1;

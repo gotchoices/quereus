@@ -137,9 +137,10 @@ export class SyncClient {
   // ack redelivered after a reconnect carries an id we no longer hold (dropped)
   // rather than colliding with a freshly-reused id and crediting the wrong batch.
   private applyRequestSeq = 0;
-  // True while snapshot_required recovery is draining local changes. That loop
-  // sends the next batch itself after each ack, so handleApplyResult must not
-  // start one too; both would read the same range and every batch would go twice.
+  // True while a drain loop (the handshake's push-before-pull, or snapshot_required
+  // recovery) owns the push. That loop sends the next batch itself after each ack,
+  // so handleApplyResult must not start one too; both would read the same range
+  // and every batch would go twice.
   private recoveryOwnsPush = false;
 
   // True once the server has answered a get_changes with nothing, meaning this
