@@ -32,10 +32,8 @@ SELECT id FROM idx_t WHERE k >= 10 AND k < 30 ORDER BY k;
 
 DROP TABLE idx_t;
 
--- Multi-column SECONDARY index with a DESC leading column. The secondary
--- branch carries DESC bound-column handling (the lower-bound wrap is
--- direction-independent), so a leading-column range still returns every row.
--- (The primary branch lacks this handling — tracked separately.)
+-- Multi-column SECONDARY index with a DESC leading column: a leading-column range
+-- seeks from its upper bound, and still returns every row.
 CREATE TABLE idx_d (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v TEXT);
 CREATE INDEX idx_kn_d ON idx_d (k DESC, name);
 INSERT INTO idx_d VALUES (1, 10, 'a', 'p'), (2, 20, 'b', 'q'), (3, 30, 'c', 'r');

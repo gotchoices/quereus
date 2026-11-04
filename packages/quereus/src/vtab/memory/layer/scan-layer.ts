@@ -1,4 +1,4 @@
-import type { ScanPlan } from './scan-plan.js';
+import type { ScanPlan, ScanPlanRangeBound } from './scan-plan.js';
 import type { Layer } from './interface.js';
 import { keyParts, leadingKeyPart, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
@@ -46,6 +46,31 @@ function orderSeekKeys(
 	return plan.descending
 		? [...keys].sort((a, b) => -compare(a, b))
 		: [...keys].sort(compare);
+}
+
+/**
+ * The key a walk seeks to: the equality prefix, then the bound the walk starts from. Undefined
+ * when there is neither, which leaves the start to `safeIterate`. A tuple shorter than the tree's
+ * keys sorts before every full key sharing it, so the seek lands before all of those rows.
+ *
+ * A non-composite tree stores SCALAR keys: an array-shaped seek key would position PAST the
+ * scalar match (the comparator orders the wrapped form after its scalar), silently skipping the
+ * row a full-key-length prefix (the delta-aggregate point read) targets. A lone value is
+ * therefore unwrapped there, and stays a one-element tuple on a composite tree.
+ *
+ * NOTE: no consumer today emits a single-column secondary-index `equalityPrefix` seek
+ * (single-column equality goes through `equalityKey`), so that shape has no direct test. If one
+ * ever does, add a targeted prefix-scan test; the primary key's is exercised by every
+ * delta-aggregate flush.
+ */
+function seekStartKey(
+	plan: ScanPlan,
+	seekBound: ScanPlanRangeBound | undefined,
+	isComposite: boolean,
+): { value: BTreeKey } | undefined {
+	const parts = [...(plan.equalityPrefix ?? []), ...(seekBound ? [seekBound.value] : [])];
+	if (parts.length === 0) return undefined;
+	return { value: !isComposite && parts.length === 1 ? parts[0] : parts };
 }
 
 /**
@@ -222,31 +247,7 @@ function* scanLayerResolved(
 		// prefix's group.
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-
-		// Determine start key for range scans
-		let startKey: { value: BTreeKeyForPrimary } | undefined;
-		if (plan.equalityPrefix) {
-			const compositeStart = [...plan.equalityPrefix];
-			if (seekBound) compositeStart.push(seekBound.value);
-			// A non-composite PK stores SCALAR keys: an array-shaped seek key would
-			// position PAST the scalar match (the comparator orders the wrapped form
-			// after its scalar), silently skipping the row a full-PK-length prefix
-			// (the delta-aggregate point read) targets. Unwrap the single-element
-			// prefix to the scalar; composite trees keep the array form.
-			startKey = {
-				value: (!isComposite && compositeStart.length === 1
-					? compositeStart[0]
-					: compositeStart) as BTreeKeyForPrimary,
-			};
-		} else {
-			// Composite PKs store array-shaped keys; wrap the scalar leading-column
-			// bound in a single-element array so the comparator's prefix handling
-			// positions the seek before all full keys sharing that prefix.
-			if (seekBound) {
-				const seekValue = isComposite ? [seekBound.value] : seekBound.value;
-				startKey = { value: seekValue as BTreeKeyForPrimary };
-			}
-		}
+		const startKey = seekStartKey(plan, seekBound, isComposite);
 
 		for (const value of safeIterate(tree, isAscending, startKey, primaryKeyExtractorFromRow)) {
 			const row = value as Row;
@@ -303,34 +304,11 @@ function* scanLayerResolved(
 
 		// Seek-from end depends on the physical walk direction (see the primary
 		// branch for the full rationale): seek from the upper bound exactly when
-		// isAscending === isDescBoundColumn, terminate at the complement. Composite
-		// secondary indexes store array-shaped keys, so wrap the scalar
-		// leading-column bound so the comparator's prefix handling positions the
-		// seek correctly (mirrors the primary branch).
+		// isAscending === isDescBoundColumn, terminate at the complement.
 		const isComposite = (indexDef?.columns.length ?? 1) > 1;
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-
-		// Determine start key
-		let startKey: { value: BTreeKeyForIndex } | undefined;
-		if (plan.equalityPrefix) {
-			const compositeStart = [...plan.equalityPrefix];
-			if (seekBound) compositeStart.push(seekBound.value);
-			// Mirror the primary branch: a non-composite index stores SCALAR keys, so
-			// a single-element prefix must seek with the scalar (see above).
-			// NOTE: latent mirror — no consumer today emits a single-column secondary-index
-			// equalityPrefix seek (single-column equality goes through `equalityKey`), so
-			// this branch has no direct test. If one ever does, add a targeted prefix-scan
-			// test; the primary branch is exercised by every delta-aggregate flush.
-			startKey = {
-				value: (!isComposite && compositeStart.length === 1
-					? compositeStart[0]
-					: compositeStart) as BTreeKeyForIndex,
-			};
-		} else if (seekBound) {
-			const seekValue = isComposite ? [seekBound.value] : seekBound.value;
-			startKey = { value: seekValue as BTreeKeyForIndex };
-		}
+		const startKey = seekStartKey(plan, seekBound, isComposite);
 
 		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
