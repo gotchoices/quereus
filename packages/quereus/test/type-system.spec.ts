@@ -44,6 +44,7 @@ import { createDefaultColumnSchema } from '../src/schema/column.js';
 import type { ColumnSchema } from '../src/schema/column.js';
 import { QuereusError } from '../src/common/errors.js';
 import { StatusCode } from '../src/common/types.js';
+import { createTypedComparator } from '../src/util/comparison.js';
 
 describe('Type System', () => {
 
@@ -710,10 +711,7 @@ describe('Type System', () => {
 		});
 
 		it('fails for distinct non-numeric pairs (BOOLEAN is not in the numeric key space)', () => {
-			// BOOLEAN is the deliberate omission: the key serializer and the store's byte
-			// encoding both fold booleans into the numeric space, but BOOLEAN_TYPE.compare
-			// ranks by `a === b` and so disagrees with a 1/0 operand — the memory BTree
-			// would be ordered by a comparator the probe side does not share.
+			// BOOLEAN is the deliberate omission; see the note on `sharesSeekKeySpace`.
 			expect(sharesSeekKeySpace(BOOLEAN_TYPE, INTEGER_TYPE)).to.equal(false);
 			expect(sharesSeekKeySpace(INTEGER_TYPE, BOOLEAN_TYPE)).to.equal(false);
 			expect(sharesSeekKeySpace(TEXT_TYPE, BLOB_TYPE)).to.equal(false);
@@ -755,6 +753,25 @@ describe('Type System', () => {
 					expect(sharesSeekKeySpace(ta, tb), `${a} vs ${b}`).to.equal(true);
 				}
 				expect(sharesSeekKeySpace(getType(a)!, TEXT_TYPE), `${a} vs TEXT`).to.equal(false);
+			}
+		});
+	});
+
+	// ──────────────────── Key comparators ────────────────────
+	describe('createTypedComparator', () => {
+		it('gives opposite answers for swapped operands, whatever the seek value type', () => {
+			// A key tree compares a value its column can hold against any seek value, including
+			// one of another type (`flag = 1`), and throws if the two argument orders disagree.
+			const TYPES = [INTEGER_TYPE, REAL_TYPE, NUMERIC_TYPE, TEXT_TYPE, BLOB_TYPE, ANY_TYPE, BOOLEAN_TYPE];
+			const VALUES = [null, true, false, 0, 1, 2, 1.5, 3n, '', 'a', 'B', new Uint8Array([1])];
+			for (const type of TYPES) {
+				const compare = createTypedComparator(type);
+				for (const stored of VALUES.filter(v => type.validate?.(v))) {
+					for (const seek of VALUES) {
+						expect(Math.sign(compare(stored, seek)), `${type.name}: ${String(stored)} vs ${String(seek)}`)
+							.to.equal(-Math.sign(compare(seek, stored)));
+					}
+				}
 			}
 		});
 	});

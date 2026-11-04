@@ -23,6 +23,7 @@ import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-
 import { PRIMARY_INDEX_NAME } from '../index-descriptor.js';
 import { combineConjunctive } from '../../planner/stats/selectivity-combine.js';
 import { costedRows } from '../../planner/util/row-estimates.js';
+import { normalizeCollationName } from '../../util/comparison.js';
 import type { ColumnStatistics, TableStatistics } from '../../planner/stats/catalog-stats.js';
 
 const logger = createMemoryTableLoggers('module');
@@ -211,6 +212,17 @@ function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): R
 		}
 	}
 	return cols.size === 0 ? EMPTY_COLUMN_SET : cols;
+}
+
+/**
+ * Whether walking `indexCol` emits the order its table column sorts in. Every consumer of an
+ * ordering claim (`ORDER BY`, merge join) works under the column's declared collation, so
+ * `(k collate nocase)` over a BINARY `k`, which emits `'a'` before `'B'`, claims nothing on
+ * `k`. The store's twin is `indexOrderMatchesDeclaredCollation`.
+ */
+function indexColumnSortsAsDeclared(tableInfo: TableSchema, indexCol: IndexColumnSchema): boolean {
+	const declared = tableInfo.columns[indexCol.index]?.collation;
+	return normalizeCollationName(indexCol.collation ?? 'BINARY') === normalizeCollationName(declared ?? 'BINARY');
 }
 
 /**
@@ -664,6 +676,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		if (trailingNonBound.length === 0) return {}; // single-row equality seek
 
 		const leadingCol = trailingNonBound[0];
+		if (!indexColumnSortsAsDeclared(tableInfo, leadingCol)) return {};
 
 		// A nullable DESC leading column walks its NULLs to the END; the engine's ORDER BY
 		// wants them FIRST. `equalityBound` is the pinned set the helper needs (a pinned
@@ -760,6 +773,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				// A range narrows the equality it follows, so this must estimate fewer rows than
 				// the equality-only arm below or an index that cannot use the range outranks one
 				// that can. A multi-value prefix plans as a scan regardless (see the NOTE above).
+				//
+				// NOTE: on an analyzed table with a near-unique prefix this reaches 1 row, which
+				// by arithmetic ties a unique whole-key seek at cost 0.8, so declaration order
+				// picks between them. If that choice ever shows up as a slow plan, break the tie
+				// towards the equality arm.
 				const estimatedRows = equalityMatches.isMultiSeek
 					? tableFraction
 					: Math.max(1, Math.min(
@@ -1148,7 +1166,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			const indexCol = index.columns[i];
 
 			if (required.columnIndex === indexCol.index &&
-				required.desc === (indexCol.desc ?? false)) {
+				required.desc === (indexCol.desc ?? false) &&
+				indexColumnSortsAsDeclared(tableInfo, indexCol)) {
 				i++;
 				j++;
 				continue;

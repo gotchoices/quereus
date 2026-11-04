@@ -152,6 +152,13 @@ describe('Plan shape: index selection', () => {
 			await db.exec('create unique index rk_krs on rk (k, r, s)');
 			expect(await seekDetail("select z from rk where k = 'a' and r = 3")).to.match(/USING rk_krs\b/);
 		});
+
+		it('keeps the index order under a null test on a collated column', async () => {
+			// A null test compares nothing under a collation, so it is no reason to keep the Sort.
+			await db.exec('create table nn (k text collate nocase not null, id integer primary key)');
+			await db.exec('create index nn_k on nn (k)');
+			expect(await planOps(db, 'select k from nn where k is not null order by k')).to.not.include('SORT');
+		});
 	});
 
 	describe('no index available falls back to SeqScan', () => {

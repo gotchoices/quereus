@@ -89,7 +89,7 @@ detection lives in `quereus-isolation`.
     *   Equality on leading columns of a composite key (`WHERE a = ?` on `idx(a, b)`), which reads only that group of rows and provides the order of the next column within it
     *   Range scans (`WHERE indexed_col > ?`, etc.) on the first column of chosen index
     *   Prefix-equality + trailing-range scans on composite indexes (`WHERE a = ? AND b > ?` on `idx(a, b)`)
-    *   `ORDER BY` satisfaction using index ordering
+    *   `ORDER BY` satisfaction using index ordering, when the index column's collation is the table column's
 
 ### **Schema Evolution:**
 *   **Dynamic Schema Changes:** `ALTER TABLE` support for adding, dropping, and renaming columns

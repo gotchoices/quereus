@@ -93,7 +93,9 @@ Three details are load-bearing:
   and `'a'`, and `r` restarts in each; the same mismatch also makes the seek decline to a
   scan, which emits no claimed order. Every site that lets a `Sort` go therefore also asks
   `orderingClaimSurvivesCollation` (`rule-select-access-path`), which applies the
-  collation-cover analysis to the claim's index. On a mismatch the `Sort` stays.
+  collation-cover analysis to the claim's index. On a mismatch the `Sort` stays. Whether the
+  ordered column itself sorts as the index does is the module's own check, since it can see
+  both collations ([module authoring](module-authoring.md)).
 
 Two bugs have been filed against these two directions of the same seam
 (`bug-filter-conjunct-lost-under-index-order` for `source`,

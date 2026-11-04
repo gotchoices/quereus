@@ -201,7 +201,7 @@ function* scanLayerResolved(
 			const row = value as Row;
 			const primaryKey = primaryKeyExtractorFromRow(row);
 			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator, comparators)) {
-				// Early termination for prefix-range: break when prefix no longer matches
+				// Early termination for a prefix walk: break when the prefix no longer matches
 				if (plan.equalityPrefix) {
 					const keyArr = keyParts(primaryKey, comparators.keyIsTuple);
 					let prefixMismatch = false;
@@ -315,7 +315,7 @@ function* scanLayerResolved(
 
 		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
-				// Early termination for prefix-range: break when prefix no longer matches
+				// Early termination for a prefix walk: break when the prefix no longer matches
 				if (plan.equalityPrefix) {
 					const keyArr = keyParts(indexEntry.indexKey, comparators.keyIsTuple);
 					let prefixMismatch = false;

@@ -242,3 +242,25 @@ select x from pfx3 where a = 1 and c = 1 order by b;
 → [{"x":10},{"x":30}]
 
 drop table pfx3;
+
+-- A number seeking a boolean key column means what `=` says it means, rather than
+-- failing inside the key tree. `2` equals neither `true` nor `false`.
+create table pfxb (flag boolean, r integer, primary key (flag, r));
+insert into pfxb values (true, 1), (true, 2), (false, 3);
+
+select r from pfxb where flag = 1 order by r;
+→ [{"r":1},{"r":2}]
+
+select r from pfxb where flag = 0;
+→ [{"r":3}]
+
+select r from pfxb where flag = 2;
+→ []
+
+select r from pfxb where flag = 1 and r = 2;
+→ [{"r":2}]
+
+select r from pfxb where flag = 1 and r > 1;
+→ [{"r":2}]
+
+drop table pfxb;

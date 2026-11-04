@@ -1555,7 +1555,11 @@ function isPrimaryIndexName(indexName: string | undefined): boolean {
  *
  * Deliberately coarse: a mismatched equality on any column of the index disqualifies the
  * claim, even one past the columns the claim consumed. That costs one needless Sort in a
- * rare shape. `constraints` must be the array `handledFilters` is positional against.
+ * rare shape. A null test compares nothing under a collation, so it never bears on this.
+ * `constraints` must be the array `handledFilters` is positional against.
+ *
+ * Whether the ordered columns themselves sort as the index does is the module's to answer,
+ * since it can see both collations: see `providesOrdering` in docs/module-authoring.md.
  */
 export function orderingClaimSurvivesCollation(
 	tableSchema: TableSchema,
@@ -1571,6 +1575,7 @@ export function orderingClaimSurvivesCollation(
 	const collationForColumn = indexColumnCollationLookup(tableSchema, { indexName });
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	return constraints.every((c, i) => {
+		if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return true;
 		const isEquality = c.op === '=' || c.op === 'IN';
 		const bearsOnClaim = isEquality ? c.usable : accessPlan.handledFilters[i] === true;
 		if (!bearsOnClaim || !keyColumns.some(col => col.index === c.columnIndex)) return true;

@@ -243,8 +243,15 @@ export const BOOLEAN_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
+		// A key tree walks with this for any seek value, and `flag = 1` is a legal predicate:
+		// a number shares booleans' storage class, so it arrives here rather than being ranked
+		// by class. Answer as `=` does, or the two argument orders disagree and the tree throws.
+		if (typeof a !== 'boolean' || typeof b !== 'boolean') {
+			return compareSqlValuesFast(a, b, BINARY_COLLATION);
+		}
+
 		// false < true
-		return a === b ? 0 : (a as boolean) ? 1 : -1;
+		return a === b ? 0 : a ? 1 : -1;
 	},
 };
 
@@ -386,10 +393,10 @@ function isSeekKeySpaceNumeric(type: DeepReadonly<LogicalType>): boolean {
  * residual re-check follows, but a wrong answer on the plan-time literal `IN` path, which
  * reports the predicate fully handled and keeps no residual.
  *
- * BOOLEAN is deliberately absent even though `canonicalNumeric` and the store's
- * `encodeValue` both fold booleans into the numeric key space: `BOOLEAN_TYPE.compare`
- * ranks by `a === b`, so against a `1`/`0` operand it disagrees with both — the mismatch
- * is in the comparator, not the encoding.
+ * BOOLEAN is deliberately absent even though `canonicalNumeric`, the store's `encodeValue`
+ * and `BOOLEAN_TYPE.compare` all fold booleans into the numeric key space. A rewrite keyed
+ * by a boolean column has no use case that would justify auditing it; widen this if one
+ * shows up as a slow plan.
  *
  * This answers only the CROSS-type question. Whether byte equality equals value equality
  * WITHIN one type is a separate question, answered by `hasSemanticOrdering`

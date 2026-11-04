@@ -188,3 +188,41 @@ select min(r) as m from sfxb where k = 'a' collate nocase;
 → [{"m":0}]
 
 drop table sfxb;
+
+-- An index collated differently from its column does not walk in that column's order,
+-- so it cannot replace a sort, serve a boundary read, or drive a merge join. Over BINARY
+-- `s` the index emits a, B, c where the column sorts B, a, c.
+create table sfxc (id integer primary key, g text, s text);
+create index sfxc_gs on sfxc (g, s collate nocase);
+create index sfxc_s on sfxc (s collate nocase);
+insert into sfxc values (1, 'g', 'a'), (2, 'g', 'B'), (3, 'g', 'c');
+
+select s from sfxc order by s;
+→ [{"s":"B"},{"s":"a"},{"s":"c"}]
+
+select s from sfxc where g = 'g' order by s;
+→ [{"s":"B"},{"s":"a"},{"s":"c"}]
+
+select min(s) as m from sfxc where g = 'g';
+→ [{"m":"B"}]
+
+select x.s from sfxc x join sfxc y on x.s = y.s where x.g = 'g' and y.g = 'g' order by x.id;
+→ [{"s":"a"},{"s":"B"},{"s":"c"}]
+
+drop table sfxc;
+
+-- The reverse: over NOCASE `s` a BINARY index emits B, a, c where the column sorts a, B, c.
+create table sfxr (id integer primary key, g text, s text collate nocase);
+create index sfxr_gs on sfxr (g, s collate binary);
+insert into sfxr values (1, 'g', 'a'), (2, 'g', 'B'), (3, 'g', 'c');
+
+select s from sfxr where g = 'g' order by s;
+→ [{"s":"a"},{"s":"B"},{"s":"c"}]
+
+select min(s) as m from sfxr where g = 'g';
+→ [{"m":"a"}]
+
+select x.s from sfxr x join sfxr y on x.s = y.s where x.g = 'g' and y.g = 'g' order by x.id;
+→ [{"s":"a"},{"s":"B"},{"s":"c"}]
+
+drop table sfxr;
