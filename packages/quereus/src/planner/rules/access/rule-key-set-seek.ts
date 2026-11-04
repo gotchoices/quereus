@@ -118,7 +118,9 @@
  *
  * NOTE: the `orderingLoadBearing` decline is conservative when
  * `seekPreservesTargetOrder` is false — a future enhancement could re-sort the
- * pushed output by the leaf's advertised order.
+ * pushed output by the leaf's advertised order. Until then the decline can cost a
+ * full walk of a table a few seeks would have served; tracked as
+ * `bug-absorbed-sort-blocks-key-set-seek`, do not re-file.
  *
  * NOTE: this rewrite is not a priced candidate in `join-physical-selection` — it
  * only sees semi joins that already chose hash or merge. A filtered target over a
