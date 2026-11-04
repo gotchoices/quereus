@@ -108,13 +108,13 @@ describe('evalArgsSync', () => {
 
 describe('aggregate argument coercion', () => {
 	it('routes the non-numeric aggregates away from coercion', () => {
-		for (const name of ['count', 'COUNT', 'group_concat', 'GROUP_CONCAT', 'json_group_array', 'JSON_OBJECT']) {
+		for (const name of ['count', 'COUNT', 'group_concat', 'GROUP_CONCAT', 'min', 'MIN', 'max', 'MAX', 'json_group_array', 'JSON_OBJECT']) {
 			expect(aggregateCoercesArguments(name), name).to.equal(false);
 		}
 	});
 
 	it('routes every other aggregate into coercion', () => {
-		for (const name of ['sum', 'SUM', 'avg', 'min', 'max', 'total', 'my_custom_agg', '']) {
+		for (const name of ['sum', 'SUM', 'avg', 'total', 'my_custom_agg', '']) {
 			expect(aggregateCoercesArguments(name), name).to.equal(true);
 		}
 	});

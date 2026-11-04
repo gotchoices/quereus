@@ -186,8 +186,8 @@ Aggregate functions compute a single result from multiple rows within a `GROUP B
 | `sum(X)` | 1 | INTEGER/BIGINT/REAL | Sum. `NULL` for empty set |
 | `total(X)` | 1 | REAL | Sum, always REAL. `0.0` for empty set |
 | `avg(X)` | 1 | REAL | Average. `NULL` for empty set |
-| `min(X)` | 1 | any | Minimum non-NULL value |
-| `max(X)` | 1 | any | Maximum non-NULL value |
+| `min(X)` | 1 | any | Minimum non-NULL value, in `order by` order. Text compares as text: over `'5'`, `'10'` it returns `'10'`. Use `min(cast(X as integer))` for numeric order |
+| `max(X)` | 1 | any | Maximum non-NULL value, in `order by` order. Text compares as text, as for `min` |
 | `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`). Skips NULLs. Non-text values render through the one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)) — a BLOB is UTF-8-decoded, a JSON document keeps its own text |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` if fewer than 1 value |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` for empty set |

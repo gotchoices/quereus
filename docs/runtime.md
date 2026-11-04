@@ -1132,12 +1132,14 @@ SQL requires different coercion strategies for different contexts. Quereus coerc
 **Arithmetic Context** (`coerceToNumberForArithmetic`):
 - Converts all values to numbers for arithmetic operations
 - Non-numeric strings become 0 (SQL standard behavior)
-- Example: `'abc' + 0` → 0, `'123' + 0` → 123
+- Text holding a whole number past the safe-integer range stays exact as a `bigint`, through `parseNumericText`, the one text-to-number rule that unary operators and `sum` share
+- Example: `'abc' + 0` → 0, `'123' + 0` → 123, `'9007199254740993' + 0` → 9007199254740993n
 - Used in: +, -, *, /, % operators
 
 **Aggregate Context** (`coerceForAggregate`):
 - Function-specific coercion for aggregate arguments
-- COUNT/GROUP_CONCAT/`JSON_*` skip coercion, numeric aggregates (SUM/AVG) coerce strings
+- COUNT/GROUP_CONCAT/MIN/MAX/`JSON_*` skip coercion, numeric aggregates (SUM/AVG) coerce strings
+- `min`/`max` over text therefore compare as text and return text, matching `order by`: `min` over `'5'`, `'10'` returns `'10'`. Convert explicitly for numeric order: `min(cast(v as integer))`
 - The aggregate emitters do not call it per row: the routing decision is constant for a
   call site, so `computeAggregateValueTransforms` (`runtime/emit/aggregate-setup.ts`)
   resolves it once at emit time into a per-aggregate value transform — `undefined` when

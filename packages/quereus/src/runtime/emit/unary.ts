@@ -7,6 +7,7 @@ import type { EmissionContext } from "../emission-context.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 import { isTruthy } from "../../util/comparison.js";
 import { canonicalizeInteger } from "../../util/numeric-canonical.js";
+import { coerceUnaryOperand } from "../../util/coercion.js";
 import { Temporal } from 'temporal-polyfill';
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 
@@ -130,9 +131,8 @@ export function buildUnaryOpSpec(plan: UnaryOpNode): ScalarOpSpec {
 
 					// Numeric negation
 					if (typeof operand === 'number') return -operand;
-					if (typeof operand === 'bigint') return canonicalizeInteger(-operand);
-					// Try to convert to number
-					const num = Number(operand);
+					const num = coerceUnaryOperand(operand);
+					if (typeof num === 'bigint') return canonicalizeInteger(-num);
 					return isNaN(num) ? null : -num;
 				};
 				note = 'unary -';
@@ -150,8 +150,8 @@ export function buildUnaryOpSpec(plan: UnaryOpNode): ScalarOpSpec {
 					// Unary plus - convert to number if possible
 					if (operand === null) return null;
 					if (typeof operand === 'number' || typeof operand === 'bigint') return operand;
-					const plusNum = Number(operand);
-					return isNaN(plusNum) ? null : plusNum;
+					const plusNum = coerceUnaryOperand(operand);
+					return typeof plusNum === 'number' && isNaN(plusNum) ? null : plusNum;
 				};
 				note = 'unary +';
 			}
@@ -173,10 +173,9 @@ export function buildUnaryOpSpec(plan: UnaryOpNode): ScalarOpSpec {
 			} else {
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					if (typeof operand === 'bigint') return bitwiseNot(operand);
 					// Convert to integer and apply bitwise NOT
-					const num = Number(operand);
-					if (isNaN(num)) return null;
+					const num = coerceUnaryOperand(operand);
+					if (typeof num === 'number' && isNaN(num)) return null;
 					return bitwiseNot(num);
 				};
 				note = 'bitwise ~';

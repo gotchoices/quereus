@@ -48,6 +48,18 @@ export function canonicalizeInteger(v: number | bigint): number | bigint {
 }
 
 /**
+ * The exact integer a digit string names, in canonical form. `digits` must match
+ * `/^[+-]?\d+$/`. Past the safe range this rebuilds from the digits rather than the
+ * rounded `Number()`; the explicit `+` is stripped because `BigInt()` rejects the sign
+ * `Number()` accepts.
+ */
+export function integerFromDigits(digits: string): number | bigint {
+	const parsed = Number(digits);
+	if (Number.isSafeInteger(parsed)) return parsed;
+	return canonicalizeInteger(BigInt(digits[0] === '+' ? digits.slice(1) : digits));
+}
+
+/**
  * Canonicalize a value of unknown storage class at an ingress seam (parameter
  * bind): a safe-range `bigint` narrows to `number`, everything else passes
  * through. Deliberately does NOT widen whole `number`s — a bound `1e20` may be a

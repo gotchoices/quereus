@@ -65,10 +65,11 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
-/** Handle arithmetic when at least one operand is bigint.
+/** Handle arithmetic when at least one operand is bigint. Both operands are coerced through
+ *  SQL arithmetic affinity first (string/bool/blob → number, or bigint for text past the
+ *  safe range), so the arms below test what the operands read as, not what they arrived as.
  *  Both bigint → use bigint arithmetic directly.
- *  Mixed (one bigint, one non-bigint):
- *    Non-bigint operand is coerced through SQL arithmetic affinity (string/bool/blob → number).
+ *  Mixed (one bigint, one number):
  *    - integer-valued number → promote to BigInt, stay in bigint domain
  *    - fractional number → demote bigint to Number, use float arithmetic */
 function mixedBigIntArithmetic(
@@ -76,22 +77,19 @@ function mixedBigIntArithmetic(
 	inner: (v1: number, v2: number) => number,
 	innerBigInt: (v1: bigint, v2: bigint) => bigint
 ): SqlValue {
-	if (typeof v1 === 'bigint' && typeof v2 === 'bigint') {
+	const v1n = coerceToNumberForArithmetic(v1);
+	const v2n = coerceToNumberForArithmetic(v2);
+	if (typeof v1n === 'bigint' && typeof v2n === 'bigint') {
 		try {
 			// Narrow a result that lands inside the safe-integer range back to number
 			// (R1, util/numeric-canonical.ts) — on the success path only; the catch
 			// arms (division by zero, RangeError) still return null. Narrowing itself
 			// cannot throw.
-			return canonicalizeInteger(innerBigInt(v1, v2));
+			return canonicalizeInteger(innerBigInt(v1n, v2n));
 		} catch {
 			return null;
 		}
 	}
-	// Mixed: one bigint, one non-bigint. Coerce the non-bigint side through
-	// SQL arithmetic affinity so strings/booleans/blobs map to numbers
-	// consistently with the non-bigint arithmetic path.
-	const v1n: bigint | number = typeof v1 === 'bigint' ? v1 : coerceToNumberForArithmetic(v1);
-	const v2n: bigint | number = typeof v2 === 'bigint' ? v2 : coerceToNumberForArithmetic(v2);
 	const num = typeof v1n === 'bigint' ? v2n as number : v1n as number;
 	if (Number.isInteger(num)) {
 		try {
@@ -105,9 +103,7 @@ function mixedBigIntArithmetic(
 		}
 	}
 	// Float path: convert bigint → Number, use float arithmetic
-	const n1 = typeof v1n === 'bigint' ? Number(v1n) : v1n;
-	const n2 = typeof v2n === 'bigint' ? Number(v2n) : v2n;
-	const result = inner(n1, n2);
+	const result = inner(Number(v1n), Number(v2n));
 	if (!Number.isFinite(result)) return null;
 	return result;
 }
@@ -133,11 +129,11 @@ function buildCoercingArithmeticRun(
 		}
 
 		if (v1 !== null && v2 !== null) {
-			if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-				return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
+			const n1 = coerceToNumberForArithmetic(v1);
+			const n2 = coerceToNumberForArithmetic(v2);
+			if (typeof n1 === 'bigint' || typeof n2 === 'bigint') {
+				return mixedBigIntArithmetic(n1, n2, inner, innerBigInt);
 			} else {
-				const n1 = coerceToNumberForArithmetic(v1);
-				const n2 = coerceToNumberForArithmetic(v2);
 				try {
 					const result = inner(n1, n2);
 					if (!Number.isFinite(result)) return null;

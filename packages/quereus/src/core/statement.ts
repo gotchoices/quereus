@@ -13,7 +13,7 @@ import { WorkCounterCollector, computePlanShape, type PlanShape, type WorkCounte
 import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { REPR_STRICT } from '../runtime/strict-flags.js';
-import { assertRowConforms, type DeclaredType } from '../runtime/strict-representation.js';
+import { assertRowConforms } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -36,13 +36,6 @@ import { FeedbackReplanState, ReportedSizeSnapshot, overlayTableKey } from './da
 const log = createLogger('core:statement');
 const feedbackLog = createLogger('core:cardinality-feedback');
 const errorLog = log.extend('error');
-
-/**
- * The declared-type argument for a row check that has no declared types to check
- * against — every position reads as `undefined` and takes `assertRowConforms`'s R1-only
- * path. See {@link Statement._iterateWithSignal} for why statement egress is that case.
- */
-const NO_DECLARED_TYPES: readonly (DeclaredType | undefined)[] = [];
 
 /** Lowercased `schema.table` of every table a plan read — the cardinality-feedback overlay's key. */
 function tableDependencyKeys(dependencies: BuildTimeDependencyTracker): ReadonlySet<string> {
@@ -626,29 +619,14 @@ export class Statement {
 		// (an arithmetic path that forgot to narrow) — the scan, table-valued function,
 		// write and UDF seams all sit upstream of it.
 		//
-		// R1 ONLY, for now — hence the empty declared-type array, which puts every cell
-		// on `assertRowConforms`'s untyped-position path. A result column's announced
-		// type (a `ScalarType` inference, reachable via `getColumnDefs()`) now agrees
-		// with the values the column produces everywhere the suite exercises, EXCEPT two
-		// wrong-VALUE defects this seam must not paper over. Both are runtime bugs, not
-		// inference imprecision:
-		//  - `coerceAggregateValue` (util/coercion.ts) converts numeric-looking text
-		//    before min/max, so `min(text_col)` announces TEXT (correctly) and yields a
-		//    number (wrongly) — `backlog/bug-text-coercion-in-arithmetic-and-aggregates`
-		//    (arm B). This is the one the SUITE trips, at two sites
-		//    (test/logic/14-utilities.sqllogic min(amount),
-		//    test/logic/25-aggregate-edge-cases.sqllogic mn).
-		//  - binary arithmetic over two safe-integer operands returns the raw double when
-		//    the exact answer escapes the safe range (`9007199254740991 * 3`), which the
-		//    announced INTEGER does not admit —
-		//    `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`.
-		//    No suite site trips it today, so it does not block the widening, but a
-		//    boundary case added later would.
-		// Once those land, widen this check to R2 by passing
-		// `this.columnDefCache.value.map(col => col.type.logicalType)` instead of
-		// NO_DECLARED_TYPES (and delete the constant); the rest of the suite already
-		// passes under that widening (ticket
-		// `4-remaining-scalar-result-types-and-repr-net`, measured 2026-08-11).
+		// R1 + R2, against each result column's announced type (a `ScalarType` inference,
+		// reachable via `getColumnDefs()`). An announced ANY imposes no R2 constraint.
+		//
+		// NOTE: binary arithmetic over two safe-integer operands returns the raw double
+		// when the exact answer escapes the safe range (`9007199254740991 * 3`), which the
+		// announced INTEGER does not admit —
+		// `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`. No suite
+		// site trips it today, but a boundary case added later would.
 		//
 		// The announced NULLABILITY flag is a separate axis this seam does not check:
 		// R2 admits null in every position. A measurement run asserting "announced
@@ -656,10 +634,12 @@ export class Statement {
 		// (builtins whose `inferReturnType` claims non-nullable while nulling on a null
 		// argument, outer-join columns not widened, empty scalar subqueries) — see
 		// `backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
-		const reprNames = REPR_STRICT ? this.columnDefCache.value.map(col => col.name) : undefined;
+		const reprColumns = REPR_STRICT ? this.columnDefCache.value : undefined;
+		const reprNames = reprColumns?.map(col => col.name);
+		const reprTypes = reprColumns?.map(col => col.type.logicalType);
 		for await (const row of source) {
 			if (signal) throwIfAborted(signal);
-			if (reprNames) assertRowConforms(row, NO_DECLARED_TYPES, 'the statement result row', reprNames);
+			if (reprTypes) assertRowConforms(row, reprTypes, 'the statement result row', reprNames);
 			yield row;
 		}
 	}

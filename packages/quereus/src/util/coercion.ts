@@ -1,4 +1,5 @@
 import type { SqlValue } from '../common/types.js';
+import { integerFromDigits } from './numeric-canonical.js';
 
 /**
  * SQL type coercion utilities.
@@ -6,46 +7,62 @@ import type { SqlValue } from '../common/types.js';
  */
 
 /**
- * Attempts to convert a value to a number if it's a numeric string.
+ * What a piece of text means as a number: the single text-to-number rule behind arithmetic,
+ * unary operators, `sum` and aggregate-argument conversion. A whole-number digit string
+ * past the safe-integer range is an exact `bigint`, agreeing with `cast(... as integer)`;
+ * everything else keeps `Number()`'s reading. NaN means "names no number" — each caller
+ * maps that to its own rule.
+ */
+export function parseNumericText(text: string): number | bigint {
+	const trimmed = text.trim();
+	const approx = Number(trimmed);
+	// NaN and everything inside the safe range: Number() was already exact or is float by nature.
+	if (!(Math.abs(approx) > Number.MAX_SAFE_INTEGER)) return approx;
+	// NOTE: hex past 2^53 ('0x20000000000001') keeps Number()'s rounding. `cast` reads that
+	// text as 0, so there is no exact sibling for it to agree with; if `cast` ever learns
+	// hex, widen this test to match.
+	return /^[+-]?\d+$/.test(trimmed) ? integerFromDigits(trimmed) : approx;
+}
+
+/**
+ * Attempts to convert a value to a number if it's a numeric string: exact (`bigint`) for
+ * a whole number past the safe-integer range, per {@link parseNumericText}.
  * Returns the original value if conversion is not appropriate.
- * Used for comparison contexts where numeric strings should be treated as numbers.
  */
 export function tryCoerceToNumber(value: SqlValue): SqlValue {
 	if (typeof value === 'string' && value.trim() !== '') {
-		// Try to parse as number
-		const trimmed = value.trim();
-		const asNumber = Number(trimmed);
-		if (!isNaN(asNumber) && isFinite(asNumber)) {
-			return asNumber;
-		}
+		const parsed = parseNumericText(value);
+		if (typeof parsed === 'bigint' || Number.isFinite(parsed)) return parsed;
 	}
 	return value;
 }
 
 /**
  * Converts a value to a number for arithmetic contexts.
- * Non-numeric strings become 0 (SQL arithmetic semantics).
+ * Non-numeric strings become 0 (SQL arithmetic semantics); numeric strings read per
+ * {@link parseNumericText}, so one past the safe-integer range stays exact as a `bigint`.
  * Used for +, -, *, /, % operations.
- *
- * NOTE: return type is `number`, so a numeric string past
- * Number.MAX_SAFE_INTEGER (e.g. `'9007199254740993' + 0`) rounds here —
- * unlike CAST/comparison, which go through INTEGER_TYPE.parse/NUMERIC_TYPE.parse
- * (types/builtin-types.ts) and preserve exact bigint precision past 2^53. Fixing
- * this means widening this function's return type to `number | bigint` and
- * propagating that into mixedBigIntArithmetic (runtime/emit/binary.ts) — separate
- * blast radius from the CAST/comparison/insert fix this note sits next to.
  */
-export function coerceToNumberForArithmetic(value: SqlValue): number {
-	if (typeof value === 'number') {
+export function coerceToNumberForArithmetic(value: SqlValue): number | bigint {
+	if (typeof value === 'number' || typeof value === 'bigint') {
 		return value;
 	} else if (typeof value === 'boolean') {
 		return value ? 1 : 0;
 	} else if (typeof value === 'string') {
-		const parsed = Number(value.trim());
-		return isNaN(parsed) ? 0 : parsed; // Non-numeric strings become 0
+		const parsed = parseNumericText(value);
+		return typeof parsed === 'number' && isNaN(parsed) ? 0 : parsed; // Non-numeric strings become 0
 	} else {
 		return 0; // Blobs, null, etc. become 0
 	}
+}
+
+/**
+ * Reads a non-null unary-operator operand as a number. NaN means the operand names no
+ * number, which the unary operators turn into NULL rather than arithmetic's 0.
+ */
+export function coerceUnaryOperand(value: SqlValue): number | bigint {
+	if (typeof value === 'string') return parseNumericText(value);
+	return typeof value === 'bigint' ? value : Number(value);
 }
 
 /**
@@ -84,12 +101,13 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
 	return [v1, v2];
 }
 
-/** Aggregates that never want their argument read as a number. */
-const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
+/** Aggregates that never want their argument read as a number. MIN and MAX rank values in
+ *  the argument's own order, so `min(text_col)` agrees with `order by text_col limit 1`. */
+const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT', 'MIN', 'MAX']);
 
 /**
- * Does this aggregate read its arguments numerically? False for COUNT, GROUP_CONCAT and
- * the `JSON_*` family, which take their arguments as-is.
+ * Does this aggregate read its arguments numerically? False for COUNT, GROUP_CONCAT,
+ * MIN, MAX and the `JSON_*` family, which take their arguments as-is.
  *
  * Split out so the routing decision has one home: the aggregate emitters resolve it once
  * per call site at emit time (`computeAggregateValueTransforms`,
@@ -105,13 +123,6 @@ export function aggregateCoercesArguments(functionName: string): boolean {
  * The value-level half of aggregate-argument coercion: a numeric-looking string becomes
  * a number, everything else passes through. Callers that have already established the
  * aggregate coerces at all (see {@link aggregateCoercesArguments}) use this directly.
- *
- * NOTE: this converts a numeric-looking string for min/max too, so `min('5','10')`
- * over a plain TEXT column returns the NUMBER 5 — disagreeing with
- * `order by … limit 1`, which keeps text order. Predates the semantic-ordering
- * min/max binding and is unchanged by it (the emitters skip the transform entirely when
- * every argument type is numeric or carries semantic ordering). Tracked as backlog
- * `bug-text-minmax-numeric-coercion`.
  */
 export function coerceAggregateValue(value: SqlValue): SqlValue {
 	return typeof value === 'string' && value.trim() !== '' ? tryCoerceToNumber(value) : value;
@@ -120,7 +131,7 @@ export function coerceAggregateValue(value: SqlValue): SqlValue {
 /**
  * Coerces a value for aggregate function arguments.
  * Most aggregate functions should accept numeric strings as numbers.
- * For COUNT, no coercion needed. For SUM/AVG, numeric strings should be converted.
+ * For COUNT and MIN/MAX, no coercion needed. For SUM/AVG, numeric strings should be converted.
  */
 export function coerceForAggregate(value: SqlValue, functionName: string): SqlValue {
 	return aggregateCoercesArguments(functionName) ? coerceAggregateValue(value) : value;

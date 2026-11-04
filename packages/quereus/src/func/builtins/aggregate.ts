@@ -4,6 +4,7 @@ import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, Agg
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
 import { canonicalizeInteger } from '../../util/numeric-canonical.js';
+import { parseNumericText } from '../../util/coercion.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
@@ -167,10 +168,10 @@ export const sumFunc = createAggregateFunction(
 			return addSumContribution(acc, value ? 1 : 0);
 		}
 		if (typeof value === 'string') {
-			const parsed = Number(value);
+			const parsed = parseNumericText(value);
 			// Documented skip, not a failure: text that names no number contributes nothing.
 			// (How text becomes a number at all is the coercion layer's rule, not sum's.)
-			if (isNaN(parsed)) return acc;
+			if (typeof parsed === 'number' && isNaN(parsed)) return acc;
 			return addSumContribution(acc, parsed);
 		}
 		// Documented skip, not a failure: a non-numeric storage class (Uint8Array, JSON

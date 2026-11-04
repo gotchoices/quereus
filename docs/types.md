@@ -112,6 +112,10 @@ on read paths:
   coercion of a differently-typed cell, and ALTER backfill.
 - **Bound parameters**: canonicalized as they are stored into the statement's bound-args
   map (per-bind, not per-row).
+- **Text read as a number**: `parseNumericText` (`util/coercion.ts`), behind arithmetic,
+  unary operators and `sum()`, reads a whole-number digit string past the safe range as
+  an exact `bigint`, agreeing with `cast(… as integer)`. Fractional and exponent spellings
+  (`'9007199254740993.0'`, `'1e20'`) stay doubles.
 - **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
   `sum()` narrow a result that lands back inside the safe range.
 
@@ -200,7 +204,7 @@ Five seams, each chosen so a violation is reported at the layer that CAUSED it:
 | table-valued function output (`runtime/emit/table-valued-function.ts`) | each row a table-valued function yields, after row-width normalization | its declared column types — R1 + R2; a function declaring no columns gets R1 only |
 | DML write (`runtime/emit/dml-executor.ts`) | the row about to reach `vtab.update`, after the pipeline's coercion pass | the declared column types — R1 + R2 |
 | UDF return (`runtime/emit/scalar-function.ts`) | a scalar function's returned value | its schema's declared return type — R1 + R2 |
-| statement row egress (`core/statement.ts`) | each row yielded to the caller | **R1 only** |
+| statement row egress (`core/statement.ts`) | each row yielded to the caller | each result column's announced type — R1 + R2; an announced `ANY` gets R1 only |
 
 The egress seam is the backstop for an *expression* producing a non-canonical value (an
 arithmetic path that forgot to narrow), which none of the other four sees. A result
@@ -213,22 +217,14 @@ untyped parameters) names a type whose value space the column's values inhabit, 
 concrete type announces **ANY**, which is an honest "no representation constraint —
 convert before trusting", never a guess.
 
-The seam still *asserts* R1 only. Two known wrong-VALUE defects block the upgrade to
-full R2 — both runtime bugs, not inference imprecision. `coerceAggregateValue` converts
-numeric-looking text before `min`/`max`, so `min(text_col)` announces TEXT (correctly)
-and can yield a number (wrongly) — tracked as
-`backlog/bug-text-coercion-in-arithmetic-and-aggregates`; this is the one the suite
-trips. And binary arithmetic over two safe-integer operands returns the raw double when
-the exact answer escapes the safe range (`9007199254740991 * 3`), which the announced
-INTEGER does not admit — tracked as
-`backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`; no suite site
-trips it today, so it does not block the widening, but a boundary case added later
-would. Once those land, the seam
-widens by passing the plan's output logical types instead of the empty declared-type
-array (see the comment in `Statement._iterateWithSignal`); the rest of the suite
-already passes under that widening. The announced `nullable` flag is a further axis R2
-does not cover (null is admissible in every position) — its violations are tracked as
-`backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
+The seam asserts that announcement. One known wrong-VALUE defect can still trip it, a
+runtime bug rather than inference imprecision: binary arithmetic over two safe-integer
+operands returns the raw double when the exact answer escapes the safe range
+(`9007199254740991 * 3`), which the announced INTEGER does not admit — tracked as
+`backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`. No suite site
+trips it today, but a boundary case added later would. The announced `nullable` flag is
+a further axis R2 does not cover (null is admissible in every position) — its violations
+are tracked as `backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
 
 **No capability flag, and why.** A `representationFidelity` declaration on
 `VirtualTableModule` (alongside `scanSnapshotIsolation`) was considered and rejected:
@@ -244,7 +240,7 @@ it in tests.
 - A scalar function with a `customEmitter` bypasses the UDF seam — its emitter builds its
   own `run`. Several builtins are in this category.
 - Aggregate and window function results are not checked at their own seam; they reach the
-  egress seam, where only R1 applies.
+  egress seam, which checks them against the result column's announced type.
 - Values inside a JSON document are not walked; only the top-level `SqlValue` is checked.
 - `yarn check` runs this mode over `packages/quereus` only. Table-valued functions in other
   packages (`quereus_basis_lifecycle` in `@quereus/sync`, the sample plugins) are checked only

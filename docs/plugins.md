@@ -1349,10 +1349,10 @@ import {
   resolveCollationFunctions,  // Batch name→function resolution via a CollationResolver
 
   // Coercion utilities
-  tryCoerceToNumber,          // Try to convert string to number
-  coerceToNumberForArithmetic,// Coerce for arithmetic (non-numeric → 0)
+  tryCoerceToNumber,          // Try to convert string to number (bigint past the safe range)
+  coerceToNumberForArithmetic,// Coerce for arithmetic, returns number | bigint (non-numeric → 0)
   coerceForComparison,        // Coerce for comparison operations
-  coerceForAggregate,         // Coerce for aggregate functions
+  coerceForAggregate,         // Coerce for aggregate functions (a plugin aggregate can receive a bigint from text past the safe range)
   isNumericValue,             // Check if value is numeric
 } from '@quereus/quereus';
 ```

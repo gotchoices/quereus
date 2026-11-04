@@ -154,13 +154,11 @@ INSERT INTO agg_t VALUES (1, '10'), (2, '20'), (3, '30');
 select sum(amount) from agg_t;
 → [{"sum(amount)":60}]
 
--- MIN/MAX with mixed coerced values
--- Numeric strings are coerced to numbers; non-numeric stay as text
--- Storage class ordering: NUMERIC < TEXT, so min = smallest number, max = largest text
+-- MIN/MAX over a TEXT column compare as text and return text, matching ORDER BY
 INSERT INTO agg_t VALUES (4, 'z'), (5, 'a');
 
 select min(amount) from agg_t;
-→ [{"min(amount)":10}]
+→ [{"min(amount)":"10"}]
 
 select max(amount) from agg_t;
 → [{"max(amount)":"z"}]

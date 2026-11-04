@@ -60,9 +60,9 @@ SELECT avg(val) AS a FROM aec_coerce;
 SELECT count(val) AS c FROM aec_coerce;
 → [{"c":5}]
 
--- min/max on string values — min of numeric-looking strings may coerce
+-- min/max on string values compare as text and return text
 SELECT min(val) AS mn, max(val) AS mx FROM aec_coerce;
-→ [{"mn":10,"mx":"world"}]
+→ [{"mn":"10","mx":"world"}]
 
 DROP TABLE aec_coerce;
 
@@ -287,3 +287,41 @@ SELECT id, var_samp(val) AS vs FROM aec_single GROUP BY id ORDER BY id;
 → [{"id":1,"vs":null},{"id":2,"vs":null},{"id":3,"vs":null}]
 
 DROP TABLE aec_single;
+
+-- ============================================================
+-- min/max over text: compare as text, return text, agree with ORDER BY
+-- ============================================================
+
+create table aec_minmax (id integer primary key, v text);
+insert into aec_minmax values (1, '5'), (2, '10');
+
+select min(v) as mn, max(v) as mx, typeof(min(v)) as t from aec_minmax;
+→ [{"mn":"10","mx":"5","t":"text"}]
+
+select (select min(v) from aec_minmax) = (select v from aec_minmax order by v limit 1) as mn_ok,
+	(select max(v) from aec_minmax) = (select v from aec_minmax order by v desc limit 1) as mx_ok;
+→ [{"mn_ok":true,"mx_ok":true}]
+
+select min(v) as mn, max(v) as mx from aec_minmax group by 1 = 1;
+→ [{"mn":"10","mx":"5"}]
+
+select min(distinct v) as mn from aec_minmax;
+→ [{"mn":"10"}]
+
+-- sum/avg over the same column still read the text as numbers
+select sum(v) as s, avg(v) as a from aec_minmax;
+→ [{"s":15,"a":7.5}]
+
+drop table aec_minmax;
+
+create table aec_minmax_any (id integer primary key, v any);
+insert into aec_minmax_any values (1, '5'), (2, '10'), (3, 7);
+
+select min(v) as mn, max(v) as mx from aec_minmax_any;
+→ [{"mn":7,"mx":"5"}]
+
+select (select min(v) from aec_minmax_any) = (select v from aec_minmax_any order by v limit 1) as mn_ok,
+	(select max(v) from aec_minmax_any) = (select v from aec_minmax_any order by v desc limit 1) as mx_ok;
+→ [{"mn_ok":true,"mx_ok":true}]
+
+drop table aec_minmax_any;

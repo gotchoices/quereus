@@ -5,9 +5,8 @@
  * These assertions pin the announcement for every computed-column shape the
  * ticket `4-remaining-scalar-result-types-and-repr-net` reconciled, so a
  * regression fails here as a plain type assertion — not only as a
- * representation violation under `QUEREUS_REPR_STRICT=1` (whose statement-egress
- * check stays R1-only until `bug-text-coercion-in-arithmetic-and-aggregates`
- * lands; see the seam comment in `Statement._iterateWithSignal`).
+ * representation violation under `QUEREUS_REPR_STRICT=1` (see the seam comment in
+ * `Statement._iterateWithSignal`).
  */
 
 import { expect } from 'chai';

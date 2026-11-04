@@ -271,9 +271,9 @@ describe('Utility Edge Cases', () => {
 			expect(coerceForAggregate('hello', 'SUM')).to.equal('hello');
 		});
 
-		it('should coerce numeric strings for MIN and MAX', () => {
-			expect(coerceForAggregate('42', 'MIN')).to.equal(42);
-			expect(coerceForAggregate('42', 'MAX')).to.equal(42);
+		it('should skip coercion for MIN and MAX', () => {
+			expect(coerceForAggregate('42', 'MIN')).to.equal('42');
+			expect(coerceForAggregate('42', 'MAX')).to.equal('42');
 		});
 
 		it('should skip coercion for JSON functions', () => {

@@ -1,7 +1,7 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
 import { valueToText } from '../util/value-text.js';
-import { canonicalizeInteger } from '../util/numeric-canonical.js';
+import { canonicalizeInteger, integerFromDigits } from '../util/numeric-canonical.js';
 import type { DeepReadonly, SqlValue } from '../common/types.js';
 
 /**
@@ -84,12 +84,7 @@ export const INTEGER_TYPE: LogicalType = {
 			if (!m) {
 				throw new TypeError(`Cannot convert '${v}' to INTEGER`);
 			}
-			const digits = m[0];
-			const parsed = Number(digits);
-			if (Number.isSafeInteger(parsed)) return parsed;
-			// Canonical by construction (a digit string whose Number() is unsafe names a
-			// value outside the safe range); wrapped anyway so R1 is locally evident.
-			return canonicalizeInteger(BigInt(digits[0] === '+' ? digits.slice(1) : digits));
+			return integerFromDigits(m[0]);
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to INTEGER`);
 	},
@@ -288,15 +283,8 @@ export const NUMERIC_TYPE: LogicalType = {
 
 			// Try integer first. Past 2^53 rebuild from the digit string, not the
 			// rounded number — same safe-integer boundary as the lexer's number()
-			// for INTEGER literals. An explicit '+' is accepted here so this arm
-			// agrees with INTEGER_TYPE.parse, but stripped before BigInt(), which
-			// rejects the sign that Number() accepts.
-			if (/^[+-]?\d+$/.test(trimmed)) {
-				const parsed = Number(trimmed);
-				if (Number.isSafeInteger(parsed)) return parsed;
-				// Canonical by construction — see INTEGER_TYPE.parse's string arm.
-				return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
-			}
+			// for INTEGER literals.
+			if (/^[+-]?\d+$/.test(trimmed)) return integerFromDigits(trimmed);
 
 			// Fall back to real
 			const parsed = parseFloat(trimmed);
