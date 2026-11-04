@@ -31,6 +31,8 @@ import { extractConstraintsForTable } from './constraint-extractor.js';
 import { planTimeLiteralValue } from './predicate-shape.js';
 import { compareSqlValues } from '../../util/comparison.js';
 import { getTypeOrDefault } from '../../types/registry.js';
+import { castConverter } from '../../types/cast-semantics.js';
+import { CastNode } from '../nodes/scalar.js';
 
 /** Qualified base-table name, lowercased. */
 export interface QualifiedName {
@@ -66,11 +68,24 @@ export interface PortableScalarType {
 	readonly isReadOnly?: boolean;
 }
 
+/**
+ * The cast between a parameter and the key column it is compared against. Binding runs
+ * it, because the key a row is matched on is the converted value and not the bound one:
+ * `t = ?` bound to `'2020-01-01T00:00:00Z'` matches the stored `2020-01-01T00:00:00`.
+ */
+export interface ParamScopeConversion {
+	readonly typeName: string;
+	/** True for a planner-minted comparison cast; see {@link castConverter}. */
+	readonly synthetic: boolean;
+}
+
 /** An unbound parameter placeholder inside a `ScopeValue` tuple. */
 export interface ParamScopeValue {
 	readonly kind: 'param';
 	readonly index: number | string;
 	readonly type: PortableScalarType;
+	/** Absent when the parameter is compared directly, so the bound value is the key. */
+	readonly conversion?: ParamScopeConversion;
 }
 
 function isParamScopeValue(v: ScopeValue): v is ParamScopeValue {
@@ -698,7 +713,14 @@ export function scopeValueFromExpr(expr: ScalarPlanNode, unboundParams: Set<numb
 		: expr;
 	if (inner instanceof ParameterReferenceNode) {
 		unboundParams.add(inner.nameOrIndex);
-		return { kind: 'param', index: inner.nameOrIndex, type: portableFromScalarType(inner.targetType) };
+		return {
+			kind: 'param',
+			index: inner.nameOrIndex,
+			type: portableFromScalarType(inner.targetType),
+			...(expr instanceof CastNode
+				? { conversion: { typeName: expr.getType().logicalType.name, synthetic: expr.synthetic } }
+				: {}),
+		};
 	}
 	// `planTimeLiteralValue`, not a raw `expression.value` read behind a `SqlValue` cast:
 	// a folded constant scalar subquery (`k = (select 1)`) is a LiteralNode whose value is
@@ -1032,7 +1054,11 @@ export function bindParameters(scope: ChangeScope, params: SqlParameters | SqlVa
 	const substituteValue = (v: ScopeValue): ScopeValue => {
 		if (isParamScopeValue(v)) {
 			const bound = lookup(v.index);
-			if (bound !== undefined) return bound;
+			if (bound !== undefined) {
+				return v.conversion
+					? castConverter(getTypeOrDefault(v.conversion.typeName), v.conversion.synthetic)(bound)
+					: bound;
+			}
 		}
 		return v;
 	};

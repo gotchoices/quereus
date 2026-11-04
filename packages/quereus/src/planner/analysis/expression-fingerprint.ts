@@ -74,7 +74,11 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 			// `cast(x as text)` fingerprint apart even though both resolve to TEXT. Only
 			// costs a missed CSE (never an over-merge); switch to
 			// `ca.getType().logicalType.name` if alias-spelled casts ever need to share.
-			return `CA:${ca.expression.targetType}(${fingerprintExpression(ca.operand)})`;
+			//
+			// A synthetic cast fingerprints apart from a user-written one because the two
+			// can yield different values for one operand (`comparandConverter` keeps
+			// unparseable text that CAST turns into NULL).
+			return `${ca.synthetic ? 'CAS' : 'CA'}:${ca.expression.targetType}(${fingerprintExpression(ca.operand)})`;
 		}
 
 		case PlanNodeType.Collate: {

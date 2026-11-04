@@ -437,6 +437,7 @@ export type {
 	TableWatch,
 	WatchScope,
 	ScopeValue,
+	ParamScopeConversion,
 	ParamScopeValue,
 	PortableScalarType,
 	NonDetSource,

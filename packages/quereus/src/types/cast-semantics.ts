@@ -87,6 +87,47 @@ export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
 }
 
 /**
+ * Build the conversion of one comparison operand to `type`, for one comparison site: the
+ * type's {@link LogicalType.normalizeComparand} when it has one, otherwise {@link lenientCast}.
+ *
+ * THE one definition of "convert a comparison operand". Every comparison coercion comes
+ * through here (the planner's synthetic casts in `emitCast`, `makeComparisonGroup`,
+ * `inMembershipKeys`), while a user-written `cast(x as t)` stays on `lenientCast`: there
+ * unparseable text has no result, but in a comparison it still compares as text.
+ *
+ * The one-entry memo exists because a parameter, or a literal argument of `greatest`, hands
+ * the same string to this site for a whole scan. Without it an unindexed `t = ?` over DATETIME
+ * measured 23-32 us per row against about 1.4 us with no parse (5,000 rows, median of 5 runs).
+ * Sharing the memo across rows and executions is safe because the hook is a pure function of
+ * its input, so a remembered answer cannot go stale.
+ */
+export function comparandConverter(type: LogicalType): (value: SqlValue) => SqlValue {
+	const normalize = type.normalizeComparand;
+	if (!normalize) return value => lenientCast(value, type);
+
+	let lastInput: string | undefined;
+	let lastOutput: SqlValue = null;
+	return value => {
+		if (typeof value !== 'string') return normalize(value);
+		if (value !== lastInput) {
+			lastOutput = normalize(value);
+			lastInput = value;
+		}
+		return lastOutput;
+	};
+}
+
+/**
+ * The conversion a `CastNode` to `type` runs: {@link comparandConverter} for a synthetic
+ * cast, which reconciles a comparison operand, and {@link lenientCast} for a user-written
+ * one, which is CAST. `emitCast` runs it per row, and a change scope runs it on a bound
+ * parameter so the watched key is the value the comparison actually matches.
+ */
+export function castConverter(type: LogicalType, synthetic: boolean): (value: SqlValue) => SqlValue {
+	return synthetic ? comparandConverter(type) : value => lenientCast(value, type);
+}
+
+/**
  * Can `cast(<non-null operand> as type)` produce NULL? Answers the static
  * nullability of a converting CAST ({@link import('../planner/nodes/scalar.js').CastNode}).
  *

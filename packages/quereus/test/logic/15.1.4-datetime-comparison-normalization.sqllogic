@@ -1,0 +1,250 @@
+-- 15.1.4-datetime-comparison-normalization.sqllogic
+--
+-- THE RULE (docs/types.md § DATETIME): comparing a DATETIME against text normalizes
+-- that text the way a write does, so a timestamp ending in `Z` or an offset finds the
+-- row it created and sorts by the instant it names. Text that does not parse compares
+-- as plain text, and a number is not read as an epoch.
+--
+-- The seekable predicates run over three shapes because each reaches the comparison
+-- by a different route: a scan filter, a secondary-index seek and a primary-key seek.
+-- The remaining comparison sites share one coercion decision, so they run once.
+--
+-- Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`), whose seeks encode their keys differently.
+
+create table dn (id integer primary key, t datetime null);
+-- run
+create table di (id integer primary key, t datetime null);
+-- run
+create index di_t on di (t);
+-- run
+create table dp (t datetime primary key, id integer null);
+-- run
+insert into dn values (1, '2020-01-01T00:00:00Z'), (2, '2021-06-05T10:00:00+02:00');
+-- run
+insert into di values (1, '2020-01-01T00:00:00Z'), (2, '2021-06-05T10:00:00+02:00');
+-- run
+insert into dp values ('2020-01-01T00:00:00Z', 1), ('2021-06-05T10:00:00+02:00', 2);
+-- run
+
+-- The stored spelling stays bare UTC. Everything below depends on this.
+select id, t from dn order by id;
+→ [{"id":1,"t":"2020-01-01T00:00:00"},{"id":2,"t":"2021-06-05T08:00:00"}]
+
+-- ============================================================
+-- 1. Equality, range, BETWEEN and IN over each shape
+-- ============================================================
+
+select id from dn where t = '2020-01-01T00:00:00Z';
+→ [{"id":1}]
+select id from di where t = '2020-01-01T00:00:00Z';
+→ [{"id":1}]
+select id from dp where t = '2020-01-01T00:00:00Z';
+→ [{"id":1}]
+
+select id from dn where t = '2021-06-05T10:00:00+02:00';
+→ [{"id":2}]
+select id from di where t = '2021-06-05T10:00:00+02:00';
+→ [{"id":2}]
+select id from dp where t = '2021-06-05T10:00:00+02:00';
+→ [{"id":2}]
+
+select id from dn where t >= '2021-06-05T09:00:00+02:00';
+→ [{"id":2}]
+select id from di where t >= '2021-06-05T09:00:00+02:00';
+→ [{"id":2}]
+select id from dp where t >= '2021-06-05T09:00:00+02:00';
+→ [{"id":2}]
+
+select id from dn where t < '2021-06-05T09:00:00+02:00';
+→ [{"id":1}]
+select id from di where t < '2021-06-05T09:00:00+02:00';
+→ [{"id":1}]
+select id from dp where t < '2021-06-05T09:00:00+02:00';
+→ [{"id":1}]
+
+select id from dn where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
+→ [{"id":2}]
+select id from di where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
+→ [{"id":2}]
+select id from dp where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
+→ [{"id":2}]
+
+select id from dn where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
+→ [{"id":1},{"id":2}]
+select id from di where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
+→ [{"id":1},{"id":2}]
+select id from dp where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
+→ [{"id":1},{"id":2}]
+
+-- Other spellings of the same instant.
+select id from di where t = '2020-01-01';
+→ [{"id":1}]
+select id from di where t = '2020-01-01T00:00:00.000';
+→ [{"id":1}]
+
+-- A date-only upper bound is that date's midnight, so a row exactly at midnight is in
+-- range. Plain text order excluded it, because the bound sorted before the stored form.
+select id from dn where t between '2019-01-01' and '2020-01-01';
+→ [{"id":1}]
+
+-- ============================================================
+-- 2. Bound parameters
+-- ============================================================
+
+-- params: ["2020-01-01T00:00:00Z"]
+select id from dn where t = ?;
+→ [{"id":1}]
+-- params: ["2020-01-01T00:00:00Z"]
+select id from di where t = ?;
+→ [{"id":1}]
+-- params: ["2020-01-01T00:00:00Z"]
+select id from dp where t = ?;
+→ [{"id":1}]
+
+-- params: {"p":"2021-06-05T10:00:00+02:00"}
+select id from dn where t >= :p;
+→ [{"id":2}]
+-- params: {"p":"2021-06-05T10:00:00+02:00"}
+select id from di where t >= :p;
+→ [{"id":2}]
+-- params: {"p":"2021-06-05T10:00:00+02:00"}
+select id from dp where t >= :p;
+→ [{"id":2}]
+
+-- Only text normalizes: a number is not read as an epoch, though a cast or a write would.
+-- params: [1577836800000]
+select id from dn where t = ?;
+→ []
+-- params: [1577836800000]
+select id from di where t = ?;
+→ []
+-- params: [1577836800000]
+select id from dp where t = ?;
+→ []
+
+-- ============================================================
+-- 3. Text that does not parse compares as plain text
+-- ============================================================
+
+select id from dn where t = 'garbage';
+→ []
+select id from di where t = 'garbage';
+→ []
+select id from dp where t = 'garbage';
+→ []
+
+select id from dn where t < 'garbage' order by id;
+→ [{"id":1},{"id":2}]
+select id from di where t < 'garbage' order by id;
+→ [{"id":1},{"id":2}]
+select id from dp where t < 'garbage' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dn where t > 'garbage';
+→ []
+select id from di where t > 'garbage';
+→ []
+select id from dp where t > 'garbage';
+→ []
+
+-- A user-written cast keeps CAST's rule: unparseable text has no result.
+select cast('junk' as datetime) as c;
+→ [{"c":null}]
+
+-- ============================================================
+-- 4. The other comparison sites
+-- ============================================================
+
+create table s (k integer primary key, x text null);
+-- run
+insert into s values (1, '2021-06-05T10:00:00+02:00'), (2, 'junk');
+-- run
+
+select id from dn where t in (select x from s);
+→ [{"id":2}]
+
+-- A non-correlated IN over a text probe converts the probe instead.
+select k from s where x in (select t from dn);
+→ [{"k":1}]
+
+select a.id, b.k from dn a join s b on a.t = b.x;
+→ [{"id":2,"k":1}]
+
+create table su (k integer primary key, t text null);
+-- run
+insert into su values (1, '2021-06-05T10:00:00+02:00');
+-- run
+select a.id, b.k from dn a join su b using (t);
+→ [{"id":2,"k":1}]
+
+select id, case t when '2020-01-01T00:00:00Z' then 'y' else 'n' end as m from dn order by id;
+→ [{"id":1,"m":"y"},{"id":2,"m":"n"}]
+
+select id, nullif(t, '2020-01-01T00:00:00Z') as n from dn order by id;
+→ [{"id":1,"n":null},{"id":2,"n":"2021-06-05T08:00:00"}]
+
+-- greatest/least rank by the normalized key and return the argument as written.
+select greatest(t, '2021-06-05T09:00:00+02:00') as g from dn where id = 2;
+→ [{"g":"2021-06-05T08:00:00"}]
+select greatest(t, '2021-06-05T11:00:00+02:00') as g from dn where id = 2;
+→ [{"g":"2021-06-05T11:00:00+02:00"}]
+select least(t, '2021-06-05T11:00:00+02:00') as g from dn where id = 2;
+→ [{"g":"2021-06-05T08:00:00"}]
+
+-- The variadic form keeps its display spelling and its TEXT type; comparison normalizes it.
+select datetime('2020-01-01 00:00:00', '+0 days') as d;
+→ [{"d":"2020-01-01 00:00:00"}]
+select id from dn where t = datetime('2020-01-01 00:00:00', '+0 days');
+→ [{"id":1}]
+
+select datetime('2020-01-01T00:00:00Z') = '2020-01-01T00:00:00Z' as m;
+→ [{"m":true}]
+
+create table a (k integer primary key, v any null);
+-- run
+insert into a values (1, '2021-06-05T10:00:00+02:00'), (2, 42);
+-- run
+select a.k, dn.id from a join dn on a.v = dn.t;
+→ [{"k":1,"id":2}]
+
+-- The same text-column conversion and a user-written cast in one projection are
+-- different expressions: the comparison keeps unparseable text, the cast yields NULL.
+select x = t as m, cast(x as DATETIME) as c from s join dn on dn.id = 2 where s.k = 2;
+→ [{"m":false,"c":null}]
+
+-- A probe against a list mixing DATETIME and text stays unconverted, because converting
+-- it would miss the exact text match that the equivalent `=` disjunction finds.
+create table sm (k integer primary key, x text null, t datetime null);
+-- run
+insert into sm values (1, 'junk', '2020-01-01T00:00:00Z'), (2, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');
+-- run
+select k from sm where x in (t, 'junk');
+→ [{"k":1}]
+
+-- ============================================================
+-- 5. CHECK constraints compare the same way
+-- ============================================================
+
+create table c1 (id integer primary key, t datetime null, check (t >= '2020-01-01T00:00:00Z'));
+-- run
+insert into c1 values (1, '2020-01-01T00:00:00Z');
+-- run
+select t from c1;
+→ [{"t":"2020-01-01T00:00:00"}]
+
+insert into c1 values (2, '2019-12-31T23:59:59Z');
+-- error: CHECK
+
+-- ============================================================
+-- 6. Storing datetime('now') stores the bare spelling
+-- ============================================================
+
+create table sn (id integer primary key, c datetime null);
+-- run
+insert into sn values (1, datetime('now'));
+-- run
+select c like '%Z' as z from sn;
+→ [{"z":false}]
+select datetime('now') like '%Z' as z;
+→ [{"z":false}]

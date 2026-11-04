@@ -14,7 +14,8 @@ import { effectiveInCollation, inRhsTypes } from '../../planner/analysis/compari
 import { isCorrelatedSubquery } from '../../planner/cache/correlation-detector.js';
 import { PhysicalType, type LogicalType } from '../../types/logical-type.js';
 import { NULL_TYPE, NUMERIC_TYPE } from '../../types/builtin-types.js';
-import { lenientCast } from '../../types/cast-semantics.js';
+import { comparandConverter, lenientCast } from '../../types/cast-semantics.js';
+import { isComparandSource } from '../../types/comparison-coercion.js';
 
 /**
  * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
@@ -153,6 +154,10 @@ const isObjectPhysical = (type: LogicalType): boolean => type.physicalType === P
  *    uniformity gate is what keeps that shape out of here, so the two paths cannot
  *    disagree about it.
  *
+ * 1c. **A type with `normalizeComparand` vs textual or ANY.** The pairing `=` reconciles
+ *    so that `t in (select text_col …)` finds a DATETIME by any spelling of its instant.
+ *    Only the non-DATETIME side converts, under the same uniformity gate as 1b.
+ *
  * 2. **Semantic normalization (symmetric).** When an operand declares a semantic-ordering
  *    logical type (see {@link hasSemanticOrdering}) the probe AND every RHS value are
  *    normalized through that type's canonical group key before comparing. Without it,
@@ -216,6 +221,24 @@ function inMembershipKeys(plan: InNode): InMembershipKeys {
 				probe: (value: SqlValue) => lenientCast(value, target),
 				member: IDENTITY_KEY,
 				note: ` probe as ${target.name}`,
+			};
+		}
+
+		// Arm 1c: a normalizing type vs textual or ANY, over a uniform RHS.
+		if (conditionType.normalizeComparand && rhsNonNull.every(isComparandSource)) {
+			return {
+				probe: IDENTITY_KEY,
+				member: comparandConverter(conditionType),
+				note: ` member as ${conditionType.name}`,
+			};
+		}
+		const normalizing = rhsNonNull[0];
+		if (normalizing.normalizeComparand && isComparandSource(conditionType)
+			&& rhsNonNull.every(type => type === normalizing)) {
+			return {
+				probe: comparandConverter(normalizing),
+				member: IDENTITY_KEY,
+				note: ` probe as ${normalizing.name}`,
 			};
 		}
 	}

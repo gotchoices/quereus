@@ -736,7 +736,8 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 		 * user writing `cast(x as t)` in SQL. Analyses that need the operand's own
 		 * type — not the type the coercion imposed on it — look through a synthetic
 		 * cast and must not look through a user-written one, which is a deliberate
-		 * conversion with its own meaning.
+		 * conversion with its own meaning. The flag also selects the runtime conversion
+		 * (`runtime/emit/cast.ts`), since a comparison operand uses `comparandConverter`.
 		 */
 		public readonly synthetic: boolean = false,
 	) {

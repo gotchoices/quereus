@@ -189,6 +189,20 @@ export const DATETIME_TYPE: LogicalType = {
 		throw new TypeError(`Cannot convert ${typeof v} to DATETIME`);
 	},
 
+	// NOTE: a text operand that differs per row (`text_col = dt_col`) parses per row, and the
+	// memo in `comparandConverter` cannot help: 23-32 us per row where a scan with no parse
+	// costs about 1.4 us, because this parser throws its way through up to three attempts.
+	// If that shows up as slow, return early on text already in the canonical spelling.
+	normalizeComparand: (v) => {
+		if (typeof v !== 'string') return v;
+		try {
+			return parseDateTimeStringToUtcPlain(v).toString();
+		} catch {
+			// Not a failure: text naming no instant is a legal operand, compared as text.
+			return v;
+		}
+	},
+
 	compare: (a, b) => compareNulls(a, b) ?? BINARY_COLLATION(a as string, b as string),
 
 	supportedCollations: [],

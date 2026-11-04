@@ -24,8 +24,9 @@ import { comparisonGroupCoercions, comparisonGroupIndices, crossTypeCoercion } f
  * meaningfully as-is, by wrapping one side in a synthetic CastNode.
  * Returns `[left, right]` — possibly with one side replaced by a CastNode.
  *
- * See {@link crossTypeCoercion} for the rule (object-physical vs anything else,
- * then numeric vs textual) and why each side is chosen.
+ * See {@link crossTypeCoercion} for the rule (object-physical vs anything else, then
+ * a `normalizeComparand` type vs textual or ANY, then numeric vs textual) and why each
+ * side is chosen.
  */
 export function insertCrossTypeCoercion(
 	scope: Scope,

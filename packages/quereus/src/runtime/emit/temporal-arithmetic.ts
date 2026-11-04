@@ -42,8 +42,9 @@ export function tryTemporalArithmetic(operator: string, v1: SqlValue, v2: SqlVal
  * - TIMESPAN: Durations need to be compared semantically, not lexicographically
  *   (e.g., "PT30M" > "PT1H" lexicographically, but 30 minutes < 1 hour semantically)
  *
- * Note: DATE, TIME, and DATETIME use ISO 8601 format which compares correctly lexicographically,
- * so they don't need special handling here.
+ * Note: DATE, TIME, and DATETIME values are stored in one ISO 8601 spelling that compares
+ * correctly lexicographically, so they don't need special handling here. Text compared against
+ * a DATETIME is converted to that spelling at plan time (`crossTypeCoercion`), not here.
  *
  * NOTE: deliberately NOT given the emit-time specialization `buildNumericOpSpec`'s temporal
  * arm got. The shapes look alike, but the economics do not:

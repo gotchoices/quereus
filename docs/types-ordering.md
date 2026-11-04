@@ -4,8 +4,9 @@
 
 Which comparison a value gets when its declared logical type orders differently from its
 stored representation — the `semanticOrdering` / `collationAware` flags, the surfaces that
-route through the type's `compare`, and the ones that route through `groupKey` identity
-instead. A satellite of [Quereus Type System](types.md).
+route through the type's `compare`, the ones that route through `groupKey` identity
+instead, and how text converts before it is compared against a DATETIME. A satellite of
+[Quereus Type System](types.md).
 
 ## Semantic ordering
 
@@ -260,3 +261,58 @@ same `AggregateArgBinding` and routing through the same
 three execution shapes (the buffered frame walk, the streaming running
 accumulator, and the streaming sliding-frame scan) and all three fold through
 that one bound schema, so they cannot rank differently for the same query.
+
+## DATETIME against text
+
+A DATETIME is a fixed instant stored in one spelling, bare UTC. Text order over that
+spelling is already its semantic order, so the type has no `semanticOrdering` flag. What
+it needs is for the text a query spells to reach that spelling before the comparison:
+`t = '2020-01-01T00:00:00Z'` finds the row that text created, and
+`t >= '2021-06-05T09:00:00+02:00'` compares the instant it names.
+
+The optional `normalizeComparand` hook on `LogicalType` provides this, and only DATETIME
+defines it. When one operand has the hook and the other is textual or ANY,
+`crossTypeCoercion` (`types/comparison-coercion.ts`) converts the other one. ANY is
+included because an untyped `?` announces it, and a bound parameter is the most common way
+an application hands in a timestamp.
+
+This is not `cast(x as datetime)`. Text that does not parse compares as plain text, so
+`t = 'garbage'` is false and `t < 'garbage'` is true for every row. Only text converts, so
+a number is not read as an epoch, although a write or a CAST reads it that way. Only the
+planner's own casts behave like this: a user-written `cast('junk' as datetime)` is still
+NULL.
+
+Consequences worth knowing:
+
+- A date-only bound means that date's midnight, so `t between '2021-01-01' and '2022-01-01'`
+  includes a row at exactly midnight on 2022-01-01.
+- A literal folds to the stored spelling at plan time, so `=`, ranges, BETWEEN and IN lists
+  still plan as index seeks. A parameter keeps the cast in its seek key.
+- A text operand that differs per row, such as a text column, parses per row. A parameter or
+  literal that repeats one string is remembered at the comparison site and parses once.
+- `dt_col = text_col` no longer plans as a hash join, because the cast moves the pair out of
+  the join's equality keys and into its residual condition. Joins between two DATETIME
+  columns are unaffected.
+- `nullif`, `greatest` and `least` rank by the converted key and still return the argument as
+  written, so `greatest(t, '2021-06-05T11:00:00+02:00')` returns that literal's own spelling
+  when it wins.
+- A watch on `t = ?` keys on the converted value, not the bound spelling
+  ([Change Scope](change-scope.md)).
+
+**One probe against many values** follows the rule in
+[types.md § Type Coercion in Comparisons](types.md#type-coercion-in-comparisons). A DATETIME
+probe converts each textual or ANY value independently, and a textual or ANY probe converts
+once, only when every non-NULL value is DATETIME. A probe against a list mixing DATETIME and
+text stays unconverted, because converting it would make
+`text_col in (dt_col, '2020-01-01T00:00:00Z')` miss an exact text match that the `=`
+disjunction finds.
+
+**Shape checks see the canonical spelling.** `check (ts like '%Z')` on a `datetime` column
+fails every insert, because the engine owns the stored spelling and a CHECK sees the stored
+value. A column that must keep the caller's exact text should be `text`, using `datetime(col)`
+to compare it as an instant.
+
+**Rows stored earlier with a `Z`.** `datetime('now')` used to return a `Z` spelling while
+announcing DATETIME, so the write path stored that `Z` unconverted. Nothing migrates those
+rows, and they do not match a normalized comparison exactly. `update t set c = datetime(c)`
+rewrites them.

@@ -1,6 +1,6 @@
 import type { LogicalType } from './logical-type.js';
 import { PhysicalType } from './logical-type.js';
-import { INTEGER_TYPE, NULL_TYPE, NUMERIC_TYPE } from './builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE, NULL_TYPE, NUMERIC_TYPE } from './builtin-types.js';
 
 /**
  * THE type-level decision behind every comparison-site coercion: given the
@@ -12,13 +12,13 @@ import { INTEGER_TYPE, NULL_TYPE, NUMERIC_TYPE } from './builtin-types.js';
  *   `CastNode` wrappers, for `=` and friends, BETWEEN, IN value lists and simple
  *   CASE.
  * - **Emit-time** (`runtime/emit/operand-comparator.ts` `makeComparisonGroup`)
- *   maps the same answer onto per-row {@link import('./cast-semantics.js').lenientCast}
+ *   maps the same answer onto per-row {@link import('./cast-semantics.js').comparandConverter}
  *   calls, for the comparison builtins that *return* one of their arguments
  *   (`nullif`, `greatest`, `least`) and therefore cannot have that argument
  *   replaced by its cast.
  *
- * Both paths convert identically: a plan-time `CastNode` runs `lenientCast` per
- * row too (`runtime/emit/cast.ts`), so "compare the converted copy" and "compare
+ * Both paths convert identically: a synthetic `CastNode` runs `comparandConverter`
+ * per row too (`runtime/emit/cast.ts`), so "compare the converted copy" and "compare
  * the cast operand" are the same comparison.
  */
 
@@ -47,10 +47,19 @@ export interface CrossTypeCoercion {
 const isObject = (type: LogicalType): boolean => type.physicalType === PhysicalType.OBJECT;
 
 /**
+ * Can this operand hold text that a type's `normalizeComparand` should convert? ANY
+ * counts because an untyped `?` announces it, and a bound parameter is the most common
+ * way an application hands in a timestamp. By NAME, for the reason on
+ * {@link textCoercionTarget}.
+ */
+export const isComparandSource = (type: LogicalType): boolean =>
+	type.isTextual === true || type.name === ANY_TYPE.name;
+
+/**
  * Reconcile two operand types that cannot be compared meaningfully as-is.
  * Returns `null` when neither side converts.
  *
- * Two pairings are handled, in this order:
+ * Three pairings are handled, in this order:
  *
  * 1. **Object-physical vs anything else.** JSON is the engine's only logical type
  *    whose `physicalType` is `PhysicalType.OBJECT`: its runtime values are native
@@ -61,11 +70,9 @@ const isObject = (type: LogicalType): boolean => type.physicalType === PhysicalT
  *    equality depend on spelling and put `=` out of step with the index, which
  *    compares structurally.
  *
- *    The gate is deliberately `physicalType === OBJECT`, **not**
- *    `semanticOrdering`. DATE/TIME/DATETIME/TIMESPAN also carry semantic ordering
- *    but are physically text, and the runtime's `tryTemporalComparison` already
- *    reconciles them; routing them through a conversion would change behavior for
- *    no gain.
+ *    The gate is deliberately `physicalType === OBJECT`, **not** `semanticOrdering`:
+ *    TIMESPAN also carries semantic ordering but is physically text, and the runtime's
+ *    `tryTemporalComparison` already reconciles it. DATETIME takes arm 2 below.
  *
  *    A conversion to JSON is lenient (see `types/cast-semantics.ts`): text that
  *    does not parse comes back unchanged, so `json_col = 'not json'` is false
@@ -79,7 +86,15 @@ const isObject = (type: LogicalType): boolean => type.physicalType === PhysicalT
  *    A NULL-typed operand is left alone: the comparison is UNKNOWN regardless, so
  *    the conversion would only add a runtime hop.
  *
- * 2. **Numeric vs textual.** The textual operand converts to the numeric side's
+ * 2. **A type with `normalizeComparand` vs textual or ANY.** DATETIME is stored in one
+ *    spelling, so the text a query spells must convert to that spelling before binary
+ *    comparison: `t = '2020-01-01T00:00:00Z'` has to find the row that literal created.
+ *    The conversion is the type's own hook rather than a cast (see
+ *    `types/cast-semantics.ts` `comparandConverter`), so unparseable text and non-text values
+ *    survive and compare as they would unconverted. A NULL-typed operand is left alone,
+ *    as in arm 1.
+ *
+ * 3. **Numeric vs textual.** The textual operand converts to the numeric side's
  *    type so the runtime can take the fast path — except an INTEGER side targets
  *    NUMERIC: text names its numeric value in full (`'1e3'` is 1000, `'1.5'` is
  *    1.5), and `INTEGER_TYPE.parse`'s leading-digit-prefix reading (`'1e3'` → 1,
@@ -98,6 +113,13 @@ export function crossTypeCoercion(left: LogicalType, right: LogicalType): CrossT
 		if (rightObject && left !== NULL_TYPE) return { side: 'left', target: right };
 		return null;
 	}
+
+	// NOTE: wrapping a join key in this cast takes `dt_col = text_col` out of
+	// `extractEquiPairs` and into the join's residual, so it no longer plans as a hash
+	// join (same-type DATETIME joins are unaffected). Fine now; if joining DATETIME to
+	// text shows up as slow, canonicalize the key instead.
+	if (left.normalizeComparand && isComparandSource(right)) return { side: 'right', target: left };
+	if (right.normalizeComparand && isComparandSource(left)) return { side: 'left', target: right };
 
 	if (left.isNumeric && right.isTextual) return { side: 'right', target: textCoercionTarget(left) };
 	if (right.isNumeric && left.isTextual) return { side: 'left', target: textCoercionTarget(right) };
@@ -133,12 +155,16 @@ function textCoercionTarget(numeric: LogicalType): LogicalType {
  *   For the numeric arm it is NOT — `cast('abc' as real)` is `0`, so hoisting a
  *   probe conversion over a MIXED list would make `t in (1, 'abc')` true for the
  *   stored text `'0'`, which `t = 1 or t = 'abc'` is not. So the numeric probe
- *   conversion applies only when every non-NULL value is numeric.
+ *   conversion applies only when every non-NULL value is numeric. A probe converting
+ *   by `normalizeComparand` is held to the same rule: it converts only when every
+ *   non-NULL value has that one type.
  *
  * NOTE: the leftover gap is a textual probe against a list mixing numeric and
  * textual values (`text_col in (1, 'abc')`), which stays unconverted and so still
- * disagrees with the `=` disjunction on the numeric member. Closing it needs a
- * per-value probe, which `IN` cannot express — its members live in ONE key space
+ * disagrees with the `=` disjunction on the numeric member. A list mixing DATETIME
+ * and text has the same gap: hoisting would make `text_col in (dt_col, '…Z')` miss an
+ * exact text match that the `=` disjunction finds, so that probe stays unconverted and
+ * disagrees on the DATETIME member instead. Closing it needs a per-value probe, which `IN` cannot express — its members live in ONE key space
  * (a BTree keyed under one collation, `runtime/emit/subquery.ts`). If that shape
  * ever matters, desugar a mixed `IN` list into an `OR` of `=` comparisons at build
  * time rather than widening the hoist here.
@@ -168,17 +194,23 @@ export function comparisonGroupCoercions(
 		];
 	}
 
-	// Numeric probe: every textual value converts to the probe's numeric type, independently.
-	if (probe.isNumeric) {
+	// Numeric or normalizing probe: each convertible value converts to the probe's type,
+	// independently.
+	if (probe.isNumeric || probe.normalizeComparand) {
 		return [null, ...values.map(value => valueTarget(probe, value))];
 	}
 
+	const nonNull = values.filter(type => type !== NULL_TYPE);
+
+	// Textual or ANY probe over values of one normalizing type: one hoisted conversion.
+	const normalizing = nonNull[0]?.normalizeComparand ? nonNull[0] : undefined;
+	if (normalizing && isComparandSource(probe) && nonNull.every(type => type === normalizing)) {
+		return [normalizing, ...values.map(() => null)];
+	}
+
 	// Textual probe: one hoisted conversion, but only over an all-numeric value list.
-	if (probe.isTextual) {
-		const nonNull = values.filter(type => type !== NULL_TYPE);
-		if (nonNull.length > 0 && nonNull.every(type => type.isNumeric)) {
-			return [commonNumericType(nonNull), ...values.map(() => null)];
-		}
+	if (probe.isTextual && nonNull.length > 0 && nonNull.every(type => type.isNumeric)) {
+		return [commonNumericType(nonNull), ...values.map(() => null)];
 	}
 
 	return none;

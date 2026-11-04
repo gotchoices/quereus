@@ -65,6 +65,17 @@ export interface LogicalType {
 	validate?(value: SqlValue): boolean;
 	/** Convert/normalize value to canonical form */
 	parse?(value: SqlValue): SqlValue;
+	/**
+	 * Convert an operand of a comparison against this type to the type's stored
+	 * spelling, returning anything it cannot convert unchanged. Defining this opts the
+	 * type in: `crossTypeCoercion` then converts a textual or ANY operand compared
+	 * against the type (see `types/comparison-coercion.ts`).
+	 *
+	 * Deliberately not {@link parse}: a comparison must keep a value `parse` would
+	 * reject or reinterpret, so unparseable text compares as text and a number is not
+	 * read as an epoch.
+	 */
+	normalizeComparand?(value: SqlValue): SqlValue;
 
 	// Comparison
 	/** Type-specific comparison function */

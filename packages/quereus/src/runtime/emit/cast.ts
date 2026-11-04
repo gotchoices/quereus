@@ -2,7 +2,7 @@ import type { CastNode } from '../../planner/nodes/scalar.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { lenientCast } from '../../types/cast-semantics.js';
+import { castConverter } from '../../types/cast-semantics.js';
 import { emitScalarOp, type ScalarOpSpec } from './scalar-op.js';
 
 export function buildCastSpec(plan: CastNode): ScalarOpSpec {
@@ -10,13 +10,13 @@ export function buildCastSpec(plan: CastNode): ScalarOpSpec {
 	// plan can advertise a type the emitter does not produce.
 	const logicalType = plan.getType().logicalType;
 
+	const convert = castConverter(logicalType, plan.synthetic);
+
 	function run(
 		_runtimeCtx: RuntimeContext,
 		operandValue: SqlValue
 	): SqlValue {
-		// Shared with emitIn's membership coercion — see lenientCast for the
-		// parse/fallback contract and the parse-less-type note.
-		return lenientCast(operandValue, logicalType);
+		return convert(operandValue);
 	}
 
 	return {

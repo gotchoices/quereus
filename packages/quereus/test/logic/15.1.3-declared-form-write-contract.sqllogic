@@ -20,10 +20,13 @@
 -- as '2099-01-01T00:00:00'. Any expression that still sees the trailing `Z` (or
 -- the `.000` fraction) is reading the written form and is wrong.
 --
--- Scope note: whether a DATETIME column should preserve a `Z` suffix at all is a
--- separate question, tracked as bug-datetime-literal-with-timezone-never-matches.
--- This file pins only that every write-path expression agrees with storage on
--- whatever the declared form turns out to be.
+-- Scope note: a DATETIME column does not preserve a `Z` suffix (docs/types.md §
+-- DATETIME), and comparing one against text normalizes that text, so
+-- `d = '2099-01-01T00:00:00.000Z'` matches the stored row. That rule is pinned by
+-- 15.1.4-datetime-comparison-normalization.sqllogic. Because of it, a control here
+-- that must detect the written form reads the spelling with LIKE, which does not
+-- normalize. This file pins only that every write-path expression agrees with
+-- storage on the declared form.
 --
 -- The same contract for JSON — where the split is between raw JSON text and the
 -- parsed document — lives in 15.1.1-json-check-coercion.sqllogic, and
@@ -99,10 +102,10 @@ select d from wf_chk;
 drop table wf_chk;
 -- run
 
--- Control: a CHECK written against the WRITTEN form matches nothing. This is the
+-- Control: a CHECK requiring the WRITTEN spelling matches nothing. This is the
 -- sharp end of the contract — if the CHECK saw the raw statement text this row
 -- would be admitted.
-create table wf_chk_raw (id integer primary key, d datetime null, check (d = '2099-01-01T00:00:00.000Z'));
+create table wf_chk_raw (id integer primary key, d datetime null, check (d like '%Z'));
 -- run
 
 insert into wf_chk_raw values (1, '2099-01-01T00:00:00.000Z');
@@ -133,7 +136,7 @@ select d from wf_def;
 drop table wf_def;
 -- run
 
-create table wf_def_raw (id integer primary key, d datetime null, check ((select d = '2099-01-01T00:00:00.000Z')));
+create table wf_def_raw (id integer primary key, d datetime null, check ((select d like '%Z')));
 -- run
 
 insert into wf_def_raw values (1, '2099-01-01T00:00:00.000Z');

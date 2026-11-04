@@ -2,7 +2,7 @@ import type { SqlValue } from "../../common/types.js";
 import type { ScalarType } from "../../common/datatype.js";
 import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering } from "../../util/comparison.js";
 import type { CollationFunction, LogicalType } from "../../types/logical-type.js";
-import { castedScalarType, lenientCast } from "../../types/cast-semantics.js";
+import { castedScalarType, comparandConverter } from "../../types/cast-semantics.js";
 import { comparisonGroupCoercions, comparisonGroupIndices } from "../../types/comparison-coercion.js";
 import { tryTemporalCompare } from "./temporal-arithmetic.js";
 
@@ -81,8 +81,8 @@ export interface ComparisonGroup {
  *
  * The conversion decision is {@link comparisonGroupCoercions} — the same rule the
  * plan-time rewrite reads — and the per-row conversion is
- * {@link import('../../types/cast-semantics.js').lenientCast}, which is what a
- * plan-time `CastNode` runs anyway. So the comparison a coerced key takes part in
+ * {@link import('../../types/cast-semantics.js').comparandConverter}, which is what a
+ * synthetic `CastNode` runs anyway. So the comparison a coerced key takes part in
  * is byte-identical to the one the cast operand took part in; only the *returned*
  * value differs, and that is the point.
  *
@@ -105,11 +105,13 @@ export function makeComparisonGroup(
 		return target ? castedScalarType(operandType, target) : operandType;
 	});
 
+	const converters = targets.map(target => target ? comparandConverter(target) : null);
+
 	return {
 		types,
 		key(index: number, value: SqlValue): SqlValue {
-			const target = targets[index];
-			return target ? lenientCast(value, target) : value;
+			const convert = converters[index];
+			return convert ? convert(value) : value;
 		},
 	};
 }

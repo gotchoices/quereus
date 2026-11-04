@@ -444,13 +444,13 @@ SELECT id, d, t FROM dt_offset ORDER BY id;
 DROP TABLE dt_offset;
 
 -- ============================================================
--- DATETIME pushed-down filter: the comparison LITERAL is compared
--- RAW (BINARY, no canonicalization) against the stored canonical
--- value. Row 1 stores the bare form '2017-07-14T02:40:00' (see
--- dt_canon above). A Z-suffixed or offset-bearing literal that
--- denotes the SAME instant does NOT match the bare stored value.
--- Pins the no-canonicalization contract against a future planner
--- change that inserts a temporal cast or canonicalizes the seek key.
+-- DATETIME pushed-down filter: the comparison LITERAL is normalized
+-- the way a write normalizes it, then compared (BINARY) against the
+-- stored canonical value. Row 1 stores the bare form
+-- '2017-07-14T02:40:00' (see dt_canon above). A Z-suffixed or
+-- offset-bearing literal that denotes the SAME instant matches it.
+-- The full rule is pinned by
+-- 15.1.4-datetime-comparison-normalization.sqllogic.
 -- ============================================================
 
 CREATE TABLE dt_filter (ts DATETIME PRIMARY KEY);
@@ -458,26 +458,25 @@ INSERT INTO dt_filter VALUES ('2017-07-14T02:40:00Z');   -- stores bare '2017-07
 INSERT INTO dt_filter VALUES ('2017-07-14T03:40:00');    -- a later canonical row, stored bare
 -- run
 
--- Z-suffixed literal of the SAME instant as row 1: raw compare → no match.
-SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T02:40:00Z';
-→ [{"c":0}]
+-- Z-suffixed literal of the SAME instant as row 1 matches row 1.
+SELECT ts FROM dt_filter WHERE ts = '2017-07-14T02:40:00Z';
+→ [{"ts":"2017-07-14T02:40:00"}]
 
 -- +01:00-offset literal denoting the SAME instant as row 1
--- ('2017-07-14T03:40:00+01:00' == 02:40:00Z): still raw, still no match — and
--- note it does NOT match row 2 either, whose bare stored value shares the
--- '2017-07-14T03:40:00' prefix but lacks the '+01:00' suffix.
-SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T03:40:00+01:00';
-→ [{"c":0}]
+-- ('2017-07-14T03:40:00+01:00' == 02:40:00Z) matches row 1, and does NOT match
+-- row 2, whose bare stored value shares the '2017-07-14T03:40:00' wall-clock text.
+SELECT ts FROM dt_filter WHERE ts = '2017-07-14T03:40:00+01:00';
+→ [{"ts":"2017-07-14T02:40:00"}]
 
 -- The bare canonical literal matches exactly.
 SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T02:40:00';
 → [{"c":1}]
 
--- Range: raw lexicographic order places bare '...02:40:00' BELOW the
--- Z-suffixed '...02:40:00Z' (the bare form is a proper prefix), so row 1
--- is included by strict-less-than and row 2 ('...03:40:00') is not.
+-- Range: the literal normalizes to row 1's own value, so strict-less-than excludes
+-- row 1. Raw text order included it, because the bare form is a proper prefix of
+-- the Z-suffixed spelling.
 SELECT ts FROM dt_filter WHERE ts < '2017-07-14T02:40:00Z';
-→ [{"ts":"2017-07-14T02:40:00"}]
+→ []
 
 DROP TABLE dt_filter;
 

@@ -400,6 +400,28 @@ describe('Database.watch (integration)', () => {
 		sub.unsubscribe();
 	});
 
+	// The comparison converts the bound value, so the watch must key on the converted one.
+	it("'rows' watch keys on the value the comparison matches, not the bound spelling", async () => {
+		await db.exec("create table dw (t datetime primary key, v integer null) using memory");
+		await db.exec("insert into dw values ('2020-01-01T00:00:00Z', 1)");
+		await db.exec('create table iw (k integer primary key, v integer null) using memory');
+		await db.exec('insert into iw values (5, 1)');
+
+		const dtScope = db.prepare('select v from dw where t = ?').getChangeScope(['2020-01-01T00:00:00Z']);
+		const intScope = db.prepare('select v from iw where k = ?', ['5']).getChangeScope(['5']);
+
+		const events: WatchEvent[] = [];
+		const subs = [dtScope, intScope].map(scope => db.watch(scope, e => { events.push(e); }));
+
+		await db.exec('update dw set v = 2');
+		expect(events.map(e => e.matched[0].hits)).to.deep.equal([[['2020-01-01T00:00:00']]]);
+
+		await db.exec('update iw set v = 2');
+		expect(events.map(e => e.matched[0].hits)).to.deep.equal([[['2020-01-01T00:00:00']], [[5]]]);
+
+		subs.forEach(sub => sub.unsubscribe());
+	});
+
 	it("'groups' watch reports the STORED group key for a coerced column", async () => {
 		await db.exec('CREATE TABLE jw (id INTEGER PRIMARY KEY, j JSON) USING memory');
 		const events: WatchEvent[] = [];

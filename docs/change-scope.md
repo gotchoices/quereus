@@ -54,6 +54,12 @@ interface ParamScopeValue {
   readonly kind: 'param';
   readonly index: number | string;
   readonly type: PortableScalarType;
+  readonly conversion?: ParamScopeConversion;  // the cast between the parameter and its key column, if any
+}
+
+interface ParamScopeConversion {
+  readonly typeName: string;     // logical type the comparison converts the parameter to
+  readonly synthetic: boolean;   // true for a planner-minted comparison cast, false for a user-written CAST
 }
 
 interface PortableScalarType {
@@ -149,7 +155,10 @@ behaviour functions) from a portable shape, call
 `bindParameters(scope, params)` substitutes matching `ParamScopeValue`
 placeholders with literal values and removes the bound indices from
 `unboundParameters` and from `nonDeterministicSources` (kind `'parameter'`).
-It accepts the same parameter key spellings as every other binding surface —
+A placeholder carrying a `conversion` substitutes the converted value, because
+that is what the comparison matches against the key column: `t = ?` on a
+`datetime` column, bound to `'2020-01-01T00:00:00Z'`, watches the stored
+`2020-01-01T00:00:00`. It accepts the same parameter key spellings as every other binding surface —
 a named parameter as `:name`, `$name` or `name`, a positional slot as `1`,
 `'1'` or `':1'` — and, like them, rejects an object that binds two spellings
 of one parameter with a `MisuseError`. The contract is stated once in

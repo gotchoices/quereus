@@ -194,7 +194,9 @@ export const DATETIME_FUNC = createScalarFunction(
 
 		// Special case: 'now' returns current datetime
 		if (value === 'now') {
-			return new Date().toISOString();
+			// Through parse, because this function announces DATETIME: the write path skips
+			// conversion for a matching type, so a `Z` returned here would be stored.
+			return DATETIME_TYPE.parse!(new Date().toISOString());
 		}
 
 		try {
