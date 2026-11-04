@@ -173,7 +173,10 @@ async function runAddConstraintViaModule(
 	// module-side `validateForeignKeyOverExistingRows` stays where it is — it needs a row
 	// scan, this is a pure schema check. (The `foreign_keys` pragma does NOT gate this:
 	// a conflicting-collation declaration is malformed regardless of enforcement.)
-	if (constraint.type === 'foreignKey') {
+	//
+	// Both checks in this block stand down during an unwind, which is putting back a foreign
+	// key the table already had (docs/schema-undo-plan.md § Guards during an unwind).
+	if (constraint.type === 'foreignKey' && !rctx.db._isSchemaUnwinding()) {
 		const fk = buildForeignKeyConstraintSchema(
 			constraint,
 			tableSchema.columnIndexMap,
@@ -255,7 +258,7 @@ async function runAddConstraintViaModule(
 		rctx.db,
 		tableSchema.schemaName,
 		tableSchema.name,
-		{ type: 'addConstraint', constraint, ddl: sql },
+		{ type: 'addConstraint', constraint, ddl: sql, ...(rctx.db._isSchemaUnwinding() ? { restoring: true as const } : {}) },
 	);
 
 	schema.addTable(updatedTableSchema);
@@ -303,12 +306,17 @@ async function runAddConstraintViaModule(
  * The scan itself (`new.` resolution, `old.` conjunct screen) is the one every
  * existing-row CHECK path shares; the row-invariant (operation-mask) gate in front of
  * it is the ALTER paths' — see `validateRowInvariantChecksOverExistingRows`.
+ *
+ * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`): the
+ * CHECK is one the table already had, and the target is the pre-apply state whether or not
+ * its rows, or the tables it reads, would pass a fresh check.
  */
 async function rejectCheckViolatedByExistingRows(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	check: RowConstraintSchema,
 ): Promise<void> {
+	if (rctx.db._isSchemaUnwinding()) return;
 	const module = requireVtabModule(tableSchema);
 	if (module.getCapabilities?.().permitsGrandfatheredCheckViolators === true) return;
 	await validateRowInvariantChecksOverExistingRows(rctx.db, tableSchema, [check]);

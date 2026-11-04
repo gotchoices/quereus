@@ -213,6 +213,44 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		});
 	});
 
+	it('a UNIQUE the stored rows no longer satisfy is restored, and its covering index is rebuilt', async () => {
+		// Redefining the collation is the way through the public API to make rows collide
+		// without touching them, so the plan cannot have changed what the undo's scan reads.
+		db.registerCollation('FOLD', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		await db.exec('create table t (id integer primary key, b integer null)');
+		await db.exec('insert into t values (1, 1), (2, 1)');
+		await db.exec('create table e (id integer primary key, x text collate FOLD null, constraint c unique (x))');
+		await db.exec("insert into e values (1, 'a'), (2, 'A')");
+		db.registerCollation('FOLD', (a, b) => {
+			const [x, y] = [a.toLowerCase(), b.toLowerCase()];
+			return x < y ? -1 : x > y ? 1 : 0;
+		});
+		await db.exec(`
+			declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					b INTEGER NULL,
+					constraint ub unique (b)
+				}
+				table e {
+					id INTEGER PRIMARY KEY,
+					x TEXT COLLATE FOLD NULL
+				}
+			}
+		`);
+		const before = restoreFingerprint(db);
+
+		const err = await rejection(db.exec('apply schema main'));
+		expect(err.message).to.match(/ub|UNIQUE/);
+		expect(err.message, 'a verified restore rethrows the step error unchanged').to.not.match(/could not be restored/);
+
+		expect(restoreFingerprint(db)).to.equal(before);
+		expect(await rows(db, 'select id from e order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		await db.exec("insert into e values (3, 'b')");
+		const duplicate = await rejection(db.exec("insert into e values (4, 'B')"));
+		expect(duplicate.message).to.match(/UNIQUE constraint failed/);
+	});
+
 	describe('a multi-step migration', () => {
 		beforeEach(async () => {
 			await db.exec(TABLE_T);

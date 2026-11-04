@@ -1225,7 +1225,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				await manager.alterPrimaryKey(change.newPkColumns, rows);
 				break;
 			case 'addConstraint':
-				await manager.addConstraint(change.constraint, rows);
+				await manager.addConstraint(change.constraint, rows, change.restoring);
 				break;
 			case 'dropConstraint':
 				await manager.dropConstraint(change.constraintName);

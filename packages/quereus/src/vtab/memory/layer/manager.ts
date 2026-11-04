@@ -3102,7 +3102,7 @@ export class MemoryTableManager {
 	 *   only for modules that omit `alterTable` — which cannot DROP/RENAME a constraint
 	 *   anyway.)
 	 */
-	async addConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources): Promise<void> {
+	async addConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources, restoring?: true): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -3111,9 +3111,9 @@ export class MemoryTableManager {
 			await this.ensureSchemaChangeSafety();
 
 			if (constraint.type === 'unique') {
-				await this.addUniqueConstraint(constraint, rows);
+				await this.addUniqueConstraint(constraint, rows, restoring);
 			} else if (constraint.type === 'foreignKey') {
-				await this.addForeignKeyConstraint(constraint);
+				await this.addForeignKeyConstraint(constraint, restoring);
 			} else if (constraint.type === 'check') {
 				this.addCheckConstraint(constraint);
 			} else {
@@ -3143,7 +3143,8 @@ export class MemoryTableManager {
 	 * structure, and the existing-row validation is not the module's job — the engine
 	 * runs it pre-dispatch for every module (`rejectCheckViolatedByExistingRows` in
 	 * `runtime/emit/add-constraint.ts`), so by the time this arm runs the rows are known
-	 * to conform and this just appends the constraint to the cached schema. Forward
+	 * to conform (or the engine is restoring the constraint during an unwind, and does not
+	 * ask) and this just appends the constraint to the cached schema. Forward
 	 * enforcement is engine-side at INSERT/UPDATE plan time. Runs under the same latch /
 	 * rollback scaffolding as the other arms (via {@link addConstraint}).
 	 */
@@ -3167,8 +3168,9 @@ export class MemoryTableManager {
 	 * transaction's effective rows via {@link validateUniqueOverEffectiveRows} first),
 	 * unless an existing *unique* index already covers the exact columns — in which
 	 * case the data is already validated and we only register the covering structure.
+	 * `restoring` skips the validation and still builds the index: see `SchemaChangeInfo`.
 	 */
-	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources): Promise<void> {
+	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources, restoring?: true): Promise<void> {
 		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
 		const columns = this.tableSchema.columns;
 		const existingIndexes = this.tableSchema.indexes ?? [];
@@ -3230,12 +3232,14 @@ export class MemoryTableManager {
 		// restore (BUSY — see `createIndex`). The covering index carries no `unique: true`
 		// flag, so `addIndexToBase` would not check it anyway — and must not: it populates
 		// from committed rows, which the restorable-state pass has already judged.
-		await this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema, rows);
-		const constrainedColumns = uc.columns.map(colIdx => columns[colIdx]?.name ?? String(colIdx)).join(', ');
-		await this.assertUniqueOverRestorableStates(
-			indexSchema, this.tableSchema, rows,
-			`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
-		);
+		if (!restoring) {
+			await this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema, rows);
+			const constrainedColumns = uc.columns.map(colIdx => columns[colIdx]?.name ?? String(colIdx)).join(', ');
+			await this.assertUniqueOverRestorableStates(
+				indexSchema, this.tableSchema, rows,
+				`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
+			);
+		}
 
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,
@@ -3258,9 +3262,10 @@ export class MemoryTableManager {
 	 * FOREIGN KEY arm of {@link addConstraint}. Validates existing child rows
 	 * against the new FK (pragma-gated; throws CONSTRAINT on an orphan), then
 	 * appends it to the cached schema. No physical structure — FK enforcement is
-	 * engine-side (synthesized EXISTS checks at plan time).
+	 * engine-side (synthesized EXISTS checks at plan time). `restoring` skips the
+	 * validation: see `SchemaChangeInfo`.
 	 */
-	private async addForeignKeyConstraint(constraint: ASTTableConstraint): Promise<void> {
+	private async addForeignKeyConstraint(constraint: ASTTableConstraint, restoring?: true): Promise<void> {
 		const fk = buildForeignKeyConstraintSchema(
 			constraint,
 			this.tableSchema.columnIndexMap,
@@ -3276,7 +3281,7 @@ export class MemoryTableManager {
 		// Validate BEFORE swapping the cached schema — a throw leaves the table
 		// unmodified. The scan only reads (no schema-change latch), so holding our
 		// own latch here is safe; ensureSchemaChangeSafety already drained to base.
-		await validateForeignKeyOverExistingRows(this.db, newSchema, fk);
+		if (!restoring) await validateForeignKeyOverExistingRows(this.db, newSchema, fk);
 
 		this.baseLayer.updateSchema(newSchema);
 		this.tableSchema = newSchema;

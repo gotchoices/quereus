@@ -582,9 +582,10 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * NOTE: the build populates from THIS module's own rows (`populateIndexStore`), never a
 	 * wrapper's — mirroring `createIndex`. Under the isolation layer the wrapper's rows are
 	 * what ADD CONSTRAINT's validation judged, and the physical index legitimately fills from
-	 * this module's committed rows. Duplicates were already rejected by
-	 * `validateUniqueOverExistingRows` (ADD) or cannot exist (RENAME leaves data unchanged),
-	 * so the in-pass check is skipped.
+	 * this module's committed rows. The in-pass duplicate check is skipped because the build
+	 * must not refuse: an ADD has already rejected duplicates in
+	 * `validateUniqueOverExistingRows`, or is `restoring` a constraint during an unwind and
+	 * accepts them, and a RENAME leaves the data unchanged.
 	 */
 	protected async reconcileImplicitUniqueIndexStores(
 		db: Database,
@@ -632,7 +633,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			// genuine IO error — the same non-atomicity `rebuildSecondaryIndexes` documents; a
 			// re-run / reopen rebuilds. Add a try/catch teardown if this ever bites.
 			const indexStore = await this.provider.getIndexStore(schemaName, tableName, name);
-			// Dup rejection is already owned by the arm (ADD validates; RENAME is data-preserving).
+			// Dup rejection is owned by the arm (ADD validates unless restoring; RENAME is data-preserving).
 			await populateIndexStore(table, indexStore, newSchema, indexSchema, db.getKeyNormalizerResolver(), true);
 		}
 	}

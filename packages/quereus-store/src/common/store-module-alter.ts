@@ -554,7 +554,8 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	}
 
 	/** ADD CONSTRAINT arm of {@link alterTable}: validate existing rows as the constraint kind
-	 *  (UNIQUE / FOREIGN KEY / CHECK) requires, then persist. Behavior-preserving extraction. */
+	 *  (UNIQUE / FOREIGN KEY / CHECK) requires, then persist. `change.restoring` skips the
+	 *  validation and installs the same structures: see `SchemaChangeInfo`. */
 	private async alterAddConstraint(
 		db: Database,
 		table: StoreTable,
@@ -579,14 +580,16 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// could restore is judged next (BUSY): a committed duplicate the
 			// transaction deleted would come back under the constraint on rollback.
 			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
-			const keyNormalizers = db.getKeyNormalizerResolver();
-			await validateUniqueOverExistingRows(effectiveDdlRows(table, rows), oldSchema, uc, keyNormalizers);
-			const constrainedColumns = uc.columns.map(i => oldSchema.columns[i]?.name ?? String(i)).join(', ');
-			await judgeRollbackStates(
-				table, rows,
-				state => validateUniqueOverExistingRows(state.rows(), oldSchema, uc, keyNormalizers),
-				`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
-			);
+			if (!change.restoring) {
+				const keyNormalizers = db.getKeyNormalizerResolver();
+				await validateUniqueOverExistingRows(effectiveDdlRows(table, rows), oldSchema, uc, keyNormalizers);
+				const constrainedColumns = uc.columns.map(i => oldSchema.columns[i]?.name ?? String(i)).join(', ');
+				await judgeRollbackStates(
+					table, rows,
+					state => validateUniqueOverExistingRows(state.rows(), oldSchema, uc, keyNormalizers),
+					`add ${uc.name ? `constraint ${uc.name} ` : ''}unique (${constrainedColumns})`,
+				);
+			}
 			updatedSchema = {
 				...oldSchema,
 				uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
@@ -604,13 +607,14 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
 			};
 			// Pragma-gated existing-row validation; throws before persistence on an orphan.
-			await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
+			if (!change.restoring) await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
 		} else if (constraint.type === 'check') {
 			// Schema-only HERE: a CHECK has no physical structure, and the existing-row
 			// scan is the engine's, run pre-dispatch for every module
 			// (`rejectCheckViolatedByExistingRows` in the engine's
 			// `runtime/emit/add-constraint.ts`) — so the rows are known to conform by
-			// now and nothing persists on a rejection. Routing it here — rather than
+			// now, unless the engine is restoring the constraint during an unwind and
+			// does not ask, and nothing persists on a rejection. Routing it here — rather than
 			// catalog-only — keeps the persisted DDL and the connected-table schema in
 			// lock-step so DROP/RENAME CONSTRAINT resolve it.
 			const check = buildCheckConstraintSchema(

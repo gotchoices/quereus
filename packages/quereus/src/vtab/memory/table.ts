@@ -347,7 +347,7 @@ export class MemoryTable extends VirtualTable {
 					await this.manager.alterPrimaryKey(changeInfo.newPkColumns, undefined, validateOnly);
 					break;
 				case 'addConstraint':
-					await this.manager.addConstraint(changeInfo.constraint);
+					await this.manager.addConstraint(changeInfo.constraint, undefined, changeInfo.restoring);
 					break;
 				case 'dropConstraint':
 					await this.manager.dropConstraint(changeInfo.constraintName);

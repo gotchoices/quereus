@@ -870,7 +870,19 @@ export type SchemaChangeInfo = (
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }
 	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> }
-	| { type: 'addConstraint'; constraint: TableConstraint }
+	| {
+		type: 'addConstraint';
+		constraint: TableConstraint;
+		/**
+		 * Set only while a failed `apply schema` is being unwound, on the call that puts back
+		 * a constraint the table already had. The target is the pre-apply state whether or not
+		 * that state would pass a fresh check, so skip every judgement of the existing rows and
+		 * still build everything that installs the constraint, covering index included. A module
+		 * that ignores this fails safely: its scan refuses, and the apply reports that the
+		 * schema could not be restored.
+		 */
+		restoring?: true;
+	}
 	| {
 		/**
 		 * DROP CONSTRAINT — remove a named table-level constraint by name. The module

@@ -52,9 +52,14 @@ An undo statement that throws stops the unwind where it is: the schema is then i
 
 - the DEFAULT / generated, CHECK and assertion guards on `DROP COLUMN`, and the guard for a foreign key pointing at the column;
 - the assertion and expression guards on `DROP TABLE`, `DROP VIEW` and `DROP MATERIALIZED VIEW`;
-- the row guard on `DROP TABLE` (`assertNoReferencingChildrenForDrop`).
+- the row guard on `DROP TABLE` (`assertNoReferencingChildrenForDrop`);
+- every judgement of a re-added constraint: the engine's CHECK scan (`rejectCheckViolatedByExistingRows`), its foreign key collation and key-arity checks, and, through the `restoring` field on the `addConstraint` arm of `SchemaChangeInfo`, the module's UNIQUE and foreign key scans.
 
-The other `DROP COLUMN` validations stay on (primary key, last column, own generated column, partial index). These are structural to the altered table, cannot name a column the table does not yet have, and are undone in order. Validation of a re-added constraint stays on too, so an undo that re-adds a constraint the existing rows do not satisfy still fails the unwind.
+The other `DROP COLUMN` validations stay on (primary key, last column, own generated column, partial index). These are structural to the altered table, cannot name a column the table does not yet have, and are undone in order.
+
+An `ADD CONSTRAINT` issued during an unwind makes no judgement about the constraint and still does everything that installs it, covering index included. Those checks protect a user adding a new rule. Here the constraint is one the table already had and the target is the pre-apply state, whether or not that state would pass a fresh check, so a refusal would leave the schema partially migrated for no benefit. A restored CHECK or foreign key over rows that break it is what the table had before the apply, including how the optimizer treats it.
+
+The checks on the shape of the catalog stay on (`assertConstraintNameFree`, `assertUniqueConstraintNotDuplicated`, `assertUniqueConstraintIndexNameFree`), as do `assertDdlTransactionPolicy` and the capability checks. The undo runs in exact reverse, so the catalog at that point held this constraint without a conflict, and if one of these fires it is a defect that should surface as a failed undo. Two refusals can still fail the unwind: a module that ignores `restoring` still runs its own scans, and the isolation layer validates the issuing connection's staged rows when it installs a UNIQUE on its overlay (the `NOTE:` at `installOverlayUniqueConstraint`).
 
 The fingerprint comparison is the backstop: an undo the guards would have stopped and that leaves the wrong catalog is reported as *after unwinding, the catalog does not match its pre-apply state*. `renderCatalogForRestoreCheck` renders only the applying schema, so a dependent in another schema is outside that comparison, but this plan cannot have created it: it is the already-dangling case and returns to the state it was in.
 

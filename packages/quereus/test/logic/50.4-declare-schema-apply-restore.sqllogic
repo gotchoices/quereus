@@ -606,3 +606,128 @@ select d from v order by d;
 
 drop view v;
 drop table t;
+
+-- ===================================
+-- 11. A constraint the undo re-adds is restored whether or not it would pass a fresh check
+-- ===================================
+
+-- Each e_* table gives up a constraint that a new ADD CONSTRAINT would refuse, then ub fails. The
+-- undo re-adds them all, and any one refusal would stop the unwind and be named in the error.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+
+-- The row was valid when written, then o grew past it.
+create table o (id integer primary key);
+insert into o values (1);
+create table e_grown (id integer primary key, x integer null, constraint c check (x > (select max(id) from o)));
+insert into e_grown values (1, 5);
+insert into o values (10);
+
+-- The CHECK reads a table that does not exist, so its scan cannot even be prepared.
+create table e_absent (id integer primary key, x integer null, constraint c check (x > (select max(id) from zz)));
+
+-- Orphans written with enforcement off, one against a parent that exists and one against a parent that does not.
+create table p (id integer primary key);
+insert into p values (1);
+create table e_orphan (id integer primary key, x integer null, constraint c foreign key (x) references p(id));
+create table e_noparent (id integer primary key, x integer null, constraint c foreign key (x) references zz(id));
+pragma foreign_keys = off;
+insert into e_orphan values (1, 99);
+insert into e_noparent values (1, 99);
+pragma foreign_keys = on;
+
+-- Both parents arrive after the foreign key naming them, with a shape it could not be declared against now.
+create table e_arity (id integer primary key, x integer null, constraint c foreign key (x) references p2);
+create table p2 (a integer, b integer, primary key (a, b));
+create table e_coll (id integer primary key, x text collate nocase null, constraint c foreign key (x) references p3(k));
+create table p3 (id integer primary key, k text collate rtrim null);
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		constraint ub unique (b)
+	}
+	table o {
+		id integer primary key
+	}
+	table e_grown {
+		id integer primary key,
+		x integer null
+	}
+	table e_absent {
+		id integer primary key,
+		x integer null
+	}
+	table p {
+		id integer primary key
+	}
+	table e_orphan {
+		id integer primary key,
+		x integer null
+	}
+	table e_noparent {
+		id integer primary key,
+		x integer null
+	}
+	table e_arity {
+		id integer primary key,
+		x integer null
+	}
+	table p2 {
+		a integer,
+		b integer,
+		primary key (a, b)
+	}
+	table e_coll {
+		id integer primary key,
+		x text collate nocase null
+	}
+	table p3 {
+		id integer primary key,
+		k text collate rtrim null
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+-- A restored catalog plans every DROP CONSTRAINT again; an unrestored one has nothing left to drop.
+diff schema main;
+→ [{"ddl": "ALTER TABLE e_grown DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE e_absent DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE e_orphan DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE e_noparent DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE e_arity DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE e_coll DROP CONSTRAINT c"}, {"ddl": "ALTER TABLE t ADD constraint ub unique (b)"}]
+
+-- The rows that break their restored constraints are still there.
+select * from e_grown;
+→ [{"id": 1, "x": 5}]
+
+select * from e_orphan;
+→ [{"id": 1, "x": 99}]
+
+select * from e_noparent;
+→ [{"id": 1, "x": 99}]
+
+-- The restored constraints are enforced on new rows wherever they can be evaluated.
+insert into e_grown values (2, 5);
+-- error: CHECK constraint failed: c
+
+insert into e_grown values (2, 50);
+insert into e_orphan values (2, 98);
+-- error: constraint failed: c
+
+insert into e_orphan values (2, 1);
+
+-- run
+
+drop table e_coll;
+drop table e_arity;
+drop table e_noparent;
+drop table e_orphan;
+drop table e_absent;
+drop table e_grown;
+drop table p3;
+drop table p2;
+drop table p;
+drop table o;
+drop table t;

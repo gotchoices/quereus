@@ -1174,6 +1174,10 @@ async function forwardAddConstraintToOverlay(
  * overlay untouched — routed by the caller to INTERNAL (the issuer, whose merged rows the
  * underlying already judged via `IsolationModule.issuerEffectiveRows`) or poison (a foreign
  * overlay). A missing overlay `createIndex` is a no-op, as in the index paths.
+ *
+ * NOTE: this validates even when the change is `restoring`, so duplicates staged in an overlay
+ * refuse an unwind's undo. If an overlay can ever hold rows that break a UNIQUE they were
+ * written under, this refusal also has to stand down during an unwind.
  */
 async function installOverlayUniqueConstraint(
 	host: AlterMigrationHost,

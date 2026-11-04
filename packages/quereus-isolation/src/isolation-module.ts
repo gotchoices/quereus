@@ -89,6 +89,8 @@ export function clampToReentrantReads(mode: VtabConcurrencyMode): VtabConcurrenc
  */
 function describeRowValidatingAlter(change: SchemaChangeInfo): string | undefined {
 	if (change.type === 'addConstraint') {
+		// A restored constraint is not judged, so no rollback state can refuse it.
+		if (change.restoring) return undefined;
 		const constraint = change.constraint;
 		return constraint.type === 'unique' ? `add ${constraint.name ? `constraint ${constraint.name} ` : ''}unique` : undefined;
 	}
