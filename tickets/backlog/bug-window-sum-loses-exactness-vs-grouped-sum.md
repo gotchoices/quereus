@@ -111,3 +111,7 @@ framed window is the same requirement restricted to each frame's rows.
 The same holds for arm 2: whenever the engine declares two ways to compute an
 aggregate, both must return the same value over every input the aggregate accepts —
 not merely over inputs small enough that the difference is invisible.
+
+## Text operands (added from `bug-text-coercion-in-arithmetic-and-aggregates`)
+
+Text past the safe-integer threshold rounds here too, verified: over rows `'9007199254740993'` and `'1'`, `sum(v) over ()` returns 9007199254740992 while grouped `sum(v)` is being fixed to return 9007199254740994. When this ticket gives the window accumulator exact handling, convert text through `parseNumericText` (`util/coercion.ts`) rather than `Number()`, or the two spellings will still disagree on text columns.
