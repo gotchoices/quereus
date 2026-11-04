@@ -69,3 +69,7 @@ keyword or drop the field.
 - An ignored item as the last item in the block (nothing after it to swallow) and
   as the first (a following item to swallow).
 - A block with only ignored items.
+
+## Being resolved elsewhere
+
+The same code site is being fixed by `bug-declare-schema-using-clause-does-not-round-trip` (in `tickets/implement/`), which carries the use cases above into its TODO and deletes this ticket when they pass. Do not promote this ticket separately.
