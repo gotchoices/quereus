@@ -564,6 +564,11 @@ export class IndexSeekNode extends TableAccessNode {
 			// `planner/stats/table-cardinality.ts`), change it there — do not invent a
 			// second convention here.
 			estimatedRows: this.plannedRowsPerKey ?? Number(this.filterInfo.indexInfoOutput.estimatedRows),
+			// NOTE: these facts are the source's only. The equalities this seek consumed are not
+			// surfaced as FDs or constant bindings, though a Filter holding them would surface both.
+			// Compared over a leading-column seek, DISTINCT, GROUP BY and ORDER BY plans got no
+			// worse. If a rewrite that needs a pinned column misses over a seek, derive them from
+			// `pushedConstraints`.
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,

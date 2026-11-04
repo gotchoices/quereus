@@ -145,3 +145,100 @@ SELECT a, b FROM tdup WHERE a <= 20 ORDER BY a, b;
 → [{"a":10,"b":1},{"a":20,"b":1},{"a":20,"b":2}]
 
 DROP TABLE tdup;
+
+-- Equality on a leading part of a composite PRIMARY KEY seeks that part, and the
+-- predicate is dropped from the filter above the seek. Each group position guards a
+-- different failure: the first against a walk that starts late, the middle against one
+-- that runs past its group, the last against one that stops early, and the missing
+-- values against a seek that lands on a neighbouring group.
+create table pfx (k text, r integer, x integer, primary key (k, r));
+insert into pfx values ('b', 1, 10), ('b', 2, 20), ('d', 1, 30), ('d', 2, 40), ('f', 1, 50), ('f', 2, 60);
+
+select x from pfx where k = 'b' order by r;
+→ [{"x":10},{"x":20}]
+
+select x from pfx where k = 'd' order by r;
+→ [{"x":30},{"x":40}]
+
+select x from pfx where k = 'f' order by r;
+→ [{"x":50},{"x":60}]
+
+select x from pfx where k = 'a';
+→ []
+
+select x from pfx where k = 'c';
+→ []
+
+select x from pfx where k = 'g';
+→ []
+
+-- A row the prefix selects, with the residual still applied to a later column.
+select x from pfx where k = 'd' and x > 30;
+→ [{"x":40}]
+
+-- The same group read through a transaction's own writes, then after they roll back.
+begin;
+insert into pfx values ('d', 3, 70);
+update pfx set x = 41 where k = 'd' and r = 2;
+delete from pfx where k = 'd' and r = 1;
+insert into pfx values ('c', 1, 80);
+
+select r, x from pfx where k = 'd' order by r;
+→ [{"r":2,"x":41},{"r":3,"x":70}]
+
+select x from pfx where k = 'c';
+→ [{"x":80}]
+
+select x from pfx where k = 'b' order by r;
+→ [{"x":10},{"x":20}]
+
+rollback;
+
+select r, x from pfx where k = 'd' order by r;
+→ [{"r":1,"x":30},{"r":2,"x":40}]
+
+select x from pfx where k = 'c';
+→ []
+
+drop table pfx;
+
+-- The same groups over a DESC leading key: the group's start is still found, and the
+-- walk stops at the next group in the other direction.
+create table pfxd (k text, r integer, x integer, primary key (k desc, r));
+insert into pfxd values ('b', 1, 10), ('b', 2, 20), ('d', 1, 30), ('d', 2, 40), ('f', 1, 50), ('f', 2, 60);
+
+select x from pfxd where k = 'f' order by r;
+→ [{"x":50},{"x":60}]
+
+select x from pfxd where k = 'd' order by r;
+→ [{"x":30},{"x":40}]
+
+select x from pfxd where k = 'b' order by r;
+→ [{"x":10},{"x":20}]
+
+select x from pfxd where k = 'c';
+→ []
+
+drop table pfxd;
+
+-- One and two leading columns of a three-column key.
+create table pfx3 (a integer, b integer, c integer, x integer, primary key (a, b, c));
+insert into pfx3 values (1, 1, 1, 10), (1, 1, 2, 20), (1, 2, 1, 30), (2, 1, 1, 40), (2, 2, 2, 50);
+
+select x from pfx3 where a = 1 order by b, c;
+→ [{"x":10},{"x":20},{"x":30}]
+
+select x from pfx3 where a = 1 and b = 1 order by c;
+→ [{"x":10},{"x":20}]
+
+select x from pfx3 where a = 2 and b = 2;
+→ [{"x":50}]
+
+select x from pfx3 where a = 1 and b = 3;
+→ []
+
+-- A gap in the key: only `a` can be a prefix, so `c` must survive as a filter.
+select x from pfx3 where a = 1 and c = 1 order by b;
+→ [{"x":10},{"x":30}]
+
+drop table pfx3;

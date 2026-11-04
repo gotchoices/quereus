@@ -54,3 +54,137 @@ SELECT id FROM idx_d WHERE k <= 25 ORDER BY k;
 → [{"id":1},{"id":2}]
 
 DROP TABLE idx_d;
+
+-- Equality on the leading column of a multi-column secondary index. The first, middle,
+-- last and missing groups each guard a different walk failure (see the primary key
+-- counterpart in 05.1-composite-pk-range-scan). `k` is nullable so that stored NULLs
+-- form a group of their own.
+create table sfx (id integer primary key, k text null, r integer, x integer);
+create index sfx_kr on sfx (k, r);
+insert into sfx values (1, 'b', 1, 10), (2, 'b', 2, 20), (3, 'd', 1, 30), (4, 'd', 2, 40), (5, 'f', 1, 50), (6, 'f', 2, 60), (7, null, 1, 70);
+
+select x from sfx where k = 'b' order by r;
+→ [{"x":10},{"x":20}]
+
+select x from sfx where k = 'd' order by r;
+→ [{"x":30},{"x":40}]
+
+select x from sfx where k = 'f' order by r;
+→ [{"x":50},{"x":60}]
+
+select x from sfx where k = 'a';
+→ []
+
+select x from sfx where k = 'c';
+→ []
+
+select x from sfx where k = 'g';
+→ []
+
+-- A parameter bound to NULL matches nothing, not the group of stored NULLs.
+-- params: [null]
+select x from sfx where k = ?;
+→ []
+
+-- params: ["d"]
+select x from sfx where k = ? order by r;
+→ [{"x":30},{"x":40}]
+
+select x from sfx where k is null;
+→ [{"x":70}]
+
+-- The same group read through a transaction's own writes, then after they roll back.
+begin;
+insert into sfx values (8, 'd', 3, 80);
+update sfx set x = 41 where id = 4;
+delete from sfx where id = 3;
+update sfx set k = 'd' where id = 1;
+
+select id, x from sfx where k = 'd' order by r, id;
+→ [{"id":1,"x":10},{"id":4,"x":41},{"id":8,"x":80}]
+
+select id from sfx where k = 'b';
+→ [{"id":2}]
+
+rollback;
+
+select id, x from sfx where k = 'd' order by r;
+→ [{"id":3,"x":30},{"id":4,"x":40}]
+
+drop table sfx;
+
+-- Over a DESC leading column.
+create table sfxd (id integer primary key, k text, r integer);
+create index sfxd_kr on sfxd (k desc, r);
+insert into sfxd values (1, 'b', 2), (2, 'b', 1), (3, 'd', 2), (4, 'd', 1), (5, 'f', 2), (6, 'f', 1);
+
+select id from sfxd where k = 'f' order by r;
+→ [{"id":6},{"id":5}]
+
+select id from sfxd where k = 'd' order by r;
+→ [{"id":4},{"id":3}]
+
+select id from sfxd where k = 'b' order by r;
+→ [{"id":2},{"id":1}]
+
+select id from sfxd where k = 'c';
+→ []
+
+drop table sfxd;
+
+-- The ordering a seek provides, from a DESC column after the prefix.
+create table sfxo (id integer primary key, k text, r integer);
+create index sfxo_kr on sfxo (k, r desc);
+insert into sfxo values (1, 'a', 1), (2, 'a', 3), (3, 'a', 2), (4, 'b', 9);
+
+select r from sfxo where k = 'a' order by r desc;
+→ [{"r":3},{"r":2},{"r":1}]
+
+select r from sfxo where k = 'a' order by r desc limit 1;
+→ [{"r":3}]
+
+drop table sfxo;
+
+-- A NOCASE index: a NOCASE predicate reads the whole group, and a BINARY one reads the
+-- group and filters it down to the one spelling.
+create table sfxn (id integer primary key, k text collate nocase, r integer);
+create index sfxn_kr on sfxn (k, r);
+insert into sfxn values (1, 'a', 1), (2, 'A', 2), (3, 'a', 3), (4, 'b', 4);
+
+select id from sfxn where k = 'a' order by r;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select id from sfxn where k = 'a' collate binary order by r;
+→ [{"id":1},{"id":3}]
+
+select id from sfxn where k = 'A' collate binary order by r;
+→ [{"id":2}]
+
+drop table sfxn;
+
+-- A NOCASE predicate over a BINARY index cannot use the index, whose groups it spans, so
+-- the index's order cannot replace the sort. With two spellings `r` restarts in each
+-- group of a walk; with one spelling a scan of the table emits rows in `id` order.
+create table sfxb (id integer primary key, k text collate binary, r integer);
+create index sfxb_kr on sfxb (k, r);
+insert into sfxb values (1, 'A', 2), (2, 'a', 1), (3, 'A', 0), (4, 'b', 9), (5, 'c', 3), (6, 'c', 1), (7, 'c', 2);
+
+select r from sfxb where k = 'a' collate nocase order by r;
+→ [{"r":0},{"r":1},{"r":2}]
+
+select r from sfxb where k = 'c' collate nocase order by r;
+→ [{"r":1},{"r":2},{"r":3}]
+
+select r from sfxb where k = 'c' collate nocase order by r limit 2;
+→ [{"r":1},{"r":2}]
+
+select r from sfxb where k = 'a' collate nocase and r > 0 order by r;
+→ [{"r":1},{"r":2}]
+
+select min(r) as m from sfxb where k = 'c' collate nocase;
+→ [{"m":1}]
+
+select min(r) as m from sfxb where k = 'a' collate nocase;
+→ [{"m":0}]
+
+drop table sfxb;

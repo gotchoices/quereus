@@ -122,6 +122,11 @@ function* scanLayerResolved(
 		return;
 	}
 
+	// A NULL prefix value is UNKNOWN ⇒ no row matches. `planAppliesToKey` would reject
+	// every row anyway, but the prefix comparators treat NULL as equal to NULL, so the walk
+	// would visit the whole group of stored NULLs before its early termination fires.
+	if (plan.equalityPrefix?.some(v => v === null)) return;
+
 	const schema = layer.getSchema();
 	const { primaryKeyExtractorFromRow, primaryKeyComparator } = layer.getPkExtractorsAndComparators(schema);
 

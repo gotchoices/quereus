@@ -169,7 +169,8 @@ describe('minmax-index-boundary', () => {
 
 		it('an equality-bound composite prefix still absorbs the ordering', async () => {
 			// `indexSatisfiesOrdering` skips leading equality-bound columns, so
-			// (g, c DESC) serves `order by c desc` once `g` is pinned.
+			// (g, c DESC) serves `order by c desc` once `g` is pinned. The seek on `g` starts
+			// at the group's largest `c`, so the boundary read is one row.
 			await createTable();
 			await db.exec('create index t_gc on t(g, c desc)');
 
@@ -178,11 +179,12 @@ describe('minmax-index-boundary', () => {
 			expect(rows.map(r => r.op)).to.include('LIMITOFFSET');
 			expect(rows.map(r => r.op)).to.not.include('SORT');
 
-			const leaf = rows.find(r => r.op === 'INDEXSCAN');
-			expect(leaf, 'no INDEXSCAN in the plan').to.not.equal(undefined);
+			const leaf = rows.find(r => r.op === 'INDEXSEEK');
+			expect(leaf, 'no INDEXSEEK in the plan').to.not.equal(undefined);
 			expect(leaf!.detail).to.match(/USING t_gc\b.*ORDER BY .*DESC/);
 
 			expect(await scalar(sql), 'the WHERE clause must not be lost').to.equal(60);
+			expect(await rowsScanned(sql)).to.equal(BOUNDARY_ROWS);
 		});
 
 		it('a NOT NULL column emits no IS NOT NULL filter', async () => {

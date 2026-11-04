@@ -22,6 +22,7 @@ import type { OptContext } from '../../framework/context.js';
 import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { FilterNode } from '../../nodes/filter.js';
 import type { TableReferenceNode } from '../../nodes/reference.js';
+import type { TableSchema } from '../../../schema/table.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import type { SupportAssessment } from '../../../vtab/module.js';
@@ -38,7 +39,7 @@ import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
 import { LiteralNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
-import { combineResidualExpressions } from '../access/rule-select-access-path.js';
+import { combineResidualExpressions, orderingClaimSurvivesCollation } from '../access/rule-select-access-path.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
@@ -525,7 +526,7 @@ function fallbackIndexSupports(
 	// so it exercises trySortAbsorbViaIndexOrdering's satisfaction check but not
 	// this clobber. If you refactor this branch, run Lamina's suite too, or add a
 	// Quereus-native repro that re-grows over an already-reverse-equipped Retrieve.
-	if (equippedOrdering && !orderingMatches(accessPlan.providesOrdering, equippedOrdering)) {
+	if (equippedOrdering && !planDeliversOrdering(tableSchema, accessPlan, equippedOrdering, plannerConstraints)) {
 		log('Re-probe would clobber equipped ordering; declining grow to preserve absorbed plan');
 		return undefined;
 	}
@@ -538,7 +539,7 @@ function fallbackIndexSupports(
 	// providesOrdering of equal length must not let a Sort be grown into (and thus
 	// dropped by) this Retrieve. Direction-aware, not length-only.
 	const providesOrdering = request.requiredOrdering
-		? orderingMatches(accessPlan.providesOrdering, request.requiredOrdering)
+		? planDeliversOrdering(tableSchema, accessPlan, request.requiredOrdering, plannerConstraints)
 		: false;
 
 	// Accept the plan if it handles filters OR provides required ordering
@@ -636,6 +637,21 @@ function orderingMatches(
 		}
 	}
 	return true;
+}
+
+/**
+ * True when `plan` can stand in for a Sort on `required`. Every site that lets a Sort go
+ * asks this, because a module's claim alone is not enough: see
+ * {@link orderingClaimSurvivesCollation}.
+ */
+function planDeliversOrdering(
+	tableSchema: TableSchema,
+	plan: BestAccessPlanResult,
+	required: readonly OrderingSpec[],
+	constraints: readonly PredicateConstraint[],
+): boolean {
+	return orderingMatches(plan.providesOrdering, required)
+		&& orderingClaimSurvivesCollation(tableSchema, plan, constraints);
 }
 
 /** A row bound a caller already knows, to be handed to the module as LIMIT/OFFSET. */
@@ -903,7 +919,7 @@ export function trySortAbsorbViaIndexOrdering(
 	// position must be provided by the SAME column and direction, not merely
 	// matched on length. A length-only check would let an ascending
 	// providesOrdering of equal length wrongly drop a DESC Sort.
-	if (!orderingMatches(accessPlan.providesOrdering, requiredOrdering)) {
+	if (!planDeliversOrdering(tableSchema, accessPlan, requiredOrdering, constraints)) {
 		log('Access plan does not satisfy required ordering; leaving Sort in place');
 		return null;
 	}

@@ -243,7 +243,9 @@ describe('ConstantBinding propagation per operator', () => {
 	});
 
 	it('Filter: literal + parameter mix produces two bindings', async () => {
-		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, c TEXT) USING memory");
+		// A declared key, so that neither predicate seeks a leading key column and both
+		// stay in the Filter. Without one the key is every column, led by `a`.
+		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, c TEXT, id INTEGER PRIMARY KEY) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM t WHERE a = 5 AND c = ?');
 		const props = physicalOf(rows, r => r.op === 'FILTER');
 		expect(props).to.not.equal(undefined);
@@ -255,7 +257,8 @@ describe('ConstantBinding propagation per operator', () => {
 	});
 
 	it('Filter: closes binding over EC (a = b AND a = 7 binds both a and b)', async () => {
-		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER) USING memory");
+		// A declared key for the same reason as the literal + parameter case above.
+		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, id INTEGER PRIMARY KEY) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM t WHERE a = b AND a = 7');
 		const props = physicalOf(rows, r => r.op === 'FILTER');
 		expect(props).to.not.equal(undefined);

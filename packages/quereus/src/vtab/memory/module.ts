@@ -95,22 +95,27 @@ function columnStatsFor(
  * worlds. The store module follows the same rule, so the two backends agree.
  */
 function equalityTupleSelectivity(tableInfo: TableSchema, eqCols: readonly number[]): number {
+	return measuredEqualitySelectivity(tableInfo, eqCols) ?? EQ_SELECTIVITY_WITHOUT_STATS;
+}
+
+/** {@link equalityTupleSelectivity} from statistics alone; undefined when they cannot answer. */
+function measuredEqualitySelectivity(tableInfo: TableSchema, eqCols: readonly number[]): number | undefined {
 	const stats = tableInfo.statistics;
 	// A snapshot taken while the table was EMPTY describes nothing — every `distinctCount`
 	// is 0 — and applying it would read `1 / max(0, 1)` as "this equality matches EVERY
 	// row". Treated as no statistics at all, as the store module and the engine's own
 	// `estimatePredicateSelectivity` both do.
-	if (!stats || stats.rowCount <= 0) return EQ_SELECTIVITY_WITHOUT_STATS;
+	if (!stats || stats.rowCount <= 0) return undefined;
 
 	const factors: number[] = [];
 	for (const colIdx of eqCols) {
 		const colStats = columnStatsFor(tableInfo, stats, colIdx);
 		// One uncovered equality column falls back WHOLESALE rather than mixing a measured
 		// factor with the shape constant — again the store module's rule.
-		if (!colStats) return EQ_SELECTIVITY_WITHOUT_STATS;
+		if (!colStats) return undefined;
 		factors.push(1 / Math.max(colStats.distinctCount, 1));
 	}
-	return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
+	return factors.length > 0 ? combineConjunctive(factors) : undefined;
 }
 
 /**
@@ -160,6 +165,25 @@ function estimateEqualityRows(
 	// and wins plans it should not); revisit if a genuine zero estimate ever needs to
 	// reach the cost model.
 	return Math.max(1, Math.min(estimatedTableSize, inCardinality * perKey));
+}
+
+/**
+ * Rows a single-valued equality on a leading part of an index is expected to match.
+ *
+ * Differs from {@link estimateEqualityRows} in two ways. Uniqueness earns nothing, since a
+ * part of a unique key is not unique. And the fallback applies the shape constant once per
+ * column, because a flat constant would price every prefix length alike: a plan narrowing
+ * on two columns would tie one narrowing on the first, and the tie goes to whichever index
+ * was declared first.
+ */
+function estimateEqualityPrefixRows(
+	tableInfo: TableSchema,
+	prefixCols: readonly number[],
+	estimatedTableSize: number,
+): number {
+	const selectivity = measuredEqualitySelectivity(tableInfo, prefixCols)
+		?? combineConjunctive(prefixCols.map(() => EQ_SELECTIVITY_WITHOUT_STATS));
+	return Math.max(1, Math.floor(estimatedTableSize * selectivity));
 }
 
 /**
@@ -732,7 +756,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					(eq, i) => eq || trailingRange.handledFilters[i]
 				);
 				const seekCols = indexCols.slice(0, equalityMatches.matchCount + 1).map(c => c.index);
-				const estimatedRows = Math.max(1, Math.floor(estimatedTableSize / 8));
+				const tableFraction = Math.max(1, Math.floor(estimatedTableSize / 8));
+				// A range narrows the equality it follows, so this must estimate fewer rows than
+				// the equality-only arm below or an index that cannot use the range outranks one
+				// that can. A multi-value prefix plans as a scan regardless (see the NOTE above).
+				const estimatedRows = equalityMatches.isMultiSeek
+					? tableFraction
+					: Math.max(1, Math.min(
+						tableFraction,
+						Math.floor(estimateEqualityPrefixRows(tableInfo, seekCols.slice(0, -1), estimatedTableSize) / 2),
+					));
 				return AccessPlanBuilder
 					.rangeScan(estimatedRows)
 					.setHandledFilters(combinedHandled)
@@ -741,6 +774,25 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					.setExplanation(`Index prefix-range scan on ${index.name}`)
 					.build();
 			}
+		}
+
+		// Equality on leading columns only. A whole-key match already returned above.
+		//
+		// NOTE: a multi-value `IN` in the prefix stays a scan, for literal lists and runtime
+		// key sets alike, because the scan layer's multi-seek (`orderSeekKeys`, `tree.get`)
+		// assumes whole keys. `a = 1 and b in (1, 2)` over `(a, b, c)` could still seek
+		// `a = 1` and leave the `IN` as a filter. If per-group `IN` lookups show up as slow,
+		// teach the multi-seek to walk each key as a prefix group.
+		if (equalityMatches.matchCount > 0 && !equalityMatches.isMultiSeek) {
+			const seekCols = indexCols.slice(0, equalityMatches.matchCount).map(c => c.index);
+			return AccessPlanBuilder
+				.eqMatch(estimateEqualityPrefixRows(tableInfo, seekCols, estimatedTableSize))
+				.setHandledFilters(equalityMatches.handledFilters)
+				.setIsSet(true)
+				.setIndexName(index.name)
+				.setSeekColumns(seekCols)
+				.setExplanation(`Index prefix seek on ${index.name}`)
+				.build();
 		}
 
 		// Check for range constraints on first index column

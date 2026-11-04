@@ -41,7 +41,10 @@ export interface ScanPlan {
 	equalityKey?: BTreeKey;
 	/** Multiple keys for IN-list multi-seek (used instead of equalityKey) */
 	equalityKeys?: BTreeKey[];
-	/** Equality prefix values for prefix-range scans (plan=7) */
+	/**
+	 * Values for a leading part of the index key: from a prefix-range scan (plan=7), or
+	 * from an equality seek (plan=2) that binds fewer columns than the key has.
+	 */
 	equalityPrefix?: SqlValue[];
 	/**
 	 * Per-column collations parallel to {@link equalityPrefix}, used so the
@@ -203,6 +206,34 @@ function buildCompositeEqualityKey(
 		: keyParts;
 }
 
+/**
+ * The values bound to the leading `maxColumns` index columns, with each column's
+ * collation in parallel so the runtime prefix match honours it. Stops at the first
+ * unbound column: a later value cannot be part of a prefix, since positions in
+ * `equalityPrefix` are positions in the index key.
+ */
+function collectEqualityPrefix(
+	indexSchema: IndexSchemaLike,
+	maxColumns: number,
+	argvMap: ArgvMap,
+	args: ReadonlyArray<SqlValue>,
+	constraints: ReadonlyArray<{ constraint: IndexConstraint; argvIndex: number }>,
+	indexInfoOutput: IndexInfo,
+): { equalityPrefix: SqlValue[]; equalityPrefixCollations: string[] } {
+	const equalityPrefix: SqlValue[] = [];
+	const equalityPrefixCollations: string[] = [];
+	for (let i = 0; i < maxColumns; i++) {
+		const colSpec = indexSchema.columns[i];
+		if (!colSpec) break;
+		const val = findArgValueForColumn(colSpec.index, argvMap, args, indexInfoOutput)
+			?? findConstraintValueForColumn(colSpec.index, constraints, args);
+		if (val === undefined) break;
+		equalityPrefix.push(val);
+		equalityPrefixCollations.push(resolveColumnCollation(indexSchema, i) ?? 'BINARY');
+	}
+	return { equalityPrefix, equalityPrefixCollations };
+}
+
 function isLowerBoundOp(op: IndexConstraintOp): op is typeof ActualIndexConstraintOp.GT | typeof ActualIndexConstraintOp.GE {
 	return op === ActualIndexConstraintOp.GT || op === ActualIndexConstraintOp.GE;
 }
@@ -326,20 +357,7 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 
 	if (isPrefixRangePlan && indexSchema) {
 		const prefixLen = parseInt(params.get('prefixLen') ?? '0', 10);
-		// Build equality prefix from the first prefixLen columns, tracking each
-		// column's collation in parallel so the runtime prefix match honours it.
-		const prefix: SqlValue[] = [];
-		const equalityPrefixCollations: string[] = [];
-		for (let i = 0; i < prefixLen; i++) {
-			const colSpec = indexSchema.columns[i];
-			if (!colSpec) break;
-			const val = findArgValueForColumn(colSpec.index, argvMap, args, indexInfoOutput)
-				?? findConstraintValueForColumn(colSpec.index, constraints, args);
-			if (val !== undefined) {
-				prefix.push(val);
-				equalityPrefixCollations.push(resolveColumnCollation(indexSchema, i) ?? 'BINARY');
-			}
-		}
+		const prefix = collectEqualityPrefix(indexSchema, prefixLen, argvMap, args, constraints, indexInfoOutput);
 		// Extract range bounds for the trailing column (the one after the prefix)
 		const trailingCol = indexSchema.columns[prefixLen];
 		if (trailingCol) {
@@ -349,13 +367,23 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 		}
 		const boundCollation = resolveColumnCollation(indexSchema, prefixLen);
 		return {
-			indexName, descending, equalityPrefix: prefix, equalityPrefixCollations,
+			indexName, descending, ...prefix,
 			boundCollation, lowerBound, upperBound, idxNum, idxStr,
 		};
 	} else if (isEqPlan && indexSchema) {
 		equalityKey = buildEqualityKey(
 			indexName, indexSchema, argvMap, args, constraints, indexInfoOutput, tableSchema,
 		);
+		if (equalityKey === undefined) {
+			// A short seek: equality on leading columns only. An empty prefix (the leading
+			// column is unbound) stays an unbounded walk rather than a prefix of nothing.
+			const prefix = collectEqualityPrefix(
+				indexSchema, indexSchema.columns.length, argvMap, args, constraints, indexInfoOutput,
+			);
+			if (prefix.equalityPrefix.length > 0) {
+				return { indexName, descending, ...prefix, idxNum, idxStr };
+			}
+		}
 	} else if (isMultiSeekPlan && indexSchema) {
 		// Multi-seek: args are individual lookup keys (single-col) or flattened composite keys
 		const inCount = parseInt(params.get('inCount') ?? '0', 10);

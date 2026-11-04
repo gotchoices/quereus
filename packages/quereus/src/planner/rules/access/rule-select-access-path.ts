@@ -1525,10 +1525,10 @@ export function effectivePredicateCollation(constraint: PlannerPredicateConstrai
  */
 function indexColumnCollationLookup(
 	tableSchema: TableSchema,
-	accessPlan: BestAccessPlanResult
+	accessPlan: Pick<BestAccessPlanResult, 'indexName'>
 ): (colIdx: number) => string {
 	const indexName = accessPlan.indexName;
-	const isPrimary = indexName === '_primary_' || indexName === 'primary';
+	const isPrimary = isPrimaryIndexName(indexName);
 	const index = isPrimary ? undefined : tableSchema.indexes?.find(i => i.name === indexName);
 	return (colIdx: number): string => {
 		if (isPrimary) {
@@ -1537,6 +1537,47 @@ function indexColumnCollationLookup(
 		const idxCol = index?.columns.find(c => c.index === colIdx);
 		return normalizeCollationName(idxCol?.collation ?? 'BINARY');
 	};
+}
+
+function isPrimaryIndexName(indexName: string | undefined): boolean {
+	return indexName === PRIMARY_INDEX_NAME || indexName === PRIMARY_PHYSICAL_INDEX_NAME;
+}
+
+/**
+ * Whether the leaf this rule would build can deliver `accessPlan`'s ordering claim, as far
+ * as collation decides it. A caller must ask before dropping a Sort on the claim's word.
+ *
+ * A module cannot see a predicate's collation, so it takes any equality as pinning its
+ * column to one value and skips that column when matching an index against the required
+ * ordering. A predicate coarser than the index breaks that: `k = 'a' collate nocase` over a
+ * BINARY `(k, r)` matches the two groups `'A'` and `'a'`, and `r` restarts in each. The same
+ * mismatch makes the seek arms decline to a scan, which emits no claimed order at all.
+ *
+ * Deliberately coarse: a mismatched equality on any column of the index disqualifies the
+ * claim, even one past the columns the claim consumed. That costs one needless Sort in a
+ * rare shape. `constraints` must be the array `handledFilters` is positional against.
+ */
+export function orderingClaimSurvivesCollation(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	constraints: readonly PlannerPredicateConstraint[],
+): boolean {
+	const indexName = accessPlan.orderingIndexName ?? accessPlan.indexName;
+	const keyColumns = isPrimaryIndexName(indexName)
+		? tableSchema.primaryKeyDefinition
+		: tableSchema.indexes?.find(i => i.name === indexName)?.columns;
+	if (!keyColumns) return true;
+
+	const collationForColumn = indexColumnCollationLookup(tableSchema, { indexName });
+	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
+	return constraints.every((c, i) => {
+		const isEquality = c.op === '=' || c.op === 'IN';
+		const bearsOnClaim = isEquality ? c.usable : accessPlan.handledFilters[i] === true;
+		if (!bearsOnClaim || !keyColumns.some(col => col.index === c.columnIndex)) return true;
+		const predColl = effectivePredicateCollation(c);
+		const indexColl = collationForColumn(c.columnIndex);
+		return classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
+	});
 }
 
 /**
