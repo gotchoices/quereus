@@ -101,8 +101,13 @@ export class PeerStateStore {
   /**
    * The lowest sent watermark across all peers: everything at or below it has been
    * acknowledged by every peer holding a record. `undefined` when this replica has
-   * never had a push acknowledged. A peer that has not acknowledged anything yet has
-   * no record, so it is not counted.
+   * never had a push acknowledged.
+   *
+   * NOTE: a peer that has not acknowledged anything yet has no record, so it is not
+   * counted, and own tombstones at or below this minimum can prune before that peer has
+   * them. Fine with one coordinator per database, which is today's shape (see the
+   * checkpoint NOTE in `SyncClient.maybeBootstrap`). If a replica ever syncs one database
+   * to several servers that share data, record a peer when it is first met.
    */
   async getMinSentWatermark(): Promise<HLC | undefined> {
     let min: HLC | undefined;

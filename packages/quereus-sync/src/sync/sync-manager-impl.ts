@@ -2016,7 +2016,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		let count = 0;
 		const batch = this.kv.batch();
 		let maxPrunedHLC: HLC | undefined;
-		// Read once: a watermark only rises, so a stale value keeps more, never less.
+		// Read once: each peer's watermark only rises, so a stale value keeps more, never less.
 		const minSentWatermark = await this.peerStates.getMinSentWatermark();
 
 		const tbBounds = buildAllTombstonesScanBounds();
