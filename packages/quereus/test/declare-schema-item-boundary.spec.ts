@@ -441,6 +441,12 @@ describe('declare schema item boundaries', () => {
 				.to.throw(/USING/);
 		});
 
+		for (const item of ['table t1 (id integer primary key); using memory', 'view v1 as select 1 as a using memory', 'index i1 on t1 (id) using memory']) {
+			it(`rejects the stray \`using\` in \`${item}\``, () => {
+				expect(() => parse(`declare schema main { ${item} }`)).to.throw(/USING/);
+			});
+		}
+
 		it('rejects `using` after the `with` clauses', () => {
 			expect(() => parse(`declare schema main { table t1 (id integer primary key) with tags (t = 1) using memory }`))
 				.to.throw(/USING/);

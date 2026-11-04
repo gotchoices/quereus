@@ -56,8 +56,8 @@ Bindings have two cadences (a general mutation-context property, independent of 
 -- basis: two relations sharing a surrogate `rid`; the anchor declares its allocator
 create table u_core    (rid int primary key
                           default (coalesce((select max(rid) from u_core), 0) + mutation_ordinal()),
-                        name text) using mem();
-create table u_contact (rid int primary key, email text) using mem();
+                        name text) using memory;
+create table u_contact (rid int primary key, email text) using memory;
 
 -- the lens get
 create view User as
@@ -96,14 +96,14 @@ The two flavours of generated key follow directly:
 
 ```sql
 -- parent identity table
-create table h0_users_id (rowId int primary key, value int) using mem();
+create table h0_users_id (rowId int primary key, value int) using memory;
 
 -- extension relation: its rowId resolves the parent's via the supplied `value`
 create table h2_uprof (
   rowId int primary key
           default (select rowId from h0_users_id h0 where h0.value = new.value),
   value int
-) using mem();
+) using memory;
 
 insert into h2_uprof (value) values (200);   -- rowId is resolved to the matching parent row
 ```

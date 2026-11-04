@@ -3670,6 +3670,11 @@ export class Parser {
 	 * needs a real grammar for these kinds, not a tighter skip.
 	 */
 	private declareIgnoredItem(): AST.DeclareIgnoredItem {
+		// No item begins with `using`, so this is a module clause that attached to nothing;
+		// keeping it as text would lose the module silently.
+		if (this.peekKeyword('USING')) {
+			throw this.error(this.peek(), "Misplaced USING: a table names its module once, directly before or after its body; a materialized view names it before AS.");
+		}
 		const start = this.peek();
 		this.skipToDeclareItemBoundary();
 		const endTok = this.previous();
@@ -3818,11 +3823,6 @@ export class Parser {
 				this.current--;
 				break;
 			}
-		}
-
-		// Past this point a `using` would be read as an unrecognized item and its module lost.
-		if (this.peekKeyword('USING')) {
-			throw this.error(this.peek(), "Misplaced USING: a table names its module once, directly before or directly after its body.");
 		}
 
 		// Build the CREATE TABLE AST node for this declared table

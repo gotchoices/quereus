@@ -113,8 +113,9 @@ A `(` directly after a leading module name is always its argument list. So
 could equally be arguments or untyped columns. Use the trailing form, an empty
 argument list (`using m () (…)`), or braces (`using m { … }`).
 
-Naming a module on both sides of the body, or after a `maintained` or `with` clause,
-is a parse error. The SQL writer always emits the trailing form.
+Naming a module on both sides of the body, after a `maintained` or `with` clause, or
+anywhere else an item could begin (after a `;`, a view or an index), is a parse error.
+The SQL writer always emits the trailing form.
 
 #### Item keywords and bare aliases
 
@@ -245,6 +246,7 @@ apply schema main to version '1.0.0' options (
   ```
 
   `diff schema` surfaces the `DROP TABLE` / `create materialized view` DDL unconditionally (it is a read-only preview, never gated). Other drops are **not yet** gated — a general `allow_destructive` gate over all destructive schema changes remains future work.
+- A plain (non-maintained) table's module is read only when the table is created. The differ does not compare it, so re-declaring an existing table with a different `using` gives an empty diff and the table stays on its original module.
 - Rename hints prevent accidental drops during renames — see "Rename detection" below.
 
 **Rename detection (`rename_policy`):**
