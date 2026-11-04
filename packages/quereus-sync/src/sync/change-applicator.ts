@@ -15,7 +15,7 @@ import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
 import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
 import { alterPrimaryKeyColumns } from './migration-ddl.js';
-import { rekeyTableBookkeeping, reportRekeyOutcome } from './rekey-on-pk-change.js';
+import { rekeyRelayBookkeeping, rekeyTableBookkeeping, reportRekeyOutcome, type RekeyCounts } from './rekey-on-pk-change.js';
 import type {
 	ChangeSet,
 	Change,
@@ -515,6 +515,7 @@ export async function applyChanges(
 						// receiver's own re-relay/snapshot would ship the rename
 						// without it — undecidable downstream.
 						...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
+						...(migration.columns !== undefined ? { columns: migration.columns } : {}),
 						ddl: migration.ddl,
 						hlc: migration.hlc,
 						schemaVersion,
@@ -614,7 +615,9 @@ export async function applyChanges(
  * BEFORE Phase 2 runs that DDL. A table the batch also creates has no records and no
  * schema yet, and resolves to nothing; a table the same batch renames first is looked
  * up under its new name, which the catalog does not have yet, and resolves to nothing
- * either — {@link rekeyAfterReplicatedKeyChange} says so when the DDL then runs.
+ * either — {@link rekeyAfterReplicatedKeyChange} says so when the DDL then runs. On a
+ * relay (no schema oracle) nothing resolves and nothing is needed: its pass reads each
+ * record's row key from the record itself.
  */
 function captureRetiredKeyColumns(
 	ctx: SyncContext,
@@ -655,22 +658,20 @@ async function rekeyAfterReplicatedKeyChange(
 	// Per table, the key its records are filed under as the passes proceed.
 	const filedUnder = new Map(retiredKeys);
 	const rekeyedTables = new Set<string>();
+	// NOTE: nothing serializes applies on a manager, so another push can apply between a
+	// pass's scan and its write. A duplicate push of the same key change is safe: the relay
+	// pass reads each record's new key from the record itself, so one already moved stays
+	// put, and a record moving in never overwrites a newer one (`CellContest`). A different
+	// device's DATA write to the table interleaving here is the concurrent-write race
+	// docs/sync.md asks callers to quiesce around a key change. If interleaving ever shows
+	// up beyond duplicate pushes, serialize applies per manager.
 	for (const change of executed) {
 		if (change.type !== 'alter_column') continue;
 		const newKeyColumns = alterPrimaryKeyColumns(change.ddl);
 		if (newKeyColumns === undefined) continue;
 		const key = tableKey(change.schema, change.table);
-		const oldKeyColumns = filedUnder.get(key);
-		if (oldKeyColumns === undefined) {
-			console.warn(
-				`[Sync] ${change.schema}.${change.table}: replicated primary key change ran but the key it retired was not `
-					+ `captured (the table was created or renamed by the same batch) — sync bookkeeping for its existing rows `
-					+ `cannot be re-filed`,
-			);
-			continue;
-		}
 		const batch = ctx.kv.batch();
-		const counts = await rekeyTableBookkeeping(ctx, change.schema, change.table, oldKeyColumns, newKeyColumns, batch);
+		const counts = await rekeyOneTable(ctx, change, filedUnder.get(key), newKeyColumns, batch);
 		if (!counts) continue;
 		await batch.write();
 		filedUnder.set(key, newKeyColumns);
@@ -688,6 +689,32 @@ async function rekeyAfterReplicatedKeyChange(
 			entry.oldColumnVersion = await ctx.columnVersions.getColumnVersion(change.schema, change.table, change.pk, change.column);
 		}
 	}
+}
+
+/**
+ * One table's re-key pass: from the records themselves on a relay — no catalog there
+ * names the retired key, but every record names its own row's — and from the table on a
+ * peer with a schema oracle, which needs the retired key to match records to rows.
+ */
+async function rekeyOneTable(
+	ctx: SyncContext,
+	change: SchemaChangeToApply,
+	oldKeyColumns: readonly string[] | undefined,
+	newKeyColumns: readonly string[],
+	batch: WriteBatch,
+): Promise<RekeyCounts | undefined> {
+	if (!ctx.hasSchemaOracle) {
+		return rekeyRelayBookkeeping(ctx, change.schema, change.table, newKeyColumns, change.columns, batch);
+	}
+	if (oldKeyColumns === undefined) {
+		console.warn(
+			`[Sync] ${change.schema}.${change.table}: replicated primary key change ran but the key it retired was not `
+				+ `captured (the table was created or renamed by the same batch) — sync bookkeeping for its existing rows `
+				+ `cannot be re-filed`,
+		);
+		return undefined;
+	}
+	return rekeyTableBookkeeping(ctx, change.schema, change.table, oldKeyColumns, newKeyColumns, batch);
 }
 
 /**
@@ -1211,7 +1238,7 @@ async function refuseEditsOfForgottenRows(
 			foundedRows.add(rowIdentityKey(ctx, change, freshLocalTable));
 		}
 	}
-	const elsewhere = await tablesWithRecordsElsewhere(ctx, flagged, batchSchemaChanges);
+	const elsewhere = tablesWithRecordsElsewhere(batchSchemaChanges);
 
 	return resolved.map(entry => {
 		if (!entry.editOfForgottenRow) return entry;
@@ -1229,48 +1256,25 @@ function redefinesKey(migration: { type: string; ddl?: string }): boolean {
 }
 
 /**
- * Those of the flagged changes' tables whose row records this replica may hold somewhere
- * the flagged address does not reach, so finding no cells there proves nothing:
+ * The tables whose row records this replica may hold somewhere a flagged change's
+ * address does not reach, so finding no cells there proves nothing:
  *
  * - The batch renames the table. Phase 1 read by the new name while the records still
  *   answer to the old one. An engine peer resolves such a table read-free, but a relay
  *   has no catalog and takes the new name for one it already has.
- * - The table's key was redefined by this batch or an earlier one. A relay cannot re-file
- *   records under the new key at all, and an engine peer does so only in Phase 3.
+ * - The batch redefines the table's key. Phase 1 read by the new key before Phase 3's
+ *   pass re-files the records under it ({@link rekeyAfterReplicatedKeyChange}, on a
+ *   relay too).
+ *
+ * A key redefined by an EARLIER batch exempts nothing: that batch's pass already re-filed
+ * the records, so a row with none under the new key is one this replica has forgotten.
  */
-async function tablesWithRecordsElsewhere(
-	ctx: SyncContext,
-	flagged: readonly ResolvedChange[],
-	batchSchemaChanges: readonly SchemaChangeToApply[],
-): Promise<Set<string>> {
-	const elsewhere = new Set(
+function tablesWithRecordsElsewhere(batchSchemaChanges: readonly SchemaChangeToApply[]): Set<string> {
+	return new Set(
 		batchSchemaChanges
 			.filter(change => change.type === 'rename_table' || redefinesKey(change))
 			.map(change => tableKey(change.schema, change.table)),
 	);
-	const tables = new Map(flagged.map(({ change }) => [tableKey(change.schema, change.table), change]));
-	for (const [key, { schema, table }] of tables) {
-		if (!elsewhere.has(key) && await keyWasEverRedefined(ctx, schema, table)) {
-			elsewhere.add(key);
-		}
-	}
-	return elsewhere;
-}
-
-/** Whether the recorded migrations redefine this table's key, under this name or an earlier one. */
-async function keyWasEverRedefined(ctx: SyncContext, schema: string, table: string): Promise<boolean> {
-	const visited = new Set<string>();
-	let name: string | undefined = table;
-	while (name !== undefined && !visited.has(name)) {
-		visited.add(name);
-		let renamedFrom: string | undefined;
-		for await (const migration of ctx.schemaMigrations.getAllMigrations(schema, 'table', name)) {
-			if (redefinesKey(migration)) return true;
-			if (migration.type === 'rename_table') renamedFrom = migration.fromTable;
-		}
-		name = renamedFrom;
-	}
-	return false;
 }
 
 /**

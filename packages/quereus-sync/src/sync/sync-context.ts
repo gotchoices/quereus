@@ -56,6 +56,13 @@ export interface SyncContext {
 	 * deployment, or a bare emitter source — that pass cannot run here and says so.
 	 */
 	readonly db?: Database;
+	/**
+	 * Whether a `getTableSchema` oracle was wired. Without one — a relay-only deployment —
+	 * no table has a catalog here: every row keys raw, basis detection is inert, and a
+	 * replicated key change re-files a table's records from the records themselves rather
+	 * than from the table (`rekey-on-pk-change.ts`).
+	 */
+	readonly hasSchemaOracle: boolean;
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;

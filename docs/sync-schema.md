@@ -461,8 +461,9 @@ the row's primary-key identity, so `alter primary key` would abandon the metadat
 existing row. The origin re-files it in its own commit capture, and each receiver does the
 same once the replayed statement has executed — the table component of those keys, the
 generation, is untouched. See [sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)
-for what the pass recovers (live rows from the table, deleted rows from their tombstone's
-before-image) and what it cannot (a change already on the wire under the old key).
+for what the pass recovers (live rows from the table, or on a relay from their own cells;
+deleted rows from their tombstone's before-image, laid out on a relay as the migration's
+`columns`) and what it cannot (a change already on the wire under the old key).
 
 The receiver still warns in `applySchemaChange`'s blank-DDL early return, naming
 migration type, schema and table — a blank migration can now only come from an

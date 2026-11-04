@@ -152,6 +152,8 @@ export interface SerializedSchemaMigration {
    * rename as undecidable (see store-adapter.ts `decideSchemaChange`).
    */
   fromTable?: string;
+  /** `alter primary key` only: the table's column layout (`SchemaMigration.columns`). Optional, present-only. */
+  columns?: string[];
   ddl: string;
   hlc: string;
   schemaVersion: number;
@@ -257,6 +259,7 @@ function serializeSchemaMigration(m: SchemaMigration): SerializedSchemaMigration
     table: m.table,
     // Present-only: never emit a phantom `fromTable` key for a non-rename.
     ...(m.fromTable !== undefined ? { fromTable: m.fromTable } : {}),
+    ...(m.columns !== undefined ? { columns: m.columns } : {}),
     ddl: m.ddl,
     hlc: serializeHLCForTransport(m.hlc),
     schemaVersion: m.schemaVersion,
@@ -269,6 +272,7 @@ function deserializeSchemaMigration(m: SerializedSchemaMigration): SchemaMigrati
     schema: m.schema,
     table: m.table,
     ...(m.fromTable !== undefined ? { fromTable: m.fromTable } : {}),
+    ...(m.columns !== undefined ? { columns: m.columns } : {}),
     ddl: m.ddl,
     hlc: deserializeHLCFromTransport(m.hlc),
     schemaVersion: m.schemaVersion,

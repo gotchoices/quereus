@@ -37,16 +37,18 @@ import {
 import { makeNoAlterModule } from './no-alter-module.js';
 
 /**
- * One event rendered as `type/objectType/objectName[/columnName[/oldColumnName]][/key(old,…)]`
+ * One event rendered as `type/objectType/objectName[/columnName[/oldColumnName]][/key(old,…)/cols(…)]`
  * — the whole asserted contract of an ALTER schema event in one comparable string. Trailing
  * absent fields are omitted rather than placeholdered, so a spurious `columnName` on a
- * table-level arm shows up as a diff; `key(…)` is the retired key an ALTER PRIMARY KEY names.
+ * table-level arm shows up as a diff; `key(…)` and `cols(…)` are the retired key and the
+ * column layout an ALTER PRIMARY KEY names.
  */
 function shape(e: DatabaseSchemaChangeEvent): string {
 	const parts = [e.type, e.objectType, e.objectName];
 	if (e.columnName !== undefined) parts.push(e.columnName);
 	if (e.oldColumnName !== undefined) parts.push(e.oldColumnName);
 	if (e.oldKeyColumns !== undefined) parts.push(`key(${e.oldKeyColumns.join(',')})`);
+	if (e.columns !== undefined) parts.push(`cols(${e.columns.join(',')})`);
 	return parts.join('/');
 }
 
@@ -183,7 +185,7 @@ describe('ALTER TABLE raises a schema-change event on the engine\'s own path', (
 			await db.exec('create table t (a integer not null, b integer not null, primary key (a))');
 			await db.exec('alter table t alter primary key (a, b)');
 
-			assert.deepEqual(alterEvents().map(shape), ['alter/table/t/key(a)']);
+			assert.deepEqual(alterEvents().map(shape), ['alter/table/t/key(a)/cols(a,b)']);
 		});
 
 		it('add constraint reports alter/table for each class', async () => {
@@ -476,7 +478,7 @@ describe('ALTER TABLE on an emitter-backed module emits exactly once', () => {
 	it('alter primary key', async () => {
 		await db.exec('create table t (a integer not null, b integer not null, primary key (a))');
 		await db.exec('alter table t alter primary key (a, b)');
-		assert.deepEqual(alterEvents().map(shape), ['alter/table/t/key(a)']);
+		assert.deepEqual(alterEvents().map(shape), ['alter/table/t/key(a)/cols(a,b)']);
 	});
 
 	it('add constraint', async () => {

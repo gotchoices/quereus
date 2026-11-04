@@ -168,7 +168,7 @@ describe('an edit of a row this replica has forgotten', () => {
 		expect(result.skipped).to.equal(0);
 	});
 
-	describe('on a table whose primary key was redefined, where a relay never re-files its records', () => {
+	describe('on a table whose primary key was redefined', () => {
 		const redefineKey = (): SchemaMigration => ({
 			type: 'alter_column',
 			schema: 'main',
@@ -190,17 +190,20 @@ describe('an edit of a row this replica has forgotten', () => {
 			expect(result.skipped).to.equal(0);
 		});
 
-		it('is accepted when an earlier batch redefined the key', async () => {
+		// The relay re-filed its records under the new key when the earlier batch ran, so a
+		// row with none there is one it has forgotten, as on any other table.
+		it('is refused when an earlier batch redefined the key and the row was never founded', async () => {
 			const server = await makeServer();
 			await pruneAnUnrelatedDelete(server);
 			await server.applyChanges([changeSet([], [redefineKey()])]);
 
 			const result = await server.applyChanges([changeSet([edit([1, 'one'], 'qty', 5)])]);
 
-			expect(result.skipped).to.equal(0);
+			expect(result.skipped).to.equal(1);
+			expect(await cellsOf(server, [1, 'one'])).to.deep.equal([]);
 		});
 
-		it('is accepted when an earlier batch redefined the key and a later one renamed the table', async () => {
+		it('is refused when an earlier batch redefined the key and a later one renamed the table', async () => {
 			const server = await makeServer();
 			await pruneAnUnrelatedDelete(server);
 			await server.applyChanges([changeSet([], [redefineKey()])]);
@@ -208,7 +211,19 @@ describe('an edit of a row this replica has forgotten', () => {
 
 			const result = await server.applyChanges([changeSet([editOfRenamed([1, 'one'], 'qty')])]);
 
+			expect(result.skipped).to.equal(1);
+		});
+
+		it('is accepted for a row the relay re-filed under the new key', async () => {
+			const server = await makeServer();
+			await pruneAnUnrelatedDelete(server);
+			await server.applyChanges([changeSet([founding([1], 'id', 1), founding([1], 'note', 'one')])]);
+			await server.applyChanges([changeSet([], [redefineKey()])]);
+
+			const result = await server.applyChanges([changeSet([edit([1, 'one'], 'qty', 5)])]);
+
 			expect(result.skipped).to.equal(0);
+			expect(await cellsOf(server, [1, 'one'])).to.deep.equal(['id', 'note', 'qty']);
 		});
 	});
 });

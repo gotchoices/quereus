@@ -247,7 +247,117 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
       await peerC.close();
     }
   });
+
+  // The server is a relay: it holds sync records but no table, so it must re-file its
+  // records under the new key from the records themselves. In the second case A's delete
+  // of row 9, pruned on the server, puts the server's delta floor above B's watermark, so
+  // B is refused a delta and takes a snapshot after pushing.
+  for (const [serverState, pruneBeforeReconnect] of [
+    ['has not pruned, so the device catches up by delta', false],
+    ['has pruned, so the device takes a snapshot', true],
+  ] as const) {
+    it(`a key change made offline converges on every replica and a new device when the server ${serverState}`, async () => {
+      const service = coordinator.server.service;
+      const serverEntry = await service.storeManager.acquire(DB_ID);
+
+      await peerA.db.exec(`insert into orders (id, note, qty) values (1, 'one', 1), (2, 'two', 2), (9, 'nine', 9)`);
+      await waitFor(
+        async () => (await notesOn(peerB)).length === 3,
+        { label: 'A\'s rows to reach B by broadcast' },
+      );
+
+      await clientB.disconnect();
+      await peerB.db.exec('alter table orders alter primary key (id, qty)');
+      await peerB.db.exec(`update orders set note = 'edited after key change' where id = 1`);
+
+      await peerA.db.exec('delete from orders where id = 9');
+      await waitFor(
+        async () => !(await notesOnServer(serverEntry.syncManager)).some(([id]) => id === 9),
+        { label: 'A\'s delete to reach the server' },
+      );
+      if (pruneBeforeReconnect) await pruneEveryTombstone(serverEntry.syncManager);
+
+      await clientB.connect(coordinator.url, DB_ID);
+
+      const expected = JSON.stringify([[1, 'edited after key change'], [2, 'two']]);
+      await waitFor(
+        async () => [await notesOn(peerA), await notesOn(peerB), await notesOnServer(serverEntry.syncManager)]
+          .every(notes => JSON.stringify(notes) === expected),
+        { label: 'A, B and the server to hold rows 1 and 2, with row 1 edited' },
+      );
+      service.storeManager.release(DB_ID);
+
+      await withNewDevice(async peerC => {
+        expect(JSON.stringify(await notesOn(peerC)), 'a new device').to.equal(expected);
+      });
+    });
+  }
+
+  it('a delete made while a device was offline still removes the row there after another device changed the key', async () => {
+    const service = coordinator.server.service;
+    const serverEntry = await service.storeManager.acquire(DB_ID);
+    const peerC = await makeClientPeer(DDL);
+    const clientC = new SyncClient({ syncManager: peerC.syncManager, syncEvents: peerC.syncEvents, autoReconnect: false });
+    try {
+      await clientC.connect(coordinator.url, DB_ID);
+      await waitForSynced(clientC);
+
+      await peerA.db.exec(`insert into orders (id, note, qty) values (1, 'one', 1), (2, 'two', 2), (3, 'three', 3)`);
+      await waitFor(
+        async () => (await notesOn(peerB)).length === 3 && (await notesOn(peerC)).length === 3,
+        { label: 'A\'s rows to reach B and C by broadcast' },
+      );
+
+      await clientC.disconnect();
+      await peerA.db.exec('delete from orders where id = 3');
+      // B must hold the delete before it changes the key: a delete arriving under the old
+      // key after the change is the documented concurrent-write race, not this case.
+      await waitFor(
+        async () => !(await notesOnServer(serverEntry.syncManager)).some(([id]) => id === 3)
+          && !(await notesOn(peerB)).some(([id]) => id === 3),
+        { label: 'A\'s delete to reach the server and B' },
+      );
+      await peerB.db.exec('alter table orders alter primary key (id, qty)');
+      await waitFor(
+        async () => JSON.stringify(await keyColumnsOn(peerA)) === JSON.stringify(['id', 'qty']),
+        { label: 'B\'s key change to reach A' },
+      );
+
+      await clientC.connect(coordinator.url, DB_ID);
+
+      const expected = JSON.stringify([[1, 'one'], [2, 'two']]);
+      await waitFor(
+        async () => [await notesOn(peerA), await notesOn(peerB), await notesOn(peerC), await notesOnServer(serverEntry.syncManager)]
+          .every(notes => JSON.stringify(notes) === expected),
+        { label: 'A, B, C and the server to hold rows 1 and 2 only' },
+      );
+    } finally {
+      service.storeManager.release(DB_ID);
+      await clientC.disconnect();
+      await peerC.close();
+    }
+  });
+
+  /** Connect a brand-new device, let it bootstrap, and hand it to `check`. */
+  async function withNewDevice(check: (peer: ClientPeer) => Promise<void>): Promise<void> {
+    const peer = await makeClientPeer(DDL);
+    const client = new SyncClient({ syncManager: peer.syncManager, syncEvents: peer.syncEvents, autoReconnect: false });
+    try {
+      await client.connect(coordinator.url, DB_ID);
+      await waitForSynced(client);
+      await check(peer);
+    } finally {
+      await client.disconnect();
+      await peer.close();
+    }
+  }
 });
+
+/** The `orders` table's primary-key column names, in key order, lower-cased. */
+async function keyColumnsOn(peer: ClientPeer): Promise<string[]> {
+  const table = peer.db.schemaManager.getTable('main', 'orders')!;
+  return table.primaryKeyDefinition.map(def => table.columns[def.index].name.toLowerCase());
+}
 
 /** Each row's id and note, by id. */
 async function notesOn(peer: ClientPeer): Promise<Array<[number, unknown]>> {

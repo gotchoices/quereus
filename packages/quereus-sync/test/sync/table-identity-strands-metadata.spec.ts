@@ -132,7 +132,7 @@ describe('sync bookkeeping follows the table across a rename and its rows across
 		await localWrite(a, 'alter table orders alter primary key (id, extra)');
 		expect(rekeys, 'a re-filed every cell of both rows and dropped nothing').to.deep.equal([{
 			schema: 'main', table: 'orders',
-			cellsRekeyed: 6, rowsRekeyed: 2, rowsDropped: 0, tombstonesRekeyed: 0, tombstonesDropped: 0,
+			cellsRekeyed: 6, rowsRekeyed: 2, rowsDropped: 0, rowsStranded: 0, tombstonesRekeyed: 0, tombstonesDropped: 0,
 		}]);
 
 		await relayAll(a, b);

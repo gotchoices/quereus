@@ -21,6 +21,8 @@ export interface AlterSchemaEventShape {
 	oldColumnName?: string;
 	/** ALTER PRIMARY KEY only: the retired key's column names, in key order. */
 	oldKeyColumns?: string[];
+	/** ALTER PRIMARY KEY only: the table's column names in order (`VTableSchemaChangeEvent.columns`). */
+	columns?: string[];
 	/** Canonical, fully-qualified SQL of the statement — the node's plan-build
 	 *  rendering (`AlterTableNode.sql` / `AddConstraintNode.sql`), so the auto
 	 *  path announces the identical text an emitter-backed module does. */

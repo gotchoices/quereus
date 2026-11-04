@@ -56,6 +56,13 @@ export const SYNC_KEY_PREFIX = {
 /**
  * Current sync-metadata storage format version, persisted under the `fv:` key.
  *
+ * Version 7: schema migration RECORDS (`sm:` values) carry a second length-prefixed
+ * slot, after `fromTable` and before the DDL, holding an `alter primary key`
+ * migration's column layout as a JSON string array (`columns`, see
+ * `metadata/schema-migration.ts`), so a relay with no catalog can project a deleted
+ * row's new key from its tombstone's before-image. A version-6 record has the DDL
+ * where version 7 reads that slot's length, so it is unreadable under this layout.
+ *
  * Version 6: the per-row records (`cv:`/`tb:`/`cl:`) are keyed by the table's
  * GENERATION — a random per-peer identity a `(schema, table)` name resolves to
  * through the new `tg:` record (see `metadata/table-identity.ts`) — instead of by
@@ -89,7 +96,7 @@ export const SYNC_KEY_PREFIX = {
  * mismatches must re-bootstrap from a peer snapshot (see docs/sync.md
  * § Metadata format version).
  */
-export const SYNC_METADATA_FORMAT_VERSION = 6;
+export const SYNC_METADATA_FORMAT_VERSION = 7;
 
 /** Separator between a component's length and the component itself. */
 const SEPARATOR = ':';

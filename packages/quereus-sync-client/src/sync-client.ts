@@ -532,22 +532,49 @@ export class SyncClient {
 
     // Seed the sent watermark from durable per-peer state so a fresh process
     // (or a reconnect) resumes delta-push where it left off instead of
-    // replaying the entire local history to the server. Seeded BEFORE the
-    // get_changes goes out: its reply may be snapshot_required, whose recovery
-    // pushes from this watermark and must not see it still unseeded.
+    // replaying the entire local history to the server. Seeded BEFORE anything
+    // is pushed or pulled: the push below starts from it, and a snapshot_required
+    // reply to the pull recovers from it too.
     await this.seedSentWatermark();
+
+    // Push BEFORE pulling. The server handles a connection's messages concurrently, so
+    // a pull sent alongside the push is answered from what the server held before our
+    // offline work reached it — and a reconnect routinely re-pulls history it already
+    // has, because a broadcast never advances the received watermark. After an offline
+    // key change that reply addresses rows by the OLD key, which the re-keyed table
+    // cannot resolve, and the device loses its own edit. The pull therefore waits for
+    // the last push's acknowledgement; a device with a large offline backlog reports
+    // `synced` later than it used to.
+    if (!this.options.readOnly) {
+      // Subscribed first, so a local write made during the drain is not missed.
+      this.subscribeToLocalChanges();
+      if (!await this.pushBeforePull()) return;
+    }
 
     // Request changes from server since our last sync with this peer
     await this.requestChangesFromServer();
+  }
 
-    // In read-only (pull-only) mode, skip push entirely
-    if (!this.options.readOnly) {
-      // Subscribe to local changes for pushing to server
-      this.subscribeToLocalChanges();
-
-      // Push any existing local changes to server (changes made while offline).
-      // This sends the first batch; each ack sends the next (handleApplyResult).
-      await this.pushLocalChanges();
+  /**
+   * Drain every unsent local change to the server ahead of the handshake's first pull
+   * ({@link pushUntilDrained}). Returns whether the pull should still follow: not when the
+   * socket is gone or replaced — the reconnect runs the whole handshake again — but yes
+   * when the server rejected a batch or one could not be sent on a socket that is still
+   * open, logged as a failed push is today, so a device with a rejected batch does not
+   * stop receiving.
+   */
+  private async pushBeforePull(): Promise<boolean> {
+    const ws = this.ws;
+    try {
+      await this.pushUntilDrained();
+      return true;
+    } catch (err) {
+      if (this.ws !== ws || !this.isConnected) return false;
+      this.emitSyncEvent(
+        'info',
+        `Pulling with local changes still unsent: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return true;
     }
   }
 
@@ -884,7 +911,8 @@ export class SyncClient {
 
     // Ahead of the push, so a device that is about to stop does not first drain its
     // work to the server, and rows being adopted go out with that work and so come
-    // back in the snapshot. (The handshake's own first push has already gone by now.)
+    // back in the snapshot. (The handshake's own push has drained by now, so what is
+    // left to push is at most what was written since.)
     if (await this.settleUnrecordedRows() === 'stopped') return;
 
     this.emitSyncEvent(
@@ -921,8 +949,8 @@ export class SyncClient {
   /**
    * Send local changes one batch at a time, waiting for each ack, until a read
    * past the acknowledged watermark finds nothing. That read is the whole safety
-   * condition, so a push already in flight (the handshake-time one) needs no
-   * wait of its own: its range is at worst re-sent once, and whichever ack lands
+   * condition, so a push already in flight (a debounced local-change push) needs
+   * no wait of its own: its range is at worst re-sent once, and whichever ack lands
    * first subsumes the other.
    *
    * @throws when a batch could not be sent or its ack will not come — unsent work

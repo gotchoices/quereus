@@ -77,14 +77,13 @@ describe('sync metadata format version', () => {
 		expect(error!.message).to.match(/format version 99 does not match/i);
 	});
 
-	it('refuses version-5 metadata under version 6 (the table-generation key bump)', async () => {
-		// v5 `cv:`/`tb:`/`cl:` keys carry the table NAME where v6 carries its
-		// generation (`tg:`), so a v5 record would parse as trailing garbage or, for
-		// a tombstone, as a record of some other generation. The gate must refuse
-		// loudly instead.
-		expect(SYNC_METADATA_FORMAT_VERSION).to.equal(6);
+	it('refuses version-6 metadata under version 7 (the migration column-layout slot)', async () => {
+		// A v6 `sm:` value has the DDL where v7 reads the column-layout slot's length, so
+		// a v6 migration record would decode as garbage. The gate must refuse loudly
+		// instead.
+		expect(SYNC_METADATA_FORMAT_VERSION).to.equal(7);
 		await create();
-		await kv.put(SYNC_KEY_PREFIX.FORMAT_VERSION, new TextEncoder().encode('5'));
+		await kv.put(SYNC_KEY_PREFIX.FORMAT_VERSION, new TextEncoder().encode('6'));
 
 		let error: Error | undefined;
 		try {
@@ -93,7 +92,7 @@ describe('sync metadata format version', () => {
 			error = e as Error;
 		}
 		expect(error, 'open must fail').to.not.be.undefined;
-		expect(error!.message).to.match(/format version 5 does not match/i);
+		expect(error!.message).to.match(/format version 6 does not match/i);
 		expect(error!.message, 'names the recovery').to.match(/re-bootstrap/i);
 	});
 });

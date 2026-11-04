@@ -198,6 +198,12 @@ export interface PrimaryKeyRekeyedEvent {
   readonly rowsRekeyed: number;
   /** Rows whose cell versions were dropped because the table no longer holds them. */
   readonly rowsDropped: number;
+  /**
+   * Row groups left under the old key because no new key could be read for them — on a
+   * relay, which reads keys from the cells it holds, a key column with no cell. Unreachable
+   * under the new key, but not deleted: the relay may hold the only copy.
+   */
+  readonly rowsStranded: number;
   /** Tombstones re-filed under the deleted row's new key, projected from its before-image. */
   readonly tombstonesRekeyed: number;
   /** Tombstones dropped: no usable before-image, or a new key a live row now owns. */

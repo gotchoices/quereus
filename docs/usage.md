@@ -504,6 +504,7 @@ The `DatabaseSchemaChangeEvent` interface:
 | `columnName` | `string` | Column name (for column operations) |
 | `oldColumnName` | `string` | Previous column name (for renames) |
 | `oldKeyColumns` | `string[]` | Column names of the retired key, in key order (`alter table … alter primary key` only) |
+| `columns` | `string[]` | The table's column names in order, as of the statement (`alter table … alter primary key` only) |
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
 
@@ -559,7 +560,11 @@ Note `drop column` reports `type: 'drop'`, not `'alter'` — the arm removes an 
 `alter primary key` additionally carries `oldKeyColumns` — the retired key's column names, in
 key order. `ddl` names only the new key, and the catalog has already swapped by the time the
 event is delivered, so this is the one place the old key is still named; a subscriber that
-files anything under the row key (the sync engine's per-row bookkeeping) re-files from it.
+files anything under the row key (the sync engine's per-row bookkeeping) re-files from it. It
+also carries `columns`, the table's column names in order (the arm adds and drops none): the
+layout of every row image a subscriber recorded for the table under this column set, so a
+subscriber with no catalog of its own (a sync relay) can read a deleted row's new key out of
+its stored before-image.
 
 Every arm above also sets `ddl` to the statement's **canonical, schema-qualified SQL** — the
 text a replicating peer re-executes to reproduce the alteration. The engine renders it once at

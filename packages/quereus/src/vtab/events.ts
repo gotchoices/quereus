@@ -75,6 +75,13 @@ export interface VTableSchemaChangeEvent {
 	 * re-files from it.
 	 */
 	oldKeyColumns?: string[];
+	/**
+	 * ALTER PRIMARY KEY only: the table's column names in order, as of the statement (which
+	 * adds and drops none). This is the layout of every row image a subscriber recorded for
+	 * the table under this column set, so a subscriber with no catalog of its own (a sync
+	 * relay) can project a deleted row's new key from its stored before-image.
+	 */
+	columns?: string[];
 	/** DDL statement if available */
 	ddl?: string;
 	/** True if event originated from sync/remote source */

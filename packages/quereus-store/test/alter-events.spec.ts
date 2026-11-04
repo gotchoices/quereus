@@ -49,6 +49,7 @@ function createInMemoryProvider(): KVStoreProvider {
  * asserted per-arm contract in one comparable string, the same rendering the engine's own
  * `packages/quereus/test/alter-table-schema-events.spec.ts` uses. Trailing absent fields are
  * omitted rather than placeholdered, so a spurious `columnName` on a table-level arm diffs.
+ * `key(…)` / `cols(…)` are the retired key and the column layout an ALTER PRIMARY KEY names.
  */
 function shape(e: DatabaseSchemaChangeEvent): string {
 	const parts = [e.type, e.objectType, e.objectName];
@@ -56,6 +57,7 @@ function shape(e: DatabaseSchemaChangeEvent): string {
 	if (e.oldColumnName !== undefined) parts.push(e.oldColumnName);
 	// The retired key an ALTER PRIMARY KEY names — part of the cross-backend contract too.
 	if (e.oldKeyColumns !== undefined) parts.push(`key(${e.oldKeyColumns.join(',')})`);
+	if (e.columns !== undefined) parts.push(`cols(${e.columns.join(',')})`);
 	return parts.join('/');
 }
 
@@ -455,7 +457,7 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		await assertSingleEvent(
 			'alter table orders alter primary key (id)',
 			'alter table orders alter primary key (id)',
-			'alter/table/orders/key(id)');
+			'alter/table/orders/key(id)/cols(id,vv,w,sku)');
 		await assertSingleEvent(
 			'alter table orders drop column w',
 			'alter table orders drop column w',
@@ -670,7 +672,7 @@ describe('Store-backed and memory-backed ALTER TABLE deliver the same schema-eve
 			'alter/table/orders',
 			'alter/table/orders',
 			'alter/table/orders',
-			'alter/table/orders/key(id)',
+			'alter/table/orders/key(id)/cols(id,vv,w,sku)',
 			'drop/column/orders/w',
 			'alter/table/orders2',
 		]);

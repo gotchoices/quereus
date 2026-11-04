@@ -352,6 +352,7 @@ export async function applySnapshot(
 					// Keep the rename's old name, or this replica's own re-relay/snapshot
 					// would ship the rename without it — undecidable downstream.
 					...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
+					...(migration.columns !== undefined ? { columns: migration.columns } : {}),
 					ddl: migration.ddl,
 					hlc: migration.hlc,
 					schemaVersion,

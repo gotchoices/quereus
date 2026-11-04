@@ -11,10 +11,10 @@ import type { TableSchema } from '../schema/table.js';
 /** The fields of a schema-change event that an ALTER TABLE arm decides. */
 export type AlterEventShape = Pick<
 	VTableSchemaChangeEvent,
-	'type' | 'objectType' | 'columnName' | 'oldColumnName' | 'oldKeyColumns'
+	'type' | 'objectType' | 'columnName' | 'oldColumnName' | 'oldKeyColumns' | 'columns'
 >;
 
-/** What {@link alterEventShape} reads off the pre-ALTER schema: the key an ALTER PRIMARY KEY retires. */
+/** What {@link alterEventShape} reads off the pre-ALTER schema: the key an ALTER PRIMARY KEY retires, and the column layout it keeps. */
 export type AlterEventShapeBefore = Pick<TableSchema, 'columns' | 'primaryKeyDefinition'>;
 
 /**
@@ -60,7 +60,12 @@ export function alterEventShape(change: SchemaChangeInfo, before?: AlterEventSha
 		case 'alterPrimaryKey':
 			return {
 				type: 'alter', objectType: 'table',
-				...(before ? { oldKeyColumns: before.primaryKeyDefinition.map(def => before.columns[def.index].name) } : {}),
+				...(before
+					? {
+						oldKeyColumns: before.primaryKeyDefinition.map(def => before.columns[def.index].name),
+						columns: before.columns.map(column => column.name),
+					}
+					: {}),
 			};
 		case 'addConstraint':
 		case 'dropConstraint':

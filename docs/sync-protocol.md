@@ -466,7 +466,7 @@ The client state machine:
 
 - **DISCONNECTED** → `connectSync(url, token)` → **CONNECTING**
 - **CONNECTING** → `onopen`, send handshake → **SYNCING**
-- **SYNCING** → `handshake_ack` → `get_changes`; each non-empty `changes` reply → `applyChanges()` → next `get_changes`; an empty `changes` reply → **SYNCED**. Nothing else reports SYNCED, so a `push_changes` applied during the pull leaves the state at SYNCING
+- **SYNCING** → `handshake_ack` → every unsent local change pushed as `apply_changes`, one acknowledged batch at a time (unless `readOnly`) → `get_changes`; each non-empty `changes` reply → `applyChanges()` → next `get_changes`; an empty `changes` reply → **SYNCED**. Nothing else reports SYNCED, so a `push_changes` applied during the pull leaves the state at SYNCING
 - **SYNCED** stays put across `apply_result` / applied `push_changes`, and re-enters itself on a local change → `apply_changes`
 - Any of CONNECTING / SYNCING / SYNCED, on a WebSocket error or unintentional close → **RECONNECTING** → exponential backoff (1s, 2s, 4s … 60s) → DISCONNECTED and retry
 
@@ -480,7 +480,7 @@ batch-slice boundary — so advancing it can only land *between* whole transacti
 
 1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
 2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values, persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
-3. **Reconnection / restart**: On reconnect the client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`), so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
+3. **Reconnection / restart**: On reconnect the client re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`), pushes everything past it one acknowledged batch at a time, and only then sends `get_changes` with `sinceHLC` from the received watermark. The push goes first because the coordinator answers a connection's messages concurrently: a pull answered from the server's pre-push state hands back history the device already has (a broadcast never advances the received watermark), and after an offline key change that history addresses rows by the old key, which the re-keyed table cannot resolve. A push the server rejects, or one that could not be sent on a socket that is still open, is logged and the pull still follows; a socket that drops stops the sequence, and the reconnect runs it again. A fresh process thus resumes delta-push from the last confirmed HLC instead of replaying its entire local history, and a device with a large offline backlog reports `synced` only once its last batch is acknowledged. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
 4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity — **unless** `sinceHLC` is below its delta floor ([sync.md § Read side → The delta floor](sync-transactions.md#read-side-one-changeset-per-transaction)): a delete the client needs has been pruned, so it answers `snapshot_required` and the client recovers as described under *Client snapshot bootstrap* below. A `get_changes` with no `sinceHLC` is a from-nothing load and is never refused
 
 The push loop, end to end: a local change triggers the debounced send (50 ms window);
@@ -556,8 +556,8 @@ per edit become 1 per burst.
 
 A brand-new device cannot catch up incrementally — "changes since nothing" is not the
 database. `SyncClient` downloads a full copy instead, on three triggers. The first two are
-decided at handshake and finished *before* the incremental path (`get_changes`,
-local-change subscription, push) starts:
+decided at handshake and finished *before* the incremental path (local-change
+subscription, push, `get_changes`) starts:
 
 - `requestSnapshot()`, explicit. Idempotent while a transfer is in flight: a second call
   joins it, and exactly one `get_snapshot` goes on the wire. When the transfer lands, the

@@ -27,6 +27,8 @@ export interface StoredMigration {
   type: SchemaMigrationType;
   /** `rename_table` only: the table name before the rename. */
   fromTable?: string;
+  /** `alter primary key` only: the table's column layout — see `SchemaMigration.columns`. */
+  columns?: string[];
   ddl: string;
   hlc: HLC;
   schemaVersion: number;
@@ -35,20 +37,26 @@ export interface StoredMigration {
 /**
  * Serialize a migration for storage.
  * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type
- *         + 2 bytes fromTable byte-length (big-endian; 0 = absent) + fromTable + ddl
+ *         + 2 bytes fromTable byte-length (big-endian; 0 = absent) + fromTable
+ *         + 4 bytes columns byte-length (big-endian; 0 = absent) + columns (a JSON string array)
+ *         + ddl
  *
- * The `fromTable` slot sits BEFORE the ddl because the ddl is "rest of buffer" —
- * nothing can be appended after it. Inserting the slot is an incompatible layout
- * change, covered by the `fv:` gate (SYNC_METADATA_FORMAT_VERSION 5 in keys.ts).
+ * The optional slots sit BEFORE the ddl because the ddl is "rest of buffer" —
+ * nothing can be appended after it. Inserting a slot is an incompatible layout
+ * change, covered by the `fv:` gate (SYNC_METADATA_FORMAT_VERSION in keys.ts: 5 added
+ * `fromTable`, 7 added `columns`).
  */
 export function serializeMigration(migration: StoredMigration): Uint8Array {
   const encoder = new TextEncoder();
   const typeBytes = encoder.encode(migration.type);
   const fromBytes = encoder.encode(migration.fromTable ?? '');
+  const columnsBytes = encoder.encode(migration.columns === undefined ? '' : JSON.stringify(migration.columns));
   const ddlBytes = encoder.encode(migration.ddl);
   const hlcBytes = serializeHLC(migration.hlc);
 
-  const buffer = new Uint8Array(30 + 4 + 1 + typeBytes.length + 2 + fromBytes.length + ddlBytes.length);
+  const buffer = new Uint8Array(
+    30 + 4 + 1 + typeBytes.length + 2 + fromBytes.length + 4 + columnsBytes.length + ddlBytes.length,
+  );
   let offset = 0;
 
   // HLC (30 bytes)
@@ -71,6 +79,12 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   offset += 2;
   buffer.set(fromBytes, offset);
   offset += fromBytes.length;
+
+  // columns byte-length (4 bytes, big-endian; 0 = absent) + columns
+  view.setUint32(offset, columnsBytes.length, false);
+  offset += 4;
+  buffer.set(columnsBytes, offset);
+  offset += columnsBytes.length;
 
   // DDL (rest of buffer)
   buffer.set(ddlBytes, offset);
@@ -108,12 +122,21 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
     : undefined;
   offset += fromLength;
 
+  // columns (4-byte big-endian byte-length; 0 = absent)
+  const columnsLength = view.getUint32(offset, false);
+  offset += 4;
+  const columns = columnsLength > 0
+    ? JSON.parse(decoder.decode(buffer.slice(offset, offset + columnsLength))) as string[]
+    : undefined;
+  offset += columnsLength;
+
   // DDL
   const ddl = decoder.decode(buffer.slice(offset));
 
   return {
     type,
     ...(fromTable !== undefined ? { fromTable } : {}),
+    ...(columns !== undefined ? { columns } : {}),
     ddl,
     hlc,
     schemaVersion,
@@ -230,6 +253,7 @@ export class SchemaMigrationStore {
         schema: parsed.schema,
         table: parsed.table,
         ...(stored.fromTable !== undefined ? { fromTable: stored.fromTable } : {}),
+        ...(stored.columns !== undefined ? { columns: stored.columns } : {}),
         ddl: stored.ddl,
         hlc: stored.hlc,
         schemaVersion: stored.schemaVersion,

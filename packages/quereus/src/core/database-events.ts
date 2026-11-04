@@ -74,6 +74,9 @@ export interface DatabaseSchemaChangeEvent {
 	/** ALTER PRIMARY KEY only: the retired key's column names, in key order (`ddl` carries
 	 *  the new key). See `VTableSchemaChangeEvent.oldKeyColumns`. */
 	oldKeyColumns?: string[];
+	/** ALTER PRIMARY KEY only: the table's column names in order, as of the statement. See
+	 *  `VTableSchemaChangeEvent.columns`. */
+	columns?: string[];
 	/** DDL statement if available */
 	ddl?: string;
 	/** True if event originated from sync/remote source, false for local changes */
@@ -913,6 +916,7 @@ export class DatabaseEventEmitter {
 			columnName: event.columnName,
 			oldColumnName: event.oldColumnName,
 			oldKeyColumns: event.oldKeyColumns,
+			columns: event.columns,
 			ddl: event.ddl,
 			remote: event.remote ?? false,
 		};

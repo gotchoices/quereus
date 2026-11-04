@@ -122,6 +122,16 @@ export interface SchemaMigration {
    * renamed table stays in one contiguous version stream where the table lives.
    */
   readonly fromTable?: string;
+  /**
+   * `alter primary key` only: the table's column names in order, as of the statement
+   * (which adds and drops none). This is the layout of every row image
+   * (`Tombstone.priorRow`) a peer holds for the table under this column set, so a peer
+   * with no catalog — a relay — can project a deleted row's new key when it re-files the
+   * table's records (`sync/rekey-on-pk-change.ts`). Carried from the engine's event, not
+   * read from a catalog, which a later statement may already have moved on by the time
+   * the capture runs.
+   */
+  readonly columns?: string[];
   readonly ddl: string;           // The DDL statement
   readonly hlc: HLC;              // When migration occurred
   /**
@@ -571,6 +581,8 @@ export interface SchemaChangeToApply {
   readonly table: string;
   /** `rename_table` only: the table name before the rename. */
   readonly fromTable?: string;
+  /** `alter primary key` only: the table's column layout — see {@link SchemaMigration.columns}. */
+  readonly columns?: string[];
   /** The DDL statement to execute. */
   readonly ddl: string;
   /**
@@ -619,6 +631,7 @@ export function toSchemaChange(
 		table: migration.table,
 		// Present-only, so a non-rename migration carries no phantom key.
 		...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
+		...(migration.columns !== undefined ? { columns: migration.columns } : {}),
 		ddl: migration.ddl,
 		...(localDDLAtVersion !== undefined ? { localDDLAtVersion } : {}),
 		...(isBaselineVersion(migration.schemaVersion) ? { baseline: true as const } : {}),

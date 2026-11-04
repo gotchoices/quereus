@@ -1846,6 +1846,9 @@ async function runAlterPrimaryKey(
 	const newPkIndices = newPkDef.map(pk => pk.index);
 	// Named on the event: once the catalog swaps, nothing else says which key was retired.
 	const oldKeyColumns = oldPkIndices.map(i => tableSchema.columns[i].name);
+	// Also named: the column layout, unchanged by this arm, which a catalog-less subscriber
+	// needs to read a key out of a row image (see `VTableSchemaChangeEvent.columns`).
+	const columnNames = tableSchema.columns.map(column => column.name);
 
 	// Try native module re-key first
 	const module = requireVtabModule(tableSchema);
@@ -1890,6 +1893,7 @@ async function runAlterPrimaryKey(
 				type: 'alter', objectType: 'table',
 				objectName: tableSchema.name,
 				oldKeyColumns,
+				columns: columnNames,
 				ddl: sql,
 			});
 
@@ -1972,6 +1976,7 @@ async function runAlterPrimaryKey(
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
 		oldKeyColumns,
+		columns: columnNames,
 		ddl: sql,
 	});
 

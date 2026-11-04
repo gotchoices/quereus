@@ -1069,6 +1069,77 @@ describe('SyncClient', () => {
   });
 
   // ==========================================================================
+  // Handshake order: push, then pull
+  // ==========================================================================
+
+  describe('handshake push before pull', () => {
+    /** A one-column ChangeSet stamped with the given HLC. */
+    function changeSet(site: SiteId, txId: string, hlc: HLC): ChangeSet {
+      return {
+        siteId: site,
+        transactionId: txId,
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'n', value: txId, hlc }],
+        schemaMigrations: [],
+      };
+    }
+    const hlcAt = (wallTime: bigint, site: SiteId): HLC => ({ wallTime, counter: 1, siteId: site, opSeq: 0 });
+    const types = (ws: MockWebSocket): string[] => ws.getSentMessages().map(m => m.type);
+    const pushes = (ws: MockWebSocket): Array<{ requestId: string }> =>
+      ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId: string }>;
+
+    it('sends get_changes only once every batch of offline work is acknowledged', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      syncManager.changesPerCall = 1;
+      syncManager.changeSets = [changeSet(site, 'tx-1', hlcAt(1000n, site)), changeSet(site, 'tx-2', hlcAt(2000n, site))];
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes']);
+
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes(ws)[0].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes', 'apply_changes']);
+
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes(ws)[1].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      // No batch went twice: the ack-driven chain stayed out of the drain's way.
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes', 'apply_changes', 'get_changes']);
+    });
+
+    it('still pulls when the server rejects the push, so a device with a rejected batch keeps receiving', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      syncManager.changeSets = [changeSet(site, 'tx-1', hlcAt(1000n, site))];
+      const { client, syncEventsLog } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes']);
+
+      ws.simulateMessage({ type: 'error', code: 'APPLY_CHANGES_ERROR', message: 'one apply failed' });
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes', 'get_changes']);
+      expect(client.isConnected).to.be.true;
+      expect(syncEventsLog.some(e => e.type === 'info' && e.message.includes('still unsent'))).to.be.true;
+    });
+
+    it('stops when the socket closes before the push is acknowledged, leaving the pull to the reconnect', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      syncManager.changeSets = [changeSet(site, 'tx-1', hlcAt(1000n, site))];
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes']);
+
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(types(ws)).to.deep.equal(['handshake', 'apply_changes']);
+    });
+  });
+
+  // ==========================================================================
   // Reconnection
   // ==========================================================================
 
@@ -1879,10 +1950,18 @@ describe('SyncClient', () => {
       const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
       const ws = await connectAndHandshake(client);
 
-      const types = ws.getSentMessages().map(m => m.type);
+      // Its facts are pushed instead, and the pull follows the push's acknowledgement.
+      let types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.not.include('get_snapshot');
+      expect(types).to.include('apply_changes');
+      expect(client.isBootstrapping).to.be.false;
+
+      const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId: string };
+      ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      types = ws.getSentMessages().map(m => m.type);
       expect(types).to.not.include('get_snapshot');
       expect(types).to.include('get_changes');
-      expect(client.isBootstrapping).to.be.false;
     });
 
     it('does not bootstrap a device with prior peer sync state', async () => {

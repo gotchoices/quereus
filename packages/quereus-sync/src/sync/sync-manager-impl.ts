@@ -471,6 +471,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return this.pkKeying(schema, table);
 	}
 
+	/** See {@link SyncContext.hasSchemaOracle}. */
+	get hasSchemaOracle(): boolean {
+		return this.getTableSchema !== undefined;
+	}
+
 	/**
 	 * Basis-membership oracle for unknown-table detection. `getTableSchema(s,t)
 	 * === undefined` ⇒ the table is outside the local basis. When no oracle was
@@ -1278,6 +1283,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			...(migrationType === 'rename_table' && event.oldObjectName !== undefined
 				? { fromTable: event.oldObjectName }
 				: {}),
+			// A key change carries the table's column layout (the engine's event names it), so
+			// a relay can re-file the table's tombstones from their before-images.
+			...(migrationType === 'alter_column' && event.columns !== undefined ? { columns: event.columns } : {}),
 			ddl: ddl || '',
 			hlc: nextHlc(),
 			schemaVersion: version,
