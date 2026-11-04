@@ -7,7 +7,7 @@
 
 import { expect } from 'chai';
 import { InMemoryKVStore } from '@quereus/store';
-import { collect, closePeer, localWrite, makePeer, relay, settle, toStream, type Peer } from './_peer-harness.js';
+import { collect, closePeer, localWrite, makePeer, markAllDelivered, relay, settle, toStream, type Peer } from './_peer-harness.js';
 import { createSyncModule } from '../../src/create-sync-module.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
 
@@ -21,7 +21,8 @@ const ids = async (peer: Peer): Promise<number[]> =>
 async function deleteAndPrune(peer: Peer, where: string): Promise<void> {
 	await peer.db.exec(`delete from orders where ${where}`);
 	await settle();
-	await peer.manager.pruneTombstones();
+	await markAllDelivered(peer.manager);
+	expect(await peer.manager.pruneTombstones(), 'the delete was pruned').to.be.greaterThan(0);
 }
 
 async function chunksOf(peer: Peer): Promise<SnapshotChunk[]> {
@@ -179,7 +180,8 @@ describe('snapshot apply replaces rows absent from the snapshot', () => {
 		expect(await collect(receiver.db, 'select v from settings')).to.deep.equal([{ v: 2 }]);
 
 		await localWrite(sender, 'delete from settings');
-		await sender.manager.pruneTombstones();
+		await markAllDelivered(sender.manager);
+		expect(await sender.manager.pruneTombstones()).to.equal(1);
 		await receiver.manager.applySnapshotStream(toStream(await chunksOf(sender)));
 		expect(await collect(receiver.db, 'select v from settings')).to.deep.equal([]);
 	});

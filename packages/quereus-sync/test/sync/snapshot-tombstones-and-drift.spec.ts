@@ -19,7 +19,7 @@ import { expect } from 'chai';
 import { SNAPSHOT_WIRE_FORMAT_VERSION, type ChangeSet, type ColumnChange, type SnapshotChunk } from '../../src/sync/protocol.js';
 import { createHLC, MAX_DRIFT_MS, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
-import { makePeer, closePeer, localWrite, collect, toStream, type Peer } from './_peer-harness.js';
+import { makePeer, markAllDelivered, closePeer, localWrite, collect, toStream, type Peer } from './_peer-harness.js';
 
 const TEXT_ORDERS = 'create table orders (id text primary key, note text) using store';
 
@@ -89,6 +89,7 @@ describe('snapshot carries the delta floor', () => {
 		try {
 			await localWrite(sender, "insert into orders (id, note) values ('r1', 'hello')");
 			await localWrite(sender, "delete from orders where id = 'r1'");
+			await markAllDelivered(sender.manager);
 			expect(await sender.manager.pruneTombstones()).to.equal(1);
 			const floor = await sender.manager.getDeltaFloor();
 			expect(floor, 'the prune raised the floor of the sender').to.not.equal(undefined);
@@ -113,6 +114,7 @@ describe('snapshot carries the delta floor', () => {
 		try {
 			await localWrite(sender, "insert into orders (id, note) values ('r1', 'hello')");
 			await localWrite(sender, "delete from orders where id = 'r1'");
+			await markAllDelivered(sender.manager);
 			expect(await sender.manager.pruneTombstones()).to.equal(1);
 			const floor = await sender.manager.getDeltaFloor();
 

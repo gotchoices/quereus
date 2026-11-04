@@ -867,7 +867,8 @@ export interface SyncConfig {
    * Retention horizon in milliseconds: changes older than this are not
    * guaranteed deliverable. Bounds tombstone GC AND delta-sync eligibility,
    * and is the bound retirement guidance keys off (drop a legacy basis table
-   * no sooner than the horizon after its last directly-mapped write).
+   * no sooner than the horizon after its last directly-mapped write). A delete
+   * this replica wrote and has not yet delivered is kept past it.
    * Default: 30 days (30 * 24 * 60 * 60 * 1000)
    */
   retentionHorizonMs: number;

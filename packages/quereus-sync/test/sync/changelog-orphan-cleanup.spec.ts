@@ -34,6 +34,7 @@ import {
   flattenSets,
   localWrite,
   makePeer,
+  markAllDelivered,
   relay,
 } from './_peer-harness.js';
 
@@ -107,6 +108,7 @@ describe('change log orphan cleanup', () => {
         expect(await countChangeLog(manager)).to.equal(1);
       }
 
+      await markAllDelivered(manager);
       expect(await manager.pruneTombstones()).to.equal(1);
       expect(await countChangeLog(manager)).to.equal(0);
     });
@@ -122,6 +124,7 @@ describe('change log orphan cleanup', () => {
       expect(await countChangeLog(manager)).to.equal(rows);   // one delete entry per row
       expect(await countTombstones(manager)).to.equal(rows);
 
+      await markAllDelivered(manager);
       expect(await manager.pruneTombstones()).to.equal(rows);
       expect(await countChangeLog(manager)).to.equal(0);
     });
@@ -135,6 +138,7 @@ describe('change log orphan cleanup', () => {
       // Churn an unrelated row through its whole lifecycle.
       await insert(2, ['p', 'q', 'r']);
       await remove(2, ['p', 'q', 'r']);
+      await markAllDelivered(manager);
       await manager.pruneTombstones();
 
       // 2 live rows x 3 columns; row 2 left no residue at all.
@@ -439,6 +443,7 @@ describe('change log orphan cleanup', () => {
       await settle();
 
       expect(await countChangeLog(withColonColumn)).to.equal(1);   // the delete entry only
+      await markAllDelivered(withColonColumn);
       await withColonColumn.pruneTombstones();
       expect(await countChangeLog(withColonColumn)).to.equal(0);
     });

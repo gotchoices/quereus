@@ -416,7 +416,7 @@ function buildGenerationPrefix(prefix: string, generation: string): Uint8Array {
 }
 
 /** Scan bounds over an exact byte prefix. */
-function prefixBounds(prefix: Uint8Array): { gte: Uint8Array; lt: Uint8Array } {
+export function prefixBounds(prefix: Uint8Array): { gte: Uint8Array; lt: Uint8Array } {
   return { gte: prefix, lt: incrementLastByte(prefix) };
 }
 

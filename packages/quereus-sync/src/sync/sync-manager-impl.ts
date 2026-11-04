@@ -1998,22 +1998,33 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * seen — the delete-side twin of the column cleanup in
 	 * {@link deleteRowVersionsAndLogEntries}. Both deletions share this batch.
 	 *
+	 * A delete this replica has not delivered stays whatever its age, because its
+	 * tombstone is what {@link getChangesToPush} sends (see {@link isUndeliveredOwnDelete}).
+	 *
 	 * The delta floor (`metadata/delta-floor.ts`) is raised to the greatest
 	 * pruned tombstone HLC in this SAME batch: a peer whose watermark is below it
 	 * can no longer be served a complete delta, and a crash between the deletes
 	 * and the raise would let such a peer sync past the gap silently.
+	 *
+	 * NOTE: a replica that writes locally but never pushes (a `readOnly` client, a peer
+	 * others only pull from, a device that never connects) keeps its own tombstones
+	 * forever. The growth is one record per own delete, not measured. If that shows up,
+	 * add a way for the host to declare the replica has no upstream.
 	 */
 	async pruneTombstones(): Promise<number> {
 		const now = Date.now();
 		let count = 0;
 		const batch = this.kv.batch();
 		let maxPrunedHLC: HLC | undefined;
+		// Read once: a watermark only rises, so a stale value keeps more, never less.
+		const minSentWatermark = await this.peerStates.getMinSentWatermark();
 
 		const tbBounds = buildAllTombstonesScanBounds();
 		for await (const entry of this.kv.iterate(tbBounds)) {
 			const tombstone = deserializeTombstone(entry.value);
+			const expired = now - tombstone.createdAt > this.config.retentionHorizonMs;
 
-			if (now - tombstone.createdAt > this.config.retentionHorizonMs) {
+			if (expired && !this.isUndeliveredOwnDelete(tombstone.hlc, minSentWatermark)) {
 				batch.delete(entry.key);
 				if (!maxPrunedHLC || compareHLC(tombstone.hlc, maxPrunedHLC) > 0) {
 					maxPrunedHLC = tombstone.hlc;
@@ -2036,6 +2047,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 		await batch.write();
 		return count;
+	}
+
+	/**
+	 * Whether a tombstone holds a delete some peer has yet to receive from this replica.
+	 * Own tombstones only: {@link getChangesToPush} sends only what this replica wrote,
+	 * and a replica that only receives never gets a sent watermark, so counting other
+	 * devices' deletes would keep them forever on it. The comparison matches that read,
+	 * which sends what is strictly after the watermark.
+	 */
+	private isUndeliveredOwnDelete(hlc: HLC, minSentWatermark: HLC | undefined): boolean {
+		if (!siteIdEquals(hlc.siteId, this.getSiteId())) return false;
+		return !minSentWatermark || compareHLC(hlc, minSentWatermark) > 0;
 	}
 
 	/**

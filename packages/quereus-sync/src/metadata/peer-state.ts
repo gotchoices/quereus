@@ -6,9 +6,9 @@
  */
 
 import type { KVStore } from '@quereus/store';
-import { type HLC, serializeHLC, deserializeHLC } from '../clock/hlc.js';
+import { type HLC, compareHLC, serializeHLC, deserializeHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
-import { buildPeerStateKey, buildPeerSentStateKey, parsePeerStateKey } from './keys.js';
+import { buildPeerStateKey, buildPeerSentStateKey, parsePeerStateKey, prefixBounds } from './keys.js';
 import { SYNC_KEY_PREFIX } from './keys.js';
 
 /**
@@ -99,15 +99,25 @@ export class PeerStateStore {
   }
 
   /**
+   * The lowest sent watermark across all peers: everything at or below it has been
+   * acknowledged by every peer holding a record. `undefined` when this replica has
+   * never had a push acknowledged. A peer that has not acknowledged anything yet has
+   * no record, so it is not counted.
+   */
+  async getMinSentWatermark(): Promise<HLC | undefined> {
+    let min: HLC | undefined;
+    for await (const entry of this.kv.iterate(prefixBounds(SYNC_KEY_PREFIX.PEER_SENT_STATE))) {
+      const { lastSyncHLC } = deserializePeerState(entry.value);
+      if (!min || compareHLC(lastSyncHLC, min) < 0) min = lastSyncHLC;
+    }
+    return min;
+  }
+
+  /**
    * Get all known peers.
    */
   async *getAllPeers(): AsyncIterable<{ siteId: SiteId; state: PeerState }> {
-    const prefix = SYNC_KEY_PREFIX.PEER_STATE;
-    const lt = new Uint8Array(prefix.length);
-    lt.set(prefix);
-    lt[lt.length - 1]++;
-
-    for await (const entry of this.kv.iterate({ gte: prefix, lt })) {
+    for await (const entry of this.kv.iterate(prefixBounds(SYNC_KEY_PREFIX.PEER_STATE))) {
       // Reconstruct the peer's site id from the key: ps:{siteId_base64url}
       const siteId = parsePeerStateKey(entry.key);
       if (!siteId) {
@@ -124,10 +134,12 @@ export class PeerStateStore {
   async deletePeerState(peerSiteId: SiteId): Promise<void> {
     const key = buildPeerStateKey(peerSiteId);
     await this.kv.delete(key);
-    // NOTE: deletes only the received watermark (ps:). The sent watermark (pt:)
-    // is left behind; if peer removal ever needs to be complete (GC of stale
-    // peers), also delete buildPeerSentStateKey(peerSiteId) here. No caller
-    // exercises full peer removal today, so the orphaned pt: entry is inert.
+    // NOTE: deletes only the received watermark (ps:). The sent watermark (pt:) is
+    // left behind and still counts in getMinSentWatermark, so a server this replica no
+    // longer talks to holds the minimum down and this replica's own tombstones stop
+    // expiring. The cost is storage only. If peer removal ever needs to be complete
+    // (GC of stale peers), also delete buildPeerSentStateKey(peerSiteId) here. No
+    // caller exercises full peer removal today.
   }
 }
 

@@ -133,7 +133,7 @@ forgotten is refused (§ Tombstones and Deletions).
 Deletions are recorded as "tombstones" with an HLC timestamp, preventing deleted rows from being resurrected by older writes arriving later.
 
 **Resurrection Policy** (configurable):
-- **Default: Delete Wins** (`allowResurrection: false`) - once a row is tombstoned, **all** subsequent column writes for it are blocked — regardless of the write's HLC — until the tombstone is pruned at the retention horizon
+- **Default: Delete Wins** (`allowResurrection: false`) - once a row is tombstoned, **all** subsequent column writes for it are blocked — regardless of the write's HLC — until the tombstone is pruned (see **Tombstone TTL** below)
 - **Optional: Resurrection Allowed** (`allowResurrection: true`) - an insert/update with HLC > the tombstone's T1 resurrects the row; writes with HLC ≤ T1 stay blocked
 
 **A delete still holds against an edit after its tombstone is pruned.** Pruning is a storage limit and does not change who wins. Under the default policy, a replica that has pruned at least one tombstone (its delta floor is set) refuses a column change that carries a before-image when it holds no cell and no tombstone for that row: the writer saw an earlier version, and this replica cannot tell a row it forgot from one it never heard of. The change counts as `skipped` and fires no event, so the writer's edit is lost as it would be while the tombstone exists; its application sees the row leave through the snapshot's ordinary remote delete. Replicas that have never pruned have forgotten nothing and accept the edit, and the before-image is not compared with the floor, because the edit can be concurrent with the pruned delete.
@@ -165,6 +165,20 @@ a `NOCASE` key) stays one update and tombstones nothing.
 **What a key redefinition does not cover.** A change already on the wire, or recorded by a peer that has not yet applied the key change, carries pk values under the *old* definition; a re-keyed receiver cannot address a row by them and cannot tell which definition the sender used (the `NOTE:` at the pk-projection site in `store-adapter.ts`). That is the concurrent-DDL-versus-data race — the same class as a write to a table a peer has concurrently dropped and re-created (*Table identity* below) — and a change that carried the sender's schema version for the table (the `sm:` version counters exist) would make it detectable. Within one inbound batch the receiver resolves the batch's data changes *before* its DDL runs, under the old keying, so it sees no local prior for a row the batch's own key change re-files; Phase 3 re-reads those priors after the pass so the change log stays consistent, but the last-writer decision for a cell both sides edited across the key change is not revisited (the data is already written). Quiesce writes to a table around a key change. A relay-only peer (no catalog, no engine) cannot run the pass at all: its records for the table stay under the old key, and it says so. Devices then disagree: the writer can lose its own edit, or a row if it takes a snapshot (`bug-sync-key-change-through-relay-diverges`).
 
 **Tombstone TTL**: retained for a configurable duration (default 30 days); sync attempts after expiry should fall back to full snapshot transfer.
+
+**A delete the replica has not delivered does not expire.** A tombstone is also the only way a local delete reaches the server: `getChangesToPush` reads the change log past the sent watermark and resolves each delete entry through its tombstone. So `pruneTombstones` keeps a tombstone, whatever its age, when this replica wrote it (`tombstone.hlc.siteId` is this site) and either no `pt:` record exists or its HLC is above the lowest sent watermark across all `pt:` records. Everything else expires by age. Without this rule, a device offline past the horizon would forget its own deletes, and the rows would come back when it reconnected.
+
+- **Only the replica's own deletes.** `getChangesToPush` sends only what this replica wrote, and a replica that only receives never gets a sent watermark, so other devices' deletes still expire on it. The coordinator wires no transaction source, so it has no tombstones of its own and the rule never matches there.
+- **The lowest watermark, because a replica can push to more than one server.** A server that has not acknowledged anything yet has no `pt:` record and is not counted.
+- **Acknowledged, not sent.** The watermark advances on the server's acknowledgement, so a push in flight during a sweep does not count as delivered.
+- **The delta floor** rises only when a tombstone is actually pruned, on the sweep after the watermark reaches it.
+- **A late delete gets a full retention period on the server**, because applying it stamps `createdAt` with the current time.
+
+What this costs and leaves open:
+
+- A replica that writes locally but never pushes (a `readOnly` client, a peer others only pull from, a device that never connects) keeps its own tombstones forever.
+- A server the device no longer talks to keeps its `pt:` record, which holds the minimum down, so own tombstones stop expiring. The cost is storage only.
+- Pushing the delete reaches the server, but a third device whose received watermark is already past the delete's timestamp still does not get it (`bug-sync-late-push-skipped-by-newer-watermark`).
 
 **Tombstones travel in snapshots**, on **both** paths, so a fresh replica ends with the sender's tombstones — a row deleted before the snapshot stays deleted, and a later stale write for it stays tombstone-blocked. The streaming path (`getSnapshotStream` / `applySnapshotStream`) carries them as a global `tombstone`-chunk pass; the non-streaming path as `Snapshot.tombstones: SnapshotTombstone[]`, filled from a global tombstone scan and re-written after the metadata clear. Both forms are **global**, not nested under `TableSnapshot`, so a fully-deleted row with no live column-versions still travels. Caveat on both: `createdAt` is re-based to bootstrap time on the receiver, so a bootstrapped tombstone lives a full TTL horizon from the bootstrap, not from the original deletion.
 
@@ -316,7 +330,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | `cl:{hlc}{type}⟨generation⟩⟨pkIdentity⟩[⟨col⟩]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*); the prefix and `buildTransactionKey` are reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state (received watermark) | `{lastSyncHlc}` |
-| `pt:{siteId}` | Peer sent state (highest HLC pushed to a peer and acked) | `{lastSyncHlc}` |
+| `pt:{siteId}` | Peer sent state (highest HLC pushed to a peer and acked). The lowest across peers holds back expiry of this replica's own tombstones (see [Tombstones and Deletions](#tombstones-and-deletions)) | `{lastSyncHlc}` |
 | `sm:⟨schema⟩⟨kind⟩⟨object⟩{version:010}` | Schema migration (`kind`: `table`\|`index`) | `{ddl, hlc}` |
 | `si:` | Site identity | `{siteId, createdAt}` |
 | `hc:` | HLC state | `{wallTime, counter}` |
@@ -680,7 +694,8 @@ interface SyncConfig {
   /**
    * Retention horizon in milliseconds: changes older than this are not
    * guaranteed deliverable. Bounds tombstone GC, delta-sync eligibility,
-   * and retirement timing guidance. Default: 30 days.
+   * and retirement timing guidance. A delete this replica wrote and has not
+   * yet delivered is kept past it. Default: 30 days.
    */
   retentionHorizonMs: number;
 

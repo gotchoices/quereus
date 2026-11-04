@@ -3,7 +3,9 @@ import { StoreModule, StoreEventEmitter, InMemoryKVStore, type KVStoreProvider }
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
-import { type SiteId } from '../../src/clock/site.js';
+import { MAX_OPSEQ } from '../../src/clock/hlc.js';
+import { generateSiteId, type SiteId } from '../../src/clock/site.js';
+import type { SyncManager } from '../../src/sync/manager.js';
 import {
 	DEFAULT_SYNC_CONFIG,
 	type ApplyResult, type Change, type ChangeSet, type SnapshotChunk, type SyncConfig, type UnknownTableDisposition,
@@ -65,6 +67,19 @@ export function createInMemoryProvider(): { provider: KVStoreProvider; stores: M
 		},
 	};
 	return { provider, stores };
+}
+
+/** One id, so repeated calls for a manager advance one `pt:` record rather than leave a lower one behind. */
+const DELIVERY_PEER = generateSiteId();
+
+/**
+ * Declare everything this replica has written delivered, as an acknowledged push would,
+ * so its expired tombstones can prune: an undelivered own delete stays whatever its age.
+ * For a replica standing in for a relay or a sender. `MAX_OPSEQ` covers every fact of the
+ * latest transaction, where `getCurrentHLC()` alone stops at its first.
+ */
+export async function markAllDelivered(manager: SyncManager): Promise<void> {
+	await manager.updatePeerSentState(DELIVERY_PEER, { ...manager.getCurrentHLC(), opSeq: MAX_OPSEQ });
 }
 
 /** Replay a collected chunk array as the `AsyncIterable` `applySnapshotStream` consumes. */

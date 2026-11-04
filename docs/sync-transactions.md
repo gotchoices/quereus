@@ -220,8 +220,10 @@ one winner and leave the loser in the store with no bookkeeping at all.
 gone — so every entry is deleted in the same `WriteBatch` as the record it points at:
 a row's `column` entries with its column versions on delete
 (`deleteRowVersionsAndLogEntries`, called from the local write path `recordDataEvent`
-and from apply's `commitChangeMetadata`), and a pk's `delete` entry with its expired
-tombstone (`SyncManagerImpl.pruneTombstones`). This bounds the change log to **live
+and from apply's `commitChangeMetadata`), and a pk's `delete` entry with its pruned
+tombstone (`SyncManagerImpl.pruneTombstones`; an expired delete this replica has not
+delivered is not pruned, see [sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)).
+This bounds the change log to **live
 cells + live tombstones** rather than to the replica's lifetime delete volume, and is
 lossless by construction — a dropped entry already resolved to `null` and could never
 have appeared in any `ChangeSet`.
@@ -232,7 +234,9 @@ forever, with nothing on either side reporting anything. So every prune of deliv
 history raises the replica's **delta floor** — the greatest HLC of any tombstone it has
 pruned, one `df:` record (`metadata/delta-floor.ts`), written in the *same* `WriteBatch`
 as the tombstone deletes so a crash between the two cannot reopen the gap, and only ever
-moving forward. An incremental request `since T` is complete iff `T >= floor` (replies
+moving forward. A tombstone kept past the horizon as an undelivered delete
+([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)) raises nothing until it
+is actually pruned. An incremental request `since T` is complete iff `T >= floor` (replies
 carry changes strictly after `T`, so a tombstone at exactly `T` was already delivered);
 `SyncManager.canDeltaSync(sinceHLC)` is exactly that comparison, and `getDeltaFloor()`
 exposes the value. The floor is *not* a wall-clock test: a watermark is the HLC of the

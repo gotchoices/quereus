@@ -190,7 +190,8 @@ export interface SyncManager {
   getPeerSentState(peerSiteId: SiteId): Promise<HLC | undefined>;
 
   /**
-   * Prune expired tombstones.
+   * Prune expired tombstones, except a delete this replica wrote that a peer has yet
+   * to acknowledge, which stays whatever its age (docs/sync.md § Tombstones and Deletions).
    *
    * Should be called periodically to clean up old tombstones.
    * Returns the number of tombstones pruned.

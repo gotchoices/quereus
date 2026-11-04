@@ -25,6 +25,7 @@ import { compareHLC, type HLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
 import { Database, type SqlValue, type TableSchema } from '@quereus/quereus';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
+import { markAllDelivered } from './_peer-harness.js';
 
 // ============================================================================
 // Test Infrastructure
@@ -1729,6 +1730,7 @@ describe('Sync Protocol E2E', () => {
       await new Promise(r => setTimeout(r, 10));
 
       // Prune should remove the expired tombstone
+      await markAllDelivered(replica.manager);
       const pruned = await replica.manager.pruneTombstones();
       expect(pruned).to.equal(1);
 
