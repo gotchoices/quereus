@@ -187,7 +187,7 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  * executor reports it, not the proposed row, to every post-write consumer. For a
  * DELETE only its presence is read, never its contents. See
  * `VirtualTable.update`'s doc comment for the module-author contract and
- * docs/runtime.md § per-row post-write pipeline.
+ * docs/runtime-dml.md § per-row post-write pipeline.
  *
  * Two REPLACE-displacement channels, both consumed by the DML executor so the
  * single post-write pipeline (change-tracking, row-time MV maintenance, FK

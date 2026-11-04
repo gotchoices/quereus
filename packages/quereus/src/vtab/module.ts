@@ -208,7 +208,7 @@ export interface VirtualTableModule<
 	 *
 	 * The false default is **correctness-first**: any durable / third-party store
 	 * is safe out of the box (it buffers) and opts into streaming only after it can
-	 * prove per-scan snapshot isolation. See `docs/runtime.md` § "DML executor:
+	 * prove per-scan snapshot isolation. See `docs/runtime-dml.md` § "DML executor:
 	 * read/write phase separation".
 	 */
 	readonly scanSnapshotIsolation?: boolean;

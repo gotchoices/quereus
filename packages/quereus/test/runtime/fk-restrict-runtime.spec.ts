@@ -353,7 +353,7 @@ describe('runtime FK RESTRICT pre-check', () => {
 		// RETURNING output; the batched path yields every row and aborts at the
 		// end-of-statement flush. Final state and error class are identical —
 		// the transient RETURNING output is the one observable difference
-		// (documented in docs/runtime.md).
+		// (documented in docs/runtime-dml.md).
 		const yielded: unknown[] = [];
 		let thrown: unknown;
 		try {

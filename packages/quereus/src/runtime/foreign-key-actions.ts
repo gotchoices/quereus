@@ -32,7 +32,7 @@ const log = createLogger('runtime:fk-actions');
 // DML executor accumulates each affected row's OLD referenced-key tuple here
 // during the row loop and flushes before the statement savepoint releases, so
 // a violation still rolls the whole statement back exactly like a per-row
-// abort under ABORT/ROLLBACK. See docs/runtime.md § Batched RESTRICT.
+// abort under ABORT/ROLLBACK. See docs/runtime-dml.md § Batched RESTRICT.
 // ---------------------------------------------------------------------------
 
 /** Per-FK accumulation state for one statement execution. */

@@ -25,7 +25,7 @@ import {
  * The fix: the DML executor drains the source match set (closing the scan
  * cursor) before applying any write, UNLESS the target module declares
  * `scanSnapshotIsolation` (memory does; this fragile fixture does not). See
- * `docs/runtime.md` § "DML executor: read/write phase separation" and
+ * `docs/runtime-dml.md` § "DML executor: read/write phase separation" and
  * `src/runtime/emit/dml-executor.ts` (runUpdate/runDelete).
  */
 describe('predicate DELETE/UPDATE does not invalidate its own scan cursor (Halloween)', () => {
