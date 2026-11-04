@@ -653,8 +653,9 @@ schema at delivery. A collation-only re-key deliberately skips that rewrite — 
 key value moves, so the recorded images stay accurate.
 
 **Rule 1 does not assume the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK
-TO SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated
-against *are* — which is why rule 1 judges every restorable state and refuses with `BUSY` when a
+TO SAVEPOINT` (the `non-transactional` tier of
+[module-capabilities.md § DDL transactionality tiers](module-capabilities.md#ddl-transactionality-tiers)),
+but the rows it validated against *are* — which is why rule 1 judges every restorable state and refuses with `BUSY` when a
 rollback would restore a row the surviving index, collation, type or `NOT NULL` forbids. The one
 rollback a user can still take past an accepted statement restores only rows that satisfy it.
 
@@ -681,10 +682,11 @@ change. Two consequences follow.
 
 A module that fully cooperated with the transaction coordinator would instead stage the
 catalog entry and the new structure alongside the transaction's row writes and publish or
-discard both atomically at commit/rollback. Quereus does not yet expose a capability flag
-distinguishing the two, so callers cannot currently ask a module whether its DDL is
-transactional; see `tickets/backlog/feat-ddl-transaction-capability.md`. Modules that degrade
-here should document it, as this section does.
+discard both atomically at commit/rollback. `getCapabilities().ddlTransactionality` declares which
+of the two a module does ([module-capabilities.md § DDL transactionality
+tiers](module-capabilities.md#ddl-transactionality-tiers)); raising the bundled backends to the
+`transactional` tier is `tickets/backlog/feat-transactional-ddl-native-backends.md`. Modules that
+degrade here should document it, as this section does.
 
 The store module (`packages/quereus-store`) reaches the same two rules by a different route
 (it validates over `StoreTable.iterateEffectiveEntries` and its index store is likewise

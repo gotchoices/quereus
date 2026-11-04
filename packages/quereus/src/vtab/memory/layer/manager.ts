@@ -2738,6 +2738,10 @@ export class MemoryTableManager {
 	 * (`convertBaseRows`) and every layer in the chain (`TransactionLayer.convertColumn`). A
 	 * wrapper's frame is not reached, so `set not null` judges it as-is (see `RestorableState`).
 	 * Own states are SYNC iterables for the same reason `effectiveDdlRows` is (`scanRows`).
+	 *
+	 * NOTE: with `rows` supplied this manager's own savepoint markers are not judged — under the
+	 * wrapper they are all lazy and re-pointed at the base, which is judged. If a wrapper ever
+	 * lets the underlying hold its own open work, merge `savepointRestoreLayers(connection)` in.
 	 */
 	private restorableStates(rows?: IssuerRowSources): RestorableState[] {
 		const connection = this.ddlConnection();

@@ -1,5 +1,5 @@
 import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
-import { rolledBackRowsWouldViolate, MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
+import { describeAlterColumn, rolledBackRowsWouldViolate, MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
@@ -93,10 +93,8 @@ function describeRowValidatingAlter(change: SchemaChangeInfo): string | undefine
 		return constraint.type === 'unique' ? `add ${constraint.name ? `constraint ${constraint.name} ` : ''}unique` : undefined;
 	}
 	if (change.type !== 'alterColumn') return undefined;
-	if (change.setCollation !== undefined) return `alter column ${change.columnName} set collate ${change.setCollation}`;
-	if (change.setDataType !== undefined) return `alter column ${change.columnName} set data type ${change.setDataType}`;
-	if (change.setNotNull === true) return `alter column ${change.columnName} set not null`;
-	return undefined;
+	const judgesRows = change.setCollation !== undefined || change.setDataType !== undefined || change.setNotNull === true;
+	return judgesRows ? describeAlterColumn(change) : undefined;
 }
 
 export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseModuleConfig>, AlterMigrationHost {

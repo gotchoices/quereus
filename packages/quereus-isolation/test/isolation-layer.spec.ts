@@ -7827,3 +7827,44 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 		await dbM.close();
 	});
 });
+
+describe('row-validating DDL over an overlay module that cannot report its savepoint frames', () => {
+	// An overlay staging table without `VirtualTable.savepointRowSources` leaves the wrapper
+	// unable to hand the underlying the states a `rollback to savepoint` could restore. The
+	// wrapper refuses a row-validating DDL under an open savepoint rather than judge the
+	// transaction over a state it cannot see (`IsolationModule.effectiveRowsFor`).
+	class HooklessOverlayModule extends MemoryTableModule {
+		override async create(db: Database, schema: TableSchema): ReturnType<MemoryTableModule['create']> {
+			const table = await super.create(db, schema);
+			Object.defineProperty(table, 'savepointRowSources', { value: undefined });
+			return table;
+		}
+	}
+
+	it('refuses (BUSY) under an open savepoint, and accepts once no savepoint is open', async () => {
+		const db = new Database();
+		db.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule(), overlay: new HooklessOverlayModule() }));
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, 'a')`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'b')`);
+		await db.exec('savepoint s');
+
+		let err: unknown;
+		try { await db.exec(`create unique index ix on t (v)`); } catch (e) { err = e; }
+		expect(err, 'the frame is unreadable, so the DDL cannot be judged').to.be.instanceOf(QuereusError);
+		expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+		expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
+		expect((err as QuereusError).message, 'names the user table').to.not.match(/_overlay_/);
+
+		// A DDL that judges no rows needs no frames.
+		await db.exec(`create index ix_plain on t (v)`);
+
+		// Released, the savepoint is no longer a restorable state, and the effective rows are clean.
+		await db.exec('release savepoint s');
+		await db.exec(`create unique index ix on t (v)`);
+		await db.exec('commit');
+		await db.close();
+	});
+});
