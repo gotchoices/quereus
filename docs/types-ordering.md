@@ -296,8 +296,9 @@ Consequences worth knowing:
   `d < '2024-01-15T12:00:00'` is false. An offset or `[zone]` moves the text to its UTC date
   first, as a write does, so `d = '2024-01-15T23:00:00-05:00'` finds `2024-01-16`.
 - `date(col)` returns DATE, so `date(col) = <text>` follows the same rule. The literal folds
-  to a bare date before the sargable range rewrite reads it, so the filter and the evaluated
-  comparison agree.
+  to a bare date before the sargable range rewrite reads it, and the rewrite declines anything
+  else, so the filter and the evaluated comparison agree. `date(col) = '2020-01-01[Mars/Base]'`
+  names a zone a write rejects, so it compares as text and matches nothing.
 - Blank text against a TIMESTAMP is NULL, because a write of it stores NULL, so `ts = ''`,
   `ts <> ''` and `ts not in ('')` match no rows, as they do for INTEGER. DATE, TIME and
   DATETIME reject blank text on a write, so for them it stays text.

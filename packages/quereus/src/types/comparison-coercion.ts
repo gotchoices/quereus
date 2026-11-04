@@ -128,7 +128,7 @@ export function crossTypeCoercion(left: LogicalType, right: LogicalType): CrossT
 
 /**
  * The conversion target for a TEXT operand compared against a numeric one — the
- * numeric side's own type, except INTEGER widens to NUMERIC (rule 2 above: the
+ * numeric side's own type, except INTEGER widens to NUMERIC (arm 3 above: the
  * prefix parse must not decide a comparison). Matched by NAME: a schema
  * round-tripped through persistence may hold a non-singleton instance.
  */

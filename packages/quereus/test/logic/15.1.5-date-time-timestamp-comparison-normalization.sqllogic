@@ -341,6 +341,26 @@ select id from mi where m >= ? order by id;
 select id from mp where m >= ? order by id;
 → [{"id":2},{"id":3}]
 
+-- A range seek whose bound stays text, or converts to NULL, at run time.
+-- params: ["junk"]
+select id from mi where m < ? order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+-- params: ["junk"]
+select id from mp where m < ? order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+-- params: ["junk"]
+select id from mi where m > ?;
+→ []
+-- params: ["junk"]
+select id from mp where m > ?;
+→ []
+-- params: [""]
+select id from mi where m >= ?;
+→ []
+-- params: [""]
+select id from mp where m >= ?;
+→ []
+
 -- params: ["junk"]
 select id from mn where m = ?;
 → []
@@ -477,4 +497,13 @@ select id, date(t) = '2020-01-01[Asia/Tokyo]' as eq from b order by id;
 select id from b where date(t) = '2020-01-01[Asia/Tokyo]';
 → []
 select id from bi where date(t) = '2020-01-01[Asia/Tokyo]';
+→ []
+
+-- A write rejects this zone, so the text stays text and equals no date. The filter must not
+-- read a date out of it, although Temporal.PlainDate.from would.
+select id, date(t) = '2020-01-01[Mars/Base]' as eq from b order by id;
+→ [{"eq":false,"id":1},{"eq":false,"id":2}]
+select id from b where date(t) = '2020-01-01[Mars/Base]';
+→ []
+select id from bi where date(t) = '2020-01-01[Mars/Base]';
 → []

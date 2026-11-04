@@ -277,8 +277,9 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 				let matched = false;
 				let hasNull = false;
-				// Keyed FIRST, then null-checked: an object-arm coercion can yield NULL
-				// (a blob is a JSON value under no reading), which is UNKNOWN, not false.
+				// Keyed FIRST, then null-checked: a coercion can yield NULL (a blob is a JSON
+				// value under no reading, blank text against a TIMESTAMP stores NULL), which
+				// is UNKNOWN, not false.
 				const conditionKey = condition === null ? null : probeKey(condition);
 				const shouldCompare = conditionKey !== null;
 

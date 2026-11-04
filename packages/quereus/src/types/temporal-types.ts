@@ -63,9 +63,9 @@ const validatesAs = (parseText: (text: string) => unknown) => (v: SqlValue): boo
  * NOTE: a text operand that differs per row (`text_col = dt_col`) parses per row, and the
  * memo in `comparandConverter` cannot help: 23-32 us per row for DATETIME where a scan with
  * no parse costs about 1.4 us, because its parser throws its way through up to three
- * attempts. TIME's parser can throw more times before succeeding on bare time text, and has
- * not been measured. If that shows up as slow, return early on text already in the canonical
- * spelling.
+ * attempts. DATE, TIME and DATETIME measured alike side by side: 67-75 us per row against
+ * 2-3 us with no parse (5,000 rows, median of 5 runs). If that shows up as slow, return early
+ * on text already in the canonical spelling.
  */
 const normalizesTextAs = (parseText: (text: string) => SqlValue) => (v: SqlValue): SqlValue => {
 	if (typeof v !== 'string') return v;
@@ -99,6 +99,27 @@ const timestampFromText = (text: string): number | bigint | null => {
 	// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —
 	// same canonicalization DATE / DATETIME apply.
 	return parseDateTimeStringToUtcPlain(trimmed).toZonedDateTime('UTC').epochMilliseconds;
+};
+
+/**
+ * The date a `date_bucket` constant names and the day after it, for `bucketBounds`, or
+ * undefined to decline the range rewrite.
+ *
+ * Only a bare date qualifies. By the time the rewrite reads the constant, comparison
+ * coercion has folded all text a write accepts to a bare date, so anything else is text a
+ * write rejects, which compares as text and equals no date. `PlainDate.from` still accepts
+ * some of it (`'2020-01-01[Mars/Base]'`), and bounds from that would match rows the
+ * comparison does not.
+ */
+const bareDateBucket = (kind: string, value: SqlValue): { date: string; next: string } | undefined => {
+	if (kind !== 'date_bucket' || typeof value !== 'string') return undefined;
+	try {
+		const date = Temporal.PlainDate.from(value);
+		if (date.toString() !== value) return undefined;
+		return { date: value, next: date.add({ days: 1 }).toString() };
+	} catch {
+		return undefined;
+	}
 };
 
 /**
@@ -136,15 +157,8 @@ export const DATE_TYPE: LogicalType = {
 	supportedCollations: [],
 
 	bucketBounds: (kind, value) => {
-		if (kind !== 'date_bucket') return undefined;
-		if (typeof value !== 'string') return undefined;
-		try {
-			const date = Temporal.PlainDate.from(value);
-			const next = date.add({ days: 1 });
-			return { lowerInclusive: date.toString(), upperExclusive: next.toString() };
-		} catch {
-			return undefined;
-		}
+		const bucket = bareDateBucket(kind, value);
+		return bucket && { lowerInclusive: bucket.date, upperExclusive: bucket.next };
 	},
 };
 
@@ -226,19 +240,12 @@ export const DATETIME_TYPE: LogicalType = {
 	supportedCollations: [],
 
 	bucketBounds: (kind, value) => {
-		if (kind !== 'date_bucket') return undefined;
-		if (typeof value !== 'string') return undefined;
-		try {
-			const date = Temporal.PlainDate.from(value);
-			const next = date.add({ days: 1 });
-			// Express bounds in the column's value space (ISO datetime strings, midnight UTC).
-			return {
-				lowerInclusive: `${date.toString()}T00:00:00`,
-				upperExclusive: `${next.toString()}T00:00:00`,
-			};
-		} catch {
-			return undefined;
-		}
+		const bucket = bareDateBucket(kind, value);
+		// Express bounds in the column's value space (ISO datetime strings, midnight UTC).
+		return bucket && {
+			lowerInclusive: `${bucket.date}T00:00:00`,
+			upperExclusive: `${bucket.next}T00:00:00`,
+		};
 	},
 };
 
