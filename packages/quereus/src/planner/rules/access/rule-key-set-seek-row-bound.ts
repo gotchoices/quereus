@@ -25,6 +25,11 @@
  * makes the walk read more than estimated, as does a writing Project, which makes the
  * limit drain its source. Either error costs reads, never a row, and is bounded by
  * today's full walk. Revisit if a measured query picks badly.
+ *
+ * NOTE: only a literal LIMIT gets here, and the node learns nothing of a bound known
+ * only at runtime. Over 1000 evenly spread keys in 2000 rows, `limit ?` bound to 1 reads
+ * 1000 rows where the literal reads 2. If parameterized limits over large key sets show
+ * up slow, hand the node the bound at runtime and make the same comparison there.
  */
 
 import { createLogger } from '../../../common/logger.js';

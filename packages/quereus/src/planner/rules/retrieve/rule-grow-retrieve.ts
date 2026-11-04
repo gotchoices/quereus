@@ -938,7 +938,7 @@ export function trySortAbsorbViaIndexOrdering(
 	// pushed-down filters) is preserved. The dropped Sort makes the plan's
 	// ordering load-bearing: the physical leaf's emission order is now the only
 	// thing producing the requested ORDER BY, so leaf rewrites that change
-	// emission order must see the marker and decline.
+	// emission order must see the marker and decline or put that order back.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
 		accessPlan,
