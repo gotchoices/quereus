@@ -31,3 +31,5 @@ select id from b where date(t) = '2020-01-01[Asia/Tokyo]';
 ```
 
 Expected behaviour: the filter and the evaluated comparison agree. The rewrite applies only when the constant is exactly a bare date, and otherwise declines, leaving the comparison as written. `date(t) = '2020-01-01'` still rewrites.
+
+**Note, 2026-11-04:** `date-time-timestamp-comparisons-against-text` (now in `implement/`) resolves this. Text compared against a DATE will convert the way a write does, so the literal becomes a bare date before the rewrite runs, and the filter and the evaluated comparison agree. This was confirmed by patching the hook on at load time. That ticket deletes this one once its test covers the repro. The "should return no rows" expectations above assumed byte comparison and no longer apply.
