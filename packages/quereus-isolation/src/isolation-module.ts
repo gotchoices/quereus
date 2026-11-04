@@ -1704,7 +1704,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Migrate the issuer's own overlay (already validated above). Its NOT NULL /
 		// tombstone throw sites are unreachable after pre-validation; so is a UNIQUE
 		// rejection, which `rowSource` already judged — the CONSTRAINT routing raises
-		// INTERNAL if one fires anyway rather than dropping the row.
+		// INTERNAL if one fires anyway rather than dropping the row. A `restoring` add is
+		// not judged, so it can fire there: see `installOverlayUniqueConstraint`.
 		if (ownEntry) {
 			await migrateOverlay(ownEntry[0], ownEntry[1], true);
 		}

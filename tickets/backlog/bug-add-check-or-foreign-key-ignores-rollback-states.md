@@ -54,3 +54,7 @@ Not run: the isolation wrapper, and inline `check` on `add column`.
 The same rule as the other row-validating DDL: a violation among the rows the transaction can see keeps `CONSTRAINT`, and a violation confined to a state a rollback could restore refuses with `BUSY`, leaving the transaction usable. `commit` followed by the same statement then lands the constraint.
 
 A module that declares `permitsGrandfatheredCheckViolators` opts out of the CHECK half by its existing contract.
+
+## Interaction with a failed `apply schema`
+
+The undo of a dropped constraint must not be judged at all (`restoring` on the `addConstraint` arm of `SchemaChangeInfo`, see docs/schema-undo-plan.md § Guards during an unwind). The CHECK half is covered if the new refusal lands inside `rejectCheckViolatedByExistingRows`, which returns early during an unwind. The foreign key half must skip the new refusal when `restoring` is set, in both the memory and the store arm.

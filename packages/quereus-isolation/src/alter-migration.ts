@@ -1175,9 +1175,12 @@ async function forwardAddConstraintToOverlay(
  * underlying already judged via `IsolationModule.issuerEffectiveRows`) or poison (a foreign
  * overlay). A missing overlay `createIndex` is a no-op, as in the index paths.
  *
- * NOTE: this validates even when the change is `restoring`, so duplicates staged in an overlay
- * refuse an unwind's undo. If an overlay can ever hold rows that break a UNIQUE they were
- * written under, this refusal also has to stand down during an unwind.
+ * NOTE: this validates even when the change is `restoring`, where the underlying judged nothing
+ * and has already installed the constraint, so a staged duplicate fails the undo as INTERNAL and
+ * leaves the underlying holding a constraint the catalog lacks. The only known way to reach it
+ * is re-registering a collation while the colliding rows are staged, then failing an apply in
+ * that same transaction. If an overlay gets a likelier way to hold rows that break a UNIQUE they
+ * were written under, this refusal has to stand down during an unwind too.
  */
 async function installOverlayUniqueConstraint(
 	host: AlterMigrationHost,
