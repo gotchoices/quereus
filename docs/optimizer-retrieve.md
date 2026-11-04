@@ -421,7 +421,7 @@ estimatedRows: (operands) => {
 
 | TVF | Advertisement |
 |---|---|
-| `generate_series(start, end)` | `isSet`, `keys=[[value]]`, `ordering=[{value, asc}]`, `monotonicOnColumns=[{value, asc, strict}]`, `estimatedRows` (when bounds are literal). |
+| `generate_series(start, stop)` | `isSet`, `keys=[[value]]`, `ordering=[{value, asc}]`, `monotonicOnColumns=[{value, asc, strict}]`, `estimatedRows` (when bounds are literal). |
 | `json_each(json[, path])` | `isSet`, `keys=[[id]]`. |
 | `json_tree(json[, path])` | `isSet`, `keys=[[id]]`. |
 | `query_plan(sql)` | `isSet`, `keys=[[id]]`. |
