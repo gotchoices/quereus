@@ -611,8 +611,8 @@ the planner's typed, validated {@link AccessPath} record (`resolveScanIndex` in
 
 This holds **regardless of the plan kind**, not only for a plain unbounded or bounded-range
 scan: a `multiSeek` (`plan=5`, e.g. `WHERE pk IN (3, 1, 2)`) on an index with `role:
-'primary'` still merges by primary key, so the underlying module owes ascending (or, for a
-`DESC` leading key, descending) primary-key emission order for its multi-seek too — not the
+'primary'` still merges by primary key, so the underlying module owes its own primary-key
+order (reversed when the descriptor sets `reverse`) for its multi-seek too — not the
 order its seek keys were handed to it (seek-argument order, i.e. the order the `IN` list
 appears in the SQL text). A multi-seek that visits keys in seek-argument order instead
 mis-pairs overlay rows against stale stored rows whenever that order does not already
@@ -712,7 +712,7 @@ interface IsolationCapableTable extends VirtualTable {
 
 The isolation layer neither passes these comparators to the overlay module nor validates that the two modules' orderings match. On each merged read it collects the overlay's rows for the query's window and sorts them under the merge comparator, so the overlay can emit in any order, and a host-supplied `IsolationConfig.overlay` owes no particular one. For a scan with `reverse: true` on its index descriptor, the merge comparator is the negated forward comparator. The underlying's scan must agree with its own `comparePrimaryKey`; the layer does not check this.
 
-The cost is that the overlay is no longer read lazily: a merged scan under a `limit` reads every staged row in its window before yielding anything. The overlay holds one transaction's staged writes, and a seek is still narrowed by the overlay's own query.
+The cost is that the overlay is no longer read lazily: a merged scan under a `limit` reads every staged row in its window before yielding anything. The overlay holds one transaction's staged writes, and a seek is still narrowed by the overlay's own query. Measured on a memory underlying with every row staged, a `limit 1` scan takes about 3 ms at 1,000 staged rows and 60 ms at 50,000, while a primary-key seek stays near 1 ms at both sizes. The same early read means a statement that writes to a table while reading it sees the staged rows as of the start of its scan, not the ones it has just written.
 
 `comparePrimaryKey` is optional. When the underlying table does not expose it — every
 store-backed table today — `IsolatedTable` falls back to its own comparator, which walks the

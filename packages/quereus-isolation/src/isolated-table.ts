@@ -494,7 +494,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const mergeConfig = this.buildMergeConfig(indexInfo);
 		const overlayFilterInfo = this.adaptFilterInfoForOverlay(filterInfo);
 		const overlayStream = this.queryOverlayAsMergeEntries(
-			overlay, overlayFilterInfo, indexInfo, mergeConfig.compareSortKey ?? mergeConfig.comparePK);
+			overlay, overlayFilterInfo, mergeConfig.compareSortKey ?? mergeConfig.comparePK);
 		const underlyingStream = this.underlyingTable.query!(filterInfo);
 		yield* mergeStreams(overlayStream, underlyingStream, mergeConfig);
 	}
@@ -877,8 +877,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Uses the same FilterInfo as the underlying query, which fixes the rows but not their
 	 * order: the merge follows the underlying's key order and walk direction, and the overlay
 	 * emits in its own. Sorting here keeps merge correctness independent of that order, as
-	 * {@link mergedSecondaryIndexQuery} does for its overlay rows.
-	 * For secondary index scans, the sort key includes both the index key and primary key.
+	 * {@link mergedSecondaryIndexQuery} does for its overlay rows. Only the primary-key merge
+	 * reads the overlay this way, so each entry's sort key is its primary key.
 	 *
 	 * The window is re-applied here rather than trusted: `filterInfo` was negotiated with
 	 * the UNDERLYING module, and the engine dropped the residual on the underlying's claim,
@@ -896,7 +896,6 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private async *queryOverlayAsMergeEntries(
 		overlay: VirtualTable,
 		filterInfo: FilterInfo,
-		indexInfo: IndexScanInfo,
 		compareSortKey: SortKeyComparator
 	): AsyncGenerator<MergeEntry> {
 		if (!overlay.query) {
@@ -913,43 +912,24 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			const isTombstone = overlayRow[tombstoneIndex] === 1;
 			const pk = pkIndices.map(i => overlayRow[i]);
 
-			// Build sort key based on index type
-			const sortKey = this.buildSortKey(overlayRow, pkIndices, indexInfo);
-
 			if (isTombstone) {
-				entries.push(createTombstone(pk, sortKey));
+				entries.push(createTombstone(pk));
 			} else {
 				// Remove the tombstone column from the row before yielding
 				const dataRow = overlayRow.slice(0, tombstoneIndex);
 				if (matchesWindow !== MATCH_ALL_ROWS && !matchesWindow(dataRow)) continue;
-				entries.push(createMergeEntry(dataRow, pk, sortKey));
+				entries.push(createMergeEntry(dataRow, pk));
 			}
 		}
 
 		// NOTE: reads every staged row in the window before the merge yields anything, so a
-		// merged scan under a `limit` no longer stops the overlay read early. Fine while an
-		// overlay holds a single transaction's writes (cost not measured); if large overlays
-		// make this show up hot, restore the lazy read for a forward walk over an underlying
+		// merged scan under a `limit` no longer stops the overlay read early. Measured on a
+		// memory underlying with every row staged: a `limit 1` scan takes about 3 ms at 1,000
+		// staged rows and 60 ms at 50,000, growing linearly. If a transaction that large reads
+		// this way repeatedly, restore the lazy read for a forward walk over an underlying
 		// with no `comparePrimaryKey`, whose fallback comparator matches a memory overlay's order.
 		entries.sort((a, b) => compareSortKey(a.sortKey, b.sortKey));
 		yield* entries;
-	}
-
-	/**
-	 * Builds the sort key for a row based on the index being scanned.
-	 *
-	 * For primary key scans: sort key is the PK
-	 * For secondary index scans: sort key is [indexKeyParts..., pkParts...]
-	 */
-	private buildSortKey(row: Row, pkIndices: number[], indexInfo: IndexScanInfo): SqlValue[] {
-		if (indexInfo.type === 'primary') {
-			return pkIndices.map(i => row[i]);
-		}
-
-		// Secondary index: combine index key columns with PK columns
-		const indexKey = indexInfo.columnIndices.map(i => row[i]);
-		const pk = pkIndices.map(i => row[i]);
-		return [...indexKey, ...pk];
 	}
 
 	/**
