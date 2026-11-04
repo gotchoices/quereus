@@ -159,7 +159,7 @@ describe('key-set-seek plan shape', () => {
 		)).to.have.lengthOf(0);
 	});
 
-	describe('ORDER BY interactions — the node never claims an emission order', () => {
+	describe('ORDER BY interactions — the node claims only an order both branches deliver', () => {
 		beforeEach(async () => {
 			await db.exec('insert into big (pk, v, w) values (1, 30, 5), (2, 10, 9), (3, 20, 7)');
 			await db.exec('insert into small values (10), (30), (20)');
@@ -181,14 +181,19 @@ describe('key-set-seek plan shape', () => {
 			expect(await orderedColumn(sql, 'w')).to.deep.equal([5, 7, 9]);
 		});
 
-		it('declines when the leaf order absorbed the Sort (ORDER BY pk)', async () => {
+		it('fires when the leaf order absorbed the Sort (ORDER BY pk), and claims that order', async () => {
 			// The ORDER BY pk Sort is absorbed into the primary-key walk before
-			// decorrelation; the hash semi join then carries that order through
-			// at runtime. A pushed multi-seek would emit in v-order instead, so
-			// the rule must decline and leave the hash join in place.
+			// decorrelation. A multi-seek on idx_v would emit in v order, so the seek
+			// branch sorts; the walk branch already delivers the order. v order and pk
+			// order disagree in this data, so unsorted seek rows would fail below.
 			const sql = 'select pk, v from big where v in (select id from small) order by pk';
 			const plan = db.getPlan(sql);
-			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline — leaf order is load-bearing').to.have.lengthOf(0);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes, 'the rewrite fires despite orderingLoadBearing').to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the absorbed Sort does not come back').to.have.lengthOf(0);
+			expect(nodes[0].getLogicalAttributes().restoresTargetOrder).to.equal(true);
+			expect(nodes[0].physical.ordering).to.deep.equal([{ column: 0, desc: false }]);
+			expect(nodes[0].physical.monotonicOn, 'a sorted seek is no walk: nothing needs this').to.equal(undefined);
 			expect(await orderedColumn(sql, 'pk')).to.deep.equal([1, 2, 3]);
 		});
 
@@ -825,22 +830,24 @@ describe('key-set-seek plan shape', () => {
 			expect(rows, 'pk 1 is in the key set but below the range').to.deep.equal([{ pk: 3 }, { pk: 4 }]);
 		});
 
-		it('declines an absorbed-Sort seek leaf (orderingLoadBearing)', async () => {
+		it('fires over an absorbed-Sort seek leaf (orderingLoadBearing), re-applying its predicate', async () => {
 			// `s >= 'a'` plans as a range seek on idx_s whose emission order
 			// absorbs the ORDER BY s — no Sort survives, so the leaf's order is
-			// the only thing producing the query's ORDER BY.
-			// `seekPreservesTargetOrder` is false for every seek target, so the
-			// rule must decline and keep the hash semi join, whose runtime
-			// preserves the probe-side order.
+			// the only thing producing the query's ORDER BY. The seek branch sorts
+			// by s, and the re-applied Filter above the node keeps that order.
 			const sql = "select pk, s from big where s >= 'a' and v in (select id from small) order by s";
 			const plan = pdb.getPlan(sql);
-			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
-			expect(collectNodes(plan, isHashJoin), 'hash semi join survives').to.have.lengthOf(1);
-			expect(collectNodes(plan, isSort), 'the Sort really was absorbed — the decline is the ordering gate')
-				.to.have.lengthOf(0);
-			const seeks = collectNodes(plan, isIndexSeek);
-			expect(seeks).to.have.lengthOf(1);
-			expect(seeks[0].orderingLoadBearing).to.equal(true);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes, 'the rewrite fires').to.have.lengthOf(1);
+			expect(collectNodes(plan, isHashJoin), 'the hash semi join is replaced').to.have.lengthOf(0);
+			expect(collectNodes(plan, isSort), 'the absorbed Sort does not come back').to.have.lengthOf(0);
+			expect(nodes[0].target, 'the seek is the target').to.be.instanceOf(IndexSeekNode);
+			expect((nodes[0].target as IndexSeekNode).orderingLoadBearing).to.equal(true);
+			expect(nodes[0].getLogicalAttributes().restoresTargetOrder).to.equal(true);
+			const reapplied = collectNodes(plan, isFilter).find(f => f.source === nodes[0]);
+			expect(reapplied, 'a Filter re-applying s >= \'a\' sits directly above the node').to.not.equal(undefined);
+			expect(reapplied!.predicate)
+				.to.equal((nodes[0].target as IndexSeekNode).pushedConstraints![0].sourceExpression);
 
 			await pdb.exec("insert into big values (1, 10, 0, 'x'), (2, 20, 0, 'a'), (3, 30, 0, 'm')");
 			await pdb.exec('insert into small values (10), (20), (30)');

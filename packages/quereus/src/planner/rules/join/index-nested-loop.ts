@@ -194,8 +194,9 @@ function admitWalkLeaf(leaf: AccessLeafNode): AdmittedLeaf | null {
  * in `pushedConstraints` (their residual Filter was dropped on the module's
  * promise). Admitted when that record is complete and re-offerable; the caller
  * re-offers it with the join key and re-applies whatever the module declines,
- * so no recorded predicate can be lost. Same five gates as
- * `rule-key-set-seek`'s `admitSeekLeaf`, for the same reasons.
+ * so no recorded predicate can be lost. The gates are `rule-key-set-seek`'s
+ * `admitSeekLeaf`'s, for the same reasons, plus the load-bearing order: that rule's
+ * node can sort a seek's rows back into order, and a nested loop has nowhere to.
  */
 function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 	const fi = leaf.filterInfo;

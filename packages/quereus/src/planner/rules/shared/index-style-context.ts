@@ -54,7 +54,7 @@ export interface IndexStyleContext {
 	 * order is now the only thing standing between the query and a wrong ORDER
 	 * BY. Re-grows must carry it forward, and the physical leaf lifts it as
 	 * `IndexScanNode.orderingLoadBearing` so later rewrites that would change
-	 * the leaf's emission order (`rule-key-set-seek`) know to decline. Absent /
+	 * the leaf's emission order know to decline or put that order back. Absent /
 	 * false ⇒ any advertised ordering is vacuous — nothing consumed it.
 	 */
 	orderingLoadBearing?: boolean;

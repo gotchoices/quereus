@@ -18,11 +18,10 @@ import type { AccessPath } from '../../vtab/index-descriptor.js';
  * in its `pushedConstraints`; `rule-key-set-seek` admits one only after
  * re-applying that predicate as a `Filter` directly above this node, so the
  * seek branch (which replaces the leaf's `FilterInfo` wholesale) cannot lose
- * it, while the scan branch runs the pushed seek untouched. Whether the leaf's
- * emission order is something an ancestor may depend on is settled by
- * {@link seekPreservesTargetOrder}, not by the leaf shape (see
- * `rule-key-set-seek`'s gates). Memory-vtab tables always advertise a
- * primary-key ordering, so their bare scans are ordering-only IndexScans —
+ * it, while the scan branch runs the pushed seek untouched. What the node does
+ * about the leaf's emission order is settled by {@link seekPreservesTargetOrder}
+ * and {@link seekRestoresTargetOrder}, not by the leaf shape. Memory-vtab tables
+ * always advertise a primary-key ordering, so their bare scans are ordering-only IndexScans —
  * admitting only SeqScan would make this node unreachable there.
  */
 export type KeySetTargetNode = SeqScanNode | IndexScanNode | IndexSeekNode;
@@ -85,6 +84,35 @@ export function seekPreservesTargetOrder(
 		&& ordering[0].desc === (keyColumns[0].desc === true);
 }
 
+/**
+ * True when the leaf's order is required (a Sort was dropped in its favour, see
+ * `orderingLoadBearing`) and a multi-seek would not produce it, so the seek branch
+ * must buffer and sort. The scan branch still streams in walk order, so a LIMIT
+ * above it stops early. Both branches deliver the order, so the node claims it.
+ */
+export function seekRestoresTargetOrder(
+	target: KeySetTargetNode,
+	pushdown: KeySetPushdown,
+): boolean {
+	if (target instanceof SeqScanNode) return false;
+	if (!target.orderingLoadBearing || !target.providesOrdering?.length) return false;
+	return !seekPreservesTargetOrder(target, pushdown);
+}
+
+/**
+ * The module's costs behind a pushdown's break-even, as a straight line over the
+ * seek's key count, so a rule that learns of a row bound can re-solve against them
+ * without asking the module again.
+ */
+export interface KeySetCostLine {
+	/** Module's cost for a two-key runtime-set seek. */
+	readonly seekAt2: number;
+	/** Added seek cost per key. Zero or negative when more keys cost no more. */
+	readonly slope: number;
+	/** Module's cost for the plan the seek branch displaces. */
+	readonly baselineCost: number;
+}
+
 /** How the target's access path is rewritten when the runtime decides to seek. */
 export interface KeySetPushdown {
 	/** Index name as it must appear in idxStr (the module's own spelling). */
@@ -99,6 +127,8 @@ export interface KeySetPushdown {
 	readonly maxKeys: number;
 	/** Seek iff the materialized distinct key count is ≤ this (module-cost break-even). */
 	readonly breakEvenKeys: number;
+	/** The costs `breakEvenKeys` was solved from. */
+	readonly costLine: KeySetCostLine;
 }
 
 /**
@@ -181,16 +211,17 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// constant bindings, domain constraints, and INDs (all per-row claims
 		// that hold on any subset).
 		//
-		// `ordering` and `monotonicOn` are claimed ONLY when
-		// `seekPreservesTargetOrder` holds — then both runtime branches (the
-		// untouched walk and the multi-seek over the same index) emit in the
-		// leaf's own key order, so the claim is independent of the seek-vs-scan
-		// decision; see that predicate's doc for the subsequence argument. The
-		// predicate is DERIVED here rather than carried as a constructor flag:
+		// `ordering` and `monotonicOn` are claimed when `seekPreservesTargetOrder`
+		// holds — then both runtime branches (the untouched walk and the multi-seek
+		// over the same index) emit in the leaf's own key order, so the claim is
+		// independent of the seek-vs-scan decision; see that predicate's doc for the
+		// subsequence argument. `ordering` alone is claimed when
+		// `seekRestoresTargetOrder` holds, because the seek branch sorts into it. Both
+		// predicates are DERIVED here rather than carried as constructor flags:
 		// later PostOptimization rules may rebuild the leaf through
 		// `withChildren`, and a stale flag would be a wrong-order plan, while a
-		// re-derivation against the current target cannot go stale. When it does
-		// not hold, emission order depends on the runtime decision and claiming
+		// re-derivation against the current target cannot go stale. When neither
+		// holds, emission order depends on the runtime decision and claiming
 		// either property would let a Sort be elided that the plan needs —
 		// matching BloomJoinNode, which propagates neither.
 		//
@@ -198,9 +229,7 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// leaf's ability to serve a later pushdown, and this node is not a leaf.
 		// Dropping capabilities loses optimizations, never correctness.
 		return {
-			...(seekPreservesTargetOrder(this.target, this.pushdown)
-				? { ordering: targetPhysical?.ordering, monotonicOn: targetPhysical?.monotonicOn }
-				: {}),
+			...this.claimedOrder(targetPhysical),
 			// Same formula as the logical getter, over the PHYSICAL child counts —
 			// the logical getters read `undefined` through the physical access node
 			// this semi-join targets.
@@ -215,6 +244,13 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			domainConstraints: targetPhysical?.domainConstraints,
 			inds: targetPhysical?.inds,
 		};
+	}
+
+	private claimedOrder(targetPhysical: PhysicalProperties | undefined): Partial<PhysicalProperties> {
+		if (seekPreservesTargetOrder(this.target, this.pushdown)) {
+			return { ordering: targetPhysical?.ordering, monotonicOn: targetPhysical?.monotonicOn };
+		}
+		return seekRestoresTargetOrder(this.target, this.pushdown) ? { ordering: targetPhysical?.ordering } : {};
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
@@ -254,6 +290,7 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			maxKeys: this.pushdown.maxKeys,
 			breakEvenKeys: this.pushdown.breakEvenKeys,
 			preservesTargetOrder: seekPreservesTargetOrder(this.target, this.pushdown),
+			restoresTargetOrder: seekRestoresTargetOrder(this.target, this.pushdown),
 			targetRows: this.left.estimatedRows,
 			keySourceRows: this.keySource.estimatedRows,
 		};

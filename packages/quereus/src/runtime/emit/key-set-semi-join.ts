@@ -1,4 +1,4 @@
-import type { KeySetSemiJoinNode, KeySetPushdown } from '../../planner/nodes/key-set-semi-join-node.js';
+import { seekRestoresTargetOrder, type KeySetSemiJoinNode, type KeySetPushdown } from '../../planner/nodes/key-set-semi-join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
@@ -11,7 +11,7 @@ import { IndexConstraintOp } from '../../common/constants.js';
 import { encodeIdxStr, makeIdxStrSpec } from '../../vtab/idx-str.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import { buildJoinKeyExtractor } from './join-key-extractor.js';
-import { compareSqlValuesFast, normalizeCollationName } from '../../util/comparison.js';
+import { compareSqlValuesFast, createTypedOrderByComparator, normalizeCollationName } from '../../util/comparison.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('runtime:emit:key-set-semi-join');
@@ -69,8 +69,39 @@ export function stampMultiSeek(
 }
 
 /**
+ * Row comparator for the order the seek branch must restore, or null when it need
+ * not sort. Built the way `emitSort` builds its own. Sort absorption refused explicit
+ * NULLS clauses and non-column sort keys, and the module vouched for the ordered
+ * columns' collation, so this agrees with the walk it stands in for.
+ */
+function buildOrderRestoringComparator(
+	plan: KeySetSemiJoinNode,
+	ctx: EmissionContext,
+): ((a: Row, b: Row) => number) | null {
+	if (!seekRestoresTargetOrder(plan.target, plan.pushdown)) return null;
+	const attributes = plan.target.getAttributes();
+	const keys = (plan.target.physical.ordering ?? []).map(({ column, desc }) => {
+		const type = attributes[column].type;
+		const collation = ctx.resolveCollation(type.collationName || 'BINARY');
+		return {
+			column,
+			compare: createTypedOrderByComparator(type.logicalType, desc ? 'desc' : 'asc', undefined, collation),
+		};
+	});
+	return (a, b) => {
+		for (const { column, compare } of keys) {
+			const comparison = compare(a[column], b[column]);
+			if (comparison !== 0) return comparison;
+		}
+		return 0;
+	};
+}
+
+/**
  * Emit a KeySetSemiJoin: drain the key source once into a set, decide
- * seek-vs-scan, then stream the target probing every row against the set.
+ * seek-vs-scan, then stream the target probing every row against the set. When a
+ * seek would lose an order the plan relies on, its rows are buffered and sorted
+ * first; the scan branch always streams.
  *
  * The probe is unconditional — the pushdown only changes how many rows the
  * target emits. The target leaf is emitted through `emitSeqScan`'s
@@ -112,6 +143,8 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 		normalizeCollationName(plan.pushdown.accessPath.index.keyColumns[0].collation ?? 'BINARY'));
 	const seekSign = plan.pushdown.seekDescending ? -1 : 1;
 
+	const compareRestoredOrder = buildOrderRestoringComparator(plan, ctx);
+
 	const stateByCtx = new WeakMap<RuntimeContext, KeySetState>();
 
 	const targetInstruction = emitSeqScan(plan.target, ctx, (base, rctx) => {
@@ -129,6 +162,15 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 		return stampMultiSeek(base, plan.pushdown, state.seekKeys);
 	});
 	const keySourceInstruction = emitPlanNode(plan.keySource, ctx);
+
+	async function* probeTarget(targetRows: AsyncIterable<Row>, probe: ReadonlySet<string>): AsyncIterable<Row> {
+		for await (const targetRow of targetRows) {
+			const key = extractKey(targetRow, targetIndices);
+			if (key !== null && probe.has(key)) {
+				yield targetRow;
+			}
+		}
+	}
 
 	async function* run(
 		rctx: RuntimeContext,
@@ -171,11 +213,13 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 
 		stateByCtx.set(rctx, { probe, seekKeys });
 		try {
-			for await (const targetRow of targetRows) {
-				const key = extractKey(targetRow, targetIndices);
-				if (key !== null && probe.has(key)) {
-					yield targetRow;
-				}
+			const matching = probeTarget(targetRows, probe);
+			if (seekKeys && compareRestoredOrder) {
+				const buffered: Row[] = [];
+				for await (const row of matching) buffered.push(row);
+				yield* buffered.sort(compareRestoredOrder);
+			} else {
+				yield* matching;
 			}
 		} finally {
 			stateByCtx.delete(rctx);

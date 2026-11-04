@@ -42,6 +42,13 @@
  * correctness. Every gate below exists to make an UNDER-fetch (rows the seek
  * fails to return, which the probe cannot resurrect) impossible.
  *
+ * A leaf whose emission order absorbed a Sort (`orderingLoadBearing`) needs no
+ * gate on the hash anchor. Whether a seek is cheaper is only known once the key
+ * source is drained, so the choice stays at runtime: the scan branch streams the
+ * ordered walk, and the seek branch either emits a subsequence of it
+ * (`seekPreservesTargetOrder`) or buffers and sorts (`seekRestoresTargetOrder`). A
+ * re-applied predicate's Filter keeps row order, so a seek leaf needs nothing more.
+ *
  * The rule declines (returns null, keeping the join it arrived as) on all of:
  *   - join type ≠ semi, >1 equi-pair, or a residual condition
  *   - a correlated, non-deterministic, or side-effect-bearing key source
@@ -49,7 +56,7 @@
  *   - any non-peelable node between the join and the access leaf
  *   - a walk leaf that is not an unconstrained every-row walk (residue in
  *     `FilterInfo.constraints`, or a pushed limit / offset)
- *   - a seek leaf failing any of {@link admitSeekLeaf}'s five gates:
+ *   - a seek leaf failing any of {@link admitSeekLeaf}'s four gates:
  *     - a pushed limit / offset (a directive the multi-seek would not honour,
  *       and unlike a predicate it cannot be re-applied by a Filter without
  *       changing which rows are dropped — unreachable today,
@@ -62,15 +69,6 @@
  *     - a correlated subtree (`index-nested-loop` builds seeks keyed on the
  *       OUTER side of a join — re-applying is correct but the node drains the
  *       key source per outer row, turning a linear plan quadratic)
- *     - an emission order that absorbed a Sort (`orderingLoadBearing` —
- *       `seekPreservesTargetOrder` is false for every seek, so the absorbed
- *       order cannot be reproduced)
- *   - a walk leaf whose emission order absorbed a SortNode (`orderingLoadBearing`)
- *     UNLESS the seek would reproduce that order (`seekPreservesTargetOrder`:
- *     the seek index is the walk index, so a multi-seek emits a subsequence of
- *     the walk — still in the same order). Otherwise the dropped Sort's order,
- *     which rides the leaf's walk order through the order-preserving join,
- *     would be replaced by seek-key order
  *   - target/key logical types that do not share one seek key space
  *     (`sharesSeekKeySpace`: identical types, or any two of INTEGER / REAL /
  *     NUMERIC). Anything else could be encoded into seek keys that miss rows
@@ -116,12 +114,6 @@
  * module with an expensive planner ever shows up in optimization profiles,
  * memoize by (table, seek column).
  *
- * NOTE: the `orderingLoadBearing` decline is conservative when
- * `seekPreservesTargetOrder` is false — a future enhancement could re-sort the
- * pushed output by the leaf's advertised order. Until then the decline can cost a
- * full walk of a table a few seeks would have served; tracked as
- * `bug-absorbed-sort-blocks-key-set-seek`, do not re-file.
- *
  * NOTE: this rewrite is not a priced candidate in `join-physical-selection` — it
  * only sees semi joins that already chose hash or merge. A filtered target over a
  * never-analyzed key source (priced at the 1000-row default) chooses an
@@ -137,8 +129,8 @@ import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../nodes/p
 import type { OptContext } from '../../framework/context.js';
 import { BloomJoinNode } from '../../nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../nodes/merge-join-node.js';
-import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, seekPreservesTargetOrder, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
-import { IndexScanNode, IndexSeekNode } from '../../nodes/table-access-nodes.js';
+import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, seekPreservesTargetOrder, type KeySetCostLine, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
+import { IndexSeekNode } from '../../nodes/table-access-nodes.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
@@ -219,13 +211,6 @@ interface AdmittedLeaf {
  * {@link admitSeekLeaf} for the gates. A pushed limit / offset declines both
  * arms: a directive the multi-seek would not honour, and one a Filter cannot
  * re-apply without changing which rows are dropped.
- *
- * Deliberately structural only for the walk arm: its `orderingLoadBearing`
- * decline needs the pushdown (an absorbed Sort is fine when
- * `seekPreservesTargetOrder` holds), so it lives in `ruleKeySetSeek` after
- * `planPushdown` rather than here. The seek arm's ordering decline IS here
- * (gate 5): `seekPreservesTargetOrder` is false for every seek, so no pushdown
- * could ever change the answer.
  */
 function admitLeaf(left: RelationalPlanNode): AdmittedLeaf | null {
 	const leaf = peelToSeekableAccessLeaf(left);
@@ -252,7 +237,7 @@ function admitLeaf(left: RelationalPlanNode): AdmittedLeaf | null {
 /**
  * Admission gates for an `IndexSeekNode` target. The type / collation /
  * module-claim / break-even gates applied later concern the SEEK column and
- * apply to this arm identically; these five concern the pushed predicate.
+ * apply to this arm identically; these four concern the pushed predicate.
  */
 function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 	const fi = leaf.filterInfo;
@@ -291,15 +276,6 @@ function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 	// plan quadratic. Same test `admitJoin` applies to the key source.
 	if (isCorrelatedSubquery(leaf)) {
 		log('decline: seek leaf is correlated (per-outer-row seek)');
-		return null;
-	}
-	// Gate 5: `seekPreservesTargetOrder` is false for every IndexSeekNode (it
-	// requires an ordering-only index walk whose index is the seek index), so a
-	// seek target can never reproduce an absorbed Sort's order — one ordering
-	// doctrine with the walk arm's gate in `ruleKeySetSeek`, resolved here
-	// because no pushdown could change the answer.
-	if (leaf.orderingLoadBearing) {
-		log('decline: seek leaf emission order is load-bearing (absorbed a Sort)');
 		return null;
 	}
 	return { leaf, residual };
@@ -508,7 +484,12 @@ function planPushdown(
 		return null;
 	}
 
-	const breakEvenKeys = interpolateBreakEven(costs);
+	const costLine: KeySetCostLine = {
+		seekAt2: costs.seekAt2.cost,
+		slope: (costs.seekAtMax.cost - costs.seekAt2.cost) / (RUNTIME_SET_MAX_KEYS - 2),
+		baselineCost: costs.baselineCost,
+	};
+	const breakEvenKeys = interpolateBreakEven(costLine);
 	if (breakEvenKeys < 1) {
 		log('decline: scan beats a seek at every key count (breakEven=%d)', breakEvenKeys);
 		return null;
@@ -521,6 +502,7 @@ function planPushdown(
 		seekDescending: descriptor.keyColumns[0].desc === true,
 		maxKeys: RUNTIME_SET_MAX_KEYS,
 		breakEvenKeys,
+		costLine,
 	};
 }
 
@@ -560,14 +542,18 @@ const BREAK_EVEN_EPSILON = 1e-9;
  * NOTE: the comparison charges nothing for the re-applied predicate's per-row
  * evaluation on a seek leaf's seek branch. It is bounded by the number of rows
  * the seek returns (≤ key count), so it cannot flip a decision by much.
+ *
+ * NOTE: the break-even does not charge for the sort, or for buffering matched rows
+ * in memory, when the seek branch restores an order (`seekRestoresTargetOrder`). A
+ * seek's cost does not reflect window size on the memory module, so a key set
+ * matching most of a low-cardinality column can buffer and sort most of the table,
+ * where the walk streamed it. The Sort this replaces buffered the same rows. Revisit
+ * if this shows up in a memory profile.
  */
-function interpolateBreakEven(
-	costs: { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; baselineCost: number },
-): number {
-	const slope = (costs.seekAtMax.cost - costs.seekAt2.cost) / (RUNTIME_SET_MAX_KEYS - 2);
+function interpolateBreakEven({ seekAt2, slope, baselineCost }: KeySetCostLine): number {
 	if (slope <= 0) return RUNTIME_SET_MAX_KEYS;
 	return Math.max(0, Math.min(RUNTIME_SET_MAX_KEYS,
-		Math.floor(2 + (costs.baselineCost - costs.seekAt2.cost) / slope + BREAK_EVEN_EPSILON)));
+		Math.floor(2 + (baselineCost - seekAt2) / slope + BREAK_EVEN_EPSILON)));
 }
 
 export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | null {
@@ -584,20 +570,6 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 
 	const pushdown = planPushdown(context, leaf, node.right, cols);
 	if (!pushdown) return null;
-
-	// A leaf whose emission order absorbed a SortNode (sort absorption in
-	// rule-grow-retrieve, before this join existed) is the only thing producing
-	// the query's ORDER BY: the join preserves probe order at runtime, and the
-	// replacement must keep serving that order. When the seek index is the walk
-	// index (`seekPreservesTargetOrder`) both runtime branches emit in the
-	// leaf's own order and the absorbed Sort stays served; otherwise a pushed
-	// multi-seek would emit in seek-key order — decline, keeping the
-	// order-preserving join.
-	if (leaf instanceof IndexScanNode && leaf.orderingLoadBearing
-		&& !seekPreservesTargetOrder(leaf, pushdown)) {
-		log('decline: leaf emission order is load-bearing (absorbed a Sort) and the seek would not reproduce it');
-		return null;
-	}
 
 	if (node instanceof MergeJoinNode) {
 		// Merge-arm-only gate 1: the merge join propagates the probe side's

@@ -14,16 +14,15 @@
  *
  * Two facts shape every test here:
  *
- * - **No `order by` on a column the target leaf's own walk already provides —
- *   EXCEPT on a primary-key target.** The store advertises primary-key order, so
- *   `… order by pk` is absorbed into the leaf at plan time, which marks its emission
- *   order load-bearing. For a SECONDARY-index seek that makes `rule-key-set-seek`
- *   decline (correctly — the seek index is not the walk index, so a multi-seek could
- *   emit in some other order), and rows are therefore collected unordered and sorted
- *   in JS. For a `_primary_` seek the seek index IS the walk index, so
- *   `seekPreservesTargetOrder` holds, the rewrite fires anyway, and the absorbed Sort
- *   stays absorbed — the `primary-key target` block below pins that, asserting RAW
- *   emission order rather than sorting in JS.
+ * - **No `order by` unless the order itself is being asserted.** The store advertises
+ *   primary-key order, so `… order by pk` is absorbed into the leaf at plan time, which
+ *   marks its emission order load-bearing. For a SECONDARY-index seek the seek index is
+ *   not the walk index, so the seek branch would buffer and sort
+ *   (`seekRestoresTargetOrder`); rows here are collected unordered and sorted in JS, so
+ *   the tests read the store's own multi-seek stream. For a `_primary_` seek the seek
+ *   index IS the walk index, so `seekPreservesTargetOrder` holds and the seek needs no
+ *   sort — the `primary-key target` block below pins that, asserting RAW emission order
+ *   rather than sorting in JS.
  * - **The seek is a runtime decision.** `query_plan()` shows `KeySetSemiJoin` whether
  *   the runtime ends up seeking or scanning, so seek-vs-scan is asserted from the
  *   `idxStr` the store's `query()` was handed.

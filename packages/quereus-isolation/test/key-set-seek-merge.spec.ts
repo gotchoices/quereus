@@ -98,10 +98,9 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 	/**
 	 * Rows of `q`, sorted in JS by `pk`.
 	 *
-	 * Deliberately no `order by`: the target leaf's own walk order would be absorbed
-	 * from an `order by pk`, which marks the leaf's emission order load-bearing and
-	 * makes `rule-key-set-seek` decline — the tests would then pass vacuously on the
-	 * hash semi join they are meant to replace.
+	 * Deliberately no `order by`: an `order by pk` would be absorbed into the target
+	 * leaf's walk, and the seek branch would then sort the rows it read, so a merge that
+	 * emitted out of order would go unnoticed by anything reading the raw stream.
 	 */
 	const rowsOf = async (q: string): Promise<Record<string, SqlValue>[]> =>
 		(await asyncIterableToArray(db.eval(q)))

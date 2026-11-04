@@ -18,6 +18,13 @@ files:
   - docs/optimizer-retrieve.md # orderingLoadBearing bullet, about line 286
 repro: verified
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-11-04T17:34:13.105Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-absorbed-sort-blocks-key-set-seek.implement.2026-11-04T17-34-13-105Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 Found while reviewing `bug-table-alias-defeats-sort-absorption`. That fix gave aliased tables the plan unaliased tables already had, so this problem now reaches more queries. Answers are correct in every case. Only the amount of work differs.
 

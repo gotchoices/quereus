@@ -22,6 +22,7 @@ import { ruleSelectAccessPath } from './rules/access/rule-select-access-path.js'
 import { ruleLensAuxiliaryAccess } from './rules/access/rule-lens-auxiliary-access.js';
 import { ruleMonotonicLimitPushdown } from './rules/access/rule-monotonic-limit-pushdown.js';
 import { ruleKeySetSeek } from './rules/access/rule-key-set-seek.js';
+import { ruleKeySetSeekRowBound } from './rules/access/rule-key-set-seek-row-bound.js';
 import { ruleMonotonicRangeAccess } from './rules/access/rule-monotonic-range-access.js';
 import { ruleAsofStrategySelect } from './rules/access/rule-asof-strategy-select.js';
 import { ruleGrowRetrieve } from './rules/retrieve/rule-grow-retrieve.js';
@@ -1082,6 +1083,20 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		nodeType: PlanNodeType.MergeJoin,
 		phase: 'impl',
 		fn: ruleKeySetSeek,
+		sideEffectMode: 'safe',
+	},
+
+	// Lowers a key-set semi join's break-even when a literal LIMIT above it means the
+	// ordered walk can stop early. Anchored on LimitOffset, so it needs the join to be
+	// a KeySetSemiJoin already: registered after the two entries above, though the
+	// pass being bottom-up is what guarantees it (a limit is visited after its source).
+	{
+		pass: PassId.PostOptimization,
+		id: 'key-set-seek-row-bound',
+		nodeType: PlanNodeType.LimitOffset,
+		phase: 'impl',
+		fn: ruleKeySetSeekRowBound,
+		// Only changes a runtime threshold: the same rows come back in the same order.
 		sideEffectMode: 'safe',
 	},
 

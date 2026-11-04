@@ -104,17 +104,16 @@ DELETE FROM selfref WHERE x IN (SELECT x FROM selfref WHERE x <= 20);
 SELECT pk FROM selfref ORDER BY pk;
 → [{"pk":3},{"pk":4}]
 
--- ===== Shapes that leave the runtime free to seek =====
+-- ===== Shapes with no order for a seek to restore =====
 --
 -- Every case above pins its rows with `ORDER BY <a column the target's own walk
 -- already provides>`. Both backends absorb that sort into the target leaf, which
 -- marks the leaf's emission order load-bearing; since the seek index (idx on v)
--- is NOT the walk index in those cases, the rewrite declines — they exercise the
--- surviving hash semi join, not the seek. (When the two indexes coincide the
--- rewrite now fires despite the absorbed sort — see the primary-key section at
--- the end of this file.) The aggregate forms below need no ORDER BY, so the
--- runtime may push the multi-seek. Same answers either way, which is exactly the
--- property being pinned.
+-- is NOT the walk index in those cases, a seek there buffers and sorts (see the
+-- absorbed-order section at the end of this file). When the two indexes coincide
+-- the seek needs no sort (see the primary-key section). The aggregate forms below
+-- need no ORDER BY, so they exercise the plain streaming seek. Same answers either
+-- way, which is exactly the property being pinned.
 
 CREATE TABLE seekt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
 CREATE INDEX idx_seekt_v ON seekt(v);
@@ -170,9 +169,8 @@ SELECT pk FROM txt ORDER BY pk;
 -- and the seek is exact in either direction. This file runs under BOTH backends, which
 -- is what makes it the home for the row-level contract.
 --
--- Every query below is an aggregate with no ORDER BY, so the runtime is free to push the
--- multi-seek (see the note above on why an ORDER BY the target's own walk provides makes
--- the rewrite decline). The answers must be identical whether it seeks or scans.
+-- Every query below is an aggregate with no ORDER BY, so a seek has no order to restore.
+-- The answers must be identical whether it seeks or scans.
 
 CREATE TABLE xt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
 CREATE INDEX idx_xt_v ON xt(v);
@@ -445,3 +443,60 @@ SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
 	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
 	ORDER BY e.id;
 → [{"id":1},{"id":2},{"id":3}]
+
+-- ===== An ORDER BY the target's walk absorbed, with a key set on another index =====
+--
+-- The key set seeks idx_ord_k while the ORDER BY is served by walking some other index,
+-- so a seek's rows arrive in k order and the runtime sorts them back. The result must
+-- match the walk: NULLs first, the column's own collation, a descending index, and a
+-- composite index read by its prefix or in full. k order disagrees with every ordering
+-- below, and no ordering has a tie the output could show.
+
+CREATE TABLE ord (
+	pk INTEGER PRIMARY KEY, k INTEGER NOT NULL, n INTEGER NULL,
+	s TEXT COLLATE NOCASE NOT NULL, d INTEGER NOT NULL, a INTEGER NOT NULL, b INTEGER NOT NULL);
+CREATE INDEX idx_ord_k ON ord(k);
+CREATE INDEX idx_ord_n ON ord(n);
+CREATE INDEX idx_ord_s ON ord(s);
+CREATE INDEX idx_ord_d ON ord(d DESC);
+CREATE INDEX idx_ord_ab ON ord(a, b);
+CREATE TABLE ordk (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO ord VALUES
+	(1, 10, 3, 'cherry', 1, 2, 9),
+	(2, 20, NULL, 'apple', 3, 1, 5),
+	(3, 30, 1, 'Banana', 2, 2, 1),
+	(4, 40, 2, 'date', 4, 1, 7),
+	(5, 50, 9, 'elder', 9, 3, 0);
+INSERT INTO ordk VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+-- A nullable column: the NULL comes first.
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY n;
+→ [{"pk":2},{"pk":3},{"pk":4},{"pk":1}]
+
+-- NOCASE: 'Banana' sorts between 'apple' and 'cherry'. BINARY would put it first.
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY s;
+→ [{"pk":2},{"pk":3},{"pk":1},{"pk":4}]
+
+-- A descending index.
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY d DESC;
+→ [{"pk":4},{"pk":2},{"pk":3},{"pk":1}]
+
+-- A composite index, by its leading column and by both.
+SELECT a FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY a;
+→ [{"a":1},{"a":1},{"a":2},{"a":2}]
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY a, b;
+→ [{"pk":2},{"pk":4},{"pk":3},{"pk":1}]
+
+-- A LIMIT and an OFFSET read the sorted rows, not an arbitrary few.
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY n LIMIT 2;
+→ [{"pk":2},{"pk":3}]
+SELECT pk FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY n LIMIT 1 OFFSET 1;
+→ [{"pk":3}]
+
+-- Read-your-own-writes: staged rows are sorted in with committed ones.
+BEGIN;
+INSERT INTO ord VALUES (6, 30, 0, 'fig', 5, 0, 0);
+UPDATE ord SET n = 8 WHERE pk = 3;
+SELECT pk, n FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY n;
+→ [{"pk":2,"n":null},{"pk":6,"n":0},{"pk":4,"n":2},{"pk":1,"n":3},{"pk":3,"n":8}]
+ROLLBACK;

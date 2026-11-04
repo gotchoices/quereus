@@ -3,7 +3,7 @@ description: Two optimizer rules each keep their own hand-written copy of the sa
 files:
   - packages/quereus/src/planner/rules/shared/access-leaf.ts                 # where the shared gate would live, next to peelToSeekableAccessLeaf
   - packages/quereus/src/planner/rules/join/index-nested-loop.ts             # admitSeekLeaf (five gates)
-  - packages/quereus/src/planner/rules/access/rule-key-set-seek.ts           # admitSeekLeaf (five gates, one of them checked differently)
+  - packages/quereus/src/planner/rules/access/rule-key-set-seek.ts           # admitSeekLeaf (four gates, one of them checked differently)
   - packages/quereus/src/planner/rules/join/rule-semi-join-pushdown.ts        # second arm: the drained-once purity trio, hand-copied again
 difficulty: medium
 tradeoffs: The two copies are not identical — one checks correlation per recorded constraint, the other per subtree — so merging them means first deciding which check is correct for both, and a maintainer may reasonably prefer two clear, separately-documented gate lists over one shared helper with two behaviour flags.
@@ -27,7 +27,8 @@ predicate simply vanishes and the query returns extra rows. Two rules do this to
 ## The problem
 
 Each rule has its own private function named `admitSeekLeaf`, and each hand-writes the
-same five checks:
+checks below. `index-nested-loop` has all five. `rule-key-set-seek` has four: it no longer
+checks the load-bearing order, because its node sorts a seek's rows back into that order.
 
 | Check | Why it exists |
 | --- | --- |

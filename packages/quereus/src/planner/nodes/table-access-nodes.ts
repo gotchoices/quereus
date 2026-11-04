@@ -253,9 +253,9 @@ export class IndexScanNode extends TableAccessNode {
 		 * True when a SortNode was dropped on the strength of this scan's
 		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the
 		 * scan's emission order is the only thing producing the requested
-		 * ORDER BY. Rewrites that change this leaf's emission order
-		 * (`rule-key-set-seek`) must decline. False for a vacuously-advertised
-		 * ordering nothing consumed.
+		 * ORDER BY. A rewrite that changes this leaf's emission order must decline
+		 * or put that order back (`KeySetSemiJoinNode`'s seek branch sorts). False
+		 * for a vacuously-advertised ordering nothing consumed.
 		 */
 		public readonly orderingLoadBearing: boolean = false,
 	) {
@@ -456,7 +456,8 @@ export class IndexSeekNode extends TableAccessNode {
 		 * True when a SortNode was dropped on the strength of this seek's
 		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the seek's
 		 * emission order is the only thing producing the requested ORDER BY.
-		 * Rewrites that change this leaf's emission order must decline. False for a
+		 * A rewrite that changes this leaf's emission order must decline or put that
+		 * order back (`KeySetSemiJoinNode`'s seek branch sorts). False for a
 		 * vacuously-advertised ordering nothing consumed.
 		 */
 		public readonly orderingLoadBearing: boolean = false,

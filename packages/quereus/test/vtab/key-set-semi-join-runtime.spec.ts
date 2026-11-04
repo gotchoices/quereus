@@ -159,6 +159,159 @@ function collectNodeTypes(root: PlanNode): string[] {
 }
 
 describe('KeySetSemiJoin runtime', () => {
+	describe('an ORDER BY the walk absorbed, with a key set on another index', () => {
+		// v falls as id rises, so low ids sit at the far end of the v index: walking v
+		// to find them reads the table, and neither seek index emits in v order.
+		let db: Database;
+
+		beforeEach(async () => {
+			db = new Database();
+			db.setOption('runtime_metrics', true);
+			await db.exec('create table big (id integer primary key, c integer not null, v integer not null)');
+			await db.exec('create index big_c on big(c)');
+			await db.exec('create index big_v on big(v)');
+			await db.exec('insert into big select value, value % 50 + 1, 2000 - value from generate_series(1, 2000)');
+			await db.exec('create table small (bid integer primary key)');
+			await db.exec('insert into small values (1), (2), (3)');
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		async function runCounted(sql: string, table = 'main.big'): Promise<{ rows: Record<string, unknown>[]; scanned: number }> {
+			const stmt = db.prepare(sql);
+			try {
+				const rows: Record<string, unknown>[] = [];
+				for await (const row of stmt.all()) rows.push(row);
+				return { rows, scanned: stmt.getWorkCounters()!.tables[table].rowsScanned };
+			} finally {
+				await stmt.finalize();
+			}
+		}
+
+		// c = id % 50 + 1, so c in (1, 2, 3) selects ids whose remainder is 0, 1 or 2.
+		const matchingCIdsByFallingId = Array.from({ length: 2000 }, (_v, i) => 2000 - i)
+			.filter(id => id % 50 <= 2);
+
+		const cases: ReadonlyArray<{ name: string; sql: string; expected: unknown[]; scanned: number; analyze?: boolean }> = [
+			{
+				name: 'aliased',
+				sql: 'select id from big b where b.id in (select bid from small) order by b.v',
+				expected: [{ id: 3 }, { id: 2 }, { id: 1 }],
+				scanned: 3,
+			},
+			{
+				name: 'unaliased',
+				sql: 'select id from big where id in (select bid from small) order by v',
+				expected: [{ id: 3 }, { id: 2 }, { id: 1 }],
+				scanned: 3,
+			},
+			{
+				name: 'exists',
+				sql: 'select id from big b where exists (select 1 from small s where s.bid = b.id) order by b.v',
+				expected: [{ id: 3 }, { id: 2 }, { id: 1 }],
+				scanned: 3,
+			},
+			{
+				name: 'min, aliased',
+				sql: 'select min(b.v) as m from big b where b.id in (select bid from small)',
+				expected: [{ m: 1997 }],
+				scanned: 3,
+			},
+			{
+				name: 'min, unaliased',
+				sql: 'select min(v) as m from big where id in (select bid from small)',
+				expected: [{ m: 1997 }],
+				scanned: 3,
+			},
+			{
+				name: 'non-unique seek column reads every matching row',
+				sql: 'select id from big b where b.c in (select bid from small) order by b.v',
+				expected: matchingCIdsByFallingId.map(id => ({ id })),
+				scanned: matchingCIdsByFallingId.length,
+			},
+			{
+				name: 'filtered target (seek leaf)',
+				sql: 'select id from big where v >= 5 and id in (select bid from small) order by v',
+				expected: [{ id: 3 }, { id: 2 }, { id: 1 }],
+				scanned: 3,
+				analyze: true,
+			},
+		];
+
+		for (const { name, sql, expected, scanned, analyze } of cases) {
+			it(`seeks and sorts: ${name}`, async () => {
+				if (analyze) await db.exec('analyze small');
+				const result = await runCounted(sql);
+				expect(result.rows, 'rows, in ORDER BY order').to.deep.equal(expected);
+				expect(result.scanned, 'rows read from big').to.equal(scanned);
+			});
+		}
+
+		describe('under a LIMIT', () => {
+			it('keeps seeking when the key set is small: 3 keys, limit 2', async () => {
+				const result = await runCounted(
+					'select id from big b where b.id in (select bid from small) order by b.v limit 2');
+				expect(result.rows).to.deep.equal([{ id: 3 }, { id: 2 }]);
+				expect(result.scanned, 'the walk would read 1999').to.equal(3);
+			});
+
+			it('walks when many keys make the first match close: 1000 keys, limit 1', async () => {
+				await db.exec('delete from small');
+				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				const result = await runCounted(
+					'select id from big b where b.id in (select bid from small) order by b.v limit 1');
+				expect(result.rows).to.deep.equal([{ id: 1999 }]);
+				expect(result.scanned, 'a seek would read 1000').to.equal(2);
+			});
+
+			it('reaches through the is-not-null Filter of min over a nullable column', async () => {
+				// ids 1 to 3 hold NULL, so the walk reads those three, then n = 4 (not a key) and
+				// n = 5, where it stops. A seek would read all 1000 keys. Analyzed because a
+				// filtered target over a never-analyzed key source plans a nested loop instead.
+				await db.exec('create table nb (id integer primary key, n integer null)');
+				await db.exec('create index nb_n on nb(n)');
+				await db.exec('insert into nb select value, case when value <= 3 then null else value end from generate_series(1, 2000)');
+				await db.exec('delete from small');
+				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				await db.exec('analyze small');
+				const result = await runCounted('select min(n) as m from nb where id in (select bid from small)', 'main.nb');
+				expect(result.rows).to.deep.equal([{ m: 5 }]);
+				expect(result.scanned, 'a seek would read 1000').to.equal(5);
+			});
+		});
+	});
+
+	describe('an absorbed ORDER BY above the break-even', () => {
+		it('takes the ordered walk and streams it, with no buffering', async () => {
+			const db = new Database();
+			const module = new BreakEvenModule();
+			db.registerModule('bemem', module);
+			try {
+				await db.exec('create table small (id integer primary key, k integer null) using bemem()');
+				await db.exec('create table big (pk integer primary key, v integer null) using bemem()');
+				await db.exec('create index idx_v on big(v)');
+				const bigRows = Array.from({ length: 30 }, (_v, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ');
+				await db.exec(`insert into big values ${bigRows}`);
+				// 8 keys is one past this module's break-even of 7.
+				const keys = Array.from({ length: 8 }, (_v, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ');
+				await db.exec(`insert into small values ${keys}`);
+				const sql = 'select pk from big where v in (select k from small) order by pk';
+
+				module.reset();
+				expect(await allRows(db, sql)).to.deep.equal(Array.from({ length: 8 }, (_v, i) => ({ pk: i + 1 })));
+				expect((module.idxStrs.get('big') ?? [])[0], 'the walk, not a seek').to.not.match(MULTI_SEEK_RE);
+
+				module.reset();
+				for await (const _row of db.eval(sql)) break;
+				expect(module.rowCounts.get('big'), 'one row out needs one row read').to.equal(1);
+			} finally {
+				await db.close();
+			}
+		});
+	});
+
 	describe('seek path (instrumented memory module)', () => {
 		let db: Database;
 		let module: IdxStrCapturingModule;
@@ -417,8 +570,6 @@ describe('KeySetSemiJoin runtime', () => {
 				await db.exec('insert into big values (1, 10), (2, 20), (3, 30), (4, 40)');
 				await db.exec('insert into small values (1, 30), (2, 10), (3, 40)');
 				module.reset();
-				// No ORDER BY: an absorbed sort would mark the leaf's emission order
-				// load-bearing and the rule would (correctly) decline.
 				const rows = await allRows<{ pk: number }>(db,
 					'select pk from big where v in (select k from small)');
 				expect(rows.map(r => r.pk).sort((a, b) => a - b)).to.deep.equal([1, 3, 4]);
