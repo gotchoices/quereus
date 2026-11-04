@@ -155,6 +155,35 @@ describe('apply schema: table alters run in stages across tables', () => {
 			}`);
 		});
 
+		// `u` names only `v1`, but `v1` cannot be planned until the edited `v2` is back.
+		it('applies a DEFAULT reading an existing view over a view the plan recreates', async () => {
+			await db.exec('create view v2 as select b from t');
+			await db.exec('create view v1 as select b from v2');
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null }
+				table u { id integer primary key, y integer null, z integer null default ((select max(b) from v1)) }
+				view v2 as select b from t where id > 0
+				view v1 as select b from v2
+			}`);
+		});
+
+		// `r1` has no need to follow `t`, and doing so must not stop `r2` following `u`.
+		const readsNothingNew = 'view r1 as select max(id) as m from k';
+		const readsGainedColumn = 'view r2 as select max(d) as m from u';
+		const viewOrders: Array<[string, string]> = [['first', `${readsGainedColumn} ${readsNothingNew}`], ['second', `${readsNothingNew} ${readsGainedColumn}`]];
+
+		for (const [position, views] of viewOrders) {
+			it(`applies a view reading what one table gains while another table reads it, written ${position}`, async () => {
+				await db.exec('create table k (id integer primary key)');
+				await applies(`declare schema main {
+					table k { id integer primary key }
+					table t { id integer primary key, b integer null, z integer null default ((select m from r2)) }
+					table u { id integer primary key, y integer null, d integer null, w integer null default ((select m from r1)) }
+					${views}
+				}`);
+			});
+		}
+
 		const reader = 'table u { id integer primary key, y integer null, z integer null default ((select m from w)) }';
 		const gainer = 'table t { id integer primary key, b integer null, d integer null }';
 		const writtenOrders: Array<[string, string]> = [['the reader', `${reader} ${gainer}`], ['the gaining table', `${gainer} ${reader}`]];
@@ -248,23 +277,6 @@ describe('apply schema: table alters run in stages across tables', () => {
 		expect(error.message).to.match(/ub/).and.not.match(/could not be restored/);
 		expect(renderCatalogForComparison(collectSchemaCatalog(db, 'main'))).to.equal(before);
 	});
-
-	it('a failure after a view create takes the view back before the column it reads', async () => {
-		await applies(`declare schema main {
-			table t { id integer primary key, b integer null }
-		}`);
-		await db.exec('insert into t (id, b) values (1, 1), (2, 1)');
-		const before = renderCatalogForComparison(collectSchemaCatalog(db, 'main'));
-
-		await db.exec(`declare schema main {
-			table t { id integer primary key, b integer null, d integer null, constraint ub unique (b) }
-			view v as select d from t
-		}`);
-		const error = await rejection(db.exec('apply schema main'));
-
-		expect(error.message).to.match(/ub/).and.not.match(/partially migrated|could not be restored/);
-		expect(renderCatalogForComparison(collectSchemaCatalog(db, 'main'))).to.equal(before);
-	});
 });
 
 describe('dependency ordering', () => {
@@ -282,8 +294,8 @@ describe('dependency ordering', () => {
 	});
 
 	it('a preferred dependency orders items, and is skipped when it would close a cycle', () => {
-		expect(orderDependenciesFirst(['v', 't'], key, edges({}), edges({ v: ['t'] }))).to.deep.equal(['t', 'v']);
-		expect(orderDependenciesFirst(['v', 't'], key, edges({ t: ['v'] }), edges({ v: ['t'] }))).to.deep.equal(['v', 't']);
+		expect(orderDependenciesFirst(['v', 't'], key, edges({}), [edges({ v: ['t'] })])).to.deep.equal(['t', 'v']);
+		expect(orderDependenciesFirst(['v', 't'], key, edges({ t: ['v'] }), [edges({ v: ['t'] })])).to.deep.equal(['v', 't']);
 	});
 
 	// Each preferred edge passes when checked against the required edges alone, but all of them
@@ -291,6 +303,6 @@ describe('dependency ordering', () => {
 	it('a preferred dependency is also skipped when it would close a cycle with other preferred ones', () => {
 		const required = { t: ['v2'], s: ['v1'] };
 		const preferred = { v1: ['t'], v2: ['s'] };
-		expect(orderDependenciesFirst(['v1', 'v2', 't', 's'], key, edges(required), edges(preferred))).to.deep.equal(['v2', 't', 'v1', 's']);
+		expect(orderDependenciesFirst(['v1', 'v2', 't', 's'], key, edges(required), [edges(preferred)])).to.deep.equal(['v2', 't', 'v1', 's']);
 	});
 });

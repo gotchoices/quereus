@@ -8,6 +8,7 @@
  *
  * A preferred dependency orders items the same way, but gives way to the others: it is skipped
  * when the graph built so far already needs its target to follow the item that prefers it.
+ * `preferredTiers` is strongest first, so a weaker preference cannot crowd out a stronger one.
  *
  * `keyOf` and the dependency functions must spell a key the same way. A dependency on the item
  * itself, or on a key no item has, is ignored.
@@ -16,14 +17,14 @@ export function orderDependenciesFirst<T>(
 	items: readonly T[],
 	keyOf: (item: T) => string,
 	dependenciesOf: (item: T) => Iterable<string>,
-	preferredDependenciesOf: (item: T) => Iterable<string> = () => [],
+	preferredTiers: ReadonlyArray<(item: T) => Iterable<string>> = [],
 ): T[] {
 	const edges = resolveEdges(items, keyOf, dependenciesOf);
-	const preferred = resolveEdges(items, keyOf, preferredDependenciesOf);
-	if ([...edges, ...preferred].every(dependencies => dependencies.length === 0)) return [...items];
+	const preferred = preferredTiers.map(tier => resolveEdges(items, keyOf, tier));
+	if ([edges, ...preferred].flat().every(dependencies => dependencies.length === 0)) return [...items];
 
 	const acyclic = edges.map((dependencies, item) => dependencies.filter(d => !reaches(edges, d, item)));
-	addEdgesThatCloseNoCycle(acyclic, preferred);
+	for (const tier of preferred) addEdgesThatCloseNoCycle(acyclic, tier);
 	const placed = new Set<number>();
 	const ordered: T[] = [];
 	// NOTE: rescans from the start for each placement. That is quadratic in the items, and only

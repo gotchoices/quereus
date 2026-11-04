@@ -188,9 +188,10 @@ export interface TableAlterDiff {
 	/** Column renames discovered via `quereus.id` / `quereus.previous_name` on declared columns. */
 	columnsToRename: ColumnRenameOp[];
 	/**
-	 * Lowercased post-rename names of the tables and views this table's added columns refer to. The
-	 * plan runs this table's column and key changes after their changes or creates. Carried here
-	 * because `diff schema` plans with no catalog. Omitted when there are none.
+	 * Lowercased post-rename names of the tables and views this table's added columns refer to, plus
+	 * the views those views reach. The plan runs this table's column and key changes after their
+	 * changes or creates. Carried here because `diff schema` plans with no catalog. Omitted when there
+	 * are none.
 	 */
 	addedColumnReads?: string[];
 	/**
@@ -816,6 +817,7 @@ export function computeSchemaDiff(
 		if (viewRenames.consumedActuals.has(name)) continue;
 		if (!declaredViews.has(name)) diff.viewsToDrop.push(name);
 	}
+	followDeclaredViewsInAddedColumnReads(diff.tablesToAlter, declaredViews, targetSchemaName);
 
 	// (Maintained tables are no longer compared here. They are normalized into the
 	// table category above, so the unified table loop recognizes a body change as a
@@ -1212,8 +1214,8 @@ function freshTableCreate(
 }
 
 /**
- * Pairs a view create's rendered DDL with the exact (already schema-qualified,
- * already rename-reconciled) statement it was rendered from. Taking one statement
+ * Pairs a view create's rendered DDL with the exact (already schema-qualified)
+ * statement it was rendered from. Taking one statement
  * and rendering it here — rather than accepting a pre-rendered string — is what
  * makes text/AST disagreement unrepresentable.
  */
@@ -2545,8 +2547,10 @@ function computeTableAlterDiff(
  * `SET DEFAULT` makes no edge: it does not validate its expression, and a `SET NOT NULL` backfill
  * folds the default to a literal rather than evaluating it, so nothing in the plan reads what it names.
  *
- * NOTE: only a name written directly in the column definition counts, so a DEFAULT reading an
- * existing view over `t` is not ordered after `t`. If that shows up, follow the reach with `reachableObjects`.
+ * NOTE: only a name written directly in the column definition reaches a table, so a DEFAULT reading
+ * an existing view over `t` is not ordered after `t`. {@link followDeclaredViewsInAddedColumnReads}
+ * follows views to views only: an edge to `t` could close a cycle with an edge `t` has to this table,
+ * and a cycle drops both. If this shows up, add those as a preferred dependency.
  *
  * NOTE: an edge is per table, not per column. `t.d references u(z)` needing a new `u.z`, beside
  * `u.z references t(id)` naming an existing `t.id`, reads as a cycle and keeps declaration order,
@@ -2575,6 +2579,30 @@ function recordCrossTableReads(
 	if (dropped.size > 0) {
 		diff.droppedColumnReads = [...dropped].map(name =>
 			tableRenames.find(r => r.oldName.toLowerCase() === name)?.newName.toLowerCase() ?? name);
+	}
+}
+
+/**
+ * Adds to each table's added-column reads the views reached through the declared views it reads. An
+ * existing view over a view this plan recreates cannot be planned until the recreate has run.
+ */
+function followDeclaredViewsInAddedColumnReads(
+	alters: readonly TableAlterDiff[],
+	declaredViews: ReadonlyMap<string, AST.DeclaredView>,
+	schemaName: string,
+): void {
+	for (const alter of alters) {
+		if (!alter.addedColumnReads) continue;
+		const reads = new Set(alter.addedColumnReads);
+		// A Set iterates what is added during the walk, and visits each name once.
+		for (const name of reads) {
+			const view = declaredViews.get(name);
+			if (!view) continue;
+			for (const read of objectsNamedIn(view.viewStmt.select, schemaName)) {
+				if (declaredViews.has(read)) reads.add(read);
+			}
+		}
+		alter.addedColumnReads = [...reads];
 	}
 }
 
@@ -3292,6 +3320,8 @@ interface StageTwoItem {
 	runsAfter: readonly string[];
 	/** What should run first, unless that would close a cycle. */
 	prefersToRunAfter: readonly string[];
+	/** The same, considered only once every item's `prefersToRunAfter` has been. */
+	alsoPrefersToRunAfter: readonly string[];
 	push: () => void;
 }
 
@@ -3313,9 +3343,9 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`.
  *      New views are sorted in here, because `CREATE VIEW` plans its body as it runs. A view
  *      follows every table's steps, unless a table's new column reads it, directly or through
- *      other new views: then it goes ahead of that table. It is ordered after every altered table,
- *      not only those it names, because a view reached through an existing view would need the
- *      catalog to follow, and `diff schema` plans with none.
+ *      other declared views: then it goes ahead of that table. It is ordered after every altered
+ *      table, not only those it names, because a table it reaches through an existing view is not
+ *      in its statement, and `diff schema` plans with no catalog.
  *   3. ADD CONSTRAINT, once every table has its columns and key. Two tables' named foreign keys
  *      can point at each other's new columns.
  *   4. DROP COLUMN, once every table's `DROP CONSTRAINT` has cleared the guards that refuse a drop
@@ -3326,7 +3356,8 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
 function pushTableAlters(alters: readonly TableAlterDiff[], viewCreates: readonly MigrationCreate[], sink: AlterStepSink): void {
 	for (const alter of alters) pushColumnRenames(alter, sink);
 	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink)), ...viewStageTwoItems(viewCreates, alters, sink)];
-	for (const item of orderDependenciesFirst(stageTwo, i => i.key, i => i.runsAfter, i => i.prefersToRunAfter)) item.push();
+	const preferredTiers = [(i: StageTwoItem) => i.prefersToRunAfter, (i: StageTwoItem) => i.alsoPrefersToRunAfter];
+	for (const item of orderDependenciesFirst(stageTwo, i => i.key, i => i.runsAfter, preferredTiers)) item.push();
 	for (const alter of alters) pushConstraintAdds(alter, sink);
 	for (const alter of orderDependentsFirst(alters, alterKey, a => a.droppedColumnReads ?? [])) pushColumnDrops(alter, sink);
 	for (const alter of alters) pushTagChanges(alter, sink);
@@ -3337,6 +3368,7 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 		key: alterKey(alter),
 		runsAfter: alter.addedColumnReads ?? [],
 		prefersToRunAfter: [],
+		alsoPrefersToRunAfter: [],
 		push: () => {
 			pushColumnAdds(alter, sink);
 			pushColumnAlters(alter, sink);
@@ -3347,22 +3379,29 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 }
 
 /**
- * A view has to follow only the new views it names. A table it names is one of the altered tables
- * it merely prefers to follow: a new column on that table may read this view.
+ * A view has to follow only the new views it names. It merely prefers to follow an altered table,
+ * because a new column on that table may read this view. A table it names comes before the rest,
+ * which it may not need at all, so that following those cannot block what it does need.
  * The keys can share a sort with table names because tables and views share one namespace.
+ *
+ * NOTE: a table a view reaches only through an existing view sits in the weaker tier, so it can lose
+ * to another view's unneeded preference and fail with `Column not found`. If that shows up, carry
+ * each view's reach through the declared views on the diff, as `addedColumnReads` does.
  */
 function viewStageTwoItems(viewCreates: readonly MigrationCreate[], alters: readonly TableAlterDiff[], sink: AlterStepSink): StageTwoItem[] {
 	const viewKey = (create: MigrationCreate): string => (create.ast.type === 'createView' ? create.ast.view.name : create.sql).toLowerCase();
 	const newViews = new Set(viewCreates.map(viewKey));
 	const alteredTables = alters.map(alterKey);
-	return viewCreates.map(create => ({
-		key: viewKey(create),
-		runsAfter: create.ast.type === 'createView'
-			? objectsNamedIn(create.ast.select, sink.schemaName).filter(name => newViews.has(name))
-			: [],
-		prefersToRunAfter: alteredTables,
-		push: () => sink.pushCreate(create, 'view'),
-	}));
+	return viewCreates.map(create => {
+		const named = create.ast.type === 'createView' ? objectsNamedIn(create.ast.select, sink.schemaName) : [];
+		return {
+			key: viewKey(create),
+			runsAfter: named.filter(name => newViews.has(name)),
+			prefersToRunAfter: named.filter(name => !newViews.has(name)),
+			alsoPrefersToRunAfter: alteredTables,
+			push: () => sink.pushCreate(create, 'view'),
+		};
+	});
 }
 
 function pushColumnRenames(alter: TableAlterDiff, sink: AlterStepSink): void {
