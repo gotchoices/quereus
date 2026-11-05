@@ -467,11 +467,12 @@ export class TransactionManager {
 	 * would leave an explicit transaction running on a connection that can no
 	 * longer take part in it.
 	 *
-	 * NOTE: a rejected re-begin is reported the same way as a rejected commit, though
-	 * the rows are committed by then. No in-tree module's begin rejects; if one does
-	 * and a caller needs to tell the two apart, report which step failed.
+	 * The failure may be the re-begin, by which time the rows are committed and the
+	 * rollback cannot take them back. `onCommitted` runs as soon as the commit has
+	 * resolved, so a caller whose cleanup depends on whether the rows landed can
+	 * tell the two failures apart.
 	 */
-	async commitConnectionEarly(connection: VirtualTableConnection): Promise<void> {
+	async commitConnectionEarly(connection: VirtualTableConnection, onCommitted?: () => void): Promise<void> {
 		if (!this.openConnections.has(connection)) {
 			throw new QuereusError(
 				`Internal error: early commit of connection ${connection.connectionId}, which is not open in the current transaction`,
@@ -482,6 +483,7 @@ export class TransactionManager {
 		try {
 			await connection.commit();
 			this.openConnections.delete(connection);
+			onCommitted?.();
 			await this.joinConnection(connection);
 		} catch (error) {
 			errorLog(`Error committing connection ${connection.connectionId} ahead of its transaction: %O`, error);
@@ -580,6 +582,9 @@ export class TransactionManager {
 	// ============================================================================
 	// Change Log Management
 	// ============================================================================
+	// NOTE: the change log and its savepoint layers are a separate concern from the
+	// connection lifecycle above and take up about 400 of this file's 1,000 lines.
+	// If either half grows further, move the change log into its own module.
 
 	/**
 	 * Serialize a tuple of SqlValues for stable Map keying.

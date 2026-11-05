@@ -6,7 +6,11 @@ import type { VirtualTableConnection } from '../connection.js';
 export interface ConnectionLifecycleCheck {
 	/** Every violation recorded so far. */
 	readonly violations: readonly string[];
-	/** Throws if any violation was recorded or, with no statement running in autocommit, a registered connection is open. */
+	/**
+	 * Throws if any violation was recorded or, with no statement running in autocommit,
+	 * a registered connection is open. Call it before `db.close()`: it reads the
+	 * database's transaction state, which a closed database refuses.
+	 */
 	assertClean(): void;
 }
 
@@ -119,12 +123,16 @@ function isThenable(value: MaybePromise<void>): value is Promise<void> {
  * A call the contract forbids is recorded in `violations` and then thrown, before
  * the connection's own method runs. It is recorded as well as thrown because the
  * engine swallows some of these throws on its error paths. A legal call returns
- * exactly what the connection's method returns, with no added ticks.
+ * exactly what the connection's method returns, with no added ticks. The mutex
+ * test is whether anyone holds it (`Database._isExecuting`), which cannot tell the
+ * caller from another statement that holds it at the time.
  *
  * Only the object handed to `registerConnection` is watched. Calls a wrapper
  * connection makes on the connections inside it are that wrapper's own business.
  * Install the check before the module under test registers its connections; one
- * registered earlier is not watched.
+ * registered earlier is not watched. A connection the module removes from the
+ * registry while open gets no commit or rollback and stays open in the check's
+ * record, so registering that object again later is reported as a begin while open.
  *
  * TEST SUPPORT ONLY: the patch is permanent for the life of `db` and there is no
  * uninstall. Use a database you own.

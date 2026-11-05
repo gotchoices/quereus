@@ -535,7 +535,7 @@ describe('Maintained-table refresh re-validation', () => {
 		// `rebuildBacking`. The attach core reaches it through its OWN call site, with a
 		// different rollback shape (`restorePrior` / `restoreReshaped` / the
 		// `reconcileCommitted` branch). The rejection happens BEFORE the attach's eager
-		// `conn.commit()`, so `reconcileCommitted` is still false and the table reverts to
+		// early commit, so `reconcileCommitted` is still false and the table reverts to
 		// an ordinary, untouched table at its original attributes.
 
 		function isMaintained(name: string): boolean {
@@ -727,8 +727,8 @@ describe('Maintained-table refresh re-validation', () => {
 
 	describe('commit-first parity (an enclosing rollback does not undo a refresh)', () => {
 		// `replaceContents` swaps COMMITTED state, so a refresh is durable past an
-		// enclosing `rollback` today. The constraint-bearing branch's explicit
-		// `conn.commit()` must preserve that EXACT behavior rather than tying the swap
+		// enclosing `rollback` today. The constraint-bearing branch's early
+		// commit must preserve that EXACT behavior rather than tying the swap
 		// to the outer transaction — otherwise the two refresh branches would diverge
 		// on transactional semantics. (Verified to match the constraint-less path.)
 		it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {

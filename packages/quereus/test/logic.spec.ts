@@ -605,8 +605,8 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 				const assertConnectionLifecycle = (lineNum: number) => {
 					try {
 						lifecycleCheck.assertClean();
-					} catch (e: any) {
-						throw new Error(`[${file}:${lineNum}] ${e.message}`);
+					} catch (e) {
+						throw new Error(`[${file}:${lineNum}] ${e instanceof Error ? e.message : String(e)}`);
 					}
 				};
 

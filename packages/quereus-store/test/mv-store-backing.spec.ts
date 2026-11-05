@@ -421,7 +421,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 		// Store analogue of `quereus/test/maintained-table-refresh-revalidation.spec.ts`'s
 		// `stale fast-path` blocks, pinning `rebuildBacking`'s CONSTRAINT-BEARING branch
 		// (`applyMaintenance('replace-all')` → `validateDeclaredConstraintsOverContents`
-		// → `conn.commit()`) on the STORE backing host specifically. The memory spec only
+		// → the early commit) on the STORE backing host specifically. The memory spec only
 		// reaches that branch on memory backings, and the MV-sugar store cases above never
 		// declare a constraint (so they take the validation-free `replaceContents` fast
 		// path). Here `src` and the TABLE-FORM maintained table `mt` are both `using store`,
@@ -507,7 +507,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 		});
 
 		describe('commit-first parity on the store backing (an enclosing rollback does not undo a refresh)', () => {
-			// The constraint-bearing branch ends in an explicit `conn.commit()` on the
+			// The constraint-bearing branch ends in an early commit of the
 			// resolved attach connection — a DIFFERENT commit mechanism than the MV-sugar
 			// store path's `replaceContents` (pinned above in the `refresh` block) and than
 			// the memory constraint-bearing branch (pinned engine-wide in the memory spec's
@@ -528,7 +528,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 				await db.exec('refresh materialized view mt');
 				await db.exec('rollback');
 
-				// `conn.commit()` swapped the store backing independently of the outer txn.
+				// The early commit swapped the store backing independently of the outer txn.
 				expect(await rows(db, 'select id, v from mt order by id'))
 					.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
 				expect(isStale('mt'), 'a successful refresh clears stale even under an enclosing rollback')

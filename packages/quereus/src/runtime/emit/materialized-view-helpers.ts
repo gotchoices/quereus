@@ -1481,11 +1481,13 @@ export async function attachMaintainedDerivation(
 			// commit-first semantics — the structural ops above are already
 			// non-transactional, so the reshaping attach is DDL-grade atomicity
 			// regardless). The early commit re-begins the connection, so it stays a
-			// participant and the coordinated commit closes that second begin. Then
+			// participant and the coordinated commit closes that second begin. The flag
+			// is set from the callback, not after the await: if that re-begin rejects
+			// the rows are committed all the same, and the catch below must keep the new
+			// record rather than restore the prior one over them. Then
 			// mirror reshapeBackingInPlace's post batch: re-register the catalog after
 			// EACH op so a mid-batch throw cannot strand catalog/module divergence.
-			await db._commitConnectionEarly(conn);
-			reconcileCommitted = true;
+			await db._commitConnectionEarly(conn, () => { reconcileCommitted = true; });
 			for (const op of reshapePlan.postReconcileOps) {
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
 				live = graftReshapedRecord(current, maintained);

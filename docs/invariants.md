@@ -1252,5 +1252,6 @@ and savepoint call the engine makes holds the execution mutex, and calls on one 
 never overlap. The connection receives `begin`, then savepoint calls at in-range depths, then
 exactly one `commit` or `rollback`, before the next `begin`. A `commit` that rejects leaves it
 open, and `rollback` follows; a `begin` that rejects leaves it idle. With no statement running,
-an engine in autocommit means every registered connection is idle. Only the registered object
-is covered: calls a wrapper connection makes on the connections inside it are its own.
+an engine in autocommit means every registered connection is idle. A connection removed from
+the registry while open receives no further calls. Only the registered object is covered:
+calls a wrapper connection makes on the connections inside it are its own.

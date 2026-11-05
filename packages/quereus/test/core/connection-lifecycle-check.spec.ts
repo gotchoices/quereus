@@ -218,10 +218,33 @@ describe('connection lifecycle when a begin or commit rejects', () => {
 		await db.registerConnection(bystander);
 		await db.registerConnection(early);
 
-		expect((await rejectionOf(db._commitConnectionEarly(early))).message).to.equal('commit failed');
+		let committed = false;
+		const work = db._commitConnectionEarly(early, () => { committed = true; });
+		expect((await rejectionOf(work)).message).to.equal('commit failed');
 
+		expect(committed, 'the commit never resolved').to.equal(false);
 		expect(bystander.calls).to.deep.equal(['begin', 'rollback']);
 		expect(early.calls).to.deep.equal(['begin', 'commit', 'rollback']);
+		expect(db.getAutocommit()).to.equal(true);
+	});
+
+	it('a rejected re-begin after an early commit still reports the commit as made', async () => {
+		const bystander = new FakeConnection('bystander');
+		const early = new FakeConnection('early');
+		await db.beginTransaction();
+		await db.registerConnection(bystander);
+		await db.registerConnection(early);
+		early.rejecting.add('begin');
+
+		let committed = false;
+		const work = db._commitConnectionEarly(early, () => { committed = true; });
+		expect((await rejectionOf(work)).message).to.equal('begin failed');
+
+		// The rows are committed, so the caller must not undo what it built on them;
+		// the connection is idle and gets no rollback.
+		expect(committed).to.equal(true);
+		expect(bystander.calls).to.deep.equal(['begin', 'rollback']);
+		expect(early.calls).to.deep.equal(['begin', 'commit', 'begin']);
 		expect(db.getAutocommit()).to.equal(true);
 	});
 });

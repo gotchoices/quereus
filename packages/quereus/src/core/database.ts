@@ -2723,11 +2723,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/**
 	 * @internal Commits one connection ahead of the open transaction and brings it
 	 * back into it. For engine paths whose later steps read that connection's rows
-	 * as committed; a failure rolls the whole transaction back. See
+	 * as committed; a failure rolls the whole transaction back. `onCommitted` runs
+	 * once the commit itself has resolved, before the connection is begun again. See
 	 * `TransactionManager.commitConnectionEarly`.
 	 */
-	async _commitConnectionEarly(connection: VirtualTableConnection): Promise<void> {
-		await this.transactionManager.commitConnectionEarly(connection);
+	async _commitConnectionEarly(connection: VirtualTableConnection, onCommitted?: () => void): Promise<void> {
+		await this.transactionManager.commitConnectionEarly(connection, onCommitted);
 	}
 
 	/**
