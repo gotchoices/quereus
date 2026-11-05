@@ -2612,7 +2612,13 @@ function followDeclaredViewsInAddedColumnReads(
  */
 type ViewBodies = ReadonlyMap<string, AST.AstNode | undefined>;
 
-/** `names`, plus every view reached from them through `viewBodies`. A table's own body is not followed. */
+/**
+ * `names`, plus every view reached from them through `viewBodies`. A table's own body is not followed.
+ *
+ * NOTE: sees only `schemaName`, because the differ's catalog and declaration hold no other schema. A
+ * chain that leaves through another schema's view and comes back gets no edge, so such a create can
+ * run before the view it reaches. If that shows up, give the differ the other schemas' view bodies.
+ */
 function withViewsReached(names: Iterable<string>, viewBodies: ViewBodies, schemaName: string): Set<string> {
 	const reached = new Set(names);
 	// A Set iterates what is added during the walk, and visits each name once.
@@ -3211,7 +3217,8 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	};
 	/** Appends a create; it undoes to the `DROP … IF EXISTS` of what it made. */
 	const pushCreate = (create: MigrationCreate, kind: CreatedObjectKind): void => {
-		statements.push(undo ? { ...create, ...undo.dropCreated(create, kind) } : create);
+		const step: MigrationStep = { sql: create.sql, ast: create.ast };
+		statements.push(undo ? { ...step, ...undo.dropCreated(create, kind) } : step);
 	};
 	const pushCreates = (bucket: readonly MigrationCreate[], kind: CreatedObjectKind): void => {
 		for (const create of bucket) pushCreate(create, kind);

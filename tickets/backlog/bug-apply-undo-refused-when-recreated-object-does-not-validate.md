@@ -23,6 +23,8 @@ Run on the memory backend through a temporary spec, from `t (id, b)` with rows `
 | `create table g (id integer primary key); create view v as select id from g; drop table g;`, so `v` no longer compiles, and the declaration omits `v` | `create view v as select id from g` | `Table 'g' not found in schema path: main` |
 | table `m` with `constraint c foreign key (x) references p(id)`, made maintained from `src` under `pragma foreign_keys = off`, with a source row whose `x` has no parent. The declaration keeps `m` but not as maintained | `alter table m set maintained as select id, x from src` | `FOREIGN KEY constraint failed: c — row derived into maintained table 'main.m' references a missing 'main.p'` |
 
+A third shape was run on the memory backend after view drops were sorted dependents first. A view chain that passes through another schema gets no order, because the differ's catalog holds only the schema being applied. From `s.T`, `s.V1` over `s.T`, `main.M` over `s.V1` and `s.V3` over `main.M`, a declaration of schema `s` that redefines `V1` and `V3` and adds a view with a bad body drops `V1` before `V3`. The unwind then stops at `create view s.V3 as select S as D from main.M` with `Table not found: s.V1`, and both views are lost. An undo that does not validate the recreated view fixes this too.
+
 Two related shapes restored correctly in the same probe: a dropped unique index, and a dropped assertion that the existing rows violated.
 
 ## Expected behavior
