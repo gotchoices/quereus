@@ -118,6 +118,12 @@ async function rowsBeforeWalkStops(
  * With `rows` rows wanted and `keys` keys spread evenly, a walk stops after `rows / keys`
  * of its whole cost, so a seek is worth it while
  * `seekCost(keys) <= baselineCost * rows / keys`. Multiplied through by `keys` here.
+ *
+ * NOTE: on quereus-store a walk reads a whole row-resolution batch (`ROW_RESOLUTION_BATCH`,
+ * 256 rows) however small the limit, which this line does not model. Measured over 2000
+ * rows with 40 keys and limit 1: the walk read 256 index entries and 256 rows where the
+ * seek reads 40 of each. It costs reads, never a row, and the batch size bounds it. If it
+ * shows up slow, have the module quote its smallest walk read in `KeySetCostLine`.
  */
 function seekBeatsStoppingWalk({ seekAt2, slope, baselineCost }: KeySetCostLine, keys: number, rows: number): boolean {
 	return (seekAt2 + slope * (keys - 2)) * keys <= baselineCost * rows;

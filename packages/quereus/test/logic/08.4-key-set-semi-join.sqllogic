@@ -512,3 +512,10 @@ create table lim_outer (n integer primary key);
 insert into lim_outer values (1), (2);
 select o.n, (select id from (select id from lim_big b where b.id in (select bid from lim_keys) order by b.v limit o.n) x order by id limit 1) as r from lim_outer o order by o.n;
 → [{"n":1,"r":1999},{"n":2,"r":1997}]
+
+-- A LIMIT that writes must stay off the node: a second evaluation would write twice.
+create table lim_log (n integer primary key);
+select id from lim_big b where b.id in (select bid from lim_keys) order by b.v limit (insert into lim_log values (1) returning n);
+→ [{"id":1999}]
+select count(*) as c from lim_log;
+→ [{"c":1}]

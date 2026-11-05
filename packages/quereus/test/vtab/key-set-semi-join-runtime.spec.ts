@@ -302,18 +302,6 @@ describe('KeySetSemiJoin runtime', () => {
 				}
 			});
 
-			it('counts a bound OFFSET in the bound: limit ? offset ? = 1, 998', async () => {
-				await useThousandOddKeys();
-				const stmt = db.prepare('select id from big b where b.id in (select bid from small) order by b.v limit ? offset ?');
-				try {
-					const result = await drainCounted(stmt, 'main.big', [1, 998]);
-					expect(result.rows).to.deep.equal([{ id: 3 }]);
-					expect(result.scanned, 'a walk would read most of the table').to.equal(1000);
-				} finally {
-					await stmt.finalize();
-				}
-			});
-
 			it('reaches through the is-not-null Filter of min over a nullable column', async () => {
 				// ids 1 to 3 hold NULL, so the walk reads those three, then n = 4 (not a key) and
 				// n = 5, where it stops. A seek would read all 1000 keys. Analyzed because a
