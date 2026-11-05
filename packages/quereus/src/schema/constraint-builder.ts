@@ -366,6 +366,9 @@ export function maintainedTableUniqueViolationError(
  * every own-row reference in the CHECK is rewritten to
  * ({@link requalifyOwnRowRefsInSchemaExpression}). Spelled so that no FROM source a
  * user could write inside a CHECK subquery rebinds it.
+ *
+ * NOTE: `new.<missing>` is refused with this alias in the message
+ * (`__quereus_stored_row__.x isn't a column`); if users start hitting that, report it under `new.`.
  */
 const STORED_ROW_ALIAS = '__quereus_stored_row__';
 
@@ -450,12 +453,25 @@ function scanContextVariables(tableSchema: TableSchema): OwnRowContextVariables 
 	const declared = tableSchema.mutationContext;
 	if (!declared || declared.length === 0) return undefined;
 	const names = new Set(declared.map(contextVar => contextVar.name.toLowerCase()));
+	const takenNames = new Set(tableSchema.columns.map(column => column.name.toLowerCase()));
 	const shadowedColumns = new Map<string, string>();
 	for (const column of tableSchema.columns) {
 		const nameLower = column.name.toLowerCase();
-		if (names.has(nameLower)) shadowedColumns.set(nameLower, `__quereus_shadowed_${nameLower}`);
+		if (names.has(nameLower)) shadowedColumns.set(nameLower, mintShadowedColumnName(nameLower, takenNames));
 	}
 	return { names, shadowedColumns };
+}
+
+/**
+ * A name no column of the scan's source already has. Two source columns under one name
+ * would let `new.<name>` read the wrong one, and a row that passes on the wrong column
+ * then vanishes from queries through the fact the optimizer lifts from that spelling.
+ */
+function mintShadowedColumnName(nameLower: string, takenNames: Set<string>): string {
+	let internalName = `__quereus_shadowed_${nameLower}`;
+	while (takenNames.has(internalName)) internalName += '_';
+	takenNames.add(internalName);
+	return internalName;
 }
 
 /** The scan's FROM source: the table itself, or a derived source when a column is shadowed ({@link scanContextVariables}). */

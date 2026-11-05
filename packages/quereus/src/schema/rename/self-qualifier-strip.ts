@@ -166,9 +166,12 @@ export function requalifyOwnRowRefsInSchemaExpression(
  * variable shares it. A self-qualified `<table>.<name>` of a variable reads the variable,
  * as on a write, where {@link stripSelfQualifierInSchemaExpression} folds it to the bare
  * form the variable captures. It is rewritten to `context.<name>` rather than to the bare
- * form, because a subquery's own source could capture a bare name. Where a source would
- * capture it the write path keeps the qualifier and every write fails to plan, so that
- * case has no reading to agree with.
+ * form, because a subquery's own source could capture a bare name.
+ *
+ * NOTE: where a subquery source has a column of that name, the write path keeps the
+ * qualifier and every write fails with `<table>.<name> isn't a column`, so this scan accepts
+ * a CHECK that no write can plan, as CREATE TABLE does. If ALTER should refuse it, this is
+ * the site that would ask the catalog, as {@link stripColumnQualifier} does.
  */
 export interface OwnRowContextVariables {
 	/** Lowercase names of the declared variables. */

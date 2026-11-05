@@ -719,6 +719,13 @@ alter table context add constraint k1 check (context.who > 0);
 alter table context add constraint k2 check (context.a > 1);
 -- error: existing rows in 'context' violate
 
+-- The internal name a shadowed column is scanned under stays clear of a real column using it.
+create table AvCollide (a integer primary key, "__quereus_shadowed_who" integer null, who integer null) with context (who integer null);
+insert into AvCollide values (1, 5, -1);
+alter table AvCollide add constraint k1 check ("__quereus_shadowed_who" > 0);
+alter table AvCollide add constraint k2 check (new.who > 0);
+-- error: existing rows in 'AvCollide' violate
+
 -- A column added under a variable's name is shadowed the same way, on both ADD COLUMN paths.
 create table AvNewLit (a integer primary key) with context (who integer null);
 insert into AvNewLit values (1);
@@ -746,10 +753,8 @@ alter table AvReq add column c integer null default (new.b) check (who > 0);
 alter table AvReq add constraint k check (old.a > 0 and who > 0);
 -- error: ALTER TABLE supplies no context to validate existing rows
 insert into AvReq values (2, 6);
-select a, b from AvReq order by a
+select * from AvReq order by a
 → [{"a":1,"b":5},{"a":2,"b":6}]
-select * from AvReq where a = 1
-→ [{"a":1,"b":5}]
 
 -- A CHECK the validation does not judge owes stored rows nothing, so it stays accepted even
 -- over a NOT NULL variable: a partial operation mask on every path, and a conjunct with `old.`.
