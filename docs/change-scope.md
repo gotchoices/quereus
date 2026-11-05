@@ -455,7 +455,9 @@ The commit does not wait for a promise a handler returns. The execution mutex is
 
 After its first `await`, an asynchronous handler has no ordering against other work on the database: later statements may run, a query it awaits may see commits later than the one that fired it, and other handlers may run alongside it, including itself for a later commit. A handler that needs its own events in order must queue them itself. `event.txnId` identifies the commit and `hits` still describes it.
 
-A handler that never settles, or that awaits the promise of the statement that fired it, stalls only that statement's promise. The database keeps running.
+A handler that never settles, or that awaits the promise of the statement that fired it, stalls only that statement's promise. The database keeps running. Handlers that share an ordered queue can reach the same stall without meaning to: if a handler returns the queue's promise, and a job already in the queue awaits a write that fires such a handler, the write waits for the new job and the new job waits behind the job awaiting the write. That queue then never drains. A handler whose queued work can write to a watched table should return nothing and report its queue's failures itself.
+
+A statement a handler issues after its first `await` queues like any other caller's. If another caller has run `begin` by then, the statement joins that transaction and is rolled back with it (see [sql-txn.md](sql-txn.md) on sharing a database between callers). `close()` does not wait for handlers, so if the database has closed by then, the statement rejects.
 
 ### Schema-change invalidation
 

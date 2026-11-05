@@ -749,6 +749,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				this.watchHandlersOfHold = null;
 			}
 			releaseMutex!();
+			// NOTE: a statement's abort signal does not end this wait, because the statement
+			// has already finished; if a host needs abort to bound a slow handler, race the
+			// wait against the signal in `_withMutex` and `_iterateSerialized`.
 			await Promise.all(watchHandlers);
 		};
 	}

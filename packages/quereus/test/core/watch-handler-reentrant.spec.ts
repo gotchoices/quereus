@@ -151,6 +151,20 @@ describe('Database.watch handlers that await statements', () => {
 		expect(await countRows('t')).to.equal(1);
 	});
 
+	it('a statement failing after an earlier commit waits for that handler, then rejects with its own error', async () => {
+		let handlerFinished = false;
+		db.watch(fullWatch('t'), async () => {
+			await delay(0);
+			handlerFinished = true;
+			throw new Error('handler failed');
+		});
+		let failure: Error | undefined;
+		await db.exec("insert into t values (1, 'a'); insert into t values (1, 'duplicate')")
+			.catch((err: Error) => { failure = err; });
+		expect(handlerFinished).to.equal(true);
+		expect(failure?.message).to.match(/UNIQUE constraint failed/);
+	});
+
 	it('a handler writing during an external notification leaves later handlers their txnId', async () => {
 		const txnIds: string[] = [];
 		db.watch(fullWatch('t'), async () => { await db.exec('insert into u values (1)'); });
