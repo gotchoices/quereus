@@ -649,3 +649,123 @@ select op from query_plan('select * from FactKept where who <= 0') where op = 'E
 select op from query_plan('select * from FactKept where b <= 0') where op = 'EMPTYRELATION'
 → [{"op":"EMPTYRELATION"}]
 
+-- Test 28: existing-row validation of a CHECK added by ALTER runs as a statement with no
+-- envelope. A NULL-declared variable reads NULL, so a comparison against it is unknown and
+-- the row passes, on ADD CONSTRAINT and on both ADD COLUMN paths.
+create table AvNull (a integer primary key, b integer null) with context (who integer null);
+create table AvLookup (k integer primary key);
+create table AvOwn (k integer primary key, who integer null);
+insert into AvNull values (1, 5);
+insert into AvOwn values (1, 5);
+alter table AvNull add constraint k1 check (who is null or a > 0);
+alter table AvNull add constraint k2 check (context.who > 0);
+alter table AvNull add constraint k3 check (who is null or exists (select 1 from AvLookup where k = who));
+alter table AvNull add column c1 integer null default 1 check (who is null or c1 > 0);
+alter table AvNull add column c2 integer null default (new.b) check (who is null or c2 > 0);
+select a, b, c1, c2 from AvNull
+→ [{"a":1,"b":5,"c1":1,"c2":5}]
+
+-- A subquery source with its own column of that name keeps it.
+alter table AvNull add constraint k4 check (exists (select 1 from AvOwn where who = 5));
+alter table AvNull add constraint k5 check (exists (select 1 from AvOwn where who = 6));
+-- error: existing rows in 'AvNull' violate
+
+-- The part of the CHECK that reads no variable is still judged.
+create table AvNeg (a integer primary key) with context (who integer null);
+insert into AvNeg values (-1);
+alter table AvNeg add constraint k check (who is not null or a > 0);
+-- error: existing rows in 'AvNeg' violate
+alter table AvNeg add column c integer null default (new.a) check (who is not null or c > 0);
+-- error: CHECK constraint failed
+
+-- The accepted CHECK is enforced by a later write that supplies the variable.
+create table AvLater (a integer primary key) with context (who integer null);
+alter table AvLater add constraint k check (context.who > 0);
+insert into AvLater with context who = 0 values (1);
+-- error: CHECK constraint failed
+insert into AvLater with context who = 1 values (1);
+select a from AvLater
+→ [{"a":1}]
+
+-- A bare name shared by a column and a variable reads the variable, as on a write, so the
+-- column holding -1 violates nothing. `new.<name>` reaches the column.
+create table AvShadow (a integer primary key, who integer null) with context (who integer null);
+insert into AvShadow values (1, -1);
+alter table AvShadow add constraint k1 check (who > 0);
+alter table AvShadow add column c integer null default 1 check (who > 0);
+alter table AvShadow add column d integer null default (new.who) check (who > 0);
+select a, who, c, d from AvShadow
+→ [{"a":1,"who":-1,"c":1,"d":-1}]
+alter table AvShadow add constraint k2 check (new.who > 0);
+-- error: existing rows in 'AvShadow' violate
+alter table AvShadow add column e integer null default 1 check (new.who > 0);
+-- error: violated by backfilled rows
+alter table AvShadow add column e integer null default (new.who) check (new.who > 0);
+-- error: CHECK constraint failed
+
+-- A self-qualified name reads what a write reads, which is the variable, including inside a
+-- subquery: reading the column would find -1 in AvLookup. Other self-qualified names still
+-- reach their columns.
+insert into AvLookup values (-1);
+alter table AvShadow add constraint k3 check (AvShadow.who > 0);
+alter table AvShadow add constraint k4 check (not exists (select 1 from AvLookup where k = AvShadow.who));
+alter table AvShadow add constraint k5 check (AvShadow.c > 1);
+-- error: existing rows in 'AvShadow' violate
+
+-- On a table literally named `context`, `context.<name>` of a variable is still the variable.
+create table context (a integer primary key, who integer null) with context (who integer null);
+insert into context values (1, -1);
+alter table context add constraint k1 check (context.who > 0);
+alter table context add constraint k2 check (context.a > 1);
+-- error: existing rows in 'context' violate
+
+-- A column added under a variable's name is shadowed the same way, on both ADD COLUMN paths.
+create table AvNewLit (a integer primary key) with context (who integer null);
+insert into AvNewLit values (1);
+alter table AvNewLit add column who integer null default -1 check (who > 0);
+select a, who from AvNewLit
+→ [{"a":1,"who":-1}]
+create table AvNewRow (a integer primary key, b integer null) with context (who integer null);
+insert into AvNewRow values (1, -1);
+alter table AvNewRow add column who integer null default (new.b) check (who > 0);
+select a, b, who from AvNewRow
+→ [{"a":1,"b":-1,"who":-1}]
+
+-- A CHECK that reads a NOT NULL variable is rejected whether or not the table has rows,
+-- because ALTER cannot supply a value, and the table is left as it was.
+create table AvReq (a integer primary key, b integer null) with context (who integer);
+alter table AvReq add constraint k check (who > 0);
+-- error: ALTER TABLE supplies no context to validate existing rows
+insert into AvReq values (1, 5);
+alter table AvReq add constraint k check (who > 0);
+-- error: ALTER TABLE supplies no context to validate existing rows
+alter table AvReq add column c integer null default 1 check (who > 0);
+-- error: ALTER TABLE supplies no context to validate existing rows
+alter table AvReq add column c integer null default (new.b) check (who > 0);
+-- error: ALTER TABLE supplies no context to validate existing rows
+alter table AvReq add constraint k check (old.a > 0 and who > 0);
+-- error: ALTER TABLE supplies no context to validate existing rows
+insert into AvReq values (2, 6);
+select a, b from AvReq order by a
+→ [{"a":1,"b":5},{"a":2,"b":6}]
+select * from AvReq where a = 1
+→ [{"a":1,"b":5}]
+
+-- A CHECK the validation does not judge owes stored rows nothing, so it stays accepted even
+-- over a NOT NULL variable: a partial operation mask on every path, and a conjunct with `old.`.
+alter table AvReq add constraint k_upd check on update (who > 0);
+alter table AvReq add column c integer null default 1 check on update (who > 0);
+alter table AvReq add column d integer null default (new.b) check on update (who > 0);
+alter table AvReq add constraint k_old check (old.a is null or who > 0);
+update AvReq set b = 7 where a = 1;
+-- error: table 'main.AvReq' requires mutation context variable 'who'
+update AvReq with context who = 1 set b = 7 where a = 1;
+select a, b, c, d from AvReq where a = 1
+→ [{"a":1,"b":7,"c":1,"d":5}]
+
+-- The per-row path judges no partial-mask CHECK, the same as the literal-default path.
+create table AvMask (a integer primary key, b integer null);
+insert into AvMask values (1, 5);
+alter table AvMask add column c integer null default (new.b) check on update (c > 100);
+select a, b, c from AvMask
+→ [{"a":1,"b":5,"c":5}]

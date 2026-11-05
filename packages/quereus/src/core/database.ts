@@ -19,6 +19,7 @@ import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
 import { buildBlock } from '../planner/building/block.js';
+import { noEnvelopeCheckScope } from '../planner/building/mutation-context.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { refreshMaintainedTable } from '../runtime/emit/materialized-view.js';
 import { Scheduler } from '../runtime/scheduler.js';
@@ -2642,8 +2643,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * surfaces (`func/builtins/schema.ts`) use to plan a view body / run an insertability
 	 * probe — whose `schemaDependencies` are discarded (the read TVF already discards the body
 	 * plan's), so a fresh tracker per call is correct.
+	 *
+	 * `noEnvelopeContextTable` — see {@link Statement._noEnvelopeContextTable}.
 	 */
-	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): PlanningContext {
+	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], noEnvelopeContextTable?: TableSchema): PlanningContext {
 		const globalScope = new GlobalScope(this.schemaManager);
 
 		// If we received parameter values, infer their types
@@ -2663,7 +2666,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			db: this,
 			schemaManager: this.schemaManager,
 			parameters: paramsOrTypes instanceof Map ? {} : (paramsOrTypes ?? {}),
-			scope: parameterScope,
+			scope: noEnvelopeContextTable ? noEnvelopeCheckScope(parameterScope, noEnvelopeContextTable) : parameterScope,
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
@@ -2674,9 +2677,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		};
 	}
 
-	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. */
-	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): BuildPlanResult {
-		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride);
+	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. `noEnvelopeContextTable` — see {@link _buildProbeContext}. */
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], noEnvelopeContextTable?: TableSchema): BuildPlanResult {
+		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride, noEnvelopeContextTable);
 		const plan = buildBlock(ctx, statements);
 		return { plan, schemaDependencies: ctx.schemaDependencies };
 	}

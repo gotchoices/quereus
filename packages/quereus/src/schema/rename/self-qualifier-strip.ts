@@ -131,6 +131,9 @@ function stripColumnQualifier(
  * — the previous row image has no stored-row counterpart, so callers screen those
  * conjuncts out before reaching here (`storedRowPredicate`).
  *
+ * `contextVariables` is passed for a table that declares mutation context — see
+ * {@link OwnRowContextVariables} for what it changes.
+ *
  * Mutates `expr` in place (pass a clone) and returns whether anything changed.
  */
 export function requalifyOwnRowRefsInSchemaExpression(
@@ -138,12 +141,14 @@ export function requalifyOwnRowRefsInSchemaExpression(
 	tableName: string,
 	defaultSchemaName: string,
 	alias: string,
+	contextVariables?: OwnRowContextVariables,
 ): boolean {
 	if (!expr) return false;
 	const state: RequalifyState = {
 		tableName: tableName.toLowerCase(),
 		defaultSchema: defaultSchemaName.toLowerCase(),
 		alias,
+		contextVariables,
 		changed: false,
 	};
 	walkSchemaExpressionScope(
@@ -154,6 +159,24 @@ export function requalifyOwnRowRefsInSchemaExpression(
 	return state.changed;
 }
 
+/**
+ * What a table's declared mutation-context variables change about the own-row spellings.
+ *
+ * `new.<name>` reaches the column, under the name the scan's source exposes it by when a
+ * variable shares it. A self-qualified `<table>.<name>` of a variable reads the variable,
+ * as on a write, where {@link stripSelfQualifierInSchemaExpression} folds it to the bare
+ * form the variable captures. It is rewritten to `context.<name>` rather than to the bare
+ * form, because a subquery's own source could capture a bare name. Where a source would
+ * capture it the write path keeps the qualifier and every write fails to plan, so that
+ * case has no reading to agree with.
+ */
+export interface OwnRowContextVariables {
+	/** Lowercase names of the declared variables. */
+	readonly names: ReadonlySet<string>;
+	/** Lowercase name of each column a variable shares its name with → the name the scan's source exposes that column under. */
+	readonly shadowedColumns: ReadonlyMap<string, string>;
+}
+
 interface RequalifyState {
 	/** Lowercase owning-table name (the implicit seed binding). */
 	tableName: string;
@@ -161,6 +184,7 @@ interface RequalifyState {
 	defaultSchema: string;
 	/** The qualifier every own-row reference is rewritten to. */
 	alias: string;
+	contextVariables?: OwnRowContextVariables;
 	changed: boolean;
 }
 
@@ -188,8 +212,15 @@ function requalifyOwnRowRef(
 		// A qualified self-reference must name the OWNING table's schema exactly
 		// (see `stripColumnQualifier`).
 		if (!(col.schema === undefined || eq(col.schema, state.defaultSchema))) return;
+		if (state.contextVariables?.names.has(col.name.toLowerCase())) {
+			col.table = 'context';
+			col.schema = undefined;
+			state.changed = true;
+			return;
+		}
 	}
 	col.table = state.alias;
+	col.name = state.contextVariables?.shadowedColumns.get(col.name.toLowerCase()) ?? col.name;
 	col.schema = undefined;
 	state.changed = true;
 }

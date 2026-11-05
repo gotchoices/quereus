@@ -4,8 +4,8 @@ import type { MutationContextDefinition, TableSchema } from '../../schema/table.
 import { PlanNode, type Attribute, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
-import type { RegisteredScope } from '../scopes/registered.js';
-import type { ReferenceCallback } from '../scopes/scope.js';
+import { RegisteredScope } from '../scopes/registered.js';
+import type { ReferenceCallback, Scope } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -168,6 +168,34 @@ export function registerNoEnvelopeContextSymbols(
 		registerContextVariable(scope, contextVar, reference);
 	}
 	return new Set(declared.map(contextVar => contextVar.name.toLowerCase()));
+}
+
+/**
+ * A CHECK that ALTER TABLE validates over existing rows read a NOT NULL mutation-context
+ * variable. ALTER has no `with context` clause to supply it, so the check could never be
+ * judged, whether or not the table has rows.
+ */
+export function checkReadsRequiredContextError(tableSchema: TableSchema, contextVarName: string): QuereusError {
+	return new QuereusError(
+		`cannot add a CHECK to '${tableSchema.schemaName}.${tableSchema.name}' with ALTER TABLE: it reads mutation context variable ` +
+		`'${contextVarName}', which is NOT NULL, and ALTER TABLE supplies no context to validate existing rows; ` +
+		`declare the CHECK in CREATE TABLE, or declare the variable NULL and write the CHECK to tolerate its absence`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
+ * The root scope of the existing-row CHECK scan over a table that declares mutation
+ * context (`validateChecksOverExistingRows`, `schema/constraint-builder.ts`). Variables
+ * resolve through scopes rather than an AST rewrite, so capture stays correct at every
+ * depth: a bare name in a subquery binds to that subquery's own source when it has the
+ * column, and to the variable otherwise.
+ */
+export function noEnvelopeCheckScope(parent: Scope, tableSchema: TableSchema): RegisteredScope {
+	const scope = new RegisteredScope(parent);
+	registerNoEnvelopeContextSymbols(scope, tableSchema,
+		contextVar => checkReadsRequiredContextError(tableSchema, contextVar.name));
+	return scope;
 }
 
 /**

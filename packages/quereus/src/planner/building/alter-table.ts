@@ -9,7 +9,7 @@ import { PlanNode, type VoidNode, type ScalarPlanNode, type Attribute, type RowD
 import type { TableReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
-import { registerNoEnvelopeContextSymbols } from './mutation-context.js';
+import { checkReadsRequiredContextError, registerNoEnvelopeContextSymbols } from './mutation-context.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { buildGeneratedColumnExpr } from './generated-column-scope.js';
@@ -19,11 +19,12 @@ import { buildCellCoercion } from '../../types/validation.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { astToString, expressionToString, quoteIdentifier } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
-import { validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
+import { opsToMask, validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
+import { isRowInvariantCheck } from '../analysis/check-extraction.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -60,10 +61,6 @@ export function buildAlterTableStmt(
 
   switch (stmt.action.type) {
     case 'addConstraint': {
-      // NOTE: a CHECK added here cannot read the table's `with context` variables (it fails
-      // with `Column not found`, even on an empty table), though the same CHECK is accepted
-      // in CREATE TABLE. If ALTER needs parity, resolve them as CREATE TABLE's CHECK does.
-      //
       // Reject a typo'd / mis-sited reserved `quereus.*` tag on the constraint at
       // plan-build, mirroring CREATE TABLE's named-constraint leg and SET TAGS — a
       // bad tag can't be silently stored when introduced via ALTER ... ADD CONSTRAINT.
@@ -391,14 +388,18 @@ function buildAddColumnBackfill(
  * *new* column, so a CHECK referencing the new column (bare `<col>` or `new.<col>`) and any
  * existing sibling resolves. The new column sits at position `existingColumns.length` in the
  * row descriptor; the emitter sets that slot to `[...existingRow, backfilledValue]` per row.
- * Returns `undefined` when the column carries no CHECK (the common case allocates nothing).
+ * Mutation-context variables are layered under that row as in the backfill above, and a
+ * partial-mask CHECK is left out because stored rows owe it nothing, the same gate the
+ * literal-default scan applies (`validateRowInvariantChecksOverExistingRows`). Returns
+ * `undefined` when no CHECK applies (the common case allocates nothing).
  */
 function buildAddColumnChecks(
   ctx: PlanningContext,
   tableReference: TableReferenceNode,
   columnDef: AST.ColumnDef,
 ): AddColumnCheck | undefined {
-  const checkConstraints = (columnDef.constraints ?? []).filter(c => c.type === 'check' && c.expr);
+  const checkConstraints = (columnDef.constraints ?? []).filter(c =>
+    c.type === 'check' && c.expr && isRowInvariantCheck({ expr: c.expr, operations: opsToMask(c.operations) }));
   if (checkConstraints.length === 0) return undefined;
 
   const tableSchema = tableReference.tableSchema;
@@ -432,7 +433,10 @@ function buildAddColumnChecks(
   };
   const rowAttrs = [...existingAttrs, newColAttr];
   const targetColumns = [...tableSchema.columns, { name: columnDef.name }];
-  const rowScope = buildRowDefaultScope(ctx.scope, targetColumns, rowAttrs);
+  const contextScope = new RegisteredScope(ctx.scope);
+  const contextVarNames = registerNoEnvelopeContextSymbols(contextScope, tableSchema,
+    contextVar => checkReadsRequiredContextError(tableSchema, contextVar.name));
+  const rowScope = buildRowDefaultScope(contextScope, targetColumns, rowAttrs, contextVarNames);
 
   // Schema-authored, same as the backfill expression above and as every CHECK the DML
   // builders compile: a bare relation name means the ALTERED table's own schema, not

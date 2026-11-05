@@ -48,7 +48,11 @@ Qualifying a name with its table is how an author says "the column". Today that 
 
 ## If we do nothing
 
-The optimizer stays correct, except on a table literally named `new`. A self-qualified CHECK on a shadowed name keeps testing the variable. `bug-alter-check-validation-cannot-reference-mutation-context` is being asked to match today's write behaviour, so ALTER and writes will agree.
+The optimizer stays correct, except on a table literally named `new`. A self-qualified CHECK on a shadowed name keeps testing the variable. `bug-alter-check-validation-cannot-reference-mutation-context` matches today's write behaviour, so ALTER and writes agree.
+
+## What else changes if the meaning changes
+
+The existing-row CHECK scan holds its own copy of this reading: `requalifyOwnRowRef` in `packages/quereus/src/schema/rename/self-qualifier-strip.ts` rewrites `<table>.<name>` of a variable to `context.<name>`. `docs/sql-alter.md` states it too, in *Existing-row validation of a CHECK*. Both need to change with the strip. On a table literally named `new`, that scan already reads `new.<name>` as the column, unlike a write, because the optimizer lifts a fact from that spelling.
 
 ## How reversible this is
 

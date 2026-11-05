@@ -17,6 +17,7 @@ import { assertRowConforms } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
+import type { TableSchema } from '../schema/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { BuildTimeDependencyTracker, SchemaDependency } from '../planner/planning-context.js';
@@ -125,6 +126,15 @@ export class Statement {
 	 * path — see {@link Database._homeSchemaPath}.
 	 */
 	_schemaPathOverride?: string[];
+	/**
+	 * @internal The table whose declared mutation-context variables this statement reads
+	 * as one that supplied no `with context` envelope. Set right after `db.prepare(...)`,
+	 * under the same deferred-compile reasoning as {@link _schemaPathOverride}, by exactly
+	 * one site: the existing-row CHECK scan (`validateChecksOverExistingRows`,
+	 * `schema/constraint-builder.ts`), which prepares SQL text and so has no scope of its
+	 * own to register the variables in. Keep it that way.
+	 */
+	_noEnvelopeContextTable?: TableSchema;
 	/**
 	 * @internal When true, this statement emits with scalar fusion disabled, so its
 	 * instruction graph is the full, faithful sub-program form. Set right after
@@ -342,7 +352,7 @@ export class Statement {
 			const parameterTypes = this.establishParameterTypes();
 
 			// Pass parameter types directly to planning
-			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride);
+			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride, this._noEnvelopeContextTable);
 			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
 			// before the access-path optimizer folds `col = ?` comparisons into index
 			// seeks (which erases the comparison node). See validateParameterTypes.
@@ -1133,7 +1143,7 @@ export class Statement {
 	 */
 	private getAnalysisPlan(): BlockNode {
 		const currentAst = this.getAstStatement();
-		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.establishParameterTypes(), this._schemaPathOverride);
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.establishParameterTypes(), this._schemaPathOverride, this._noEnvelopeContextTable);
 		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
 	}
 

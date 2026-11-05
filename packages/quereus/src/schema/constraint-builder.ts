@@ -27,7 +27,7 @@ import { columnSchemaToScalarType } from '../planner/type-utils.js';
 import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
 import { containsOldRowImageRef, isRowInvariantCheck } from '../planner/analysis/check-extraction.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
-import { requalifyOwnRowRefsInSchemaExpression } from './rename-rewriter.js';
+import { requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename-rewriter.js';
 
 const log = createLogger('schema:constraint-builder');
 
@@ -392,13 +392,12 @@ function topLevelConjuncts(expr: AST.Expression): AST.Expression[] {
  * in the CHECK can be judged from a row sitting still.
  *
  * This is the validation-side twin of the optimizer's row-invariant lift
- * (`planner/analysis/check-extraction.ts`), and the two must not drift in either
- * direction: the optimizer trusts a declared CHECK as a fact about every stored row
- * and folds contradicting predicates away (`ruleFilterContradiction`), so whatever
- * it lifts MUST have been validated by the scan this feeds — validate less and rows
- * silently vanish from query results; validate more and legal statements start
- * failing. Hence the same per-top-level-AND-conjunct split, and the optimizer's own
- * screens:
+ * (`planner/analysis/check-extraction.ts`): the optimizer trusts a declared CHECK as a
+ * fact about every stored row and folds contradicting predicates away
+ * (`ruleFilterContradiction`), so whatever it lifts MUST have been validated by the
+ * scan this feeds, or rows silently vanish from query results. Validating more than
+ * rows owe makes legal statements start failing. Hence the same per-top-level-AND-conjunct
+ * split, and the optimizer's own screens:
  *
  *   - a conjunct referencing `old.<col>` is a transition constraint over the PREVIOUS
  *     row image (`check (old.a is null or a >= old.a)`); it says nothing about a row
@@ -410,14 +409,23 @@ function topLevelConjuncts(expr: AST.Expression): AST.Expression[] {
  *     the scan alias rather than left for the planner to reject as `new.<col> isn't a
  *     column`; a self-qualified `<table>.<col>` gets the same treatment.
  *
+ * One difference is deliberate: a conjunct reading a mutation-context variable is kept
+ * here though the optimizer lifts nothing from it, since it constrains a per-statement
+ * value. It is judged as a statement with no envelope would judge it, which is how a
+ * read of a NOT NULL variable gets rejected. See {@link scanContextVariables}.
+ *
  * Returns fresh AST (the stored constraint is never mutated).
  */
-export function storedRowPredicate(check: RowConstraintSchema, tableSchema: TableSchema): AST.Expression | undefined {
+export function storedRowPredicate(
+	check: RowConstraintSchema,
+	tableSchema: TableSchema,
+	contextVariables?: OwnRowContextVariables,
+): AST.Expression | undefined {
 	const kept: AST.Expression[] = [];
 	for (const conjunct of topLevelConjuncts(check.expr)) {
 		if (containsOldRowImageRef(conjunct)) continue;
 		const clone = cloneExpr(conjunct);
-		requalifyOwnRowRefsInSchemaExpression(clone, tableSchema.name, tableSchema.schemaName, STORED_ROW_ALIAS);
+		requalifyOwnRowRefsInSchemaExpression(clone, tableSchema.name, tableSchema.schemaName, STORED_ROW_ALIAS, contextVariables);
 		kept.push(clone);
 	}
 	if (kept.length === 0) return undefined;
@@ -425,6 +433,43 @@ export function storedRowPredicate(check: RowConstraintSchema, tableSchema: Tabl
 		const conjunction: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc, right: next };
 		return conjunction;
 	});
+}
+
+/**
+ * How the existing-row scan reads a table's declared mutation-context variables, or
+ * `undefined` when it declares none, which leaves the scan's SQL as it is for every
+ * other table. Maintained tables cannot declare context, so that path never gets here.
+ *
+ * The scan runs as a statement that supplied no `with context` envelope (see
+ * `Statement._noEnvelopeContextTable`). A bare name must then mean the variable
+ * even when a column shares it, as it does on a write, but a FROM source would win over
+ * the root scope the variables live in. So a shared column is exposed under an internal
+ * name ({@link storedRowSourceSql}), and the bare name falls through to the variable.
+ */
+function scanContextVariables(tableSchema: TableSchema): OwnRowContextVariables | undefined {
+	const declared = tableSchema.mutationContext;
+	if (!declared || declared.length === 0) return undefined;
+	const names = new Set(declared.map(contextVar => contextVar.name.toLowerCase()));
+	const shadowedColumns = new Map<string, string>();
+	for (const column of tableSchema.columns) {
+		const nameLower = column.name.toLowerCase();
+		if (names.has(nameLower)) shadowedColumns.set(nameLower, `__quereus_shadowed_${nameLower}`);
+	}
+	return { names, shadowedColumns };
+}
+
+/** The scan's FROM source: the table itself, or a derived source when a column is shadowed ({@link scanContextVariables}). */
+function storedRowSourceSql(tableSchema: TableSchema, contextVariables: OwnRowContextVariables | undefined): string {
+	const tableRef = qualifyRelation(tableSchema.schemaName, tableSchema.name);
+	const alias = quoteIdentifier(STORED_ROW_ALIAS);
+	const shadowed = contextVariables?.shadowedColumns;
+	if (!shadowed || shadowed.size === 0) return `${tableRef} as ${alias}`;
+	const columns = tableSchema.columns.map(column => {
+		const internalName = shadowed.get(column.name.toLowerCase());
+		const name = quoteIdentifier(column.name);
+		return internalName ? `${name} as ${quoteIdentifier(internalName)}` : name;
+	});
+	return `(select ${columns.join(', ')} from ${tableRef}) as ${alias}`;
 }
 
 /**
@@ -441,6 +486,11 @@ export function storedRowPredicate(check: RowConstraintSchema, tableSchema: Tabl
  * row is not a violation). A subquery-bearing CHECK is just SQL here; the scan
  * reads final pending state through the ordinary read path, so rows the issuing
  * transaction has staged but not committed count as present.
+ *
+ * On a table that declares mutation context, the scan reads the variables as a
+ * statement with no envelope does ({@link scanContextVariables}): a NULL-declared one is
+ * NULL, and a read of a NOT NULL one raises at plan time, so it is rejected whether or
+ * not the table has rows. A CHECK this scan never judges cannot raise that error.
  *
  * The operation-mask policy is the CALLER's, not this scan's: which stored rows
  * owe a partial-mask CHECK (`check on insert (…)`, `check on update (…)`) anything
@@ -468,13 +518,13 @@ export async function validateChecksOverExistingRows(
 	checks: ReadonlyArray<RowConstraintSchema>,
 	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
 ): Promise<void> {
-	const tableRef = qualifyRelation(tableSchema.schemaName, tableSchema.name);
+	const contextVariables = scanContextVariables(tableSchema);
+	const source = storedRowSourceSql(tableSchema, contextVariables);
 	for (const check of checks) {
-		const predicate = storedRowPredicate(check, tableSchema);
+		const predicate = storedRowPredicate(check, tableSchema, contextVariables);
 		if (!predicate) continue;
 		const exprSql = expressionToString(check.expr);
-		const sql = `select 1 from ${tableRef} as ${quoteIdentifier(STORED_ROW_ALIAS)} `
-			+ `where not (${expressionToString(predicate)}) limit 1`;
+		const sql = `select 1 from ${source} where not (${expressionToString(predicate)}) limit 1`;
 		log('CHECK existing-row validation for %s.%s: %s', tableSchema.schemaName, tableSchema.name, sql);
 		const stmt = db.prepare(sql);
 		// The CHECK is SCHEMA-AUTHORED, so a bare relation name inside it means the OWNING
@@ -483,6 +533,7 @@ export async function validateChecksOverExistingRows(
 		// (planner/building/schema-authored-context.ts), which decides the same thing for
 		// every CHECK the DML builders compile.
 		stmt._schemaPathOverride = [tableSchema.schemaName];
+		if (contextVariables) stmt._noEnvelopeContextTable = tableSchema;
 		try {
 			for await (const _row of stmt._iterateRowsRaw()) {
 				throw onViolation?.(check, exprSql) ?? new QuereusError(
@@ -504,8 +555,9 @@ export async function validateChecksOverExistingRows(
  * CHECK lets a row be legally stored in violation of it (inserted under an
  * update-only one, updated under an insert-only one), so those rows owe it
  * nothing — and the optimizer lifts nothing from it, so accepting leaves no
- * wrong-result risk open. Gating on the same predicate the lift uses is what
- * makes the validated set exactly the lifted set; change one, change the other.
+ * wrong-result risk open. Gating on the same predicate the lift uses is what keeps
+ * everything lifted validated; change one, change the other. The optimizer lifts less
+ * than this validates: nothing from a conjunct reading a mutation-context variable.
  */
 export async function validateRowInvariantChecksOverExistingRows(
 	db: Database,
