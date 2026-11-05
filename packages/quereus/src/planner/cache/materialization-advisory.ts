@@ -4,6 +4,9 @@
  */
 
 import { createLogger } from '../../common/logger.js';
+import { quereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
+import { PlanNodeCharacteristics } from '../framework/characteristics.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode, type TableDescriptor } from '../nodes/plan-node.js';
 import { CacheNode, type CacheStrategy } from '../nodes/cache-node.js';
 import { CTENode } from '../nodes/cte-node.js';
@@ -136,7 +139,15 @@ export class MaterializationAdvisory {
 	 * Decide whether a non-recursive {@link CTENode} must be materialized once per
 	 * statement execution. An explicit NOT MATERIALIZED hint is honored (the user
 	 * opted into re-execution per reference); otherwise an explicit MATERIALIZED
-	 * hint or two-plus references trips the mark.
+	 * hint or two-plus references trips the mark, unless the body reads an outer
+	 * query's row.
+	 *
+	 * The buffer lives for the whole statement, so such a body would replay the first
+	 * outer row's values for every row. It is never stored. A functional body re-runs
+	 * per reference instead, which gives the same results as sharing, so ignoring the
+	 * hint or the reference count only gives up a performance benefit. Any other body
+	 * is refused: re-running gives two references different values, and sharing freezes
+	 * the first row.
 	 *
 	 * A CTE with a data-modifying body never reaches here: it is built with
 	 * `materialize` already true, and the caller's `!node.materialize` guard short-
@@ -153,14 +164,23 @@ export class MaterializationAdvisory {
 	private shouldMaterializeCTE(node: CTENode, stats: RefStats | undefined): boolean {
 		if (node.isRecursive) return false;
 		if (node.materializationHint === 'not_materialized') return false;
-		return node.materializationHint === 'materialized' || (stats?.parentCount ?? 0) >= 2;
+		const wouldStore = node.materializationHint === 'materialized' || (stats?.parentCount ?? 0) >= 2;
+		if (!wouldStore || !isCorrelatedSubquery(node.source)) return wouldStore;
+		if (!PlanNodeCharacteristics.isFunctional(node.source)) {
+			quereusError(
+				`CTE '${node.cteName}' reads a column of an outer query and is non-deterministic or writes data, so its references cannot share one result; use 'not materialized' to run it once per reference`,
+				StatusCode.UNSUPPORTED
+			);
+		}
+		return false;
 	}
 
 	/**
 	 * Top-down memoized rewrite that sets the `materialize` flag on CTE nodes:
 	 * on a non-recursive {@link CTENode} where {@link shouldMaterializeCTE} says so,
 	 * and on a {@link RecursiveCTENode} whose working-table descriptor is referenced
-	 * two-plus times (`recursiveRefsByDescriptor`).
+	 * two-plus times (`recursiveRefsByDescriptor`), unless its body reads an outer
+	 * query's row, which is refused at planning.
 	 *
 	 * The memo (keyed by node identity) keeps a shared CTENode shared: the plain
 	 * {@link transformChildren} walk is NOT memoized, so routing this mark through it
@@ -216,6 +236,15 @@ export class MaterializationAdvisory {
 			// is preserved so the InternalRecursiveCTERefNode in the recursive case
 			// still resolves the same working table AND every duplicate keys the same
 			// shared buffer.
+			//
+			// A body that reads an outer query's row is refused: the shared buffer would
+			// replay the first outer row, and not sharing brings back the runaway above.
+			if (isCorrelatedSubquery(node)) {
+				quereusError(
+					`Recursive CTE '${node.cteName}' reads a column of an outer query and is referenced more than once, which is not supported`,
+					StatusCode.UNSUPPORTED
+				);
+			}
 			const withMarkedChildren = (childrenChanged ? node.withChildren(newChildren) : node) as RecursiveCTENode;
 			result = withMarkedChildren.withMaterialize(true);
 			log('Marked recursive CTE %s for shared buffering (%d references)', node.cteName, recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0);

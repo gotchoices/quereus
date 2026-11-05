@@ -177,10 +177,12 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 					};
 				}
 
-				if (proj.node instanceof ColumnReferenceNode) {
-					// Always preserve the original attribute ID so that any reference
-					// to the underlying column (e.g., in ORDER BY) remains valid even
-					// after aliasing. The alias is purely a name change, not a new column.
+				if (proj.node instanceof ColumnReferenceNode && sourceTypeById.has(proj.node.attributeId)) {
+					// Preserve a column the source publishes so that any reference to the
+					// underlying column (e.g., in ORDER BY) remains valid after aliasing.
+					// A column the source does not publish belongs to an outer query:
+					// publishing that id would make this subquery appear to define it, and
+					// correlation detection would then read the subquery as uncorrelated.
 					return {
 						id: proj.node.attributeId,
 						name: outputType.columns[index].name,

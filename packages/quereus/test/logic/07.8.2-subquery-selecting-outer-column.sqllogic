@@ -1,0 +1,139 @@
+-- 07.8.2-subquery-selecting-outer-column.sqllogic - a subquery whose output is an
+-- outer column depends on the outer row
+--
+-- A projection of a plain column used to publish that column's attribute id even when
+-- the column came from an outer query, so correlation detection saw the id as defined
+-- inside the subquery. The subquery was then cached once and every outer row got the
+-- first row's value, which also let a CHECK written this way admit bad rows.
+--
+-- A WITH query reading the outer row has the same problem at a different site: its
+-- buffer lasts for the whole statement. Its body is never stored, and shapes that
+-- cannot be re-run safely are refused. See docs/runtime-caching.md
+-- § Shared CTE materialization.
+
+create table u (id integer primary key);
+insert into u values (1);
+create table t (a integer primary key, b integer null);
+insert into t values (1, 5), (2, -5), (3, 9);
+
+-- ===== Shapes with no stored WITH query =====
+
+select a, (select t.b from u) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select x from (select t.b as x from u) d) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select x from (select t.b as x from u) d where x is not null) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select t.b from u order by t.b) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select t.b from u union all select null where false) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select (select t.b from u) from u) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select t.b from u group by t.b) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select distinct t.b from u) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a, (select t.b from u limit 1) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+select a from t where (select t.b from u) > 0 order by a;
+→ [{"a":1},{"a":3}]
+
+select a from t where 9 in (select t.b from u) order by a;
+→ [{"a":3}]
+
+select a from t where 9 not in (select t.b from u) order by a;
+→ [{"a":1},{"a":2}]
+
+select t.a, d.x from t join lateral (select x from (select t.b as x from u) dd where x > 0) d on 1=1 order by t.a;
+→ [{"a":1,"x":5},{"a":3,"x":9}]
+
+select a from t where a in (select x from (select t.a as x from u) d) order by a;
+→ [{"a":1},{"a":2},{"a":3}]
+
+-- ===== WITH queries that read the outer row =====
+
+-- One reference: streams, so it was never stored.
+select a, (with c as (select t.b as x from u) select max(x) from c) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+-- Two references: re-run per reference rather than stored.
+select a, (with c as (select t.b as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t order by a;
+→ [{"a":1,"v":10},{"a":2,"v":-10},{"a":3,"v":18}]
+
+-- The hint is a performance request, so it does not force a stored result.
+select a, (with c as materialized (select t.b + 0 as x from u) select x from c) as v from t order by a;
+→ [{"a":1,"v":5},{"a":2,"v":-5},{"a":3,"v":9}]
+
+-- Correlation reached through another WITH query.
+select a, (with c as (select t.b as x from u), d as (select x from c) select d1.x + d2.x from d d1 join d d2 on 1=1) as v from t order by a;
+→ [{"a":1,"v":10},{"a":2,"v":-10},{"a":3,"v":18}]
+
+select a, (with c as not materialized (select t.b as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t order by a;
+→ [{"a":1,"v":10},{"a":2,"v":-10},{"a":3,"v":18}]
+
+-- Single-reference recursion streams its own drive per outer row.
+select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+2) select max(x) from c) as v from t order by a;
+→ [{"a":1,"v":7},{"a":2,"v":-3},{"a":3,"v":11}]
+
+-- Two mentions under one alias share one reference, so this is not refused.
+select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+2) select (select max(x) from c) + (select min(x) from c)) as v from t order by a;
+→ [{"a":1,"v":12},{"a":2,"v":-8},{"a":3,"v":20}]
+
+-- ===== Refused: cannot be re-run safely and cannot be shared =====
+
+-- Non-deterministic with two references: re-running gives the references different values.
+select a, (with c as (select t.b + random() as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t;
+-- error: CTE 'c' reads a column of an outer query
+
+-- Non-deterministic with the hint.
+select a, (with c as materialized (select t.b + random() as x from u) select x from c) as v from t;
+-- error: CTE 'c' reads a column of an outer query
+
+-- `not materialized` asks for per-reference runs, so it stays allowed.
+select a, (with c as not materialized (select t.b + random() as x from u) select count(*) from c c1 join c c2 on 1=1) as v from t order by a;
+→ [{"a":1,"v":1},{"a":2,"v":1},{"a":3,"v":1}]
+
+-- Recursive with two references: sharing replays the first row, and not sharing runs away.
+select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+1) select max(c1.x + c2.x) from c c1 join c c2 on 1=1) as v from t;
+-- error: Recursive CTE 'c' reads a column of an outer query
+
+-- ===== A WITH body that does not read the outer row keeps its one buffer =====
+
+-- random() differs per run, so one distinct non-null value across all outer rows and
+-- both references shows a single run.
+select count(distinct v) as n from (
+	select (with c as (select random() as r from u) select c1.r from c c1 join c c2 on c1.r = c2.r where t.b is not null) as v from t
+) s;
+→ [{"n":1}]
+
+-- ===== CHECK constraints =====
+
+create table w (a integer primary key, b integer null, check ((select new.b from u) > 0));
+insert into w values (1, 5), (2, -5);
+-- error: CHECK constraint failed
+select count(*) as n from w;
+→ [{"n":0}]
+insert into w values (1, 5), (2, 7);
+select a, b from w order by a;
+→ [{"a":1,"b":5},{"a":2,"b":7}]
+drop table w;
+
+create table w2 (a integer primary key, b integer null, check ((with c as (select new.b as x from u) select max(x) from c) > 0));
+insert into w2 values (1, 5), (2, -5);
+-- error: CHECK constraint failed
+select count(*) as n from w2;
+→ [{"n":0}]
+drop table w2;
+
+drop table t;
+drop table u;

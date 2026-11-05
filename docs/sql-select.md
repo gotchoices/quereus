@@ -839,7 +839,7 @@ select ... from cte_name ...
 **Options:**
 - `recursive`: Enables recursive processing for the CTE
 - `column_name_list`: Optional explicit column names for the CTE  
-- `materialized` / `not materialized`: Hints for optimization - by default, results are cached if accessed more than once
+- `materialized` / `not materialized`: Hints for optimization - by default, results are cached if accessed more than once. A CTE that reads a column of an outer query is an exception; see [Optimization and Performance](#373-optimization-and-performance)
 
 **Visibility between CTEs:**
 
@@ -1092,13 +1092,21 @@ order by start_node, end_node, length(path);
 #### 3.7.3 Optimization and Performance
 
 **Materialization Hints:**
-While parsed, materialization hints are not currently enforced but may influence future optimizations:
+`materialized` stores the CTE's rows once per statement execution and every reference reads them. `not materialized` runs the body once per reference. Without a hint, a CTE referenced two or more times is stored and one referenced once is not:
 ```sql
 with recursive 
   large_cte as materialized (select ...),
   small_cte as not materialized (select ...)
 select ...
 ```
+
+A stored result lasts for the whole statement, so a CTE inside a subquery that reads a column of an outer query cannot be stored:
+
+| CTE that reads an outer column, and would be stored | Behavior |
+|---|---|
+| Deterministic and read-only | Runs once per reference, even when hinted `materialized`; results are the same as sharing |
+| Non-deterministic, or writes data | Error at planning; write `not materialized` to run it once per reference |
+| Recursive, referenced two or more times | Error at planning |
 
 **Recursion Limits:**
 Use the `option` clause to control maximum recursion depth:

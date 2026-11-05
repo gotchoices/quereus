@@ -63,6 +63,12 @@ export function readsColumnsOf(reader: RelationalPlanNode, producer: RelationalP
 /**
  * Recursively collect all attributes defined by relational nodes within a subtree.
  *
+ * Every relational node's output attributes count as defined, which is sound only
+ * because a `ProjectNode`'s output never carries an outer column's id: it keeps
+ * a plain column's id only when its source publishes that id, and mints a fresh one
+ * otherwise. Nodes above a projection republish what it outputs, so an outer id
+ * reaching this set would hide the correlation from every caller.
+ *
  * `seen` dedupes node visits within one top-level call. A relational node reaches
  * its inputs through BOTH `getChildren()` and `getRelations()` — for a join those
  * two lists overlap completely — so an undeduped walk visits each input twice per

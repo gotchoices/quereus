@@ -105,6 +105,12 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
       }
 
       // If this projection is a simple column reference, preserve its attribute ID
+      // NOTE: unlike ProjectNode, this does not check the id against the executor's
+      // attributes, because these columns read the write's old and new row, which the
+      // executor may not publish. A correlated `(insert ... returning t.b)` keeps the
+      // outer id and reads as uncorrelated, which matches the run-once contract of a
+      // writing subquery in emitScalarSubquery. If RETURNING ever becomes re-runnable
+      // per outer row, this needs the same check.
       if (proj.node instanceof ColumnReferenceNode) {
         return {
           id: proj.node.attributeId,

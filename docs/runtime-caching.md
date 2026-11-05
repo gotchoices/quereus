@@ -118,10 +118,11 @@ pair).
 
 A non-recursive CTE referenced more than once (or hinted `MATERIALIZED`) is
 marked `materialize` by the optimizer's materialization-advisory pass (see
-`docs/optimizer.md` § Materialization Advisory); a CTE with a **data-modifying
-body** is marked at build time instead (see below). `emitCTE`
-(`src/runtime/emit/cte.ts`) then evaluates the CTE **exactly once per statement
-execution**, matching standard SQL `MATERIALIZED` semantics:
+`docs/optimizer.md` § Materialization Advisory), unless its body reads an outer
+query's row (see below); a CTE with a **data-modifying body** is marked at build
+time instead (also below). `emitCTE` (`src/runtime/emit/cte.ts`) then evaluates a
+marked CTE **exactly once per statement execution**, matching standard SQL
+`MATERIALIZED` semantics:
 
 - Every `CTEReferenceNode` emits its own copy of the CTE's source subtree
   (`emitPlanNode` has no memoization). References usually share one `CTENode`
@@ -143,9 +144,27 @@ execution**, matching standard SQL `MATERIALIZED` semantics:
 - Per-execution lifetime gives the same staleness guarantee as `cacheStates`:
   a re-executed prepared statement re-materializes and observes current data.
 
-Un-marked CTEs (single reference without a `MATERIALIZED` hint, or an explicit
-`NOT MATERIALIZED`) keep the pure streaming path — early exit such as `LIMIT`
-never drains the source.
+Un-marked CTEs (single reference without a `MATERIALIZED` hint, an explicit
+`NOT MATERIALIZED`, or a deterministic read-only body that reads an outer query's
+row) keep the pure streaming path — early exit such as `LIMIT` never drains the
+source.
+
+**A body that reads an outer query's row is never stored.** The buffer lasts for
+the whole statement, so inside a correlated subquery it would replay the first
+outer row's values for every later row. When two-plus references or a
+`MATERIALIZED` hint would store such a body, the advisory decides by whether
+re-running it can change the result:
+
+- **Deterministic and read-only:** not stored, even when hinted `MATERIALIZED`.
+  Each reference re-runs the body, which gives the same results as sharing, so the
+  hint only asked for a performance benefit.
+- **Non-deterministic or writing:** refused at planning with `StatusCode.UNSUPPORTED`
+  and an error naming the CTE. Re-running would give two references different
+  values, and sharing would freeze the first row.
+
+`NOT MATERIALIZED` is honored in both cases, because it asks for per-reference runs.
+A body that does not read the outer row keeps its one buffer, even when the subquery
+around it is correlated.
 
 **Data-modifying CTEs are always buffered.** A CTE whose body is an `INSERT` /
 `UPDATE` / `DELETE` (`with c as (insert into t … returning …) select …`) is
@@ -248,4 +267,9 @@ not `emitCTE`, but follow the same buffer-once-replay pattern when referenced
   descriptor) and additionally forbids caching anything inside a recursive-case
   subtree — a `CacheNode` there would freeze the semi-naïve delta to the first
   iteration's rows. See `docs/optimizer.md` § Materialization Advisory.
+- A multi-referenced recursive CTE whose body **reads an outer query's row** is
+  refused at planning with `StatusCode.UNSUPPORTED` and an error naming the CTE.
+  Sharing replays the first outer row, and not sharing brings back the runaway
+  above. Two mentions under one `WITH` alias can share one `CTEReferenceNode`; that
+  counts as one reference, so that shape streams and is not refused.
 
