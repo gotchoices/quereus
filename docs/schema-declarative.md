@@ -180,6 +180,8 @@ An assertion that reaches an object going away for good is not dropped first and
 - `diff schema` output run by hand is refused at the `DROP VIEW`, because the exception exists only inside `apply schema`. The refusal names the CHECK, which is the way forward: drop it around the view.
 - An assertion in another schema is not in the catalog the differ sees, so it is not dropped first and refuses the drop.
 - A view removed together with the rule that reads it is refused, because view drops run before `DROP CONSTRAINT` (`bug-apply-schema-refuses-view-removed-with-its-check`).
+- A view moved off a table the plan removes is refused at the `DROP TABLE` when a CHECK reaches that view, because table drops run before view drops and the old body still reaches the table (same ticket). Nothing is lost: the refusal comes before the table is touched.
+- A stored generated column that reads the view keeps the values it already computed from the old body; the apply does not recompute them.
 - A view whose rule also reads a NOT NULL mutation-context variable cannot be redefined. The scan has no context to supply, so it refuses as `ADD CONSTRAINT` does, with that command's wording. The same is true by hand.
 
 ## Yielding during an apply

@@ -804,25 +804,21 @@ async function runStepsWithUndoJournal(
 ): Promise<StepsOutcome> {
 	const journal: Array<readonly string[]> = [];
 	let poisonedBy: MigrationStep | undefined;
+	const failed = async (error: QuereusError, failing?: MigrationStep): Promise<StepsOutcome> => {
+		const notRestored = poisonedBy !== undefined
+			? describeIrreversible(poisonedBy, failing)
+			: await unwindJournal(db, schemaName, journal, preApplyFingerprint, pace);
+		return { clean: false, failure: { error, notRestored } };
+	};
 	for (const step of migrationStatements) {
 		if (poisonedBy === undefined && step.undo === undefined) poisonedBy = step;
 		const error = await executeMigrationStep(db, step);
-		if (error) {
-			const notRestored = poisonedBy !== undefined
-				? describeIrreversible(poisonedBy, step)
-				: await unwindJournal(db, schemaName, journal, preApplyFingerprint, pace);
-			return { clean: false, failure: { error, notRestored } };
-		}
+		if (error) return failed(error, step);
 		if (poisonedBy === undefined && step.undo !== undefined && step.undo.length > 0) journal.push(step.undo);
 		await pace();
 	}
 	const error = await revalidateChecksOverRecreatedObjects(db, schemaName, pace);
-	if (error) {
-		const notRestored = poisonedBy !== undefined
-			? describeIrreversible(poisonedBy)
-			: await unwindJournal(db, schemaName, journal, preApplyFingerprint, pace);
-		return { clean: false, failure: { error, notRestored } };
-	}
+	if (error) return failed(error);
 	return { clean: true, journal, poisonedBy };
 }
 
@@ -834,6 +830,11 @@ async function runStepsWithUndoJournal(
  * NOTE: a DEFAULT, a generated column and a CHECK that is not a row invariant get no check, as a
  * hand redefinition gets none, so a new view that lost a column they read surfaces on the next
  * write that uses them. If that proves too late, plan those expressions here without scanning.
+ *
+ * NOTE: a row staged earlier in the same transaction stays queued with its CHECK compiled against
+ * the old view, so its commit judges the old view even when this scan passed it under the new
+ * one. A hand redefinition does the same, and the result is a refusal, never a bad row accepted.
+ * If that ever bites, recompile queued deferred CHECKs when what they read is recreated.
  */
 async function revalidateChecksOverRecreatedObjects(db: Database, schemaName: string, pace: EventLoopPacer): Promise<QuereusError | undefined> {
 	const recreated = db._getSchemaRecreatedObjects();

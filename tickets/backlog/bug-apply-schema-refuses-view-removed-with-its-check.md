@@ -20,6 +20,14 @@ From `table T (Id integer primary key, N integer); view V1 as select sum(N) as S
 | `V1` removed, `pc` changed to `check (U <= 5)` | the same drop first, then `DROP CONSTRAINT pc`, then `ADD constraint pc check (U <= 5)` | the same refusal |
 | a view renamed with a `quereus.previous_name` hint, and `pc` changed to read the new name | `DROP VIEW IF EXISTS V9old`, `DROP CONSTRAINT pc`, `create view V9 ...`, `ADD constraint pc ...` | the same refusal, naming `V9old` |
 
+A related shape was found while reviewing `bug-apply-schema-redefine-view-a-rule-reads`, also run on the memory module. It is the same class, a drop judged against what the catalog says mid-plan rather than against the declared end state, but a different pair of steps:
+
+| new declaration | plan | result |
+|---|---|---|
+| `T` removed, `V1` changed to read a kept table `T2`, CHECK kept | `DROP TABLE IF EXISTS t`, `DROP VIEW IF EXISTS V1`, `create view V1 ...` | `cannot drop table 'main.t': CHECK constraint 'pc' on table 'P' reaches it through view 'V1'`, with the rows of `T` intact |
+
+Without the CHECK the same declaration applies. Do not fix this by simply running view drops first. That order is what refuses a declaration whose new `V1` still reads the removed `T`: with the view gone first, the `DROP TABLE` would pass the guard and destroy the rows, and the plan would fail only afterwards, at the check of existing rows.
+
 ## Expected behavior
 
 The declaration applies, because once the plan has finished no rule reads the removed view. A declaration that removes the view and keeps the rule must still be refused.
