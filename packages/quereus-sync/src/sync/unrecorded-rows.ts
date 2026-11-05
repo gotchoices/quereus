@@ -269,7 +269,7 @@ function insertEvent(table: TableSchema, pk: SqlValue[], row: Row): DatabaseData
  * The `create` events to record with the first fact of a table whose migrations never
  * brought it into existence, and how to record them. The coordinator keeps no table
  * definitions, so a cell for a table nobody announced is quarantined by another device
- * and aborts a new device's snapshot (docs/sync.md § Unknown-Table Disposition).
+ * and aborts a new device's snapshot (docs/sync-unknown-tables.md § Unknown-Table Disposition).
  */
 export interface TableAnnouncement {
 	/**

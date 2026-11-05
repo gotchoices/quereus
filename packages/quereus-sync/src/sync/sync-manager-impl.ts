@@ -2134,7 +2134,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * outside the delivery guarantee.
 	 *
 	 * NOTE: unlike {@link pruneTombstones} this does NOT raise the delta floor.
-	 * Held forwardable changes are not in snapshots either (docs/sync.md §
+	 * Held forwardable changes are not in snapshots either (docs/sync-unknown-tables.md §
 	 * Snapshot carve-out), so refusing a delta here would force a snapshot that
 	 * lacks them just the same — the floor would cost a full copy and buy nothing.
 	 */

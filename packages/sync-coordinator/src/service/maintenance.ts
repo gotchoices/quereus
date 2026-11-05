@@ -1,7 +1,7 @@
 /**
  * Periodic sync-maintenance loop for the coordinator.
  *
- * `@quereus/sync` schedules nothing — the host owns cadence (`docs/sync.md`
+ * `@quereus/sync` schedules nothing — the host owns cadence (`docs/sync-unknown-tables.md`
  * § Who drives the sweep). The per-store pass shape (sweep order, per-sweep
  * error isolation) lives in the library as `runSyncMaintenancePass`; what is
  * coordinator-specific and therefore lives here is the multi-tenant fan-out:

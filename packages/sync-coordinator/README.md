@@ -77,7 +77,7 @@ Configuration sources (highest priority first):
 The coordinator sweeps every database it currently has open once an hour, dropping
 deletion markers and quarantined changes older than `SYNC_RETENTION_HORIZON_MS`. Only
 already-open databases are swept — a database nobody is connected to keeps its expired
-records until a client next opens it. See `docs/sync.md` § *Who drives the sweep*.
+records until a client next opens it. See `docs/sync-unknown-tables.md` § *Who drives the sweep*.
 
 A client that has been offline for longer than the retention horizon is refused incremental
 sync (`snapshot_required` over WebSocket, `409 SNAPSHOT_REQUIRED` over HTTP) and takes a

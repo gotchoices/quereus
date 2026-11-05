@@ -7,7 +7,7 @@
  * relays the held-and-marked change to peers that still have it, by folding
  * forwardable changes into the existing `getChangesSince` → `ChangeSet[]` return
  * (NO new transport surface). See `sync-store-and-forward-relay` ticket § Edge
- * cases & interactions and `docs/sync.md` § Store-and-forward relay.
+ * cases & interactions and `docs/sync-unknown-tables.md` § Store-and-forward relay.
  *
  * The load-bearing identity: a forwarded change keeps its ORIGINAL `hlc` + `siteId`
  * (the straggler's fact), which is what makes the relay loop-free and convergent

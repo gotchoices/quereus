@@ -182,7 +182,7 @@ interface ApplyResult {
   skipped: number;      // Already present (LWW no-op)
   conflicts: number;    // Conflicts resolved (remote won or lost)
   transactions: number; // Transactions processed
-  unknownTable?: number; // Diverted for out-of-basis tables (§ Unknown-Table Disposition)
+  unknownTable?: number; // Diverted for out-of-basis tables (sync-unknown-tables.md § Unknown-Table Disposition)
 }
 
 interface Snapshot {

@@ -4,7 +4,7 @@
  * `@quereus/sync` is deliberately timer-free: it exposes the five host-driven
  * sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones` /
  * `repairChangeLog` / `evictExpiredBasisTables`) but never schedules them — the host owns cadence
- * (`docs/sync.md` § Who drives the sweep, `docs/migration.md` § 4 Contract).
+ * (`docs/sync-unknown-tables.md` § Who drives the sweep, `docs/migration.md` § 4 Contract).
  * What lives here is only the *shape* of one pass — ordering, error isolation,
  * single-flight — with no timer and no `SyncManager` import, so every host
  * (browser worker, relay coordinator, native app) runs the same semantics

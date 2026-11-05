@@ -66,6 +66,7 @@
 		"docs/sync-protocol.md": "Experimental",
 		"docs/sync-schema.md": "Experimental",
 		"docs/sync-transactions.md": "Experimental",
+		"docs/sync-unknown-tables.md": "Experimental",
 		"docs/sync.md": "Experimental",
 		"docs/types-inference.md": "Stable",
 		"docs/types-ordering.md": "Stable",

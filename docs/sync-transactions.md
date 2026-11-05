@@ -210,7 +210,7 @@ contiguous and in `opSeq` order.
 A transaction this replica wrote, or received in one apply, is one group and one
 `ChangeSet`. A transaction whose facts were filed in two ticks is two: part of it was
 applied and the rest held for a table the replica lacked and replayed later
-([sync.md § Store-and-forward relay](sync.md#store-and-forward-relay)), or two pushes each
+([sync-unknown-tables.md § Store-and-forward relay](sync-unknown-tables.md#store-and-forward-relay)), or two pushes each
 carried part of it. One set with one cursor could not serve both parts, because a reply
 cut between them would move the reader past facts it was never sent. The two sets share a
 `transactionId`. Applying is unaffected: `applyChanges` works on the facts, in any order.
@@ -253,7 +253,7 @@ scan starts after `sinceHLC` in the change log, which is safe because a position
 below its fact's HLC; the HLC test is still needed per fact, because a replica restored
 from a snapshot holds its own earlier facts at the sender's positions, which stay above
 its sent watermark, and would otherwise push them on every handshake. Held
-store-and-forward changes are still offered ([sync.md § Store-and-forward relay](sync.md#store-and-forward-relay)). The origin check
+store-and-forward changes are still offered ([sync-unknown-tables.md § Store-and-forward relay](sync-unknown-tables.md#store-and-forward-relay)). The origin check
 runs before the batch counter, so a run of other devices' entries spends no budget and an
 empty read means nothing is left. With no watermark it scans the change log rather than
 `cv:`/`tb:`, so the same early exit applies and a device that writes nothing is not
@@ -317,7 +317,7 @@ always above the floor and the catch-up that follows a snapshot is never refused
 `max(own, sender's)` in the same batch as its metadata clear — a replica rebuilt from a snapshot (the
 coordinator's S3 restore after disk eviction, say) inherits the sender's incompleteness
 rather than silently resetting to "can serve anything". `pruneQuarantine` does **not**
-raise it: held forwardable changes are not in snapshots either ([sync.md § Store-and-forward relay](sync.md#store-and-forward-relay)),
+raise it: held forwardable changes are not in snapshots either ([sync-unknown-tables.md § Store-and-forward relay](sync-unknown-tables.md#store-and-forward-relay)),
 so refusing a delta there would force a snapshot that lacks them just the same. The
 coordinator consults the floor before serving `get_changes` and answers
 `snapshot_required` below it; see [sync-protocol.md § Client snapshot
