@@ -500,3 +500,15 @@ UPDATE ord SET n = 8 WHERE pk = 3;
 SELECT pk, n FROM ord WHERE k IN (SELECT k FROM ordk) ORDER BY n;
 → [{"pk":2,"n":null},{"pk":6,"n":0},{"pk":4,"n":2},{"pk":1,"n":3},{"pk":3,"n":8}]
 ROLLBACK;
+
+-- A correlated LIMIT: the key-set node evaluates the limit itself to choose seek or walk,
+-- and must read the same outer row the LimitOffset above it does.
+create table lim_big (id integer primary key, v integer not null);
+create index idx_lim_big_v on lim_big(v);
+insert into lim_big select value, 2000 - value from generate_series(1, 2000);
+create table lim_keys (bid integer primary key);
+insert into lim_keys select value from generate_series(1, 2000) where value % 2 = 1;
+create table lim_outer (n integer primary key);
+insert into lim_outer values (1), (2);
+select o.n, (select id from (select id from lim_big b where b.id in (select bid from lim_keys) order by b.v limit o.n) x order by id limit 1) as r from lim_outer o order by o.n;
+→ [{"n":1,"r":1999},{"n":2,"r":1997}]

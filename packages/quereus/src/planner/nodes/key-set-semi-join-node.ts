@@ -1,5 +1,5 @@
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type RelationalPlanNode, type BinaryRelationalNode, type PhysicalProperties, type Attribute, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type BinaryRelationalNode, type PhysicalProperties, type Attribute, type ScalarPlanNode, isRelationalNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { StatusCode } from '../../common/types.js';
@@ -7,6 +7,7 @@ import { quereusError } from '../../common/errors.js';
 import { hashJoinCost } from '../cost/index.js';
 import { estimateJoinRows } from './join-utils.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
+import { formatExpression } from '../../util/plan-formatter.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode } from './table-access-nodes.js';
 import type { AccessPath } from '../../vtab/index-descriptor.js';
 
@@ -101,8 +102,8 @@ export function seekRestoresTargetOrder(
 
 /**
  * The module's costs behind a pushdown's break-even, as a straight line over the
- * seek's key count, so a rule that learns of a row bound can re-solve against them
- * without asking the module again.
+ * seek's key count, so the runtime can weigh a seek against a walk that a
+ * {@link KeySetRowBound} stops early without asking the module again.
  */
 export interface KeySetCostLine {
 	/** Module's cost for a two-key runtime-set seek. */
@@ -125,19 +126,35 @@ export interface KeySetPushdown {
 	readonly seekDescending: boolean;
 	/** Engine ceiling the module accepted. Above this the runtime scans instead. */
 	readonly maxKeys: number;
-	/** Seek iff the materialized distinct key count is ≤ this (module-cost break-even). */
+	/**
+	 * Seek only if the materialized distinct key count is ≤ this (module-cost
+	 * break-even). It compares both branches run to completion; a
+	 * {@link KeySetRowBound} can still turn a seek into a walk at runtime.
+	 */
 	readonly breakEvenKeys: number;
 	/** The costs `breakEvenKeys` was solved from. */
 	readonly costLine: KeySetCostLine;
 }
 
 /**
+ * The LIMIT and OFFSET of the `LimitOffset` above a node whose seek must sort. A walk
+ * stops once they are met and a sorting seek cannot, so the runtime weighs them against
+ * the key count it drained. The instances are shared with that `LimitOffset` and
+ * evaluated once by each, so `rule-key-set-seek-row-bound` admits only expressions that
+ * give the same value twice without re-reading a table.
+ */
+export interface KeySetRowBound {
+	readonly limit: ScalarPlanNode;
+	readonly offset?: ScalarPlanNode;
+}
+
+/**
  * Physical semi join that materializes the key-source side into a set once, then
  * streams the target and probes each row against the set — exactly what the hash
  * semi join arm it replaces does — and additionally, when the materialized distinct
- * key count is small enough (≤ min(maxKeys, breakEvenKeys)), rewrites the target
- * leaf's `FilterInfo` at runtime into an ordinary single-column `plan=5`
- * multi-seek so the storage backend reads only the matching rows.
+ * key count is small enough (≤ min(maxKeys, breakEvenKeys), and worth it against any
+ * `rowBound`), rewrites the target leaf's `FilterInfo` at runtime into an ordinary
+ * single-column `plan=5` multi-seek so the storage backend reads only the matching rows.
  *
  * The probe never goes away: pushdown only changes how many rows the target
  * emits. An over-fetching seek is trimmed by the probe; a skipped pushdown
@@ -159,6 +176,7 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		/** Join key attribute on the keySource side. */
 		public readonly keyAttrId: number,
 		public readonly pushdown: KeySetPushdown,
+		public readonly rowBound?: KeySetRowBound,
 	) {
 		// SeqScanNode only declares `estimatedRows` through RelationalPlanNode.
 		const targetRows = (target as RelationalPlanNode).estimatedRows ?? 100;
@@ -193,7 +211,10 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 	}
 
 	getChildren(): readonly PlanNode[] {
-		return [this.target, this.keySource];
+		const children: PlanNode[] = [this.target, this.keySource];
+		if (this.rowBound) children.push(this.rowBound.limit);
+		if (this.rowBound?.offset) children.push(this.rowBound.offset);
+		return children;
 	}
 
 	getRelations(): readonly [RelationalPlanNode, RelationalPlanNode] {
@@ -254,17 +275,19 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
-		if (newChildren.length !== 2) {
-			quereusError(`KeySetSemiJoinNode expects 2 children, got ${newChildren.length}`, StatusCode.INTERNAL);
+		const expectedLength = this.getChildren().length;
+		if (newChildren.length !== expectedLength) {
+			quereusError(`KeySetSemiJoinNode expects ${expectedLength} children, got ${newChildren.length}`, StatusCode.INTERNAL);
 		}
-		const [newTarget, newKeySource] = newChildren;
+		const [newTarget, newKeySource, newLimit, newOffset] = newChildren;
 		if (!(newTarget instanceof SeqScanNode) && !(newTarget instanceof IndexScanNode) && !(newTarget instanceof IndexSeekNode)) {
 			quereusError('KeySetSemiJoinNode: first child must be a SeqScanNode, IndexScanNode, or IndexSeekNode', StatusCode.INTERNAL);
 		}
 		if (!isRelationalNode(newKeySource)) {
 			quereusError('KeySetSemiJoinNode: second child must be a RelationalPlanNode', StatusCode.INTERNAL);
 		}
-		if (newTarget === this.target && newKeySource === this.keySource) {
+		if (newTarget === this.target && newKeySource === this.keySource
+			&& newLimit === this.rowBound?.limit && newOffset === this.rowBound?.offset) {
 			return this;
 		}
 		return new KeySetSemiJoinNode(
@@ -274,6 +297,7 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			this.targetAttrId,
 			this.keyAttrId,
 			this.pushdown,
+			this.rowBound && { limit: newLimit as ScalarPlanNode, offset: newOffset as ScalarPlanNode | undefined },
 		);
 	}
 
@@ -291,6 +315,8 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			breakEvenKeys: this.pushdown.breakEvenKeys,
 			preservesTargetOrder: seekPreservesTargetOrder(this.target, this.pushdown),
 			restoresTargetOrder: seekRestoresTargetOrder(this.target, this.pushdown),
+			rowBoundLimit: this.rowBound && formatExpression(this.rowBound.limit),
+			rowBoundOffset: this.rowBound?.offset && formatExpression(this.rowBound.offset),
 			targetRows: this.left.estimatedRows,
 			keySourceRows: this.keySource.estimatedRows,
 		};

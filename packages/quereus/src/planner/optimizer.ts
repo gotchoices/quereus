@@ -1086,8 +1086,8 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		sideEffectMode: 'safe',
 	},
 
-	// Lowers a key-set semi join's break-even when a literal LIMIT above it means the
-	// ordered walk can stop early. Anchored on LimitOffset, so it needs the join to be
+	// Hands a key-set semi join the LIMIT above it, so the runtime can weigh a seek against
+	// an ordered walk that stops early. Anchored on LimitOffset, so it needs the join to be
 	// a KeySetSemiJoin already: registered after the two entries above, though the
 	// pass being bottom-up is what guarantees it (a limit is visited after its source).
 	{
@@ -1096,7 +1096,9 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		nodeType: PlanNodeType.LimitOffset,
 		phase: 'impl',
 		fn: ruleKeySetSeekRowBound,
-		// Only changes a runtime threshold: the same rows come back in the same order.
+		// Only informs a runtime choice: the same rows come back in the same order, whatever
+		// the source writes. The limit's own expressions run a second time, so the rule
+		// itself declines any that write.
 		sideEffectMode: 'safe',
 	},
 

@@ -17,7 +17,7 @@ import type { TableSchema } from '../../src/schema/table.js';
 import type { MemoryTable } from '../../src/vtab/memory/table.js';
 import type { MemoryTableConfig } from '../../src/vtab/memory/types.js';
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
-import type { Row } from '../../src/common/types.js';
+import type { Row, SqlValue } from '../../src/common/types.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { isAbortError } from '../../src/common/errors.js';
@@ -179,12 +179,20 @@ describe('KeySetSemiJoin runtime', () => {
 			await db.close();
 		});
 
+		async function drainCounted(
+			stmt: Statement,
+			table = 'main.big',
+			params?: SqlValue[],
+		): Promise<{ rows: Record<string, unknown>[]; scanned: number }> {
+			const rows: Record<string, unknown>[] = [];
+			for await (const row of stmt.all(params)) rows.push(row);
+			return { rows, scanned: stmt.getWorkCounters()!.tables[table].rowsScanned };
+		}
+
 		async function runCounted(sql: string, table = 'main.big'): Promise<{ rows: Record<string, unknown>[]; scanned: number }> {
 			const stmt = db.prepare(sql);
 			try {
-				const rows: Record<string, unknown>[] = [];
-				for await (const row of stmt.all()) rows.push(row);
-				return { rows, scanned: stmt.getWorkCounters()!.tables[table].rowsScanned };
+				return await drainCounted(stmt, table);
 			} finally {
 				await stmt.finalize();
 			}
@@ -250,6 +258,11 @@ describe('KeySetSemiJoin runtime', () => {
 		}
 
 		describe('under a LIMIT', () => {
+			async function useThousandOddKeys(): Promise<void> {
+				await db.exec('delete from small');
+				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+			}
+
 			it('keeps seeking when the key set is small: 3 keys, limit 2', async () => {
 				const result = await runCounted(
 					'select id from big b where b.id in (select bid from small) order by b.v limit 2');
@@ -258,8 +271,7 @@ describe('KeySetSemiJoin runtime', () => {
 			});
 
 			it('walks when many keys make the first match close: 1000 keys, limit 1', async () => {
-				await db.exec('delete from small');
-				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				await useThousandOddKeys();
 				const result = await runCounted(
 					'select id from big b where b.id in (select bid from small) order by b.v limit 1');
 				expect(result.rows).to.deep.equal([{ id: 1999 }]);
@@ -267,12 +279,39 @@ describe('KeySetSemiJoin runtime', () => {
 			});
 
 			it('counts the OFFSET in the bound: 1000 keys, limit 1 offset 998', async () => {
-				await db.exec('delete from small');
-				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				await useThousandOddKeys();
 				const result = await runCounted(
 					'select id from big b where b.id in (select bid from small) order by b.v limit 1 offset 998');
 				expect(result.rows).to.deep.equal([{ id: 3 }]);
 				expect(result.scanned, 'a walk would read most of the table').to.equal(1000);
+			});
+
+			it('chooses per execution from the bound limit: one statement, limit ? = 1 then 5000', async () => {
+				await useThousandOddKeys();
+				const stmt = db.prepare('select id from big b where b.id in (select bid from small) order by b.v limit ?');
+				try {
+					const small = await drainCounted(stmt, 'main.big', [1]);
+					expect(small.rows).to.deep.equal([{ id: 1999 }]);
+					expect(small.scanned, 'a seek would read 1000').to.equal(2);
+
+					const large = await drainCounted(stmt, 'main.big', [5000]);
+					expect(large.rows).to.have.lengthOf(1000);
+					expect(large.scanned, 'a walk would read the whole table').to.equal(1000);
+				} finally {
+					await stmt.finalize();
+				}
+			});
+
+			it('counts a bound OFFSET in the bound: limit ? offset ? = 1, 998', async () => {
+				await useThousandOddKeys();
+				const stmt = db.prepare('select id from big b where b.id in (select bid from small) order by b.v limit ? offset ?');
+				try {
+					const result = await drainCounted(stmt, 'main.big', [1, 998]);
+					expect(result.rows).to.deep.equal([{ id: 3 }]);
+					expect(result.scanned, 'a walk would read most of the table').to.equal(1000);
+				} finally {
+					await stmt.finalize();
+				}
 			});
 
 			it('reaches through the is-not-null Filter of min over a nullable column', async () => {
@@ -282,8 +321,7 @@ describe('KeySetSemiJoin runtime', () => {
 				await db.exec('create table nb (id integer primary key, n integer null)');
 				await db.exec('create index nb_n on nb(n)');
 				await db.exec('insert into nb select value, case when value <= 3 then null else value end from generate_series(1, 2000)');
-				await db.exec('delete from small');
-				await db.exec('insert into small select value from generate_series(1, 2000) where value % 2 = 1');
+				await useThousandOddKeys();
 				await db.exec('analyze small');
 				const result = await runCounted('select min(n) as m from nb where id in (select bid from small)', 'main.nb');
 				expect(result.rows).to.deep.equal([{ m: 5 }]);

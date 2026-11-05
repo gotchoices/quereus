@@ -19,8 +19,11 @@ interface RowWindow {
  * rows, which is what `test/logic/94.1-limit-offset-edge-cases.sqllogic` and
  * `104-emit-mutation-kills.sqllogic` pin today. Whether `limit null` should instead mean
  * "no limit" is open — `backlog/bug-null-limit-returns-no-rows`.
+ *
+ * Shared with `KeySetSemiJoin`, which weighs the same window, so both agree on what a
+ * limit value means.
  */
-async function resolveWindow(
+export async function resolveWindow(
 	ctx: RuntimeContext,
 	limitFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,
 	offsetFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,

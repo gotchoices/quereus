@@ -1,10 +1,11 @@
-import { seekRestoresTargetOrder, type KeySetSemiJoinNode, type KeySetPushdown } from '../../planner/nodes/key-set-semi-join-node.js';
+import { seekRestoresTargetOrder, type KeySetCostLine, type KeySetSemiJoinNode, type KeySetPushdown } from '../../planner/nodes/key-set-semi-join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
-import { emitPlanNode } from '../emitters.js';
+import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import { emitSeqScan } from './scan.js';
+import { resolveWindow } from './limit-offset.js';
 import type { EmissionContext } from '../emission-context.js';
-import type { Row, SqlValue } from '../../common/types.js';
+import type { MaybePromise, Row, SqlValue } from '../../common/types.js';
 import { StatusCode } from '../../common/types.js';
 import { QuereusError, throwIfAborted } from '../../common/errors.js';
 import { IndexConstraintOp } from '../../common/constants.js';
@@ -97,11 +98,37 @@ function buildOrderRestoringComparator(
 	};
 }
 
+type ScalarCallback = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
+
+/**
+ * Rows a walk delivers before the limit above it stops it, or undefined when it does
+ * not stop: a limit of zero or less opens this node only while a writing source is
+ * being drained.
+ */
+async function rowsBeforeWalkStops(
+	rctx: RuntimeContext,
+	limitFn: ScalarCallback,
+	offsetFn: ScalarCallback | undefined,
+): Promise<number | undefined> {
+	const { limit, offset } = await resolveWindow(rctx, limitFn, offsetFn);
+	return limit > 0 ? limit + offset : undefined;
+}
+
+/**
+ * With `rows` rows wanted and `keys` keys spread evenly, a walk stops after `rows / keys`
+ * of its whole cost, so a seek is worth it while
+ * `seekCost(keys) <= baselineCost * rows / keys`. Multiplied through by `keys` here.
+ */
+function seekBeatsStoppingWalk({ seekAt2, slope, baselineCost }: KeySetCostLine, keys: number, rows: number): boolean {
+	return (seekAt2 + slope * (keys - 2)) * keys <= baselineCost * rows;
+}
+
 /**
  * Emit a KeySetSemiJoin: drain the key source once into a set, decide
  * seek-vs-scan, then stream the target probing every row against the set. When a
  * seek would lose an order the plan relies on, its rows are buffered and sorted
- * first; the scan branch always streams.
+ * first; the scan branch always streams, so a limit above it can stop it early, which
+ * the decision weighs when the node carries a row bound.
  *
  * The probe is unconditional — the pushdown only changes how many rows the
  * target emits. The target leaf is emitted through `emitSeqScan`'s
@@ -167,6 +194,7 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 		rctx: RuntimeContext,
 		targetRows: AsyncIterable<Row>,
 		keyRows: AsyncIterable<Row>,
+		...boundFns: ScalarCallback[]
 	): AsyncIterable<Row> {
 		// === Drain the key source completely into the probe set. Per distinct
 		// probe string, keep the FIRST raw value seen as the seek value.
@@ -193,14 +221,20 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 			return;
 		}
 
-		const push = probe.size <= Math.min(plan.pushdown.maxKeys, plan.pushdown.breakEvenKeys);
+		const withinBreakEven = probe.size <= Math.min(plan.pushdown.maxKeys, plan.pushdown.breakEvenKeys);
+		const [limitFn, offsetFn] = boundFns;
+		const walkStopsAfter = withinBreakEven && limitFn
+			? await rowsBeforeWalkStops(rctx, limitFn, offsetFn)
+			: undefined;
+		const push = withinBreakEven
+			&& (walkStopsAfter === undefined || seekBeatsStoppingWalk(plan.pushdown.costLine, probe.size, walkStopsAfter));
 		let seekKeys: SqlValue[] | null = null;
 		if (push) {
 			seekKeys = [...seekByProbe.values()]
 				.sort((a, b) => seekSign * compareSqlValuesFast(a, b, seekCollation));
 		}
-		log('Key set drained: %d distinct keys, %s (breakEven=%d, max=%d)',
-			probe.size, push ? 'seeking' : 'scanning', plan.pushdown.breakEvenKeys, plan.pushdown.maxKeys);
+		log('Key set drained: %d distinct keys, %s (breakEven=%d, max=%d, walkStopsAfter=%s)',
+			probe.size, push ? 'seeking' : 'scanning', plan.pushdown.breakEvenKeys, plan.pushdown.maxKeys, walkStopsAfter ?? 'none');
 
 		stateByCtx.set(rctx, { probe, seekKeys });
 		try {
@@ -218,8 +252,12 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 		}
 	}
 
+	const params: Instruction[] = [targetInstruction, keySourceInstruction];
+	if (plan.rowBound) params.push(emitCallFromPlan(plan.rowBound.limit, ctx));
+	if (plan.rowBound?.offset) params.push(emitCallFromPlan(plan.rowBound.offset, ctx));
+
 	return {
-		params: [targetInstruction, keySourceInstruction],
+		params,
 		run: asRun(run),
 		note: `key-set semi join (${plan.pushdown.indexName})`,
 	};
