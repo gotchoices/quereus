@@ -104,3 +104,13 @@ Regression spec, new file `packages/quereus/test/core/watch-handler-reentrant.sp
 - A handler awaiting a write on another table settles, including when that table has its own async watcher.
 - A sync handler still runs before a statement already queued behind the writer.
 - The writer's promise resolves only after its own async handler has finished.
+
+## Decided by the maintainer 2026-11-05
+
+The proposed semantics above are accepted as written. The handoff must carry a release-note callout, because hosts outside this repository were not inspected: after its first `await`, an async handler no longer runs ahead of later statements, and it can overlap other handlers and itself.
+
+## TODO
+
+- Implement the proposed semantics, following the implementation notes above
+- Replace the handler section in `docs/change-scope.md`, and update `docs/usage.md` and the header of `database-watchers.ts`
+- Add the regression spec named above
