@@ -30,3 +30,5 @@ The query queues for the mutex, the commit waits for the handler, and the mutex 
 A connection's `commit()` that awaits a statement has the same hang, but that one is inherent to a commit being serialized and is covered by documentation. Handlers differ because they run after the connections have committed, so they do not need to run under the mutex for the commit to be correct.
 
 No `db.watch` call site in this repository passes an inline async handler, so this has not been hit here; it would hit a host application.
+
+The maintainer decided on 2026-11-04 to ship v4.26.0 with this as a known issue and fix it next. If the fix has to weaken the ordering handlers get today, route that choice to `blocked/` with a proposal.

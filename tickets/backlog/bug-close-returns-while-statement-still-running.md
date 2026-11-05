@@ -21,3 +21,5 @@ tradeoffs: The likely trigger is shutting down during other work, the closed-dat
 **Expected:** when `close()` resolves, nothing is still running against the database, and an open iterator reports that the database closed.
 
 **Why this is not simply "take the mutex in close":** an unconsumed `eval` iterator holds the mutex for as long as it stays open, so a caller that abandoned one would hang `close()` forever, where today it returns. Committed reads accept that delay, as the comment in `close()` says, but they can be aborted and serialized iterators currently have no such signal. A fix has to abort or otherwise release those iterators, and must not deadlock when `close()` is called from inside a statement, such as from a module hook.
+
+Another arm, found while asking why no test caught GitHub issue #38: `close()` calls `disconnect()` on a connection while its `commit()` is still awaiting. The write still succeeded on memory, and the effect on other modules is untested.

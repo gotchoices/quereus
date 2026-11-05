@@ -63,3 +63,7 @@ The current error stays. It is wrong about the cause ("column not found" for a d
 ## Reversibility
 
 The recommended rule rejects the NOT NULL case. A later decision to accept it turns an error into acceptance and changes no program that already works. Choosing "skip validation" first and then tightening would reject schemas that are already deployed.
+
+## Decided by the maintainer 2026-11-04
+
+The proposed rule above is accepted as written, including passing the shadow-name set to these scopes. Allowing `with context` on `alter` is a separate follow-up, `feat-alter-accepts-with-context`, and stays out of this ticket.
