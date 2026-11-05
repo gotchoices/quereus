@@ -526,7 +526,9 @@ function storedRowSourceSql(tableSchema: TableSchema, contextVariables: OwnRowCo
  * passes — it trusts the very thing it is testing. Callers must scan while the
  * live record does NOT declare the constraints under validation: the ALTER
  * paths run this before the catalog swap, the maintained-table path swaps in a
- * constraint-stripped record first.
+ * constraint-stripped record first. The one caller that scans a declared CHECK is
+ * `apply schema`'s re-validation over a recreated object, whose CHECKs read a subquery the
+ * optimizer never lifts (see `rejectCheckViolatedByExistingRows`).
  */
 export async function validateChecksOverExistingRows(
 	db: Database,

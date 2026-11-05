@@ -3,6 +3,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { findTableExpressionDependent, describeDependentTable, type ExpressionDependent } from '../../schema/expression-dependents.js';
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
+import { objectRefKey } from '../../schema/rename-rewriter.js';
 import type { DroppableObjectKind } from './assertion-drop-guard.js';
 
 /**
@@ -41,11 +42,11 @@ import type { DroppableObjectKind } from './assertion-drop-guard.js';
  * dropped by rebuilding the referencing table. The message quotes such a constraint's
  * expression so the user can at least see what is in the way.
  *
- * Called from the user-facing DDL emitters only (`emitDropTable`, `emitDropView`,
+ * Called from the DDL emitters only (`emitDropTable`, `emitDropView`,
  * `emitDropMaterializedView`) — never from `SchemaManager.dropTable`, which also drives
- * rollback, catalog import and the declarative differ's drop/recreate. Same wiring, and
- * same reason, as {@link assertNoAssertionDependsOn}: a differ convergence that replaces
- * both `t` and `x` must not be vetoed.
+ * rollback and catalog import, and those must not be vetoed. Same wiring, and same reason, as
+ * {@link assertNoAssertionDependsOn}. A declarative plan's drops DO run through these emitters,
+ * so this guard judges them like any other drop, with the one exception below.
  *
  * Not gated on `IF EXISTS`: that clause governs ABSENCE, not dependency. Callers already
  * skip the guard when the object does not exist, since there is then nothing to protect.
@@ -61,6 +62,13 @@ import type { DroppableObjectKind } from './assertion-drop-guard.js';
  * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`). That
  * drop is not a user's: it returns to the pre-apply catalog, where the referring table either
  * does not exist yet or was already dangling.
+ *
+ * Also passes a forward `apply schema` drop of an object the same plan creates again under the
+ * same name (`Database._setSchemaRecreatedObjects`): the reference is only broken until the
+ * create runs, and no statement in a plan writes rows before then. The refusal this guard exists
+ * for is not lost, because `runStepsWithUndoJournal` checks every CHECK reaching that object once
+ * the plan's steps have run. A declaration that removes the object and keeps the rule is still
+ * refused here, since a removed object is not in that set.
  */
 export function assertNoExpressionDependsOn(
 	db: Database,
@@ -69,6 +77,7 @@ export function assertNoExpressionDependsOn(
 	objectKind: DroppableObjectKind,
 ): void {
 	if (db._isSchemaUnwinding()) return;
+	if (db._getSchemaRecreatedObjects().has(objectRefKey(schemaName, objectName))) return;
 	const dependent = findTableExpressionDependent(db, schemaName, objectName);
 	if (!dependent) return;
 	// The catalog's spelling of the schema rather than the caller's: DROP emitters pass the

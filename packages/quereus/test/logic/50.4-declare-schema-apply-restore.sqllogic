@@ -731,3 +731,353 @@ drop table p2;
 drop table p;
 drop table o;
 drop table t;
+
+-- ===================================
+-- 12. A view a CHECK reads can be redefined: the guard on its drop lets it through because the
+-- plan creates it again, and the CHECK is then judged against the existing rows
+-- ===================================
+
+create table r_t (id integer primary key, n integer);
+insert into r_t values (1, 10);
+create view r_v as select sum(n) as s from r_t;
+create table r_p (id integer primary key, u integer, check (u <= (select s from r_v)));
+insert into r_p values (1, 5);
+
+declare schema main {
+	table r_t { id integer primary key, n integer }
+	view r_v as select sum(n) + 1 as s from r_t
+	table r_p { id integer primary key, u integer, check (u <= (select s from r_v)) }
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+-- The CHECK reads the new view: 11 fits only under its new sum.
+insert into r_p values (2, 11);
+insert into r_p values (3, 12);
+-- error: CHECK constraint failed
+
+select id from r_p order by id;
+→ [{"id": 1}, {"id": 2}]
+
+-- The table can be altered in the same plan, in the stretch where the view is gone.
+declare schema main {
+	table r_t { id integer primary key, n integer }
+	view r_v as select sum(n) + 2 as s from r_t
+	table r_p { id integer primary key, u integer, w integer default 3, check (u <= (select s from r_v)) }
+	index r_p_u on r_p (u)
+}
+
+-- run
+
+apply schema main;
+
+select id, w from r_p order by id;
+→ [{"id": 1, "w": 3}, {"id": 2, "w": 3}]
+
+insert into r_p (id, u) values (3, 12);
+
+drop table r_p;
+drop view r_v;
+drop table r_t;
+
+-- ===================================
+-- 13. The same through a chain of views, where the CHECK's body does not name what changes
+-- ===================================
+
+create table c_t (id integer primary key, n integer);
+insert into c_t values (1, 10);
+create view c_v1 as select sum(n) as s from c_t;
+create view c_v2 as select s from c_v1;
+create view c_v3 as select s from c_v2;
+create table c_p (id integer primary key, u integer, constraint c_ck check (u <= (select s from c_v3)));
+insert into c_p values (1, 5);
+
+declare schema main {
+	table c_t { id integer primary key, n integer }
+	view c_v1 as select sum(n) + 1 as s from c_t
+	view c_v2 as select s from c_v1
+	view c_v3 as select s from c_v2
+	table c_p { id integer primary key, u integer, constraint c_ck check (u <= (select s from c_v3)) }
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+insert into c_p values (2, 11);
+insert into c_p values (3, 12);
+-- error: CHECK constraint failed
+
+-- ===================================
+-- 14. A view removed while a CHECK still reaches it stays refused, directly or mid-chain
+-- ===================================
+
+declare schema main {
+	table c_t { id integer primary key, n integer }
+	view c_v1 as select sum(n) + 1 as s from c_t
+	view c_v3 as select s from c_v2
+	table c_p { id integer primary key, u integer, constraint c_ck check (u <= (select s from c_v3)) }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop view 'main.c_v2': CHECK constraint 'c_ck' on table 'c_p' reaches it through view 'c_v3'
+
+select s from c_v3;
+→ [{"s": 11}]
+
+declare schema main {
+	table c_t { id integer primary key, n integer }
+	view c_v1 as select sum(n) + 1 as s from c_t
+	view c_v2 as select s from c_v1
+	table c_p { id integer primary key, u integer, constraint c_ck check (u <= (select s from c_v3)) }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop view 'main.c_v3': it is referenced by CHECK constraint 'c_ck'
+
+select s from c_v3;
+→ [{"s": 11}]
+
+-- A hinted rename is a different name on each side, so nothing comes back under the name the CHECK reads.
+declare schema main {
+	table c_t { id integer primary key, n integer }
+	view c_v1 as select sum(n) + 1 as s from c_t
+	view c_v2 as select s from c_v1
+	view c_v4 as select s from c_v2 with tags ("quereus.previous_name" = 'c_v3')
+	table c_p { id integer primary key, u integer, constraint c_ck check (u <= (select s from c_v3)) }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop view 'main.c_v3': it is referenced by CHECK constraint 'c_ck'
+
+drop table c_p;
+drop view c_v3;
+drop view c_v2;
+drop view c_v1;
+drop table c_t;
+
+-- ===================================
+-- 15. A new view the existing rows violate fails the apply and brings the old view back. The
+-- CHECK's first conjunct is lifted by the optimizer as a fact about stored rows, and the scan
+-- must find the violator all the same
+-- ===================================
+
+create table v_t (id integer primary key, n integer);
+insert into v_t values (1, 10);
+create view v_v as select sum(n) as s from v_t;
+create table v_p (id integer primary key, u integer, constraint v_ck check (u > 0 and u <= (select s from v_v)));
+insert into v_p values (1, 5);
+
+declare schema main {
+	table v_t { id integer primary key, n integer }
+	view v_v as select sum(n) - 9 as s from v_t
+	table v_p { id integer primary key, u integer, constraint v_ck check (u > 0 and u <= (select s from v_v)) }
+}
+
+-- run
+
+apply schema main;
+-- error: CHECK constraint 'v_ck' on table 'v_p' reads recreated 'main.v_v' and fails: CHECK constraint failed: v_ck
+
+select s from v_v;
+→ [{"s": 10}]
+
+-- ===================================
+-- 16. A new view without the column the CHECK reads fails even with no rows to scan
+-- ===================================
+
+delete from v_p;
+
+declare schema main {
+	table v_t { id integer primary key, n integer }
+	view v_v as select sum(n) as renamed from v_t
+	table v_p { id integer primary key, u integer, constraint v_ck check (u > 0 and u <= (select s from v_v)) }
+}
+
+-- run
+
+apply schema main;
+-- error: Column not found: s
+
+select s from v_v;
+→ [{"s": 10}]
+
+-- ===================================
+-- 17. A CHECK that is not a row invariant owes the existing rows nothing, as with ADD CONSTRAINT
+-- ===================================
+
+alter table v_p drop constraint v_ck;
+alter table v_p add constraint v_ck check on insert (u <= (select s from v_v));
+
+declare schema main {
+	table v_t { id integer primary key, n integer }
+	view v_v as select sum(n) as renamed from v_t
+	table v_p { id integer primary key, u integer, constraint v_ck check on insert (u <= (select s from v_v)) }
+}
+
+-- run
+
+apply schema main;
+
+select renamed from v_v;
+→ [{"renamed": 10}]
+
+-- So it surfaces on the next write that uses it.
+insert into v_p values (1, 5);
+-- error: Column not found: s
+
+drop table v_p;
+
+-- A DEFAULT gets no check either, as with SET DEFAULT.
+create table v_d (id integer primary key, w integer default ((select renamed from v_v)));
+
+declare schema main {
+	table v_t { id integer primary key, n integer }
+	view v_v as select sum(n) as other from v_t
+	table v_d { id integer primary key, w integer default ((select renamed from v_v)) }
+}
+
+-- run
+
+apply schema main;
+
+insert into v_d (id) values (1);
+-- error: Column not found: renamed
+
+drop table v_d;
+drop view v_v;
+drop table v_t;
+
+-- ===================================
+-- 18. An assertion reading a redefined view through a chain is dropped and recreated around it,
+-- and that recreate plans its body against the new view
+-- ===================================
+
+create table a_t (id integer primary key, n integer);
+insert into a_t values (1, 10);
+create view a_v1 as select sum(n) as s from a_t;
+create view a_v2 as select s from a_v1;
+create assertion a_ck check (not exists (select 1 from a_v2 where s < 0));
+
+declare schema main {
+	table a_t { id integer primary key, n integer }
+	view a_v1 as select sum(n) + 1 as s from a_t
+	view a_v2 as select s from a_v1
+	assertion a_ck check (not exists (select 1 from a_v2 where s < 0))
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+select s from a_v2;
+→ [{"s": 11}]
+
+declare schema main {
+	table a_t { id integer primary key, n integer }
+	view a_v1 as select sum(n) as renamed from a_t
+	view a_v2 as select renamed as other from a_v1
+	assertion a_ck check (not exists (select 1 from a_v2 where s < 0))
+}
+
+-- run
+
+apply schema main;
+-- error: Cannot create assertion
+
+select s from a_v2;
+→ [{"s": 11}]
+
+-- A view going away with an assertion still reading it through a chain stays refused at its drop.
+declare schema main {
+	table a_t { id integer primary key, n integer }
+	view a_v2 as select s from a_v1
+	assertion a_ck check (not exists (select 1 from a_v2 where s < 0))
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop view 'main.a_v1': assertion 'a_ck' reaches it through view 'a_v2'
+
+select s from a_v2;
+→ [{"s": 11}]
+
+drop assertion a_ck;
+drop view a_v2;
+drop view a_v1;
+
+-- A table going away is refused the same way, with its rows intact: letting the assertion go
+-- first would fail at its recreate, after the drop had already destroyed them.
+create view a_v3 as select n from a_t;
+create assertion a_ck check (not exists (select 1 from a_v3 where n < 0));
+
+declare schema main {
+	view a_v3 as select n from a_t
+	assertion a_ck check (not exists (select 1 from a_v3 where n < 0))
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop table 'main.a_t': assertion 'a_ck' reaches it through view 'a_v3'
+
+select n from a_t;
+→ [{"n": 10}]
+
+drop assertion a_ck;
+drop view a_v3;
+
+-- ===================================
+-- 19. The same assertion rule through a maintained table: one that still reads the view after the
+-- plan, and one the plan moves off it, which the catalog says still reads it when the view drops
+-- ===================================
+
+create view m_v as select sum(n) as s from a_t;
+create materialized view m_kept as select s from m_v;
+create materialized view m_moved as select s from m_v;
+create assertion m_kept_ck check (not exists (select 1 from m_kept where s < 0));
+create assertion m_moved_ck check (not exists (select 1 from m_moved where s < 0));
+
+declare schema main {
+	table a_t { id integer primary key, n integer }
+	view m_v as select sum(n) + 1 as s from a_t
+	materialized view m_kept as select s from m_v
+	materialized view m_moved as select sum(n) as s from a_t
+	assertion m_kept_ck check (not exists (select 1 from m_kept where s < 0))
+	assertion m_moved_ck check (not exists (select 1 from m_moved where s < 0))
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+select s from m_v;
+→ [{"s": 11}]
+
+drop assertion m_moved_ck;
+drop assertion m_kept_ck;
+drop materialized view m_moved;
+drop materialized view m_kept;
+drop view m_v;
+drop table a_t;

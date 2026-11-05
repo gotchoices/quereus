@@ -569,6 +569,12 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			const maintainedTable = !isViewSchema(resolvedItem) && isMaintainedTable(resolvedItem) ? resolvedItem : undefined;
 
 			if (viewSchema) {
+				// The plan inlines this body, so redefining the view has to invalidate it. The
+				// body's tables record their own dependencies, and they are not what changed.
+				parentContext.schemaDependencies.recordDependency(
+					{ type: 'view_read', schemaName: viewSchema.schemaName, objectName: viewSchema.name },
+					viewSchema,
+				);
 				// Build the view's body. The body is a QueryExpr — today only
 				// SELECT and VALUES bodies plan; DML bodies are rejected at
 				// CREATE VIEW plan time so we never get here with one.

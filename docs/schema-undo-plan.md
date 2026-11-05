@@ -59,6 +59,8 @@ A restoring `SET TAGS` on a table whose module implements [`alterTags`](module-a
 - the row guard on `DROP TABLE` (`assertNoReferencingChildrenForDrop`);
 - every judgement of a re-added constraint: the engine's CHECK scan (`rejectCheckViolatedByExistingRows`), its foreign key collation and key-arity checks, and, through the `restoring` field on the `addConstraint` arm of `SchemaChangeInfo`, the module's UNIQUE and foreign key scans.
 
+This stand-down is not the forward exception described in [Redefining what a rule reads](schema-declarative.md#redefining-what-a-rule-reads). The two differ in what they judge. An unwind judges nothing, because it is returning to a state that already existed. A forward drop of an object the plan recreates passes only the expression guard, only for that object, and the CHECKs reaching it are judged against the rows once the plan's steps have run. A failure there unwinds through this same journal, under this same stand-down.
+
 The other `DROP COLUMN` validations stay on (primary key, last column, own generated column, partial index). These are structural to the altered table, cannot name a column the table does not yet have, and are undone in order.
 
 An `ADD CONSTRAINT` issued during an unwind makes no judgement about the constraint and still does everything that installs it, covering index included. Those checks protect a user adding a new rule. Here the constraint is one the table already had and the target is the pre-apply state, whether or not that state would pass a fresh check, so a refusal would leave the schema partially migrated for no benefit. A restored CHECK or foreign key over rows that break it is what the table had before the apply, including how the optimizer treats it.

@@ -689,7 +689,12 @@ re-resolves a name.
 Each `resolve*Schema(ctx, …)` call records what it resolved on
 `ctx.schemaDependencies`, keyed by type and object name (`'function'`, `'sum/1'`). A
 schema change emits an event (`table_added`, …), and every prepared statement holding
-a dependency on the affected object recompiles on its next execution.
+a dependency on the affected object recompiles on its next execution. Reading a view
+records a `'view_read'` dependency as well as those of its body's tables, because the
+plan inlines the body: dropping and recreating the view has to recompile it, including a
+write whose CHECK reads the view through a subquery. A tag change (`view_modified`) does
+not, since tags cannot change what a read returns. A write through the view records
+`'view'`, which a tag change does recompile, so the mutation tags are validated again.
 
 ## Attribute-Based Context System
 

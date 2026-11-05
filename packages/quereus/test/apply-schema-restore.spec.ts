@@ -377,6 +377,111 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		});
 	});
 
+	describe('redefining what a CHECK reads', () => {
+		const NEW_T = 'table T { Id INTEGER PRIMARY KEY, N INTEGER }';
+		const P_READING_V1 = 'table P { Id INTEGER PRIMARY KEY, U INTEGER, constraint pc check (U <= (select S from V1)) }';
+
+		async function startWithCheckOverView(): Promise<void> {
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('insert into T values (1, 10)');
+			await db.exec('create view V1 as select sum(N) as S from T');
+			await db.exec('create table P (Id integer primary key, U integer, constraint pc check (U <= (select S from V1)))');
+		}
+
+		it('a statement prepared before the apply enforces the new view', async () => {
+			await startWithCheckOverView();
+			const insert = db.prepare('insert into P values (?, ?)');
+			await insert.run([1, 5]);
+			await db.exec(`declare schema main { ${NEW_T} view V1 as select sum(N) + 1 as S from T ${P_READING_V1} }`);
+
+			await db.exec('apply schema main');
+
+			await insert.run([2, 11]);
+			expect((await rejection(insert.run([3, 12]))).message).to.match(/CHECK constraint failed: pc/);
+			await insert.finalize();
+		});
+
+		it('a CHECK that fails over the new view is named, with the scan\'s error as cause, and the old view is back', async () => {
+			await startWithCheckOverView();
+			await db.exec('insert into P values (1, 5)');
+			await db.exec(`declare schema main { ${NEW_T} view V1 as select sum(N) - 9 as S from T ${P_READING_V1} }`);
+			const before = fingerprint(db);
+
+			const err = await rejection(db.exec('apply schema main')) as QuereusError;
+
+			expect(err.message).to.equal(`apply schema 'main': CHECK constraint 'pc' on table 'P' reads recreated 'main.v1' and fails: CHECK constraint failed: pc — existing rows in 'P' violate the constraint`);
+			expect((err.cause as Error).message).to.match(/^CHECK constraint failed: pc/);
+			expect(fingerprint(db)).to.equal(before);
+			expect(await rows(db, 'select S from V1')).to.deep.equal([{ S: 10 }]);
+		});
+
+		it('judges a CHECK in another schema, which the differ never sees', async () => {
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('insert into T values (1, 10)');
+			await db.exec('create view V1 as select sum(N) as S from T');
+			await db.exec('declare schema s { table Q { Id INTEGER PRIMARY KEY, U INTEGER, constraint qc check (U <= (select S from main.V1)) } }');
+			await db.exec('apply schema s');
+			await db.exec('insert into s.Q values (1, 5)');
+			await db.exec(`declare schema main { ${NEW_T} view V1 as select sum(N) - 9 as S from T }`);
+
+			const err = await rejection(db.exec('apply schema main'));
+
+			expect(err.message).to.match(/CHECK constraint 'qc' on table 's\.Q' reads recreated 'main\.v1'/);
+			expect(await rows(db, 'select S from V1')).to.deep.equal([{ S: 10 }]);
+		});
+
+		it('reports the plan as not restorable when a table was dropped before the CHECK failed', async () => {
+			await startWithCheckOverView();
+			await db.exec('create table Old (Id integer primary key)');
+			await db.exec('insert into P values (1, 5)');
+			await db.exec(`declare schema main { ${NEW_T} view V1 as select sum(N) - 9 as S from T ${P_READING_V1} }`);
+
+			const err = await rejection(db.exec('apply schema main')) as QuereusError;
+
+			expect(err.message).to.match(/reads recreated 'main\.v1' and fails/);
+			expect(err.message).to.match(/partially migrated and could not be restored: the earlier step `DROP TABLE IF EXISTS old` cannot be undone/);
+		});
+
+		it('moves a maintained table a CHECK reads to another backing module', async () => {
+			db.registerModule('mem2', new MemoryTableModule());
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('insert into T values (1, 10)');
+			await db.exec('create materialized view m as select Id, N from T');
+			await db.exec('create table P (Id integer primary key, U integer, check (U <= (select max(N) from m)))');
+			await db.exec('insert into P values (1, 5)');
+			await db.exec(`declare schema main {
+				${NEW_T}
+				materialized view m using mem2() as select Id, N from T
+				table P { Id INTEGER PRIMARY KEY, U INTEGER, check (U <= (select max(N) from m)) }
+			}`);
+
+			await db.exec('apply schema main options (allow_destructive = true)');
+
+			expect(await planOf(db)).to.deep.equal([]);
+			expect(collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'm')!.maintained!.backingModuleName).to.equal('mem2');
+			expect((await rejection(db.exec('insert into P values (2, 11)'))).message).to.match(/CHECK constraint failed/);
+		});
+
+		// The drop runs under the new name, which the pre-apply catalog's view body does not spell.
+		it('keeps an assertion reading through a view a maintained table renamed and moved in the same plan', async () => {
+			db.registerModule('mem2', new MemoryTableModule());
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('create materialized view m as select Id, N from T');
+			await db.exec('create view V2 as select N from m');
+			await db.exec('create assertion a check (not exists (select 1 from V2 where N < 0))');
+			await db.exec(`declare schema main {
+				${NEW_T}
+				materialized view m2 using mem2() as select Id, N from T with tags ("quereus.previous_name" = 'm')
+				view V2 as select N from m2
+				assertion a check (not exists (select 1 from V2 where N < 0))
+			}`);
+
+			await db.exec('apply schema main options (allow_destructive = true)');
+
+			expect(await planOf(db)).to.deep.equal([]);
+		});
+	});
+
 	it('the failing step is the first step: the original error passes through untouched', async () => {
 		await db.exec(TABLE_T);
 		await db.exec("insert into t values (1, 'a')");

@@ -27,7 +27,12 @@ export interface DebugOptions {
  * Used for plan invalidation when schema changes.
  */
 export interface SchemaDependency {
-	readonly type: 'table' | 'view' | 'function' | 'vtab_module' | 'collation';
+	/**
+	 * `view` is a write through the view, which also depends on its tags. `view_read` is a plan
+	 * that inlined the view's body, which a drop and create has to recompile but a tag change
+	 * does not, since tags cannot change what a read returns.
+	 */
+	readonly type: 'table' | 'view' | 'view_read' | 'function' | 'vtab_module' | 'collation';
 	readonly schemaName?: string; // undefined for functions, collations, and vtab modules
 	readonly objectName: string;
 	readonly objectVersion?: number; // For future versioning support

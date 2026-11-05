@@ -1,4 +1,5 @@
 import type { AddConstraintNode } from '../../planner/nodes/add-constraint-node.js';
+import type { Database } from '../../core/database.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -104,7 +105,7 @@ async function runAddCheckEngineSide(
 
 	// Existing rows must already satisfy the CHECK — BEFORE `schema.addTable` below, for
 	// the reason spelled out on `rejectCheckViolatedByExistingRows`.
-	await rejectCheckViolatedByExistingRows(rctx, tableSchema, constraintSchema);
+	await rejectCheckViolatedByExistingRows(rctx.db, tableSchema, constraintSchema);
 
 	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
 	const updatedTableSchema: TableSchema = {
@@ -246,7 +247,7 @@ async function runAddConstraintViaModule(
 	// `rejectCheckViolatedByExistingRows`.
 	if (constraint.type === 'check') {
 		await rejectCheckViolatedByExistingRows(
-			rctx,
+			rctx.db,
 			tableSchema,
 			buildCheckConstraintSchema(constraint, tableSchema.checkConstraints.length, collectTableConstraintNames(tableSchema)),
 		);
@@ -310,14 +311,20 @@ async function runAddConstraintViaModule(
  * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`): the
  * CHECK is one the table already had, and the target is the pre-apply state whether or not
  * its rows, or the tables it reads, would pass a fresh check.
+ *
+ * `apply schema` also calls this, after a plan that recreated what a CHECK reads
+ * (`runStepsWithUndoJournal`), and there the CHECK is already declared. The "before it is
+ * declared" rule above does not bind that caller, because the fold it prevents needs the scan's
+ * predicate proved false from the declared facts. Such a CHECK reads a subquery, which is never
+ * lifted (`planner/analysis/check-extraction.ts`), so the conjunct reading it stays unproved.
  */
-async function rejectCheckViolatedByExistingRows(
-	rctx: RuntimeContext,
+export async function rejectCheckViolatedByExistingRows(
+	db: Database,
 	tableSchema: TableSchema,
 	check: RowConstraintSchema,
 ): Promise<void> {
-	if (rctx.db._isSchemaUnwinding()) return;
+	if (db._isSchemaUnwinding()) return;
 	const module = requireVtabModule(tableSchema);
 	if (module.getCapabilities?.().permitsGrandfatheredCheckViolators === true) return;
-	await validateRowInvariantChecksOverExistingRows(rctx.db, tableSchema, [check]);
+	await validateRowInvariantChecksOverExistingRows(db, tableSchema, [check]);
 }

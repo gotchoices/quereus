@@ -951,8 +951,8 @@ export function computeSchemaDiff(
 	// An unchanged assertion naming an object this same migration DROPS must still
 	// be dropped and recreated around it — otherwise the DROP is refused by the
 	// runtime guard (`assertNoAssertionDependsOn`) and the migration dies. The live
-	// case is a maintained table whose backing module changed: it emits
-	// `DROP TABLE IF EXISTS x` plus a recreate of `x`, so the assertion's target
+	// cases are a redefined view and a maintained table whose backing module changed:
+	// each emits a drop plus a recreate under the same name, so the assertion's target
 	// comes back and the recreate (emitted last) succeeds. When the object is
 	// genuinely gone, the recreate fails loudly with the build-time error above
 	// rather than silently bricking every write.
@@ -969,6 +969,12 @@ export function computeSchemaDiff(
 	// i.e. the same abort with a worse message and the assertion already gone. Refusing at
 	// the column drop, naming the assertion, with nothing applied, is the intended outcome.
 	//
+	// A body that reaches a dropped object through views or maintained tables counts only
+	// when this plan recreates that object, because the runtime guard follows those bodies
+	// too. An object that is really going away stays refused at its drop: letting the
+	// assertion go first would fail at its recreate instead, and by then a `DROP TABLE`
+	// has destroyed rows and made the plan unrestorable.
+	//
 	// NOTE: one AST walk per declared assertion per dropped object. Trivial at the
 	// handful-of-each scale schemas have today; if a large schema ever drops many
 	// objects at once, index the assertion bodies by referenced name instead of
@@ -977,8 +983,9 @@ export function computeSchemaDiff(
 	// Declared world is single-schema, so the single-schema resolver reproduces
 	// exactly what the forward walkers resolve for these bodies.
 	const resolveDeclaredRef = singleSchemaObjectRefResolver(targetSchemaName);
+	const reachesRecreatedObject = recreatedObjectReachProbe(diff, declaredViewBodies, declaredTables, actualViews, actualTables, targetSchemaName);
 	const namesDroppedObject = (check: AST.Expression): boolean =>
-		droppedInThisDiff.some(dropped => tableReferencedInAst(
+		reachesRecreatedObject(check) || droppedInThisDiff.some(dropped => tableReferencedInAst(
 			check, dropped, resolveDeclaredRef, objectRefKey(targetSchemaName, dropped)));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
@@ -2608,12 +2615,13 @@ function followDeclaredViewsInAddedColumnReads(
 
 /**
  * Views by lowercased name, each with the body to follow. A view with no body (a hand-built catalog
- * has none) can still be reached, but nothing is reached through it.
+ * has none) can still be reached, but nothing is reached through it. A caller that follows maintained
+ * tables as the drop guards do puts them here too ({@link recreatedObjectReachProbe}).
  */
 type ViewBodies = ReadonlyMap<string, AST.AstNode | undefined>;
 
 /**
- * `names`, plus every view reached from them through `viewBodies`. A table's own body is not followed.
+ * `names`, plus every object reached from them through `viewBodies`. Only a name in that map is followed.
  *
  * NOTE: sees only `schemaName`, because the differ's catalog and declaration hold no other schema. A
  * chain that leaves through another schema's view and comes back gets no edge, so such a create can
@@ -2644,6 +2652,37 @@ function orderViewDropsDependentsFirst(viewsToDrop: readonly string[], actualVie
 	const catalogBodies: ViewBodies = new Map([...actualViews].map(([name, view]) => [name, view.select]));
 	const key = (name: string): string => name.toLowerCase();
 	return orderDependentsFirst(viewsToDrop, key, name => withViewsReached([key(name)], catalogBodies, schemaName));
+}
+
+/**
+ * Whether an assertion body reaches an object this diff recreates, through views or maintained
+ * tables. Both worlds are walked: the catalog's bodies are what the guard follows when the drop
+ * runs, which matters for a maintained table re-attached off the object later in the plan, and
+ * only the declared bodies know a table's new name when this plan also renames it.
+ */
+function recreatedObjectReachProbe(
+	diff: SchemaDiff,
+	declaredViewBodies: ViewBodies,
+	declaredTables: ReadonlyMap<string, AST.DeclaredTable>,
+	actualViews: ReadonlyMap<string, CatalogView>,
+	actualTables: ReadonlyMap<string, CatalogTable>,
+	schemaName: string,
+): (check: AST.Expression) => boolean {
+	const recreated = objectsRecreatedByDiff(diff, schemaName);
+	if (recreated.size === 0) return () => false;
+	const declaredBodies: ViewBodies = new Map([
+		...declaredViewBodies,
+		...[...declaredTables].flatMap(([name, { tableStmt }]) => tableStmt.maintained ? [[name, tableStmt.maintained.select] as const] : []),
+	]);
+	const catalogBodies: ViewBodies = new Map([
+		...[...actualViews].map(([name, view]) => [name, view.select] as const),
+		...[...actualTables].flatMap(([name, table]) => table.maintained ? [[name, table.maintained.select] as const] : []),
+	]);
+	return check => {
+		const named = objectsNamedIn(check, schemaName);
+		return [declaredBodies, catalogBodies].some(bodies =>
+			[...withViewsReached(named, bodies, schemaName)].some(name => recreated.has(objectRefKey(schemaName, name))));
+	};
 }
 
 /** Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions name. */
@@ -3363,7 +3402,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
  */
 function orderTableCreates(creates: readonly MigrationCreate[], schemaName: string): MigrationCreate[] {
 	const keyOf = (create: MigrationCreate): string => {
-		const target = createdTableTarget(create.ast);
+		const target = createdObjectTarget(create.ast);
 		return target ? objectRefKey(target.schema ?? schemaName, target.name) : create.sql;
 	};
 	const plainTables = new Set(creates.filter(create => !isMaintainedCreate(create.ast)).map(keyOf));
@@ -3396,13 +3435,34 @@ function createsAheadOfMaintained(creates: readonly MigrationCreate[], keyOf: (c
 const isMaintainedCreate = (ast: AST.Statement): boolean =>
 	ast.type === 'createMaterializedView' || (ast.type === 'createTable' && ast.maintained !== undefined);
 
-/** What a table create creates, in either of its forms. */
-function createdTableTarget(ast: AST.Statement): AST.IdentifierExpr | undefined {
+/** What a table or view create creates, in any of its forms. */
+function createdObjectTarget(ast: AST.Statement): AST.IdentifierExpr | undefined {
 	switch (ast.type) {
 		case 'createTable': return ast.table;
-		case 'createMaterializedView': return ast.view;
+		case 'createMaterializedView':
+		case 'createView': return ast.view;
 		default: return undefined;
 	}
+}
+
+/**
+ * The `objectRefKey`s of the tables and views this diff drops and creates again under the same
+ * name: a redefined view, or a maintained table moving to another backing module. A view hinted to
+ * a new name is a different name on each side, so it is not one, and neither is a view replaced by
+ * a table, which the two buckets keep apart.
+ */
+export function objectsRecreatedByDiff(diff: SchemaDiff, schemaName: string): Set<string> {
+	const buckets = [[diff.tablesToDrop, diff.tablesToCreate], [diff.viewsToDrop, diff.viewsToCreate]] as const;
+	const recreated = new Set<string>();
+	for (const [drops, creates] of buckets) {
+		const dropped = new Set(drops.map(name => objectRefKey(schemaName, name)));
+		for (const { ast } of creates) {
+			const target = createdObjectTarget(ast);
+			const key = target && objectRefKey(target.schema ?? schemaName, target.name);
+			if (key && dropped.has(key)) recreated.add(key);
+		}
+	}
+	return recreated;
 }
 
 /** The keys of the tables a table create's foreign keys name, resolved as `extractForeignKeys` does. */

@@ -6,7 +6,9 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
 import { renderCatalogForComparison, renderCatalogForRestoreCheck } from '../../schema/catalog-rendering.js';
-import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, objectsRecreatedByDiff, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
+import { describeDependentTable, findChecksReachingObjects, type CheckReachingObjects } from '../../schema/expression-dependents.js';
+import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import { computeShortSchemaHash } from '../../schema/schema-hasher.js';
 import { deployLogicalSchema } from '../../schema/lens-compiler.js';
 import type * as AST from '../../parser/ast.js';
@@ -18,6 +20,7 @@ import { quoteIdentifier } from '../../emit/ast-stringify.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
 import { createEventLoopPacer, type EventLoopPacer } from '../../util/event-loop.js';
 import { assertModuleCanRebuild } from './alter-table.js';
+import { rejectCheckViolatedByExistingRows } from './add-constraint.js';
 import { rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 
 const log = createLogger('runtime:emit:declare');
@@ -377,12 +380,14 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 				if (refuseRebuild) refuseCertainRebuild(rctx.db, schemaName, diff);
 				const priorRefused = rctx.db._setPrimaryKeyRebuildRefused(refuseRebuild);
 				const priorMigrating = rctx.db._setSchemaMigrating(true);
+				const priorRecreated = rctx.db._setSchemaRecreatedObjects(objectsRecreatedByDiff(diff, schemaName));
 				try {
 					await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements, {
 						preApplyFingerprint: renderCatalogForRestoreCheck(actualCatalog),
 						eventWatermark,
 					}, pace);
 				} finally {
+					rctx.db._setSchemaRecreatedObjects(priorRecreated);
 					rctx.db._setSchemaMigrating(priorMigrating);
 					rctx.db._setPrimaryKeyRebuildRefused(priorRefused);
 				}
@@ -786,6 +791,9 @@ async function unwindRefusedBatchEnd(
  * The journal holds the `undo` of every step that succeeded. A step the differ marked
  * `irreversible` poisons the journal BEFORE it runs — the step may apply partially before it
  * throws, so its own failure must not read as restorable either — and journaling stops there.
+ *
+ * Once every step has run, the CHECKs over what the plan recreated are checked, and a failure
+ * there takes the failed-step path: the plan is what broke them, whichever step that was.
  */
 async function runStepsWithUndoJournal(
 	db: Database,
@@ -808,7 +816,49 @@ async function runStepsWithUndoJournal(
 		if (poisonedBy === undefined && step.undo !== undefined && step.undo.length > 0) journal.push(step.undo);
 		await pace();
 	}
+	const error = await revalidateChecksOverRecreatedObjects(db, schemaName, pace);
+	if (error) {
+		const notRestored = poisonedBy !== undefined
+			? describeIrreversible(poisonedBy)
+			: await unwindJournal(db, schemaName, journal, preApplyFingerprint, pace);
+		return { clean: false, failure: { error, notRestored } };
+	}
 	return { clean: true, journal, poisonedBy };
+}
+
+/**
+ * Checks the existing rows against each CHECK that reaches an object this plan recreated, which
+ * is what `ADD CONSTRAINT` would have judged had the user redefined the object by hand (dropping
+ * the constraint around it). Returns the first failure instead of throwing, as a failed step does.
+ *
+ * NOTE: a DEFAULT, a generated column and a CHECK that is not a row invariant get no check, as a
+ * hand redefinition gets none, so a new view that lost a column they read surfaces on the next
+ * write that uses them. If that proves too late, plan those expressions here without scanning.
+ */
+async function revalidateChecksOverRecreatedObjects(db: Database, schemaName: string, pace: EventLoopPacer): Promise<QuereusError | undefined> {
+	const recreated = db._getSchemaRecreatedObjects();
+	if (recreated.size === 0) return undefined;
+	for (const reaching of findChecksReachingObjects(db, recreated)) {
+		try {
+			await rejectCheckViolatedByExistingRows(db, reaching.table, reaching.check);
+		} catch (e) {
+			log('CHECK over a recreated object failed on %s: %O', reaching.table.name, e);
+			return recreatedObjectBrokeCheck(reaching, schemaName, e);
+		}
+		await pace();
+	}
+	return undefined;
+}
+
+/** The error for a CHECK that fails over a recreated object: it names the CHECK and what it reads, since its own body may not mention that object. */
+function recreatedObjectBrokeCheck(reaching: CheckReachingObjects, schemaName: string, cause: unknown): QuereusError {
+	const objects = reaching.reached.map(({ key, path }) => `'${key}'${describeReachPath(path)}`).join(', ');
+	const on = describeDependentTable(reaching.table, schemaName);
+	return new QuereusError(
+		`apply schema '${schemaName}': ${reaching.describe} on table ${on} reads recreated ${objects} and fails: ${errorText(cause)}`,
+		StatusCode.ERROR,
+		cause instanceof Error ? cause : undefined,
+	);
 }
 
 /** Runs one migration step; returns its wrapped error instead of throwing, so the loop can unwind. */
@@ -895,7 +945,7 @@ async function runJournalInReverse(db: Database, journal: ReadonlyArray<readonly
 
 const NOT_RESTORED = 'The schema is partially migrated and could not be restored';
 
-/** The reason text when an irreversible step ran: before the failing step, as it, or (no `failing`) before a refused batch end. */
+/** The reason text when an irreversible step ran: before the failing step, as it, or (no `failing`) before a failure that followed the last step. */
 function describeIrreversible(poisonedBy: MigrationStep, failing?: MigrationStep): string {
 	const why = poisonedBy.irreversible ?? 'no undo was recorded for it';
 	return poisonedBy === failing

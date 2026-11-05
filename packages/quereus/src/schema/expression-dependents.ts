@@ -213,6 +213,40 @@ export function findTableExpressionDependent(
 	return undefined;
 }
 
+/** A CHECK constraint that reaches at least one probed object. */
+export interface CheckReachingObjects {
+	table: TableSchema;
+	check: RowConstraintSchema;
+	/** What to call it in an error: `CHECK constraint 'ck1'`, or its expression when unnamed. */
+	describe: string;
+	/** Each probed object it reaches, as its key, with the bodies traversed to get there (empty when direct). */
+	reached: ReadonlyArray<{ key: string; path: ReadonlyArray<string> }>;
+}
+
+/**
+ * Every CHECK constraint, on any table in any schema, that reaches one of `keys` directly or
+ * through stored view / materialized-view bodies. Unlike {@link findTableExpressionDependent}
+ * this lists all of them rather than stopping at the first, and keeps a table's own CHECK that
+ * reads the table itself: the caller is judging rows, not asking whether a drop is safe.
+ */
+export function findChecksReachingObjects(db: Database, keys: ReadonlySet<string>): CheckReachingObjects[] {
+	const resolvers = snapshotObjectRefResolvers(db);
+	const found: CheckReachingObjects[] = [];
+	for (const schema of db.schemaManager._getAllSchemas()) {
+		for (const table of schema.getAllTables()) {
+			for (const check of table.checkConstraints ?? []) {
+				const reach = reachableObjects(db, check.expr, table.schemaName, resolvers, { rowImageContext: true });
+				const reached = [...keys].flatMap(key => {
+					const namer = reach.namerOf(key);
+					return namer ? [{ key, path: namer.path }] : [];
+				});
+				if (reached.length > 0) found.push({ table, check, describe: describeCheck(check), reached });
+			}
+		}
+	}
+	return found;
+}
+
 /**
  * How an error should spell `table` when the object being dropped lives in `homeSchemaName`:
  * bare when the two share a schema, schema-qualified when they do not — the same rule the

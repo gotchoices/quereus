@@ -155,6 +155,33 @@ The undo cannot take back a commit, so a **primary-key change that needs a rebui
 
 The undo is ordinary DDL, so the restore is **tier-independent** (every `ddlTransactionality` tier, nothing new for module authors). After a failed step it runs inside the module batch, before `endSchemaBatch(error)` fires; after a refused commit that batch is closed, so it runs in a second one. Inside an explicit transaction a failed apply restores to the pre-apply point and leaves the transaction open — savepoint-like. Under `ddl_transaction_policy = 'strict'` a refused forward step is unwound like any other failure, with no new exposure. A restored failure announces no schema events; an unrestorable one keeps the events of the steps that landed. Outside the guarantee: **seeding** (`with seed` runs after the loop, so a malformed seed row aborts with the migration already applied) and a table's **constraint storage order** (a restored constraint is re-appended; the differ keys constraints by name and is unaffected). Executor detail: [Undo Plan § Restoring a failed apply](schema-undo-plan.md#restoring-a-failed-apply).
 
+## Redefining what a rule reads
+
+No statement replaces a view in place, so a changed view is planned as `DROP VIEW` plus `CREATE VIEW`, and a maintained table moving to another backing module as `DROP TABLE` plus a recreate. A table's CHECK, DEFAULT or generated expression may read such an object, directly or through further views, and the guard on the drop (`assertNoExpressionDependsOn`) refuses to break it. Inside `apply schema` that refusal has one exception:
+
+**A drop passes the guard when this plan creates the same object again under the same name**: the name is in both `viewsToDrop` and `viewsToCreate`, or both `tablesToDrop` and `tablesToCreate` (`objectsRecreatedByDiff`, held on `Database._setSchemaRecreatedObjects` around the migration loop). Otherwise the guard stays on. A declaration that removes a view while a CHECK still reaches it, directly or mid-chain, is refused, and so is a hinted view rename, which is a different name on each side, and a view replaced by a table of the same name, which spans the two buckets. Nothing writes rows while the object is absent, because seeds run after the plan.
+
+**After the last step, the existing rows are judged.** Every row-invariant CHECK reaching a recreated object, on any table in any schema, is scanned by `rejectCheckViolatedByExistingRows`, the check `ADD CONSTRAINT` makes, so its `permitsGrandfatheredCheckViolators` opt-out and row-invariant filter apply the same way. This matches what a user has to write by hand (`drop constraint`, `drop view`, `create view`, `add constraint`):
+
+| what reads the object | a new view the rows violate | a new view that lost the column |
+|---|---|---|
+| row-invariant CHECK | fails: `CHECK constraint failed` | fails, even with no rows: `Column not found` |
+| `check on insert` / `check on update` | applies | applies; surfaces on the next write that uses it |
+| DEFAULT or generated column | applies | applies; surfaces on the next write that uses it |
+
+A failure takes the failed-step path: the plan is unwound, or the schema is reported as partially migrated if a `DROP TABLE` already ran. The message names the CHECK and what it reads, since its body may not mention the object: `apply schema 'main': CHECK constraint 'pc' on table 'P' reads recreated 'main.v1' through view 'v2' and fails: …`, with the scan's error as `cause`. The rows are judged against the new view alone, so rows that already broke the CHECK before the apply fail it too, as they would fail `ADD CONSTRAINT`.
+
+**Assertions keep their guard.** An unchanged assertion that reaches a recreated object through views or maintained tables is dropped first and recreated last, as one that names the object directly already was, and `CREATE ASSERTION` plans its body, so a new view that lost a column it reads fails there. The walk follows both the declared bodies and the catalog's. The catalog's are what the guard follows when the drop runs, which matters for a maintained table the plan re-attaches off the object later; only the declared ones spell a table's new name when the plan also renames it.
+
+An assertion that reaches an object going away for good is not dropped first and stays refused at the object's drop. Letting it go first would fail at its recreate instead, and by then a `DROP TABLE` would have destroyed the rows.
+
+**Known limits.**
+
+- `diff schema` output run by hand is refused at the `DROP VIEW`, because the exception exists only inside `apply schema`. The refusal names the CHECK, which is the way forward: drop it around the view.
+- An assertion in another schema is not in the catalog the differ sees, so it is not dropped first and refuses the drop.
+- A view removed together with the rule that reads it is refused, because view drops run before `DROP CONSTRAINT` (`bug-apply-schema-refuses-view-removed-with-its-check`).
+- A view whose rule also reads a NOT NULL mutation-context variable cannot be redefined. The scan has no context to supply, so it refuses as `ADD CONSTRAINT` does, with that command's wording. The same is true by hand.
+
 ## Yielding during an apply
 
 A long `apply schema` gives up the thread between migration steps, between undo statements and between seed rows, once it has held the thread for about one 60 Hz frame (16 ms). Timers, I/O callbacks and interface events can then run, including on a module whose hooks do no real waiting, where every `await` would otherwise settle without returning to the event loop. A short apply never yields.

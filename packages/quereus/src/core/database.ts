@@ -2919,6 +2919,29 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this._schemaUnwinding;
 	}
 
+	/** @internal Apply-schema recreated objects — see {@link _setSchemaRecreatedObjects}. */
+	private _schemaRecreatedObjects: ReadonlySet<string> = new Set();
+
+	/** @internal Holds the `objectRefKey`s of the objects the running `apply schema` plan drops
+	 *  and creates again under the same name. A forward `DROP` of one of them passes the
+	 *  expression guard (`assertNoExpressionDependsOn`), because the object comes straight back;
+	 *  the CHECKs that reach it are then checked against the existing rows after the plan's last
+	 *  step. Unlike {@link _setSchemaUnwinding} this judges nothing less, it only moves the
+	 *  judgement to where the new object exists. Set only with the statement mutex held, so no
+	 *  other statement observes it. Returns the prior value so the caller restores it in a
+	 *  `finally`. Docs: `docs/schema-declarative.md` § Redefining what a rule reads. */
+	public _setSchemaRecreatedObjects(keys: ReadonlySet<string>): ReadonlySet<string> {
+		const prior = this._schemaRecreatedObjects;
+		this._schemaRecreatedObjects = keys;
+		return prior;
+	}
+
+	/** @internal What the running `apply schema` plan recreates — see
+	 *  {@link _setSchemaRecreatedObjects}. Empty outside a migration. */
+	public _getSchemaRecreatedObjects(): ReadonlySet<string> {
+		return this._schemaRecreatedObjects;
+	}
+
 	/** @internal Migrating-apply flag — see {@link _setSchemaMigrating}. */
 	private _schemaMigrating = false;
 

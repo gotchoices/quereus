@@ -377,6 +377,8 @@ export class Statement {
 					let dependencyTypes: string[];
 					if (event.type === 'view_modified') {
 						dependencyTypes = ['view'];
+					} else if (event.type === 'view_added' || event.type === 'view_removed') {
+						dependencyTypes = ['view', 'view_read'];
 					} else if (event.type === 'materialized_view_added'
 						|| event.type === 'materialized_view_removed'
 						|| event.type === 'materialized_view_modified') {

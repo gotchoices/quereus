@@ -95,7 +95,7 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 		// `materialized_view_modified`) invalidates this cached write-through plan: the
 		// validation above must re-run against the view's *current* tags (a newly-added
 		// invalid tag must surface on the next run of an already-cached statement).
-		// Read-only `select … from v` records no view dependency — view tags do not affect
+		// Read-only `select … from v` records `view_read` instead — view tags do not affect
 		// read results, so its plan need not invalidate on a tag change. Both halves
 		// (recording and invalidation) are pinned in test/plan/view-dependency-invalidation.spec.ts.
 		// `viewIn`, NOT the marked clone below: the tracker holds only a `WeakRef` to the
