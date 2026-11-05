@@ -47,6 +47,13 @@ export interface ColumnRenameOp {
 export interface MigrationCreate {
 	readonly sql: string;
 	readonly ast: AST.Statement;
+	/**
+	 * A view create only: the lowercased names its body names, plus the views reached from them
+	 * through declared view bodies. `generateMigrationPlan` orders creates by this, and it has no
+	 * catalog when it runs for `diff schema`, so the walk has to happen while the diff is computed.
+	 * Absent on a hand-built diff, where the planner falls back to the names in the body.
+	 */
+	readonly viewReach?: readonly string[];
 }
 
 /**
@@ -780,10 +787,11 @@ export function computeSchemaDiff(
 	// it). A pure name match whose definition is unchanged but tags drifted still
 	// takes the in-place `ALTER VIEW … SET TAGS`.
 	let viewRecreates = 0; // deliberate drop+create pairs, excluded from the require-hint counts
+	const declaredViewBodies: ViewBodies = new Map([...declaredViews].map(([name, view]) => [name, view.viewStmt.select]));
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
 		if (!matchedActual) {
-			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(declaredView.viewStmt, targetSchemaName)));
+			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(declaredView.viewStmt, targetSchemaName), declaredViewBodies, targetSchemaName));
 			continue;
 		}
 		const stmt = declaredView.viewStmt;
@@ -805,7 +813,7 @@ export function computeSchemaDiff(
 		}
 		if (definitionDrifted || matchedActual.name.toLowerCase() !== name) {
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(stmt, targetSchemaName)));
+			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(stmt, targetSchemaName), declaredViewBodies, targetSchemaName));
 			viewRecreates++;
 			continue;
 		}
@@ -817,7 +825,8 @@ export function computeSchemaDiff(
 		if (viewRenames.consumedActuals.has(name)) continue;
 		if (!declaredViews.has(name)) diff.viewsToDrop.push(name);
 	}
-	followDeclaredViewsInAddedColumnReads(diff.tablesToAlter, declaredViews, targetSchemaName);
+	diff.viewsToDrop = orderViewDropsDependentsFirst(diff.viewsToDrop, actualViews, targetSchemaName);
+	followDeclaredViewsInAddedColumnReads(diff.tablesToAlter, declaredViewBodies, targetSchemaName);
 
 	// (Maintained tables are no longer compared here. They are normalized into the
 	// table category above, so the unified table loop recognizes a body change as a
@@ -1219,8 +1228,9 @@ function freshTableCreate(
  * and rendering it here — rather than accepting a pre-rendered string — is what
  * makes text/AST disagreement unrepresentable.
  */
-function viewCreate(stmt: AST.CreateViewStmt): MigrationCreate {
-	return { sql: createViewToString(stmt), ast: stmt };
+function viewCreate(stmt: AST.CreateViewStmt, declaredViewBodies: ViewBodies, schemaName: string): MigrationCreate {
+	const viewReach = [...withViewsReached(objectsNamedIn(stmt.select, schemaName), declaredViewBodies, schemaName)];
+	return { sql: createViewToString(stmt), ast: stmt, viewReach };
 }
 
 /** The index analogue of {@link viewCreate}. */
@@ -2588,22 +2598,46 @@ function recordCrossTableReads(
  */
 function followDeclaredViewsInAddedColumnReads(
 	alters: readonly TableAlterDiff[],
-	declaredViews: ReadonlyMap<string, AST.DeclaredView>,
+	declaredViewBodies: ViewBodies,
 	schemaName: string,
 ): void {
 	for (const alter of alters) {
-		if (!alter.addedColumnReads) continue;
-		const reads = new Set(alter.addedColumnReads);
-		// A Set iterates what is added during the walk, and visits each name once.
-		for (const name of reads) {
-			const view = declaredViews.get(name);
-			if (!view) continue;
-			for (const read of objectsNamedIn(view.viewStmt.select, schemaName)) {
-				if (declaredViews.has(read)) reads.add(read);
-			}
-		}
-		alter.addedColumnReads = [...reads];
+		if (alter.addedColumnReads) alter.addedColumnReads = [...withViewsReached(alter.addedColumnReads, declaredViewBodies, schemaName)];
 	}
+}
+
+/**
+ * Views by lowercased name, each with the body to follow. A view with no body (a hand-built catalog
+ * has none) can still be reached, but nothing is reached through it.
+ */
+type ViewBodies = ReadonlyMap<string, AST.AstNode | undefined>;
+
+/** `names`, plus every view reached from them through `viewBodies`. A table's own body is not followed. */
+function withViewsReached(names: Iterable<string>, viewBodies: ViewBodies, schemaName: string): Set<string> {
+	const reached = new Set(names);
+	// A Set iterates what is added during the walk, and visits each name once.
+	for (const name of reached) {
+		const body = viewBodies.get(name);
+		if (!body) continue;
+		for (const read of objectsNamedIn(body, schemaName)) {
+			if (viewBodies.has(read)) reached.add(read);
+		}
+	}
+	return reached;
+}
+
+/**
+ * The undo of a view drop is a `create view`, which plans its body and every view body under it, and
+ * the journal undoes in reverse. So a view has to be dropped ahead of each view it reaches, including
+ * through a view that stays, or its undo runs before what it reads is back.
+ *
+ * NOTE: one AST walk per reached view per dropped view. If a plan dropping thousands of views shows
+ * up in profiles, keep each body's names once instead of walking it again.
+ */
+function orderViewDropsDependentsFirst(viewsToDrop: readonly string[], actualViews: ReadonlyMap<string, CatalogView>, schemaName: string): string[] {
+	const catalogBodies: ViewBodies = new Map([...actualViews].map(([name, view]) => [name, view.select]));
+	const key = (name: string): string => name.toLowerCase();
+	return orderDependentsFirst(viewsToDrop, key, name => withViewsReached([key(name)], catalogBodies, schemaName));
 }
 
 /** Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions name. */
@@ -3413,7 +3447,8 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      follows every table's steps, unless a table's new column reads it, directly or through
  *      other declared views: then it goes ahead of that table. It is ordered after every altered
  *      table, not only those it names, because a table it reaches through an existing view is not
- *      in its statement, and `diff schema` plans with no catalog.
+ *      in its statement, and `diff schema` plans with no catalog. It also follows the new views it
+ *      reaches through declared views ({@link MigrationCreate.viewReach}).
  *   3. ADD CONSTRAINT, once every table has its columns and key. Two tables' named foreign keys
  *      can point at each other's new columns.
  *   4. DROP COLUMN, once every table's `DROP CONSTRAINT` has cleared the guards that refuse a drop
@@ -3447,14 +3482,16 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 }
 
 /**
- * A view has to follow only the new views it names. It merely prefers to follow an altered table,
- * because a new column on that table may read this view. A table it names comes before the rest,
- * which it may not need at all, so that following those cannot block what it does need.
- * The keys can share a sort with table names because tables and views share one namespace.
+ * A view has to follow only the new views it reaches, directly or through declared views, including
+ * one this plan leaves alone: that one cannot be planned until the new view it reads exists. It merely
+ * prefers to follow an altered table, because a new column on that table may read this view. A table
+ * it names comes before the rest, which it may not need at all, so that following those cannot block
+ * what it does need. The keys can share a sort with table names because tables and views share one
+ * namespace.
  *
  * NOTE: a table a view reaches only through an existing view sits in the weaker tier, so it can lose
- * to another view's unneeded preference and fail with `Column not found`. If that shows up, carry
- * each view's reach through the declared views on the diff, as `addedColumnReads` does.
+ * to another view's unneeded preference and fail with `Column not found`. If that shows up, keep the
+ * tables `MigrationCreate.viewReach` passes through, and put them in `prefersToRunAfter`.
  */
 function viewStageTwoItems(viewCreates: readonly MigrationCreate[], alters: readonly TableAlterDiff[], sink: AlterStepSink): StageTwoItem[] {
 	const viewKey = (create: MigrationCreate): string => (create.ast.type === 'createView' ? create.ast.view.name : create.sql).toLowerCase();
@@ -3464,7 +3501,7 @@ function viewStageTwoItems(viewCreates: readonly MigrationCreate[], alters: read
 		const named = create.ast.type === 'createView' ? objectsNamedIn(create.ast.select, sink.schemaName) : [];
 		return {
 			key: viewKey(create),
-			runsAfter: named.filter(name => newViews.has(name)),
+			runsAfter: (create.viewReach ?? named).filter(name => newViews.has(name)),
 			prefersToRunAfter: named.filter(name => !newViews.has(name)),
 			alsoPrefersToRunAfter: alteredTables,
 			push: () => sink.pushCreate(create, 'view'),

@@ -305,6 +305,78 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		});
 	});
 
+	describe('views built on other views', () => {
+		const NEW_T = 'table T { Id INTEGER PRIMARY KEY, N INTEGER, At TEXT NULL }';
+
+		/** `add column` fails on a module with no `alterTable`, so the step after the view drops fails. */
+		async function startOnNoAlterModule(...views: string[]): Promise<void> {
+			db.registerModule('noalter', makeNoAlterModule());
+			db.setDefaultVtabName('noalter');
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('insert into T values (1, 2)');
+			for (const view of views) await db.exec(view);
+		}
+
+		async function expectStepErrorAndRestore(): Promise<void> {
+			const before = fingerprint(db);
+			const err = await rejection(db.exec('apply schema main'));
+			expect(err.message).to.match(/^Failed to execute DDL: ALTER TABLE T ADD COLUMN/);
+			expect(err.message).to.not.match(/could not be restored/);
+			expect(fingerprint(db)).to.equal(before);
+		}
+
+		it('restores a chain of views both redefined, written in the order they read each other', async () => {
+			await startOnNoAlterModule(
+				'create view V1 as select sum(N) as S from T',
+				'create view V2 as select S * 2 as D from V1',
+			);
+			await db.exec(`declare schema main {
+				${NEW_T}
+				view V1 as select sum(N) + 1 as S from T
+				view V2 as select S * 3 as D from V1
+			}`);
+
+			await expectStepErrorAndRestore();
+			expect(await rows(db, 'select D from V2')).to.deep.equal([{ D: 4 }]);
+		});
+
+		it('restores a chain through a view the plan leaves alone', async () => {
+			await startOnNoAlterModule(
+				'create view V1 as select sum(N) as S from T',
+				'create view M as select S from V1',
+				'create view V3 as select S as D from M',
+			);
+			await db.exec(`declare schema main {
+				${NEW_T}
+				view V1 as select sum(N) + 1 as S from T
+				view M as select S from V1
+				view V3 as select S * 3 as D from M
+			}`);
+
+			await expectStepErrorAndRestore();
+			expect(await rows(db, 'select D from V3')).to.deep.equal([{ D: 2 }]);
+		});
+
+		it('creates a view after a new view it reads through a view the plan leaves alone, whichever is written first', async () => {
+			await db.exec('create table T (Id integer primary key, N integer)');
+			await db.exec('insert into T values (1, 2)');
+			await db.exec('create view V1 as select sum(N) as S from T');
+			await db.exec('create view M as select S from V1');
+			await db.exec('create view V3 as select S as D from M');
+			await db.exec(`declare schema main {
+				table T { Id INTEGER PRIMARY KEY, N INTEGER }
+				view V3 as select S * 3 as D from M
+				view M as select S from V1
+				view V1 as select sum(N) + 1 as S from T
+			}`);
+
+			await db.exec('apply schema main');
+
+			expect(await planOf(db)).to.deep.equal([]);
+			expect(await rows(db, 'select D from V3')).to.deep.equal([{ D: 9 }]);
+		});
+	});
+
 	it('the failing step is the first step: the original error passes through untouched', async () => {
 		await db.exec(TABLE_T);
 		await db.exec("insert into t values (1, 'a')");

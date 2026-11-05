@@ -192,7 +192,7 @@ apply schema main to version '1.0.0' options (
 **Order Independence:**
 - Tables, indexes, and views can be declared in any order within the `{...}` block.
 - Forward references are allowed (e.g., foreign keys to tables declared later).
-- The same holds between existing tables altered together: a table can refer to a column another table gains or renames in the same apply, whichever is written first. A new view can read a column gained or renamed in the same apply, or another new view written after it. See [Migration Order](schema-declarative.md#migration-order) for the known limits.
+- The same holds between existing tables altered together: a table can refer to a column another table gains or renames in the same apply, whichever is written first. A new view can read a column gained or renamed in the same apply, or another new view written after it, directly or through a view the apply leaves alone. See [Migration Order](schema-declarative.md#migration-order) for the known limits.
 
 **Each declared name appears once.** A repeated name used to last-writer-wins silently, so the first declaration never reached the migration. `diff schema` / `apply schema` now reject it up front, naming the object:
 - `table`, `view`, and `materialized view` share **one** namespace — the engine enforces it imperatively too (`create view` refuses a name a table holds, and vice versa), so a cross-kind clash could only ever half-apply and then fail mid-migration. Both the same-kind and the cross-kind case are errors:
