@@ -14,6 +14,7 @@ import {
   siteIdFromBase64,
   maxHLC,
   compareHLC,
+  replyWatermark,
   serializeChangeSet,
   deserializeChangeSet,
   serializeHLCForTransport,
@@ -685,8 +686,12 @@ export class SyncClient {
   }
 
   /**
-   * Move the received watermark up to the max HLC of an ordered reply. Forward only:
-   * the store does not guard this, and a stale reply must not drag the watermark back.
+   * Move the received watermark up to an ordered reply's resume position
+   * (`replyWatermark`: each set's `cursor`, or its `hlc` where it carries none).
+   * That is a position in the server's change log, not a write time: a change the
+   * server received late has an old `hlc`, and resuming from that would ask for the
+   * same range again. Forward only: the store does not guard this, and a stale reply
+   * must not drag the watermark back.
    *
    * @returns true only when the watermark moved.
    */
@@ -696,13 +701,13 @@ export class SyncClient {
     // back, which only re-fetches, or skip the range of a reply whose apply then fails.
     // If chains ever overlap in normal use, serialize ordered replies.
     const serverSiteId = this.serverSiteId;
-    const replyHLC = maxHLC(changeSets.map(cs => cs.hlc));
-    if (!serverSiteId || !replyHLC) return false;
+    const resumeFrom = replyWatermark(changeSets);
+    if (!serverSiteId || !resumeFrom) return false;
 
     const current = await this.syncManager.getPeerSyncState(serverSiteId);
-    if (current && compareHLC(replyHLC, current) <= 0) return false;
+    if (current && compareHLC(resumeFrom, current) <= 0) return false;
 
-    await this.syncManager.updatePeerSyncState(serverSiteId, replyHLC);
+    await this.syncManager.updatePeerSyncState(serverSiteId, resumeFrom);
     return true;
   }
 
@@ -1517,7 +1522,9 @@ export class SyncClient {
     if (!sent) return { status: 'held' };
 
     // Record the max HLC this batch carries against its request id; the matching
-    // apply_result promotes lastSentHLC to it (see promoteWatermark).
+    // apply_result promotes lastSentHLC to it (see promoteWatermark). The sent
+    // watermark is a write time (`hlc`), unlike the received one: getChangesToPush
+    // reads this device's own writes after it and its sets carry no `cursor`.
     const batchHLC = maxHLC(changes.map(cs => cs.hlc));
     if (batchHLC) {
       this.pendingSentHLCs.set(requestId, batchHLC);

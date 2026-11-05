@@ -842,6 +842,28 @@ describe('SyncClient', () => {
       expect(syncManager.updatePeerSyncStateCalls[0].hlc).to.deep.equal(hlc5);
     });
 
+    it("resumes from a reply's cursor, not from the write time of a change the server received late", async () => {
+      const syncManager = new MockSyncManager();
+      syncManager.applyChangesResult = { applied: 1, skipped: 0, conflicts: 0, transactions: 1 };
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+
+      const site = generateSiteId();
+      const server = generateSiteId();
+      const alreadyRead: HLC = { wallTime: 9000n, counter: 0, siteId: server, opSeq: 0 };
+      await syncManager.updatePeerSyncState((client as any).serverSiteId, alreadyRead);
+      syncManager.updatePeerSyncStateCalls.length = 0;
+
+      // Written at 5000, long before what the client has read, and filed by the server at 9500.
+      const writtenEarlier: HLC = { wallTime: 5000n, counter: 1, siteId: site, opSeq: 0 };
+      const filedAt: HLC = { wallTime: 9500n, counter: 0, siteId: server, opSeq: 0 };
+      const late: ChangeSet = { ...changeSet(site, 'late', writtenEarlier), cursor: filedAt };
+      ws.simulateMessage({ type: 'changes', changeSets: [serializeChangeSet(late)] });
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(syncManager.updatePeerSyncStateCalls.map(call => call.hlc)).to.deep.equal([filedAt]);
+    });
+
     it('does not lose a change when a later broadcast arrives before the ordered reply', async () => {
       // Reproduces the fire-and-forget change-loss bug: a broadcast at HLC 6 is
       // received, but an earlier broadcast at HLC 5 was dropped. If HLC 6 were

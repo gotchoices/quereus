@@ -22,6 +22,7 @@ import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
 import {
   DEFAULT_SYNC_CONFIG,
+  replyWatermark,
   type SyncConfig,
   type ChangeSet,
   type Change,
@@ -92,23 +93,17 @@ function tablesIn(sets: ChangeSet[]): string[] {
   return flatten(sets).map(c => c.table);
 }
 
-function maxSetHLC(sets: ChangeSet[]): HLC | undefined {
-  let max: HLC | undefined;
-  for (const s of sets) if (max === undefined || compareHLC(s.hlc, max) > 0) max = s.hlc;
-  return max;
-}
-
 /**
  * Simulate one transport pull: `to` pulls from `from` at watermark `since`,
- * applies the returned sets, and advances its per-peer watermark to
- * `max(ChangeSet.hlc)` — exactly what `sync-client` / `coordinator` do. Returns the
+ * applies the returned sets, and advances its per-peer watermark to the reply's
+ * resume position (`replyWatermark`) — exactly what `sync-client` does. Returns the
  * sets pulled and the advanced watermark.
  */
 async function pull(from: Peer, to: Peer, since: HLC | undefined): Promise<{ sets: ChangeSet[]; since: HLC | undefined }> {
   const sets = await from.manager.getChangesSince(to.site, since);
   if (sets.length > 0) await to.manager.applyChanges(sets);
-  const max = maxSetHLC(sets);
-  const next = max !== undefined && (since === undefined || compareHLC(max, since) > 0) ? max : since;
+  const reached = replyWatermark(sets);
+  const next = reached !== undefined && (since === undefined || compareHLC(reached, since) > 0) ? reached : since;
   return { sets, since: next };
 }
 
@@ -257,34 +252,35 @@ describe('store-and-forward relay', () => {
       const sets = await R.manager.getChangesSince(P.site, highWatermark);
       expect(tablesIn(sets), 'a below-watermark forwarded change is not relayed').to.not.include(RETIRED);
       // No ChangeSet returned at all → nothing to regress the watermark to.
-      expect(maxSetHLC(sets), 'no change returned ⇒ watermark cannot regress').to.be.undefined;
+      expect(replyWatermark(sets), 'no change returned ⇒ watermark cannot regress').to.be.undefined;
     });
   });
 
   describe('ordering', () => {
-    it('interleaves forwarded changes with change-log changes in global HLC order', async () => {
+    it('places a forwarded change at its write time and applied changes where they were filed', async () => {
       const S = generateSiteId();
       const X = generateSiteId(); // origin of R's own change-log entries on a live table
       const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users', 'main.live'] });
 
-      // R's change log: two live-table writes from X straddling the forwarded change's HLC.
-      await R.manager.applyChanges([changeSet(X, 'tx-u1', [col(X, 1000, 'live', 1, 'a', 'x')])]);
+      // R's change log: two live-table writes from X, filed in the order they arrive,
+      // which is the reverse of the order they were written in.
       await R.manager.applyChanges([changeSet(X, 'tx-u2', [col(X, 2000, 'live', 2, 'b', 'y')])]);
-      // A forwarded change for the retired table, HLC BETWEEN the two live writes.
+      await R.manager.applyChanges([changeSet(X, 'tx-u1', [col(X, 1000, 'live', 1, 'a', 'x')])]);
+      // A forwarded change for the retired table, written BETWEEN the two live writes.
       await R.manager.applyChanges([changeSet(S, 'tx-c', [col(S, 1500, RETIRED, 1, 'note', 'hi')])]);
 
       const sets = await R.manager.getChangesSince(generateSiteId());
       const seq = flatten(sets).map(c => ({ table: c.table, wall: Number(c.hlc.wallTime) }));
 
-      // ChangeSets are ordered by base HLC, so flattened wall-times are non-decreasing
-      // and the forwarded `orders` change sits between the two `live` writes.
-      const walls = seq.map(s => s.wall);
-      expect(walls, 'changes interleave in global HLC order').to.deep.equal([...walls].sort((a, b) => a - b));
-      expect(seq, 'forwarded change is HLC-ordered between change-log changes').to.deep.equal([
-        { table: 'live', wall: 1000 },
+      // A held change was never filed on R, so it sits at its own write time; an applied
+      // one sits at the tick R filed it at, which is later than any of these write times.
+      expect(seq, 'held change first, then applied changes in the order R filed them').to.deep.equal([
         { table: RETIRED, wall: 1500 },
         { table: 'live', wall: 2000 },
+        { table: 'live', wall: 1000 },
       ]);
+      // The applied sets resume from where R filed them; the held one from its write time.
+      expect(sets.map(cs => cs.cursor === undefined), 'only the held set lacks a cursor').to.deep.equal([true, false, false]);
     });
   });
 
@@ -339,15 +335,15 @@ describe('store-and-forward relay', () => {
       // so each round returns exactly one whole transaction — the truncation we want to exercise.
       const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users', 'main.live'], batchSize: 1 });
 
-      // Two live change-log writes straddle a forwarded (orders) change in global HLC order.
+      // Two live change-log writes and a forwarded (orders) change written between them.
       // The change-log scan (collectChangesSince) and the full forwardable scan are different
       // sources; the union is what buildTransactionChangeSets must bound contiguously.
       await R.manager.applyChanges([changeSet(X, 'tx-a', [col(X, 1000, 'live', 1, 'a', 'x')])]);
       await R.manager.applyChanges([changeSet(S, 'tx-b', [col(S, 1500, RETIRED, 1, 'note', 'hi')])]);
       await R.manager.applyChanges([changeSet(X, 'tx-c', [col(X, 2000, 'live', 2, 'b', 'y')])]);
 
-      // Pull round-by-round, advancing the watermark to max(ChangeSet.hlc) each time (the
-      // transport contract). With batchSize 1 each round returns exactly one transaction.
+      // Pull round-by-round, advancing the watermark to the reply's resume position each time
+      // (the transport contract). With batchSize 1 each round returns exactly one transaction.
       const seen: Array<{ table: string; wall: number }> = [];
       let since: HLC | undefined;
       for (let round = 0; round < 3; round++) {
@@ -355,15 +351,15 @@ describe('store-and-forward relay', () => {
         const flat = flatten(sets);
         expect(flat, `round ${round} returns exactly one change`).to.have.lengthOf(1);
         seen.push({ table: flat[0].table, wall: Number(flat[0].hlc.wallTime) });
-        since = maxSetHLC(sets);
+        since = replyWatermark(sets);
       }
 
-      // All three delivered exactly once, in global HLC order, the forwarded change interleaved
-      // at its true position: the bound never dropped the forwardable tail nor duplicated it, and
-      // the deferred forwardable entry was re-collected next round (still `> sinceHLC`).
-      expect(seen, 'contiguous HLC-ordered prefix across rounds').to.deep.equal([
-        { table: 'live', wall: 1000 },
+      // All three delivered exactly once: the held change at its write time, ahead of the
+      // applied ones, which follow in the order R filed them. The bound neither dropped a
+      // source's tail nor duplicated it, and each round's watermark led into the next.
+      expect(seen, 'each change once, across rounds').to.deep.equal([
         { table: RETIRED, wall: 1500 },
+        { table: 'live', wall: 1000 },
         { table: 'live', wall: 2000 },
       ]);
 

@@ -36,6 +36,7 @@ import {
   makePeer,
   markAllDelivered,
   relay,
+  withoutPosition,
 } from './_peer-harness.js';
 
 /** Local-change capture runs fire-and-forget after the commit; let it settle. */
@@ -521,10 +522,17 @@ describe('change log orphan cleanup', () => {
         );
 
       /** Everything the parity assertion compares between two relays. */
-      async function relayState(manager: SyncManagerImpl): Promise<unknown> {
+      /** Row 1's cell records, sorted, without each replica's own filing position. */
+      async function cellsOf(manager: SyncManagerImpl): Promise<unknown> {
         const versions = await manager.columnVersions.getRowVersions('main', 'users', [1]);
+        return [...versions.entries()]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([column, version]) => [column, withoutPosition(version)]);
+      }
+
+      async function relayState(manager: SyncManagerImpl): Promise<unknown> {
         return {
-          cells: [...versions.entries()].sort(([a], [b]) => a.localeCompare(b)),
+          cells: await cellsOf(manager),
           logCount: await countChangeLog(manager),
           tombstones: await countTombstones(manager),
         };
@@ -613,9 +621,7 @@ describe('change log orphan cleanup', () => {
         const versions = await batched.columnVersions.getRowVersions('main', 'users', [1]);
         expect([...versions.values()].map(v => v.value).sort()).to.deep.equal(['a', 'b', 'c']);
         expect([...versions.values()].map(v => v.priorHlc)).to.deep.equal([undefined, undefined, undefined]);
-        expect([...versions.entries()].sort(([a], [b]) => a.localeCompare(b)))
-          .to.deep.equal([...(await origin.columnVersions.getRowVersions('main', 'users', [1])).entries()]
-            .sort(([a], [b]) => a.localeCompare(b)));
+        expect(await cellsOf(batched)).to.deep.equal(await cellsOf(origin));
 
         expect(await relayState(batched)).to.deep.equal(await relayState(separate));
         expect({ applied: batchedResult.applied, skipped: batchedResult.skipped, conflicts: batchedResult.conflicts })
@@ -766,7 +772,7 @@ describe('change log orphan cleanup', () => {
     });
 
     it('deletes a delete-entry orphan whose tombstone was never written', async () => {
-      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
+      await manager.changeLog.recordDeletion({ hlc: manager.getCurrentHLC() }, 'main', 'users', [999]);
       expect(await countChangeLog(manager)).to.equal(1);
 
       expect(await manager.repairChangeLog()).to.equal(1);
@@ -774,7 +780,7 @@ describe('change log orphan cleanup', () => {
     });
 
     it('deletes a column-entry orphan whose column version was never written', async () => {
-      await manager.changeLog.recordColumnChange(manager.getCurrentHLC(), 'main', 'users', [999], 'col_0');
+      await manager.changeLog.recordColumnChange({ hlc: manager.getCurrentHLC() }, 'main', 'users', [999], 'col_0');
       expect(await countChangeLog(manager)).to.equal(1);
 
       expect(await manager.repairChangeLog()).to.equal(1);
@@ -786,7 +792,7 @@ describe('change log orphan cleanup', () => {
       await settle();
       expect(await countChangeLog(manager)).to.equal(3);   // 3 live column entries
 
-      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
+      await manager.changeLog.recordDeletion({ hlc: manager.getCurrentHLC() }, 'main', 'users', [999]);
       expect(await countChangeLog(manager)).to.equal(4);
 
       const peer = generateSiteId();
@@ -815,8 +821,8 @@ describe('change log orphan cleanup', () => {
     });
 
     it('is idempotent: a second pass over an already-repaired log finds nothing', async () => {
-      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
-      await manager.changeLog.recordColumnChange(manager.getCurrentHLC(), 'main', 'users', [998], 'col_0');
+      await manager.changeLog.recordDeletion({ hlc: manager.getCurrentHLC() }, 'main', 'users', [999]);
+      await manager.changeLog.recordColumnChange({ hlc: manager.getCurrentHLC() }, 'main', 'users', [998], 'col_0');
 
       expect(await manager.repairChangeLog()).to.equal(2);
       expect(await manager.repairChangeLog()).to.equal(0);

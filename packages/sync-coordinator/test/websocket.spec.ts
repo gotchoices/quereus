@@ -10,13 +10,20 @@ import { rm } from 'node:fs/promises';
 import WebSocket from 'ws';
 import {
   PROTOCOL_VERSION,
+  compareHLC,
   createHLC,
+  generateSiteId,
+  replyWatermark,
   siteIdFromBase64,
+  siteIdToBase64,
   serializeSnapshotCheckpoint,
   serializeChangeSet,
+  deserializeChangeSet,
   serializeHLCForTransport,
+  deserializeHLCFromTransport,
   type ChangeSet,
   type HLC,
+  type SerializedChangeSet,
 } from '@quereus/sync';
 import { createCoordinatorServer, loadConfig, type CoordinatorServer } from '../src/index.js';
 import { runCoordinatorMaintenancePass } from '../src/service/maintenance.js';
@@ -576,7 +583,7 @@ describe('Get Changes below the delta floor', () => {
     expect(ack.type).to.equal('handshake_ack');
   }
 
-  it('answers snapshot_required (floor = the pruned delete) for a pre-delete watermark, and changes for a from-nothing request', async () => {
+  it('answers snapshot_required (floor = where the pruned delete was filed) for a pre-delete watermark, and changes for a from-nothing request', async () => {
     const writerSite = siteIdFromBase64(TEST_SITE_ID_1);
     const insertHlc: HLC = createHLC(BigInt(Date.now()), 0, writerSite, 0);
     const deleteHlc: HLC = createHLC(insertHlc.wallTime + 1n, 0, writerSite, 0);
@@ -595,6 +602,17 @@ describe('Get Changes below the delta floor', () => {
       await handshake(writer, TEST_SITE_ID_1);
       const r1 = await sendAndReceive(writer, { type: 'apply_changes', changes: [serializeChangeSet(insert)] });
       expect(r1.type).to.equal('apply_result');
+
+      // The reader catches up before the delete arrives: its watermark is where the
+      // coordinator filed the insert, which the reply's cursor names. A site of its own:
+      // TEST_SITE_ID_2 decodes to the writer's bytes, and a reply leaves out the reader's own changes.
+      await handshake(reader, siteIdToBase64(generateSiteId()));
+      const caughtUp = await sendAndReceive(reader, { type: 'get_changes' });
+      expect(caughtUp.type).to.equal('changes');
+      const preDelete = serializeHLCForTransport(
+        replyWatermark((caughtUp.changeSets as SerializedChangeSet[]).map(deserializeChangeSet))!,
+      );
+
       const r2 = await sendAndReceive(writer, { type: 'apply_changes', changes: [serializeChangeSet(del)] });
       expect(r2.type).to.equal('apply_result');
 
@@ -602,18 +620,14 @@ describe('Get Changes below the delta floor', () => {
       // the instantly-expired tombstone is pruned, raising the floor.
       await runCoordinatorMaintenancePass(server.service.storeManager);
 
-      await handshake(reader, TEST_SITE_ID_2);
-      const refused = await sendAndReceive(reader, {
-        type: 'get_changes', sinceHLC: serializeHLCForTransport(insertHlc),
-      });
+      const refused = await sendAndReceive(reader, { type: 'get_changes', sinceHLC: preDelete });
       expect(refused.type).to.equal('snapshot_required');
-      expect(refused.sinceHLC).to.equal(serializeHLCForTransport(insertHlc));
-      expect(refused.deltaFloor).to.equal(serializeHLCForTransport(deleteHlc));
+      expect(refused.sinceHLC).to.equal(preDelete);
+      const floor = deserializeHLCFromTransport(refused.deltaFloor as string);
+      expect(compareHLC(floor, deserializeHLCFromTransport(preDelete))).to.be.greaterThan(0);
 
       // At the floor itself the delete was already delivered: served normally.
-      const atFloor = await sendAndReceive(reader, {
-        type: 'get_changes', sinceHLC: serializeHLCForTransport(deleteHlc),
-      });
+      const atFloor = await sendAndReceive(reader, { type: 'get_changes', sinceHLC: refused.deltaFloor });
       expect(atFloor.type).to.equal('changes');
 
       // A from-nothing load is never refused.

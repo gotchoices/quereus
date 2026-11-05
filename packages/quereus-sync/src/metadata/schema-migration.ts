@@ -19,6 +19,15 @@ import {
   type SchemaMigrationType,
   type SchemaObjectKind,
 } from '../sync/protocol.js';
+import { positionField } from './filing-position.js';
+
+/**
+ * High bit of the type-length byte: set when a 30-byte filing position follows the type.
+ * Type names are short ASCII, so the bit was always clear before positions existed and a
+ * record written then reads as "no position".
+ */
+const HAS_POSITION = 0x80;
+const TYPE_LENGTH_MASK = 0x7f;
 
 /**
  * Stored schema migration record.
@@ -31,12 +40,19 @@ export interface StoredMigration {
   columns?: string[];
   ddl: string;
   hlc: HLC;
+  /**
+   * Where this replica filed the migration (`metadata/filing-position.ts`); absent when
+   * it equals `hlc`, which is every migration recorded here. `getChangesSince` serves a
+   * migration to a peer whose watermark is below this, however old its `hlc`.
+   */
+  position?: HLC;
   schemaVersion: number;
 }
 
 /**
  * Serialize a migration for storage.
  * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type
+ *         + 30 bytes filing position, only when the type-length byte's high bit is set
  *         + 2 bytes fromTable byte-length (big-endian; 0 = absent) + fromTable
  *         + 4 bytes columns byte-length (big-endian; 0 = absent) + columns (a JSON string array)
  *         + ddl
@@ -44,7 +60,9 @@ export interface StoredMigration {
  * The optional slots sit BEFORE the ddl because the ddl is "rest of buffer" —
  * nothing can be appended after it. Inserting a slot is an incompatible layout
  * change, covered by the `fv:` gate (SYNC_METADATA_FORMAT_VERSION in keys.ts: 5 added
- * `fromTable`, 7 added `columns`).
+ * `fromTable`, 7 added `columns`). The position is the exception: it is announced by a
+ * bit no earlier record sets ({@link HAS_POSITION}), so earlier records stay readable
+ * and the format version did not move.
  */
 export function serializeMigration(migration: StoredMigration): Uint8Array {
   const encoder = new TextEncoder();
@@ -53,9 +71,15 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   const columnsBytes = encoder.encode(migration.columns === undefined ? '' : JSON.stringify(migration.columns));
   const ddlBytes = encoder.encode(migration.ddl);
   const hlcBytes = serializeHLC(migration.hlc);
+  const { position } = positionField(migration.hlc, migration.position);
+  const positionBytes = position === undefined ? new Uint8Array(0) : serializeHLC(position);
+  if (typeBytes.length > TYPE_LENGTH_MASK) {
+    throw new Error(`Migration type name too long to store: ${migration.type}`);
+  }
 
   const buffer = new Uint8Array(
-    30 + 4 + 1 + typeBytes.length + 2 + fromBytes.length + 4 + columnsBytes.length + ddlBytes.length,
+    30 + 4 + 1 + typeBytes.length + positionBytes.length
+      + 2 + fromBytes.length + 4 + columnsBytes.length + ddlBytes.length,
   );
   let offset = 0;
 
@@ -68,11 +92,15 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   view.setUint32(offset, migration.schemaVersion, false);
   offset += 4;
 
-  // Type length (1 byte) + type
-  buffer[offset] = typeBytes.length;
+  // Type length (1 byte, high bit = a position follows) + type
+  buffer[offset] = typeBytes.length | (position === undefined ? 0 : HAS_POSITION);
   offset += 1;
   buffer.set(typeBytes, offset);
   offset += typeBytes.length;
+
+  // Filing position (30 bytes), present only when it differs from the HLC
+  buffer.set(positionBytes, offset);
+  offset += positionBytes.length;
 
   // fromTable byte-length (2 bytes, big-endian; 0 = absent) + fromTable
   view.setUint16(offset, fromBytes.length, false);
@@ -108,11 +136,15 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
   const schemaVersion = view.getUint32(offset, false);
   offset += 4;
 
-  // Type length + type
-  const typeLength = buffer[offset];
+  // Type length (high bit = a position follows) + type
+  const typeLength = buffer[offset] & TYPE_LENGTH_MASK;
+  const hasPosition = (buffer[offset] & HAS_POSITION) !== 0;
   offset += 1;
   const type = decoder.decode(buffer.slice(offset, offset + typeLength)) as SchemaMigrationType;
   offset += typeLength;
+
+  const position = hasPosition ? deserializeHLC(buffer.slice(offset, offset + 30)) : undefined;
+  if (hasPosition) offset += 30;
 
   // fromTable (2-byte big-endian byte-length; 0 = absent)
   const fromLength = view.getUint16(offset, false);
@@ -139,6 +171,7 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
     ...(columns !== undefined ? { columns } : {}),
     ddl,
     hlc,
+    ...(position !== undefined ? { position } : {}),
     schemaVersion,
   };
 }
@@ -231,7 +264,8 @@ export class SchemaMigrationStore {
   }
 
   /**
-   * Every migration on this replica as a wire record, in causal (HLC) order.
+   * Every migration on this replica as a wire record, in causal (HLC) order, each
+   * carrying the position this replica filed it at when that differs from its HLC.
    *
    * The producers that ship DDL — both snapshot paths and the delta collector —
    * all need the whole set, and all need it causally ordered: DDL replays in list
@@ -256,6 +290,7 @@ export class SchemaMigrationStore {
         ...(stored.columns !== undefined ? { columns: stored.columns } : {}),
         ddl: stored.ddl,
         hlc: stored.hlc,
+        ...(stored.position !== undefined ? { position: stored.position } : {}),
         schemaVersion: stored.schemaVersion,
       });
     }

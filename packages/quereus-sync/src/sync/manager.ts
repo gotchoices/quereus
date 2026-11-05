@@ -39,10 +39,17 @@ export interface SyncManager {
   getCurrentHLC(): HLC;
 
   /**
-   * Get all changes since a peer's last known state.
+   * Get everything this replica filed in its change log after `sinceHLC`, in the
+   * order it filed it.
+   *
+   * `sinceHLC` is a position in THIS replica's change log, not a write time: the
+   * peer passes back the watermark of the last reply it applied (`replyWatermark`,
+   * each set's `cursor`, or its `hlc` where it has none). A change this replica
+   * received late is filed after everything it already had, so a peer that had
+   * read newer changes still receives it.
    *
    * @param peerSiteId - The peer requesting changes
-   * @param sinceHLC - The peer's last known HLC (omit for full sync)
+   * @param sinceHLC - The peer's received watermark for this replica (omit for full sync)
    * @returns Array of change sets to send to the peer
    */
   getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
@@ -57,6 +64,9 @@ export interface SyncManager {
    * Other devices' changes are left out on the assumption that the peer is the one route
    * they travel by: this replica received them from it, so it has them. A replica also
    * learning them over a second transport must forward them with {@link getChangesSince}.
+   *
+   * Unlike {@link getChangesSince}, `sinceHLC` here is a write time (the greatest
+   * `ChangeSet.hlc` the peer acknowledged), and the sets returned carry no `cursor`.
    *
    * @param peerSiteId - The peer being pushed to
    * @param sinceHLC - The sent watermark for that peer (see {@link getPeerSentState})
@@ -84,20 +94,20 @@ export interface SyncManager {
   /**
    * Whether an incremental request `since sinceHLC` can be served in full.
    *
-   * False once this replica has pruned a tombstone with an HLC above
+   * False once this replica has pruned a tombstone it had filed above
    * `sinceHLC` — the delete it backed can no longer be delivered, so the peer
    * must take a full snapshot instead (see {@link getDeltaFloor}). Nothing
-   * else is consulted: no peer state, no wall clock. A watermark is the HLC of
-   * the last change a peer received, not the time it last synced, so a quiet
+   * else is consulted: no peer state, no wall clock. A watermark is the position
+   * of the last change a peer received, not the time it last synced, so a quiet
    * database never ages a peer out of delta sync on its own.
    *
-   * @param sinceHLC - The peer's last known HLC (its received watermark)
+   * @param sinceHLC - The peer's received watermark for this replica
    */
   canDeltaSync(sinceHLC: HLC): Promise<boolean>;
 
   /**
-   * The delta floor: the greatest HLC of any tombstone this replica has
-   * pruned, or `undefined` when nothing deliverable has ever been pruned. An
+   * The delta floor: the greatest filing position of any tombstone this replica
+   * has pruned, or `undefined` when nothing deliverable has ever been pruned. An
    * incremental request `since T` is complete iff `T >= floor`. Raised by
    * {@link pruneTombstones} and inherited from a snapshot's sender on apply.
    */
@@ -153,26 +163,28 @@ export interface SyncManager {
   adoptUnrecordedRows(): Promise<AdoptedRows>;
 
   /**
-   * Update the last sync state for a peer.
+   * Update the received watermark for a peer: how far through that peer's change
+   * log this replica has read.
    *
-   * Called after successfully syncing with a peer.
+   * Called after applying an ordered reply from the peer, with `replyWatermark` of
+   * that reply, or after applying its snapshot, with the snapshot's header HLC.
    *
    * @param peerSiteId - The peer we synced with
-   * @param hlc - The HLC we synced up to
+   * @param hlc - The position in the peer's change log we have read up to
    */
   updatePeerSyncState(peerSiteId: SiteId, hlc: HLC): Promise<void>;
 
   /**
-   * Get the last sync state for a peer.
+   * Get the received watermark for a peer.
    *
    * @param peerSiteId - The peer to check
-   * @returns The last HLC we synced to, or undefined if never synced
+   * @returns The position in the peer's change log we have read up to, or undefined if never synced
    */
   getPeerSyncState(peerSiteId: SiteId): Promise<HLC | undefined>;
 
   /**
-   * Update the sent watermark for a peer — the highest HLC we have pushed to it
-   * and had acknowledged. Persisted separately from {@link updatePeerSyncState}
+   * Update the sent watermark for a peer — the highest HLC (a write time of our
+   * own) we have pushed to it and had acknowledged. Persisted separately from {@link updatePeerSyncState}
    * (the received watermark) so a client can resume delta-push after a restart
    * instead of re-sending its entire local history.
    *

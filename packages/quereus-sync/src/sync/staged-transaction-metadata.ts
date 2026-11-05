@@ -18,8 +18,8 @@
  */
 
 import type { SqlValue } from '@quereus/quereus';
-import type { HLC } from '../clock/hlc.js';
 import type { ColumnVersionData } from '../metadata/column-version.js';
+import type { FiledAt } from '../metadata/filing-position.js';
 import { encodePkIdentity, type PkKeying } from '../metadata/keys.js';
 
 /**
@@ -27,8 +27,12 @@ import { encodePkIdentity, type PkKeying } from '../metadata/keys.js';
  * `deleteRowVersionsAndLogEntries` in `sync-context.ts`).
  */
 export interface StagedRowState {
-	/** Cell records this transaction has staged live (column → staged HLC). */
-	readonly stagedColumns: ReadonlyMap<string, HLC>;
+	/**
+	 * Cell records this transaction has staged live (column → where the staged record is
+	 * filed, which is what its change-log entry is keyed by). A cell the transaction wrote
+	 * is filed at its own HLC; one `alter primary key` re-filed keeps the position it had.
+	 */
+	readonly stagedColumns: ReadonlyMap<string, FiledAt>;
 	/**
 	 * True when this transaction already staged removal of every cell record of
 	 * the row (a prior same-transaction delete). Cells staged after that removal
@@ -41,7 +45,7 @@ export interface StagedRowState {
 interface StagedRow {
 	cleared: boolean;
 	columns: Map<string, ColumnVersionData>;
-	tombstoneHlc?: HLC;
+	tombstone?: FiledAt;
 }
 
 export class StagedTransactionMetadata {
@@ -49,7 +53,7 @@ export class StagedTransactionMetadata {
 	// for the life of the transaction, roughly doubling capture's peak footprint (the
 	// `changes[]` array already holds one entry per fact). If very large transactions
 	// ever pressure memory, note that only `columnVersion()`'s before-image chaining
-	// needs the values; the delete cleanup needs nothing but the HLC.
+	// needs the values; the delete cleanup needs nothing but the HLC and position.
 	private readonly rows = new Map<string, StagedRow>();
 
 	constructor(private readonly getPkKeying: (schema: string, table: string) => PkKeying) {}
@@ -91,16 +95,16 @@ export class StagedTransactionMetadata {
 	}
 
 	/**
-	 * The HLC of the tombstone this transaction has staged for the row, or
+	 * Where the tombstone this transaction has staged for the row is filed, or
 	 * `undefined` when it staged none — fall back to committed storage. (Local
 	 * capture never removes a tombstone, so there is no staged-as-deleted state.)
 	 */
-	tombstoneHlc(schema: string, table: string, pk: SqlValue[]): HLC | undefined {
-		return this.rows.get(this.rowKey(schema, table, pk))?.tombstoneHlc;
+	tombstone(schema: string, table: string, pk: SqlValue[]): FiledAt | undefined {
+		return this.rows.get(this.rowKey(schema, table, pk))?.tombstone;
 	}
 
-	noteTombstone(schema: string, table: string, pk: SqlValue[], hlc: HLC): void {
-		this.row(schema, table, pk).tombstoneHlc = hlc;
+	noteTombstone(schema: string, table: string, pk: SqlValue[], filed: FiledAt): void {
+		this.row(schema, table, pk).tombstone = filed;
 	}
 
 	/**
@@ -110,9 +114,7 @@ export class StagedTransactionMetadata {
 	rowState(schema: string, table: string, pk: SqlValue[]): StagedRowState | undefined {
 		const row = this.rows.get(this.rowKey(schema, table, pk));
 		if (!row) return undefined;
-		const stagedColumns = new Map<string, HLC>();
-		for (const [column, version] of row.columns) stagedColumns.set(column, version.hlc);
-		return { stagedColumns, rowCleared: row.cleared };
+		return { stagedColumns: new Map<string, FiledAt>(row.columns), rowCleared: row.cleared };
 	}
 
 	/**

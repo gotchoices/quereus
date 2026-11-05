@@ -67,8 +67,14 @@ import type { SnapshotCheckpoint } from './manager.js';
  * instead of `changes` (its delta floor is above the client's watermark). A v1
  * client would log it as an unknown message and sit unsynced forever, so the
  * change is breaking in effect even though no v1 message shape moved.
+ *
+ * Version 3: a change set in a `changes` reply may carry `cursor`, the position the
+ * client must resume from (`replyWatermark`), and `sinceHLC` on `get_changes` is that
+ * position rather than a write time. A v2 client would resume from the set's `hlc`,
+ * which for a change that reached the server late is below what it already holds, and
+ * ask for the same range forever.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // ============================================================================
 // Base64 helpers (work in both browser and Node.js)
@@ -127,6 +133,7 @@ export interface SerializedChangeSet {
   hlc: string;                          // base64 of serializeHLC
   changes: SerializedChange[];
   schemaMigrations: SerializedSchemaMigration[];
+  cursor?: string;                      // base64; present-only (see ChangeSet.cursor)
 }
 
 export interface SerializedChange {
@@ -156,6 +163,8 @@ export interface SerializedSchemaMigration {
   columns?: string[];
   ddl: string;
   hlc: string;
+  /** Snapshots only: the sender's filing position (`SchemaMigration.position`). Optional, present-only. */
+  position?: string;
   schemaVersion: number;
 }
 
@@ -188,6 +197,7 @@ export interface SerializedSnapshotColumnVersionsChunk {
   entries: Array<{
     column: string;
     hlc: string;                        // base64
+    position?: string;                  // base64; present-only (the sender's filing position)
     value: unknown;                     // encodeSqlValue(value)
     pk: unknown[];                      // encodeSqlValue per cell
   }>;
@@ -200,6 +210,7 @@ export interface SerializedSnapshotTombstoneChunk {
   entries: Array<{
     pk: unknown[];                      // encodeSqlValue per cell
     hlc: string;                        // base64
+    position?: string;                  // base64; present-only (the sender's filing position)
     createdAt: number;
     priorRow?: unknown[];               // present-only ([] is present)
   }>;
@@ -252,6 +263,15 @@ export interface SerializedSnapshotCheckpoint extends Omit<SnapshotCheckpoint, '
 // Schema migration codec
 // ============================================================================
 
+/** An optional filing position for transport, present-only: `{}` or `{ position }`. */
+function serializePosition(position: HLC | undefined): { position?: string } {
+  return position !== undefined ? { position: serializeHLCForTransport(position) } : {};
+}
+
+function deserializePosition(position: string | undefined): { position?: HLC } {
+  return position !== undefined ? { position: deserializeHLCFromTransport(position) } : {};
+}
+
 function serializeSchemaMigration(m: SchemaMigration): SerializedSchemaMigration {
   return {
     type: m.type,
@@ -262,6 +282,7 @@ function serializeSchemaMigration(m: SchemaMigration): SerializedSchemaMigration
     ...(m.columns !== undefined ? { columns: m.columns } : {}),
     ddl: m.ddl,
     hlc: serializeHLCForTransport(m.hlc),
+    ...serializePosition(m.position),
     schemaVersion: m.schemaVersion,
   };
 }
@@ -275,6 +296,7 @@ function deserializeSchemaMigration(m: SerializedSchemaMigration): SchemaMigrati
     ...(m.columns !== undefined ? { columns: m.columns } : {}),
     ddl: m.ddl,
     hlc: deserializeHLCFromTransport(m.hlc),
+    ...deserializePosition(m.position),
     schemaVersion: m.schemaVersion,
   };
 }
@@ -364,6 +386,7 @@ export function serializeChangeSet(cs: ChangeSet): SerializedChangeSet {
     hlc: serializeHLCForTransport(cs.hlc),
     changes: cs.changes.map(serializeChange),
     schemaMigrations: cs.schemaMigrations.map(serializeSchemaMigration),
+    ...(cs.cursor !== undefined ? { cursor: serializeHLCForTransport(cs.cursor) } : {}),
   };
 }
 
@@ -381,6 +404,7 @@ export function deserializeChangeSet(obj: SerializedChangeSet): ChangeSet {
     // (ChangeSet.schemaMigrations is required), so this only guards a malformed
     // peer — cheap Postel, and real drift is caught by the version handshake.
     schemaMigrations: (obj.schemaMigrations ?? []).map(deserializeSchemaMigration),
+    ...(obj.cursor !== undefined ? { cursor: deserializeHLCFromTransport(obj.cursor) } : {}),
   };
 }
 
@@ -415,6 +439,7 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): SerializedSnapshot
         entries: chunk.entries.map(e => ({
           column: e.column,
           hlc: serializeHLCForTransport(e.hlc),
+          ...serializePosition(e.position),
           value: encodeSqlValue(e.value),
           pk: e.pk.map(v => encodeSqlValue(v)),
         })),
@@ -430,6 +455,7 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): SerializedSnapshot
         entries: chunk.entries.map(e => ({
           pk: e.pk.map(v => encodeSqlValue(v)),
           hlc: serializeHLCForTransport(e.hlc),
+          ...serializePosition(e.position),
           createdAt: e.createdAt,
           ...(e.priorRow !== undefined
             ? { priorRow: e.priorRow.map(v => encodeSqlValue(v)) }
@@ -477,6 +503,7 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
         entries: obj.entries.map(e => ({
           column: e.column,
           hlc: deserializeHLCFromTransport(e.hlc),
+          ...deserializePosition(e.position),
           value: decodeSqlValue(e.value),
           pk: e.pk.map(v => decodeSqlValue(v)) as SqlValue[],
         })),
@@ -489,6 +516,7 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
         entries: obj.entries.map(e => ({
           pk: e.pk.map(v => decodeSqlValue(v)) as SqlValue[],
           hlc: deserializeHLCFromTransport(e.hlc),
+          ...deserializePosition(e.position),
           createdAt: e.createdAt,
           ...(e.priorRow !== undefined
             ? { priorRow: e.priorRow.map(v => decodeSqlValue(v)) as Row }

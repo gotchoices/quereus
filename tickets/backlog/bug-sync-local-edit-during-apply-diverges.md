@@ -1,8 +1,8 @@
 description: If a device edits a row in the brief moment after an incoming sync change has written that row but before sync has filed its bookkeeping, the edit stays in that device's row while sync's records keep the old value, so the device silently disagrees with the others.
 architecture: docs/sync-transactions.md
 files:
-  - packages/quereus-sync/src/sync/change-applicator.ts # applyChanges drains the commit chain (~482), then commitChangeMetadata overwrites the local capture's cell records; setColumnVersionBatch (~1423)
-  - packages/quereus-sync/src/sync/sync-manager-impl.ts # enqueueTransactionCommit (~785): local capture runs behind the engine commit, with no ordering against an apply's data write
+  - packages/quereus-sync/src/sync/change-applicator.ts # applyChanges drains the commit chain (~507), then commitChangeMetadata overwrites the local capture's cell records; setColumnVersionBatch (~1545)
+  - packages/quereus-sync/src/sync/sync-manager-impl.ts # enqueueTransactionCommit (~861): local capture runs behind the engine commit, with no ordering against an apply's data write
 repro: verified
 severity: wrong-result
 likelihood: unusual
@@ -21,11 +21,12 @@ Reproduced in-process with real engines by running a local update from inside th
 |---|---|
 | Row | `(1, 'one', 2)` |
 | Cell record for `qty` | `1`, with the sender's timestamp |
-| Next push of that cell | `qty = 1` |
+| Next push of that cell | nothing |
+| What another device reading this one receives for that cell | `qty = 1` |
 
-The receiver's row says 2, and its metadata says 1, as does the sender. Only the receiver and its push list were inspected; the change was not relayed onward, so a third device was not observed. Only a new row was tried. An edit of a row that already has records was not run.
+The receiver's row says 2, and its metadata says 1, as does the sender. Only the receiver, its push list and what it serves were inspected; the change was not relayed onward, so a third device was not observed. Only a new row was tried. An edit of a row that already has records was not run.
 
-From reading the code, not run: the capture's change-log entry is left behind when the apply overwrites its cell, so the push above passes the filter on the entry's local timestamp and then resolves to the sender's timestamp. That also breaks the invariant documented on `collectChangesSince`, that a log entry's timestamp equals its cell's. Since the local timestamp is gone, nothing later should correct the row.
+Re-run after `bug-sync-late-push-skipped-by-newer-watermark` landed, which is where the push list above changed (it used to carry `qty = 1` under the sender's timestamp). The apply's final metadata write now runs on the same queue as local capture, but that does not close this: the apply decides what to write before the local edit happens. The capture's change-log entries are left behind when the apply overwrites its cells. Each then points at a record filed at another position, which the read side treats as stale and skips, so the local edit is sent to nobody; `repairChangeLog` removes them (three in the run, one per column, because the edit was the first sync had seen of the row). Since the local timestamp is gone, nothing later should correct the row.
 
 ## Expected behaviour
 

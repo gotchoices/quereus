@@ -221,6 +221,18 @@ describe('wire protocol', () => {
       expect(restored).to.deep.equal(cs);
     });
 
+    it('round-trips a cursor, and omits the key from a set that has none', () => {
+      const change: ColumnChange = { type: 'column', schema: 'main', table: 't', pk: [1], column: 'a', value: 1, hlc: hlc(1000, 5, 3) };
+      const cs: ChangeSet = { ...makeChangeSet([change]), cursor: hlc(2000, 0, 7) };
+
+      const restored = deserializeChangeSet(JSON.parse(JSON.stringify(serializeChangeSet(cs))) as SerializedChangeSet);
+      expect(restored).to.deep.equal(cs);
+
+      const withoutCursor = serializeChangeSet(makeChangeSet([change]));
+      expect(withoutCursor).to.not.have.property('cursor');
+      expect(deserializeChangeSet(withoutCursor)).to.not.have.property('cursor');
+    });
+
     it('round-trips a rename_table migration WITH fromTable', () => {
       const migration: SchemaMigration = {
         type: 'rename_table',

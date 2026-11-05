@@ -10,7 +10,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { InMemoryKVStore } from '@quereus/store';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl, type PrimaryKeyRekeyedEvent } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG, type Change, type ChangeSet, type SchemaMigration } from '../../src/sync/protocol.js';
+import { DEFAULT_SYNC_CONFIG, replyWatermark, type Change, type ChangeSet, type SchemaMigration } from '../../src/sync/protocol.js';
 import { createHLC, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 
@@ -107,6 +107,25 @@ describe('a relay re-files its records when a replicated primary key change runs
 			schema: 'main', table: 'orders',
 			cellsRekeyed: 6, rowsRekeyed: 2, rowsDropped: 0, rowsStranded: 0, tombstonesRekeyed: 0, tombstonesDropped: 0,
 		}]);
+	});
+
+	it('keeps each record where it was filed: a reader past it is not sent it again, and one behind it still is', async () => {
+		const { relay } = await makeRelay();
+		const reader = generateSiteId();
+		await relay.applyChanges([changeSet([...row(1, 'one', 1)])]);
+		const afterRowOne = replyWatermark(await relay.getChangesSince(reader))!;
+		await relay.applyChanges([changeSet([...row(2, 'two', 2)])]);
+		const afterRowTwo = replyWatermark(await relay.getChangesSince(reader, afterRowOne))!;
+
+		await relay.applyChanges([changeSet([], [redefineKey('id, qty')])]);
+
+		const caughtUp = await relay.getChangesSince(reader, afterRowTwo);
+		expect(caughtUp.flatMap(set => set.changes)).to.deep.equal([]);
+		expect(caughtUp.flatMap(set => set.schemaMigrations)).to.have.lengthOf(1);
+
+		const behind = await relay.getChangesSince(reader, afterRowOne);
+		expect(behind.flatMap(set => set.changes).map(change => JSON.stringify(change.pk)))
+			.to.deep.equal(['[2,2]', '[2,2]', '[2,2]']);
 	});
 
 	it('moves a tombstone to the key read from its before-image, laid out as the migration\'s column list', async () => {

@@ -29,6 +29,7 @@ import {
 	makePeer,
 	relay,
 	reviveOrders,
+	withoutPosition,
 	type Peer,
 } from './_peer-harness.js';
 
@@ -42,10 +43,12 @@ async function pull(from: Peer, to: Peer): Promise<ChangeSet[]> {
 	return dataOnly(await from.manager.getChangesSince(to.manager.getSiteId()));
 }
 
-/** The row's live cell records, comparable across peers (sorted, HLCs included). */
+/** The row's live cell records, comparable across peers (sorted, HLCs included, each peer's own filing position left out). */
 async function cells(peer: Peer, pk: number): Promise<unknown> {
 	const versions = await peer.manager.columnVersions.getRowVersions('main', 'orders', [pk]);
-	return [...versions.entries()].sort(([a], [b]) => a.localeCompare(b));
+	return [...versions.entries()]
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([column, version]) => [column, withoutPosition(version)]);
 }
 
 /** What this peer would relay onward to a never-seen third site. */

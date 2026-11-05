@@ -65,6 +65,7 @@ export {
   type SchemaMigration,
   // Transaction types
   type ChangeSet,
+  replyWatermark,
   // API types
   type ApplyRejection,
   type ApplyResult,

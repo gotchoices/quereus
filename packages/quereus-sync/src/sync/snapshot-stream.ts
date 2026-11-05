@@ -208,7 +208,13 @@ async function* streamSnapshotChunks(
 			const cv = deserializeColumnVersion(entry.value);
 			// Only the raw pk (the row's address, from the record value) travels; the
 			// sender's key identity stays local — the receiver derives its own.
-			entries.push({ column: parsed.column, hlc: cv.hlc, value: cv.value, pk: cv.pk });
+			entries.push({
+				column: parsed.column,
+				hlc: cv.hlc,
+				...(cv.position !== undefined ? { position: cv.position } : {}),
+				value: cv.value,
+				pk: cv.pk,
+			});
 			entriesWritten++;
 
 			if (entries.length >= chunkSize) {
@@ -288,6 +294,7 @@ async function* streamSnapshotChunks(
 		tsEntries.push({
 			pk: tombstone.pk,
 			hlc: tombstone.hlc,
+			...(tombstone.position !== undefined ? { position: tombstone.position } : {}),
 			createdAt: tombstone.createdAt,
 			...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
 		});
@@ -314,21 +321,31 @@ async function* streamSnapshotChunks(
 
 /**
  * Stream a snapshot as chunks for memory-efficient transfer.
+ *
+ * The header's HLC is a fresh tick taken on the commit chain before anything is read
+ * (see `getSnapshot` for why the clock's current value would not do). It is also
+ * always above the delta floor, which a pruned tombstone's position can raise to the
+ * same clock reading with a higher `opSeq`: a header below the floor would have the
+ * receiver's first `get_changes` refused, and it would loop through snapshots.
  */
 export async function* getSnapshotStream(
 	ctx: SyncContext,
 	chunkSize: number = DEFAULT_SNAPSHOT_CHUNK_SIZE,
 ): AsyncIterable<SnapshotChunk> {
+	const hlc = await ctx.nextFilingTick();
 	yield* streamSnapshotChunks(ctx, {
 		snapshotId: crypto.randomUUID(),
 		siteId: ctx.getSiteId(),
-		hlc: ctx.getCurrentHLC(),
+		hlc,
 		chunkSize,
 	});
 }
 
 /**
- * Resume a snapshot transfer from a checkpoint.
+ * Resume a snapshot transfer from a checkpoint. The header keeps the ORIGINAL
+ * snapshot's HLC while the data is read live, so the receiver's watermark ends up
+ * below some of what it was sent and its catch-up re-fetches that: conservative, and
+ * idempotent.
  */
 export async function* resumeSnapshotStream(
 	ctx: SyncContext,
@@ -610,7 +627,7 @@ export async function applySnapshotStream(
 	// greatest HLC per identity. NOTE: flushed when the incoming chunk's
 	// (schema, table) changes — correct ONLY because the producer's `tb:` scan is
 	// key-sorted, so all tombstone chunks for one table are contiguous in the stream.
-	const tombstoneRows = new Map<string, { pk: SqlValue[]; hlc: HLC; priorRow?: Row }>();
+	const tombstoneRows = new Map<string, { pk: SqlValue[]; hlc: HLC; position?: HLC; priorRow?: Row }>();
 	let tombstoneSchema: string | undefined;
 	let tombstoneTable: string | undefined;
 
@@ -621,7 +638,11 @@ export async function applySnapshotStream(
 			// the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
 			// horizon is re-based to bootstrap time rather than preserved. Acceptable
 			// for phase 1 (the tombstone lives a full horizon from bootstrap).
-			ctx.tombstones.setTombstoneBatch(batch, tombstoneSchema, tombstoneTable, ts.pk, ts.hlc, ts.priorRow);
+			// Filed at the sender's position, with its change-log entry, like a cell at
+			// `table-end`: without the entry this replica could not serve the delete to
+			// a peer reading its log.
+			ctx.tombstones.setTombstoneBatch(batch, tombstoneSchema, tombstoneTable, ts.pk, ts, ts.priorRow);
+			ctx.changeLog.recordDeletionBatch(batch, ts, tombstoneSchema, tombstoneTable, ts.pk);
 			batchSize++;
 			if (batchSize >= BATCH_FLUSH_SIZE) {
 				await flushMetadataBatch();
@@ -783,6 +804,7 @@ export async function applySnapshotStream(
 					keepMaxHLC(tombstoneRows, encodePkIdentity(entry.pk, keying), {
 						pk: entry.pk,
 						hlc: entry.hlc,
+						...(entry.position !== undefined ? { position: entry.position } : {}),
 						...(entry.priorRow !== undefined ? { priorRow: entry.priorRow } : {}),
 					});
 				}
@@ -794,29 +816,16 @@ export async function applySnapshotStream(
 				// per (receiver identity, column) by greatest HLC during accumulation, so
 				// exactly one cell record, one change-log entry, and one data column
 				// survive per cell — collapsed sender spellings resolve by timestamp, not
-				// by batch order.
+				// by batch order. Each is filed at the position the SENDER had it at (see
+				// the non-streaming apply for why).
 				if (currentTableSchema && currentTableName) {
 					for (const row of tableRows.values()) {
 						const columns: Record<string, SqlValue> = {};
 						for (const [column, cell] of row.cells) {
 							columns[column] = cell.value;
 
-							ctx.columnVersions.setColumnVersionBatch(
-								batch,
-								currentTableSchema,
-								currentTableName,
-								row.pk,
-								column,
-								{ hlc: cell.hlc, value: cell.value },
-							);
-							ctx.changeLog.recordColumnChangeBatch(
-								batch,
-								cell.hlc,
-								currentTableSchema,
-								currentTableName,
-								row.pk,
-								column,
-							);
+							ctx.columnVersions.setColumnVersionBatch(batch, currentTableSchema, currentTableName, row.pk, column, cell);
+							ctx.changeLog.recordColumnChangeBatch(batch, cell, currentTableSchema, currentTableName, row.pk, column);
 
 							batchSize++;
 							if (batchSize >= BATCH_FLUSH_SIZE) {
@@ -872,6 +881,7 @@ export async function applySnapshotStream(
 							...(migration.columns !== undefined ? { columns: migration.columns } : {}),
 							ddl: migration.ddl,
 							hlc: migration.hlc,
+							...(migration.position !== undefined ? { position: migration.position } : {}),
 							schemaVersion,
 						},
 					},
@@ -893,6 +903,12 @@ export async function applySnapshotStream(
 				}
 
 				// Update HLC
+				// NOTE: on a RESUMED transfer the data was read after the original header was
+				// issued, so a copied position can be above the header merged here. This
+				// replica's next tick still files above it unless its clock runs behind the
+				// sender's by more than the time since. If a replica restored from a resumed
+				// stream ever serves a delta that skips its own later writes, merge the
+				// greatest copied position here as well (validating its drift first).
 				if (snapshotHLC) {
 					ctx.hlcManager.receive(snapshotHLC);
 					await persistHLCState(ctx);

@@ -7,20 +7,23 @@
  *   tg: - Table generation: the stable per-peer identity a `(schema, table)` name
  *         currently resolves to (see `metadata/table-identity.ts`)
  *   tx: - Transaction records
- *   ps: - Peer sync state (received watermark: highest HLC pulled from a peer)
- *   pt: - Peer sent state (sent watermark: highest HLC pushed to a peer and acked)
+ *   ps: - Peer sync state (received watermark: how far through a peer's change log this
+ *         replica has read — a filing position on THAT peer; see `metadata/filing-position.ts`)
+ *   pt: - Peer sent state (sent watermark: highest origin HLC pushed to a peer and acked)
  *   sm: - Schema migrations (keyed by object KIND as well as name — see buildSchemaMigrationKey)
  *   si: - Site identity
  *   hc: - HLC clock state
- *   cl: - Change log (HLC-indexed for efficient delta queries), keyed by table generation
+ *   cl: - Change log: one entry per live `cv:`/`tb:` record, keyed by the record's filing
+ *         position (then its table generation), so a scan reads facts in the order this
+ *         replica filed them; the value holds the origin HLC when it differs
  *   qt: - Quarantine (held out-of-basis straggler changes) — keyed by NAME: it describes
  *         a name the receiver does not have, not a table it does
  *   bl: - Basis-table lifecycle (mapped/derivation-source/unreferenced/detached bookkeeping)
  *   fv: - Sync-metadata format version (single record; see SYNC_METADATA_FORMAT_VERSION)
  *   sc: - Snapshot checkpoints (resume position of an interrupted streaming snapshot apply)
- *   df: - Delta floor (single record: the greatest HLC of any tombstone this replica has
- *         pruned — the HLC below which it can no longer serve a complete incremental delta;
- *         see `metadata/delta-floor.ts`)
+ *   df: - Delta floor (single record: the greatest filing position of any tombstone this
+ *         replica has pruned — the position below which it can no longer serve a complete
+ *         incremental delta; see `metadata/delta-floor.ts`)
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -633,21 +636,23 @@ export function deserializeHLCFromKey(buffer: Uint8Array): HLC {
 
 /**
  * Build a change log key.
- * Format: cl:{hlc_bytes}{type_byte}{n}:{generation}{n}:{identity}[{n}:{column}]
+ * Format: cl:{position_bytes}{type_byte}{n}:{generation}{n}:{identity}[{n}:{column}]
  *
- * The HLC comes first to enable efficient range scans by time.
+ * `position` is the fact's FILING POSITION (`metadata/filing-position.ts`), not its
+ * origin timestamp: it comes first so a range scan reads facts in the order this replica
+ * filed them. The two are equal for a fact written here.
  * type_byte: 0x01 for column change, 0x02 for delete
  * Every text component is length-prefixed — see {@link joinKeyParts}.
  */
 export function buildChangeLogKey(
-  hlc: HLC,
+  position: HLC,
   entryType: ChangeLogEntryType,
   generation: string,
   identity: string,
   column?: string
 ): Uint8Array {
   assertKeyableIdentifiers(...(column !== undefined ? [column] : []));
-  const hlcBytes = serializeHLCForKey(hlc);
+  const positionBytes = serializeHLCForKey(position);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
   // `!== undefined`, not truthiness: a zero-length column name must still emit its
   // (empty) component, or the builder would write 2 parts where `parseChangeLogKey`
@@ -657,10 +662,10 @@ export function buildChangeLogKey(
     : joinKeyParts(generation, identity);
   const suffixBytes = encoder.encode(suffix);
 
-  // cl: (3) + hlc (30) + type (1) + suffix
+  // cl: (3) + position (30) + type (1) + suffix
   const key = new Uint8Array(3 + 30 + 1 + suffixBytes.length);
   key.set(SYNC_KEY_PREFIX.CHANGE_LOG, 0);
-  key.set(hlcBytes, 3);
+  key.set(positionBytes, 3);
   key[33] = typeByte;
   key.set(suffixBytes, 34);
 
@@ -668,15 +673,15 @@ export function buildChangeLogKey(
 }
 
 /**
- * Build scan bounds for change log entries after a given HLC.
- * Returns keys to scan cl:{sinceHLC}* to end of change log.
+ * Build scan bounds for change log entries filed strictly after a given position.
+ * Returns keys to scan cl:{sincePosition}* to end of change log.
  */
-export function buildChangeLogScanBoundsAfter(sinceHLC: HLC): { gte: Uint8Array; lt: Uint8Array } {
-  const hlcBytes = serializeHLCForKey(sinceHLC);
-  // Start just after sinceHLC
+export function buildChangeLogScanBoundsAfter(sincePosition: HLC): { gte: Uint8Array; lt: Uint8Array } {
+  const positionBytes = serializeHLCForKey(sincePosition);
+  // Start just after sincePosition
   const gte = new Uint8Array(3 + 30);
   gte.set(SYNC_KEY_PREFIX.CHANGE_LOG, 0);
-  gte.set(incrementHLCBytes(hlcBytes), 3);
+  gte.set(incrementHLCBytes(positionBytes), 3);
 
   return {
     gte,
@@ -711,23 +716,23 @@ function incrementHLCBytes(hlcBytes: Uint8Array): Uint8Array {
 }
 
 /**
- * Parse a change log key to extract components.
+ * Parse a change log key to extract components. `position` is the entry's filing
+ * position; its origin timestamp is in the entry's VALUE (see `ChangeLogStore`).
  */
 export function parseChangeLogKey(key: Uint8Array): {
-  hlc: HLC;
+  position: HLC;
   entryType: ChangeLogEntryType;
   generation: string;
   identity: string;
   column?: string;
 } | null {
-  // Minimum: cl: (3) + hlc (30) + type (1) + some suffix
+  // Minimum: cl: (3) + position (30) + type (1) + some suffix
   if (key.length < 35) return null;
 
   const prefixStr = decoder.decode(key.slice(0, 3));
   if (prefixStr !== 'cl:') return null;
 
-  const hlcBytes = key.slice(3, 33);
-  const hlc = deserializeHLCFromKey(hlcBytes);
+  const position = deserializeHLCFromKey(key.slice(3, 33));
 
   const typeByte = key[33];
   const entryType: ChangeLogEntryType = typeByte === 0x01 ? 'column' : 'delete';
@@ -740,18 +745,19 @@ export function parseChangeLogKey(key: Uint8Array): {
 
   const [generation, identity] = split.parts;
   if (entryType === 'column') {
-    return { hlc, entryType, generation, identity, column: split.parts[2] };
+    return { position, entryType, generation, identity, column: split.parts[2] };
   }
   // Delete entry - no column
-  return { hlc, entryType, generation, identity };
+  return { position, entryType, generation, identity };
 }
 
 /**
  * Build a quarantine key for a held out-of-basis straggler change.
  * Format: qt:{n}:{schema}{n}:{table} + hlc_bytes(30) + type_byte(1) + {n}:{raw_identity}[{n}:{column}]
  *
- * Unlike the change log (`cl:`), the table prefix comes BEFORE the HLC so the
- * range scans by `(schema, table)` for operator inspection. The HLC + type + pk
+ * Unlike the change log (`cl:`), the table prefix comes BEFORE the timestamp, so the
+ * range scans by `(schema, table)` for operator inspection, and the timestamp is the
+ * change's own origin HLC: a held change is never filed, so it has no position. The HLC + type + pk
  * (+ column) suffix make the key idempotent: re-applying the same straggler
  * change (same HLC) overwrites its own entry rather than accumulating.
  *

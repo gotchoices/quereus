@@ -7,7 +7,7 @@
  */
 
 import type { AssertionViolation, Row, SqlValue } from '@quereus/quereus';
-import { type HLC, compareHLC } from '../clock/hlc.js';
+import { type HLC, compareHLC, maxHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { joinKeyParts } from '../metadata/keys.js';
 
@@ -135,6 +135,13 @@ export interface SchemaMigration {
   readonly ddl: string;           // The DDL statement
   readonly hlc: HLC;              // When migration occurred
   /**
+   * Snapshots only: where the sending replica filed the migration in its change log,
+   * when that differs from `hlc`, so a replica restored from the snapshot keeps the
+   * sender's filing order. A migration inside a {@link ChangeSet} never carries one
+   * (the set's `cursor` covers it), and a receiver applying a set ignores it.
+   */
+  readonly position?: HLC;
+  /**
    * Monotonic per (object kind, object name), from 1 for ordinary migrations.
    *
    * Version {@link BASELINE_SCHEMA_VERSION} (0) is a **baseline**: a `create_table`
@@ -256,6 +263,24 @@ export interface ChangeSet {
   readonly changes: Change[];
   /** Schema migrations in this transaction (DDL sorts below the same tx's DML). */
   readonly schemaMigrations: SchemaMigration[];
+  /**
+   * Where a consumer that received this set resumes from on the replica that served it: the
+   * set's greatest filing position. Absent when it equals `hlc`. Means nothing to any other
+   * replica, and applying a set ignores it.
+   */
+  readonly cursor?: HLC;
+}
+
+/**
+ * The watermark a `getChangesSince` reply moves its consumer to: the greatest resume
+ * position among its sets (`cursor`, or `hlc` where a set carries none). The next request
+ * passes it as `sinceHLC`. `undefined` for an empty reply, which moves nothing.
+ *
+ * Only for a reply read from another replica's log. What a replica pushes
+ * (`getChangesToPush`) is tracked by `hlc` alone.
+ */
+export function replyWatermark(changeSets: readonly ChangeSet[]): HLC | undefined {
+	return maxHLC(changeSets.map(cs => cs.cursor ?? cs.hlc));
 }
 
 // ============================================================================
@@ -317,6 +342,14 @@ export const SNAPSHOT_WIRE_FORMAT_VERSION = 1;
 export interface ColumnVersionEntry {
   readonly column: string;
   readonly hlc: HLC;
+  /**
+   * Where the sending replica filed this cell in its change log, when that differs
+   * from `hlc` (the cell reached the sender from another replica). The receiver files
+   * the cell at the same position, so its own log keeps the sender's order and a peer
+   * whose watermark was taken on the sender stays meaningful on a replica restored
+   * from this snapshot. See docs/sync-protocol.md § Delta Sync Optimization.
+   */
+  readonly position?: HLC;
   readonly value: SqlValue;
   /**
    * The row's raw pk (its ADDRESS). The pk IDENTITY deliberately does NOT
@@ -353,6 +386,8 @@ export interface SnapshotTombstone {
   readonly table: string;
   readonly pk: SqlValue[];
   readonly hlc: HLC;
+  /** The sender's filing position for the delete, when it differs from `hlc`; see {@link ColumnVersionEntry.position}. */
+  readonly position?: HLC;
   readonly createdAt: number;
   /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
   readonly priorRow?: Row;
@@ -469,6 +504,8 @@ export interface SnapshotTombstoneChunk {
   readonly entries: ReadonlyArray<{
     readonly pk: SqlValue[];
     readonly hlc: HLC;
+    /** The sender's filing position for the delete, when it differs from `hlc`; see {@link ColumnVersionEntry.position}. */
+    readonly position?: HLC;
     readonly createdAt: number;
     /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
     readonly priorRow?: Row;

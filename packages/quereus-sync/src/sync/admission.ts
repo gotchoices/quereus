@@ -135,7 +135,9 @@ export interface AdmissionGroup {
 	/**
 	 * Local HLC clock watermark to merge in on full-unit success. The per-PEER
 	 * `lastSyncHLC` is the transport caller's concern (it differs per modality and
-	 * transport) and is deliberately NOT advanced here.
+	 * transport) and is deliberately NOT advanced here. The wire apply leaves this
+	 * unset and merges inside `commitMetadata`, in the same write as the filing
+	 * positions it takes from the merged clock (`commitChangeMetadata`).
 	 */
 	readonly watermarkHLC?: HLC;
 }

@@ -741,10 +741,10 @@ describe('store-adapter seam integration', () => {
 			// branches of clearExistingMetadata that the cv assertions don't reach)
 			// while still dropping tableC's — proving the preserve filter is
 			// selective, not a blanket skip.
-			await syncManager.tombstones.setTombstone('main', 'tableA', ['a2'], remoteHLC.tick());
-			await syncManager.changeLog.recordColumnChange(remoteHLC.tick(), 'main', 'tableA', ['a1'], 'v');
-			await syncManager.tombstones.setTombstone('main', 'tableC', ['c1'], remoteHLC.tick());
-			await syncManager.changeLog.recordColumnChange(remoteHLC.tick(), 'main', 'tableC', ['c1'], 'v');
+			await syncManager.tombstones.setTombstone('main', 'tableA', ['a2'], { hlc: remoteHLC.tick() });
+			await syncManager.changeLog.recordColumnChange({ hlc: remoteHLC.tick() }, 'main', 'tableA', ['a1'], 'v');
+			await syncManager.tombstones.setTombstone('main', 'tableC', ['c1'], { hlc: remoteHLC.tick() });
+			await syncManager.changeLog.recordColumnChange({ hlc: remoteHLC.tick() }, 'main', 'tableC', ['c1'], 'v');
 			const checkpoint = {
 				snapshotId,
 				siteId: remoteSiteId,

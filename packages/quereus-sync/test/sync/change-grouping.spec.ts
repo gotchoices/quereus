@@ -2,14 +2,16 @@
  * Unit tests for transaction grouping (`buildTransactionChangeSets`).
  *
  * These exercise the pure grouping/bounding logic in isolation: one ChangeSet
- * per source transaction, never split, never merged; transaction-granularity
- * bounding; oversized-transaction telemetry; DDL grouping.
+ * per source transaction per filing tick, never merged; ordering and bounding by
+ * filing position; oversized-transaction telemetry; DDL grouping; the `cursor`.
  */
 
 import { expect } from 'chai';
 import {
 	buildTransactionChangeSets,
-	groupByTransaction,
+	filedAtOrigin,
+	groupByTransactionAndTick,
+	type FiledChange,
 } from '../../src/sync/change-grouping.js';
 import { createHLC, deterministicTxnId, compareHLC, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId, type SiteId } from '../../src/clock/site.js';
@@ -57,6 +59,11 @@ function base(wallTime: number, counter: number, site: SiteId = SITE): HLC {
 	return createHLC(BigInt(wallTime), counter, site, 0);
 }
 
+/** A change another site wrote, filed by `SITE` at `(wallTime, counter, SITE, opSeq)`. */
+function filedLate(change: ColumnChange, wallTime: number, counter: number, opSeq: number): FiledChange {
+	return { change, position: createHLC(BigInt(wallTime), counter, SITE, opSeq) };
+}
+
 describe('change-grouping', () => {
 	describe('buildTransactionChangeSets', () => {
 		it('returns [] for an empty stream', () => {
@@ -67,7 +74,7 @@ describe('change-grouping', () => {
 			// Deliberately out of opSeq order to verify the grouper sorts.
 			const changes: Change[] = [col(1000, 0, 2), col(1000, 0, 0), col(1000, 0, 1)];
 
-			const result = buildTransactionChangeSets(changes, [], 1000);
+			const result = buildTransactionChangeSets(filedAtOrigin(changes), [], 1000);
 
 			expect(result).to.have.lengthOf(1);
 			const cs = result[0];
@@ -83,7 +90,7 @@ describe('change-grouping', () => {
 			const t1 = [col(1000, 0, 0), col(1000, 0, 1)];
 			const t2 = [col(1000, 1, 0), col(1000, 1, 1)];
 
-			const result = buildTransactionChangeSets([...t2, ...t1], [], 1000);
+			const result = buildTransactionChangeSets(filedAtOrigin([...t2, ...t1]), [], 1000);
 
 			expect(result).to.have.lengthOf(2);
 			// Ordered by base HLC ascending regardless of input order.
@@ -99,7 +106,7 @@ describe('change-grouping', () => {
 			const t3 = [col(1000, 2, 0), col(1000, 2, 1)];
 
 			// batchSize 3: after t1 cumulative=2 (<3, continue); after t2 cumulative=4 (>=3, stop).
-			const result = buildTransactionChangeSets([...t1, ...t2, ...t3], [], 3);
+			const result = buildTransactionChangeSets(filedAtOrigin([...t1, ...t2, ...t3]), [], 3);
 
 			expect(result).to.have.lengthOf(2);
 			expect(result[0].changes).to.have.lengthOf(2);
@@ -114,7 +121,7 @@ describe('change-grouping', () => {
 			const facts = [0, 1, 2, 3, 4].map(opSeq => col(1000, 0, opSeq));
 			const oversized: Array<{ id: string; count: number }> = [];
 
-			const result = buildTransactionChangeSets(facts, [], 2, (id, count) =>
+			const result = buildTransactionChangeSets(filedAtOrigin(facts), [], 2, (id, count) =>
 				oversized.push({ id, count }),
 			);
 
@@ -138,7 +145,7 @@ describe('change-grouping', () => {
 		it('groups DDL + DML of the same transaction into one ChangeSet (DDL at lower opSeq)', () => {
 			// Migration takes opSeq 0; data facts take 1, 2 — same base.
 			const result = buildTransactionChangeSets(
-				[col(1000, 0, 1), col(1000, 0, 2)],
+				filedAtOrigin([col(1000, 0, 1), col(1000, 0, 2)]),
 				[migration(1000, 0, 0)],
 				1000,
 			);
@@ -149,13 +156,58 @@ describe('change-grouping', () => {
 			expect(cs.changes).to.have.lengthOf(2);
 			// Group hlc is the max fact (last DML opSeq), not the migration.
 			expect(cs.hlc.opSeq).to.equal(2);
+			// Filed where it was written, so the resume position is the hlc itself.
+			expect(cs.cursor).to.equal(undefined);
+		});
+
+		it('orders and cuts by filing position, and resumes from the position, when an old change was filed late', () => {
+			// OTHER_SITE wrote at 900; SITE filed it at tick (2000, 0), after its own writes at 1000 and 1500.
+			const late = filedLate(col(900, 0, 0, OTHER_SITE), 2000, 0, 0);
+			const own = filedAtOrigin([col(1000, 0, 0), col(1500, 0, 0)]);
+
+			const firstTwo = buildTransactionChangeSets([late, ...own], [], 2);
+
+			// Origin order would put the late change first and cut after the 1000 write, leaving
+			// the reply's greatest hlc at 1000 with the 1500 write and nothing else to resume past.
+			expect(firstTwo.map(cs => cs.hlc.wallTime)).to.deep.equal([1000n, 1500n]);
+
+			const all = buildTransactionChangeSets([late, ...own], [], 1000);
+			expect(all.map(cs => cs.hlc.wallTime)).to.deep.equal([1000n, 1500n, 900n]);
+			expect(all[2].cursor).to.deep.equal(late.position);
+			expect(all[2].transactionId).to.equal(deterministicTxnId(base(900, 0, OTHER_SITE)));
+		});
+
+		it('splits one transaction filed at two ticks into two ChangeSets, each with its own cursor', () => {
+			const first = filedLate(col(900, 0, 0, OTHER_SITE), 2000, 0, 0);
+			const between = filedLate(col(950, 0, 0, OTHER_SITE), 2000, 1, 0);
+			const second = filedLate(col(900, 0, 1, OTHER_SITE), 2000, 2, 0);
+
+			const result = buildTransactionChangeSets([second, between, first], [], 1000);
+
+			expect(result.map(cs => cs.transactionId)).to.deep.equal([
+				deterministicTxnId(base(900, 0, OTHER_SITE)),
+				deterministicTxnId(base(950, 0, OTHER_SITE)),
+				deterministicTxnId(base(900, 0, OTHER_SITE)),
+			]);
+			expect(result.map(cs => cs.cursor)).to.deep.equal([first.position, between.position, second.position]);
+		});
+
+		it("strips a migration's own position and files a late one with its transaction's data", () => {
+			const lateMigration = { ...migration(900, 0, 0, OTHER_SITE), position: createHLC(2000n, 0, SITE, 0) };
+			const data = filedLate(col(900, 0, 1, OTHER_SITE), 2000, 0, 1);
+
+			const result = buildTransactionChangeSets([data], [lateMigration], 1000);
+
+			expect(result).to.have.lengthOf(1);
+			expect(result[0].schemaMigrations).to.deep.equal([migration(900, 0, 0, OTHER_SITE)]);
+			expect(result[0].cursor).to.deep.equal(data.position);
 		});
 	});
 
-	describe('groupByTransaction', () => {
+	describe('groupByTransactionAndTick', () => {
 		it('separates transactions from different sites at the same (wallTime, counter)', () => {
-			const groups = groupByTransaction(
-				[col(1000, 0, 0, SITE), col(1000, 0, 0, OTHER_SITE)],
+			const groups = groupByTransactionAndTick(
+				filedAtOrigin([col(1000, 0, 0, SITE), col(1000, 0, 0, OTHER_SITE)]),
 				[],
 			);
 			expect(groups).to.have.lengthOf(2);

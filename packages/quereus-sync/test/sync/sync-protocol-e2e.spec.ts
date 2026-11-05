@@ -10,6 +10,7 @@ import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
 import {
   DEFAULT_SYNC_CONFIG,
+  replyWatermark,
   type SyncConfig,
   type DataChangeToApply,
   type SchemaChangeToApply,
@@ -1827,7 +1828,7 @@ describe('Sync Protocol E2E', () => {
       expect(result.applied).to.equal(8);
 
       // Watermark lands on the SECOND transaction's HLC (a real commit boundary).
-      const watermark = changeSets[changeSets.length - 1].hlc;
+      const watermark = replyWatermark(changeSets)!;
       await guest.manager.updatePeerSyncState(host.manager.getSiteId(), watermark);
       expect(compareHLC(watermark, changeSets[0].hlc)).to.be.greaterThan(0);
 

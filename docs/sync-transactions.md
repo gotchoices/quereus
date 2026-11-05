@@ -95,7 +95,8 @@ commit N+1's dedup would read pre-N-write state, miss the prior version, and lea
 change-log entry — breaking the *at most one surviving entry per key* invariant the read
 side relies on. `SyncManagerImpl` therefore chains each commit onto a tail promise
 (`enqueueTransactionCommit`). The tick itself is synchronous and already ordered; only the
-post-tick dedup reads need this.
+post-tick dedup reads need this. The same chain orders the filing of received changes
+(§ Filing position).
 
 **Local capture reads its own writes.** Within one transaction, every metadata read (the
 dedup lookups and the delete cleanup's column set) consults a per-transaction
@@ -138,30 +139,81 @@ Edge cases:
 a random UUID. Same transaction ⇒ same id on every peer (the read side reproduces it
 from the change-log facts' shared base), so no separate `tx:` record is persisted.
 
+### Filing position: the order of the change log
+
+A fact's HLC says when it was written. Where it sits in a replica's change log is a
+separate value, its **filing position** (`metadata/filing-position.ts`), and the change
+log (`cl:`) is keyed by that. The two are kept apart because a peer reading the log needs
+to know how far through the replica's *arrival* order it has read, and arrival order
+differs from write order whenever a change arrives late
+([sync-protocol.md § Delta Sync Optimization](sync-protocol.md#delta-sync-optimization)).
+
+```
+local write:     position = hlc                 // the tick that stamped the transaction
+received change: position = (T, opSeq i)        // T = one tick of THIS replica's clock per
+                                                // admitted batch, taken after merging the
+                                                // batch's greatest HLC into the clock
+```
+
+So positions rise in the order facts are filed and a position is never below its fact's
+HLC. Every received change takes the second path, whether it is late or not: there is no
+separate "late" case. A `cv:` / `tb:` / `sm:` record stores its position only when it
+differs from its HLC, and a change-log entry stores the HLC as its value under the same
+condition, so a fact written here, and every record written before positions existed,
+reads as "filed at its HLC".
+
+**Commit order equals position order.** An apply's data writes are not serialized, but its
+final step is: merging the batch's clock, taking the tick, giving each fact a position and
+writing them all (`commitChangeMetadata` → `fileAtNextTick`) runs as one entry on the same
+chain local capture records on. Without that, an apply could take a tick, be overtaken by
+a later apply that commits first, and then commit below a position some peer had already
+read past. The clock is persisted in that same write: persisted afterwards, a crash
+between the two would restart the clock below positions already on disk. A batch's schema
+migrations are filed in the same write and tick as its data.
+
+Within a tick, facts are filed in HLC order. Facts of one transaction share a base HLC,
+so each transaction's facts of that tick occupy one unbroken run of positions, its
+migrations first. That contiguity is what lets a reply be cut between transactions.
+
+A record that is re-filed under a new key by `alter primary key`
+([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)) keeps its position:
+a key redefinition is not a new arrival. A snapshot carries each record's position and the
+receiver files it there too, so a replica rebuilt from a snapshot has the sender's order
+and a watermark taken on the sender stays meaningful on it.
+
 ### Read side: one ChangeSet per transaction
 
 `getChangesSince(peerSiteId, sinceHLC?)` returns **one `ChangeSet` per source
-transaction** — never splitting a commit, never merging two
-(`change-grouping.ts` `buildTransactionChangeSets`):
+transaction per filing tick**, in filing order, never merging two transactions
+(`change-grouping.ts` `buildTransactionChangeSets`). `sinceHLC` is a filing position:
 
 ```
 getChangesSince(peerSiteId, sinceHLC):
-  facts      = sinceHLC ? changeLog.scan(after sinceHLC) : (all column-versions + tombstones)
+  facts      = sinceHLC ? changeLog.scan(filed after sinceHLC) : (all column-versions + tombstones)
                skipping any fact whose hlc.siteId == peerSiteId   // echo filter (whole tx)
-  migrations = sm: scan, after sinceHLC, not from peerSiteId
-  group facts+migrations by transaction identity (wallTime, counter, siteId):
+  migrations = sm: scan, filed after sinceHLC, not from peerSiteId
+  group facts+migrations by (transaction identity (wallTime, counter, siteId), filing tick):
     each group ⇒ one ChangeSet:
-      changes:          group's facts in opSeq order (intra-table write order)
-      schemaMigrations: group's migrations in opSeq order (DDL below the tx's DML)
+      changes:          group's facts in filing order (= opSeq order, intra-table write order)
+      schemaMigrations: group's migrations in filing order (DDL below the tx's DML)
       hlc:              group's MAX fact HLC (last opSeq) — the commit boundary
+      cursor:           group's MAX filing position; omitted when equal to hlc
       transactionId:    deterministicTxnId(base)          — same derivation as write side
       siteId:           the group's origin site
-  order ChangeSets by base HLC ascending
-  bound by batchSize at TRANSACTION granularity (below)
+  order ChangeSets by filing position ascending
+  bound by batchSize at ChangeSet granularity (below)
 ```
 
-The HLC scan is already ordered by `(wallTime, counter, siteId, opSeq)` (the
-change-log key), so a transaction's facts are contiguous and in `opSeq` order.
+The change-log scan is ordered by filing position (its key), so a group's facts are
+contiguous and in `opSeq` order.
+
+A transaction this replica wrote, or received in one apply, is one group and one
+`ChangeSet`. A transaction whose facts were filed in two ticks is two: part of it was
+applied and the rest held for a table the replica lacked and replayed later
+([sync.md § Store-and-forward relay](sync.md#store-and-forward-relay)), or two pushes each
+carried part of it. One set with one cursor could not serve both parts, because a reply
+cut between them would move the reader past facts it was never sent. The two sets share a
+`transactionId`. Applying is unaffected: `applyChanges` works on the facts, in any order.
 
 - **Echo filter** — facts/migrations whose `hlc.siteId == peerSiteId` are excluded.
   Because a transaction is wholly one site's, this drops *whole* transactions — never
@@ -173,24 +225,34 @@ change-log key), so a transaction's facts are contiguous and in `opSeq` order.
   applicator processes `schemaMigrations` first regardless).
 
 **Transaction-granularity bounding.** `batchSize` caps the response by accumulating
-**whole** transactions: once a completed transaction pushes the cumulative `changes`
+**whole** ChangeSets: once a completed one pushes the cumulative `changes`
 count `>= batchSize`, extraction stops and returns — the rest come on the next
-`getChangesSince` call. A transaction is **never** split to hit the bound.
+`getChangesSince` call. A ChangeSet is **never** split to hit the bound.
 
 The bound applies at **scan time**, not just response time: on the delta path the
-change-log scan is HLC-ordered, so `collectChangesSince` detects each transaction
-boundary and stops scanning the moment enough whole transactions accumulate. Two scans
+change-log scan is in filing order, so `collectChangesSince` detects each group
+boundary — a change of transaction *or* of filing tick — and stops scanning the moment
+enough whole groups accumulate. Two scans
 are *not* bounded this way — the from-zero full scan (`collectAllChanges`, used when
-`sinceHLC` is absent) reads `cv:`/`tb:` keyed by table/pk rather than HLC, so it cannot
-early-exit (a large initial range is served by a snapshot instead); and the `sm:`
-schema-migration scan is not HLC-ordered, so it is drained in full (migrations are few,
-and grouping drops any that sort past the bounded fact watermark — over-scan costs work,
+`sinceHLC` is absent) reads `cv:`/`tb:` keyed by table/pk rather than position, so it cannot
+early-exit (a large initial range is served by a snapshot instead); it reads each
+record's stored position, so its reply is ordered and cut exactly as a change-log read
+would be and its watermark continues into one. The `sm:`
+schema-migration scan is not in filing order either, so it is drained in full (migrations are few,
+and grouping drops any filed past the bounded fact watermark — over-scan costs work,
 never correctness).
 
 **Pushing upstream.** `getChangesToPush(peerSiteId, sinceHLC?)` answers a different
 question with the same machinery: what should this replica send to the server it follows?
-It keeps only facts and migrations whose `hlc.siteId` is this replica's own. That identifies
-the writer for good, because relays, applies and snapshots all keep the original HLC. Held
+It stays on the write-time axis: `sinceHLC` is the greatest `ChangeSet.hlc` the server has
+acknowledged, the sets are grouped by transaction alone, and none carries a `cursor`.
+It keeps only facts and migrations whose `hlc.siteId` is this replica's own and whose HLC
+is after `sinceHLC`. The site identifies
+the writer for good, because relays, applies and snapshots all keep the original HLC. The
+scan starts after `sinceHLC` in the change log, which is safe because a position is never
+below its fact's HLC; the HLC test is still needed per fact, because a replica restored
+from a snapshot holds its own earlier facts at the sender's positions, which stay above
+its sent watermark, and would otherwise push them on every handshake. Held
 store-and-forward changes are still offered ([sync.md § Store-and-forward relay](sync.md#store-and-forward-relay)). The origin check
 runs before the batch counter, so a run of other devices' entries spends no budget and an
 empty read means nothing is left. With no watermark it scans the change log rather than
@@ -199,13 +261,19 @@ reading every record per handshake. It makes no delta-floor check: the floor say
 receiver may be missing, which has no bearing on what this replica has to send. See
 [sync-protocol.md § Delta Sync Optimization](sync-protocol.md#delta-sync-optimization) for the push loop.
 
-Scan-time boundary detection keys off the *log entry's* HLC while grouping keys off the
-*resolved version's* HLC; the two agree because **at most one change-log entry survives
-per key**, with HLC equal to the current version. Three mechanisms keep that true:
+Scan-time boundary detection and grouping both read an entry's position and HLC, and a
+reply's resume position is the greatest position it carries. So every entry that
+resolves to a change must be keyed by that change's record's own position: an entry
+resolving to a record filed elsewhere would let the resume position pass facts the reply
+does not hold. `resolveLogEntry` enforces this by treating an entry whose record is filed
+at another position as stale, and the writers keep it true by leaving **at most one
+change-log entry per key**, at the current version's position. Every writer deletes a
+superseded entry by the superseded *record's* position (`ChangeLogStore` takes the
+record, not an HLC), which for a fact that arrived late is not its HLC. Three mechanisms
+maintain the one-entry rule:
 **overwrite dedup** across separate writes/applies (a newer value dedupes the prior
 column entry, a newer tombstone the prior delete entry — so a `delete → reinsert →
-delete` key reuse leaves no stale delete entry to re-attribute to the later tombstone's
-HLC and split that transaction across rounds); the **staged-metadata overlay** for
+delete` key reuse leaves no stale delete entry behind); the **staged-metadata overlay** for
 repeats within one local transaction (§ Write side → *Local capture reads its own
 writes*); and **in-batch collapse** on apply (`commitChangeMetadata`), where two versions
 of one key in a single `applyChanges` call resolve against the same pre-batch prior
@@ -217,7 +285,7 @@ one winner and leave the loser in the store with no bookkeeping at all.
 
 **Entries die with their target.** The change log is a *derived index* over the live
 `cv:`/`tb:` records — `resolveLogEntry` returns `null` for an entry whose record is
-gone — so every entry is deleted in the same `WriteBatch` as the record it points at:
+gone or filed elsewhere — so every entry is deleted in the same `WriteBatch` as the record it points at:
 a row's `column` entries with its column versions on delete
 (`deleteRowVersionsAndLogEntries`, called from the local write path `recordDataEvent`
 and from apply's `commitChangeMetadata`), and a pk's `delete` entry with its pruned
@@ -231,17 +299,20 @@ have appeared in any `ChangeSet`.
 **The delta floor.** Pruning a tombstone removes a fact a peer may still need: a peer whose
 received watermark predates that delete would get a delta without it and keep the row
 forever, with nothing on either side reporting anything. So every prune of deliverable
-history raises the replica's **delta floor** — the greatest HLC of any tombstone it has
-pruned, one `df:` record (`metadata/delta-floor.ts`), written in the *same* `WriteBatch`
+history raises the replica's **delta floor** — the greatest filing position of any
+tombstone it has pruned, one `df:` record (`metadata/delta-floor.ts`). The position, not
+the HLC: a delete that arrived late has an old HLC and a recent position, and a peer that
+has read past the first but not the second still needs it. The record is written in the *same* `WriteBatch`
 as the tombstone deletes so a crash between the two cannot reopen the gap, and only ever
 moving forward. A tombstone kept past the horizon as an undelivered delete
 ([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)) raises nothing until it
 is actually pruned. An incremental request `since T` is complete iff `T >= floor` (replies
 carry changes strictly after `T`, so a tombstone at exactly `T` was already delivered);
 `SyncManager.canDeltaSync(sinceHLC)` is exactly that comparison, and `getDeltaFloor()`
-exposes the value. The floor is *not* a wall-clock test: a watermark is the HLC of the
+exposes the value. The floor is *not* a wall-clock test: a watermark is the position of the
 last change a peer received, not the time it last synced, so a quiet database never ages
-a peer out of delta sync on its own. The floor travels in snapshot headers
+a peer out of delta sync on its own. A snapshot's header is a fresh clock tick, so it is
+always above the floor and the catch-up that follows a snapshot is never refused. The floor travels in snapshot headers
 (`deltaFloor` on `SnapshotHeaderChunk` / `Snapshot`) and a receiver takes
 `max(own, sender's)` in the same batch as its metadata clear — a replica rebuilt from a snapshot (the
 coordinator's S3 restore after disk eviction, say) inherits the sender's incompleteness
@@ -270,13 +341,14 @@ this sweep (see *Table identity*).
 
 **Oversized transaction.** A transaction whose fact count exceeds `batchSize` is returned
 **whole** as one ChangeSet and telemetered (a `console.warn`), never silently chunked —
-splitting it would violate the one-ChangeSet-per-transaction contract.
+`batchSize` never splits a ChangeSet.
 
-**Watermark halts at transaction boundaries.** Every returned ChangeSet is a whole
-transaction whose `hlc` is the commit's max fact HLC, so a consumer setting
-`lastSyncHLC = max(applied ChangeSet.hlc)` always lands on a real commit boundary;
-`buildChangeLogScanBoundsAfter` then excludes everything `<=` it, so re-fetch resumes
-strictly *after* the last whole transaction (no repeats, no gaps, no mid-transaction
+**Watermark halts at ChangeSet boundaries.** Every returned ChangeSet is everything this
+replica filed for one transaction at one tick, and its resume position (`cursor`, or
+`hlc` when it has none) is the greatest position among those facts. A consumer setting
+`lastSyncHLC = replyWatermark(applied reply)` therefore lands between whole sets;
+`buildChangeLogScanBoundsAfter` then excludes everything filed `<=` it, so re-fetch resumes
+strictly *after* the last whole set (no repeats, no gaps, no mid-set
 resume). A partially applied transaction never advances the watermark: `applyChanges`
 applies a ChangeSet atomically and commits metadata only on success (§ Transactional
 Integrity During Sync), so a failed ChangeSet leaves the watermark at the prior
@@ -296,7 +368,7 @@ Applying remote changes writes to two separate stores: **CRDT metadata** (column
 
 In the **mixed case** — one batch carrying *both* a per-change `errors` failure and a reported global-assertion violation tripped by a successfully-applied change B — `applyDataToStore` emits `onAssertionViolation` **before** the abort throws. B's violating row already committed in report mode (the abort blocks the metadata commit, not the storage write), so the violation is a fact about committed data. On retry B contributes nothing to the seam batch, so the assertion over B's table is not re-evaluated (assertions fire only when their referenced tables changed) and does not double-fire; deferring the emit past the abort would lose it permanently.
 
-**Unified admission core** (`admission.ts`) centralizes both failure shapes and the ordering in one seam, so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a group-atomic unit — data, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The streaming snapshot (`snapshot-stream`) keeps its checkpoint-based model but reuses `applyDataToStore` per flush, so a flush throw emits the same `status: 'error'` event.
+**Unified admission core** (`admission.ts`) centralizes both failure shapes and the ordering in one seam, so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a group-atomic unit — data, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The wire path merges its clock watermark inside `commitMetadata` instead, in the same write as the filing positions it takes from the merged clock (§ Filing position). The streaming snapshot (`snapshot-stream`) keeps its checkpoint-based model but reuses `applyDataToStore` per flush, so a flush throw emits the same `status: 'error'` event.
 
 With no metadata committed the caller does not advance its per-peer `lastSyncHLC` watermark, so the **whole batch re-resolves and re-applies on the next sync**, idempotently — value-identical upserts are suppressed by the adapter, so only the previously-failed change is genuinely retried. (A change that *always* fails blocks its batch forever: an accepted "poison batch" property; detection/recovery is the host's.) Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done — a batch spans multiple HLCs but re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore **one** all-or-nothing `admitGroup` unit, not one per `ChangeSet`.
 

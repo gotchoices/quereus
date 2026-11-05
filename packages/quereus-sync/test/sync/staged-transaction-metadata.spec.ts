@@ -17,7 +17,7 @@ describe('StagedTransactionMetadata', () => {
   it('reads undefined for an untouched cell (fall back to storage)', () => {
     const staged = makeOverlay();
     expect(staged.columnVersion('main', 'users', [1], 'a')).to.equal(undefined);
-    expect(staged.tombstoneHlc('main', 'users', [1])).to.equal(undefined);
+    expect(staged.tombstone('main', 'users', [1])).to.equal(undefined);
     expect(staged.rowState('main', 'users', [1])).to.equal(undefined);
   });
 
@@ -44,7 +44,7 @@ describe('StagedTransactionMetadata', () => {
     expect(staged.columnVersion('main', 'users', [1], 'b')).to.equal(null);
   });
 
-  it('exposes row state as staged HLCs plus the cleared flag', () => {
+  it('exposes row state as the staged records plus the cleared flag', () => {
     const staged = makeOverlay();
     staged.noteColumnVersion('main', 'users', [1], 'a', { hlc: hlc(0), value: 'x' });
     staged.noteColumnVersion('main', 'users', [1], 'b', { hlc: hlc(1), value: 'y' });
@@ -52,7 +52,7 @@ describe('StagedTransactionMetadata', () => {
     const before = staged.rowState('main', 'users', [1])!;
     expect(before.rowCleared).to.equal(false);
     expect([...before.stagedColumns.keys()].sort()).to.deep.equal(['a', 'b']);
-    expect(before.stagedColumns.get('b')).to.deep.equal(hlc(1));
+    expect(before.stagedColumns.get('b')!.hlc).to.deep.equal(hlc(1));
 
     staged.noteRowCleared('main', 'users', [1]);
     const after = staged.rowState('main', 'users', [1])!;
@@ -60,11 +60,11 @@ describe('StagedTransactionMetadata', () => {
     expect(after.stagedColumns.size).to.equal(0);
   });
 
-  it('keeps the tombstone HLC through a row clear', () => {
+  it('keeps the tombstone through a row clear', () => {
     const staged = makeOverlay();
-    staged.noteTombstone('main', 'users', [1], hlc(2));
+    staged.noteTombstone('main', 'users', [1], { hlc: hlc(2) });
     staged.noteRowCleared('main', 'users', [1]);
-    expect(staged.tombstoneHlc('main', 'users', [1])).to.deep.equal(hlc(2));
+    expect(staged.tombstone('main', 'users', [1])).to.deep.equal({ hlc: hlc(2) });
   });
 
   it('does not bleed across rows or tables', () => {

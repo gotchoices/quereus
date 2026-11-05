@@ -8,8 +8,9 @@
  */
 
 import type { WriteBatch } from '@quereus/store';
-import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
+import { compareHLC, maxHLC, assertWithinDrift, type HLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
+import { positionsFrom } from '../metadata/filing-position.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
@@ -29,7 +30,7 @@ import type {
 } from './protocol.js';
 import { isBaselineVersion, migrationObjectKind, orderMigrations, sameVersionLocalDDL, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
+import { toError, deleteRowVersionsAndLogEntries, persistHLCStateBatch } from './sync-context.js';
 import { admitGroup } from './admission.js';
 
 /**
@@ -85,6 +86,20 @@ interface UnknownTableGroup {
 	/** Straggler origin: the changeset siteId that first referenced this table. */
 	siteId: SiteId;
 	changes: Change[];
+}
+
+/** A schema migration Phase 1a kept, with the version it is recorded at. */
+export interface PendingSchemaMigration {
+	readonly migration: SchemaMigration;
+	readonly schemaVersion: number;
+}
+
+/** What {@link commitChangeMetadata} files and merges beyond the resolved data changes. */
+export interface FilingOptions {
+	/** The batch's schema migrations, recorded in the same write and tick as its data. */
+	readonly migrations?: readonly PendingSchemaMigration[];
+	/** The batch's greatest HLC, merged into the clock before the tick is taken. */
+	readonly watermarkHLC?: HLC;
 }
 
 /** Stable `schema.table` map key for batch deltas and diversion groups. */
@@ -263,10 +278,7 @@ export async function applyChanges(
 	// siteId. Counters and apply lists are built from these AFTER the in-batch
 	// delete reconciliation below, not inside the resolve loop.
 	const dataResolutions: Array<{ resolved: ResolvedChange; siteId: SiteId }> = [];
-	const pendingSchemaMigrations: Array<{
-		migration: SchemaMigration;
-		schemaVersion: number;
-	}> = [];
+	const pendingSchemaMigrations: PendingSchemaMigration[] = [];
 	// Out-of-basis straggler changes diverted out of the resolve/apply/metadata
 	// path, grouped per table for disposition + telemetry.
 	const unknownByTable = new Map<string, UnknownTableGroup>();
@@ -276,9 +288,12 @@ export async function applyChanges(
 	// with a badly-wrong clock cannot land far-future LWW winners that then beat every
 	// legitimate future write. `cs.hlc` is each transaction's max fact HLC, so the batch
 	// max bounds every fact in the batch. This same value is the merge watermark below
-	// (one `maxHLC` computation, reused). Throwing here exits before `admitGroup`, so no
-	// data and no metadata commit; emit `status:'error'` first for parity with the
-	// `applyDataToStore` failure path so the UI reacts identically to a rejected batch.
+	// (one `maxHLC` computation, reused). A set's `cursor` is deliberately not read, here
+	// or anywhere in the apply: it is a position on the replica that served the set, and
+	// this replica files each fact at a position of its own. Throwing here exits before
+	// `admitGroup`, so no data and no metadata commit; emit `status:'error'` first for
+	// parity with the `applyDataToStore` failure path so the UI reacts identically to a
+	// rejected batch.
 	const watermarkHLC = maxHLC(changes.map(cs => cs.hlc));
 	if (watermarkHLC) {
 		try {
@@ -465,7 +480,7 @@ export async function applyChanges(
 	const receivedAt = Date.now();
 
 	// Admit the whole resolved batch as one all-or-nothing unit: data first (PHASE
-	// 2), then CRDT metadata (PHASE 3), then the merged clock watermark — aborting
+	// 2), then CRDT metadata with the merged clock watermark (PHASE 3) — aborting
 	// with no metadata committed on any data-apply failure. The batch is admitted
 	// once (not per ChangeSet): the single per-peer lastSyncHLC watermark cannot
 	// express a partial commit, so selective commit is intentionally not done.
@@ -501,31 +516,16 @@ export async function applyChanges(
 			// filed below, so those overwrite re-filed ones, never the reverse.
 			await rekeyAfterReplicatedKeyChange(ctx, executed, retiredKeys, resolvedDataChanges);
 
-			await commitChangeMetadata(ctx, resolvedDataChanges);
-
-			// Commit schema migration metadata
-			for (const { migration, schemaVersion } of pendingSchemaMigrations) {
-				await ctx.schemaMigrations.recordMigration(
-					migration.schema,
-					migrationObjectKind(migration.type),
-					migration.table,
-					{
-						type: migration.type,
-						// Carry the rename's old name into local storage, or this
-						// receiver's own re-relay/snapshot would ship the rename
-						// without it — undecidable downstream.
-						...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
-						...(migration.columns !== undefined ? { columns: migration.columns } : {}),
-						ddl: migration.ddl,
-						hlc: migration.hlc,
-						schemaVersion,
-					},
-				);
-			}
+			// One write, at one clock tick: the batch's migrations and data, and the
+			// clock merged with the batch's greatest HLC. Merging once is equivalent to
+			// receiving each changeset's HLC (receive is a monotonic max-merge); on a
+			// mid-batch abort the clock does not advance and the batch re-resolves next
+			// sync. Undefined only for an empty batch, which merges nothing.
+			await commitChangeMetadata(ctx, resolvedDataChanges, { migrations: pendingSchemaMigrations, watermarkHLC });
 
 			// Hold diverted changes as part of the admission unit — durable BEFORE
-			// the watermark advances below, so a crash never strands a straggler's
-			// change with no re-delivery (the batch re-resolves and re-holds
+			// this apply returns, so the sender's watermark cannot pass a straggler's
+			// change that a crash left unheld (the batch re-resolves and re-holds
 			// idempotently, HLC-keyed). Both `quarantine` and `store-and-forward`
 			// hold identically; `store-and-forward` additionally marks each entry
 			// forwardable so the relay (sibling ticket) can re-offer it. `ignore`
@@ -546,12 +546,6 @@ export async function applyChanges(
 			// (docs/migration.md § 2 Converge). Advisory — never aborts the apply.
 			await bumpLastDirectlyMappedWrites(ctx, appliedChanges);
 		},
-		// Merging the batch max once is equivalent to receiving each changeset's
-		// HLC (receive is a monotonic max-merge); on a mid-batch abort the clock
-		// does not advance and the batch re-resolves next sync. Computed once at the
-		// top (drift-validated there); undefined only for an empty batch, which
-		// admitGroup treats as no watermark merge.
-		watermarkHLC,
 	});
 
 	// Emit remote change events (grouped by the relaying changeset's siteId).
@@ -644,7 +638,7 @@ function captureRetiredKeyColumns(
  * recorded by the sender after its own key change — are under the new one, so it found
  * no prior for any of them. The pass has just made those priors addressable; without
  * re-reading them `commitChangeMetadata` would leave each prior's `cl:` entry behind,
- * pointing at a record whose HLC it no longer matches (the LOAD-BEARING INVARIANT of
+ * pointing at a record no longer filed where the entry is (the LOAD-BEARING INVARIANT of
  * `collectChangesSince`). The last-writer decision itself is not revisited — the data
  * is already written — which is the concurrent-DDL-versus-data race docs/sync.md
  * § Tombstones leaves open.
@@ -658,8 +652,9 @@ async function rekeyAfterReplicatedKeyChange(
 	// Per table, the key its records are filed under as the passes proceed.
 	const filedUnder = new Map(retiredKeys);
 	const rekeyedTables = new Set<string>();
-	// NOTE: nothing serializes applies on a manager, so another push can apply between a
-	// pass's scan and its write. A duplicate push of the same key change is safe: the relay
+	// NOTE: only an apply's final metadata write is serialized on a manager (the commit
+	// chain), so another push can apply between a pass's scan and its write. A duplicate
+	// push of the same key change is safe: the relay
 	// pass reads each record's new key from the record itself, so one already moved stays
 	// put, and a record moving in never overwrites a newer one (`CellContest`). A different
 	// device's DATA write to the table interleaving here is the concurrent-write race
@@ -941,6 +936,8 @@ async function drainTableGroup(
 	// No watermarkHLC — these HLCs were already merged into the local clock at the
 	// original receive (applyChanges merges the batch maxHLC even for diverted
 	// changes), so re-merging would be a no-op; omitting it keeps drain a pure replay.
+	// The drained changes are filed at a tick of their own, taken now: this is when
+	// they reach the change log, whenever the rest of their transactions did.
 	await admitGroup(ctx, {
 		dataChanges: dataChangesToApply,
 		schemaChanges: [],
@@ -1281,9 +1278,16 @@ function tablesWithRecordsElsewhere(batchSchemaChanges: readonly SchemaChangeToA
 }
 
 /**
- * Commit CRDT metadata for resolved changes.
+ * Commit CRDT metadata for resolved changes, and with it the batch's schema migrations
+ * and merged clock ({@link FilingOptions}).
  *
  * Phase 3 of the 3-phase apply pattern: called AFTER data is written to store.
+ *
+ * Everything is filed at ONE clock tick taken here, in one write, as one entry on the
+ * commit chain ({@link fileAtNextTick}): each fact's filing position is that tick plus
+ * its place in the batch, which is what a peer reading this replica's change log orders
+ * by and resumes from (`metadata/filing-position.ts`). A fact's own HLC only decides
+ * which write wins.
  *
  * In-batch repeats of one key are collapsed to the max-HLC winner before any write.
  * Two versions of the same key can land in a single `applyChanges` batch (e.g.
@@ -1305,12 +1309,50 @@ function tablesWithRecordsElsewhere(batchSchemaChanges: readonly SchemaChangeToA
 export async function commitChangeMetadata(
 	ctx: SyncContext,
 	resolvedChanges: ResolvedChange[],
+	filing: FilingOptions = {},
 ): Promise<void> {
-	if (resolvedChanges.length === 0) return;
+	const winners = collapseInBatchRepeats(ctx, resolvedChanges);
+	const facts: FactToFile[] = [
+		...(filing.migrations ?? []).map((pending): FactToFile => ({ kind: 'migration', hlc: pending.migration.hlc, pending })),
+		...winners,
+	];
+	if (facts.length === 0 && !filing.watermarkHLC) return;
 
-	// Collapse in-batch repeats per key, keeping the max-HLC change. Deletes key by
-	// (schema, table, pk); columns by (schema, table, pk, column) — distinct change-log
-	// entry types that never collide.
+	await ctx.onCommitChain(() => fileAtNextTick(ctx, facts, filing.watermarkHLC));
+
+	// Column-version cleanup for deletes requires async iteration — once per winning
+	// delete (losers were never written, so there is nothing of theirs to clean). The
+	// row's change-log column entries go in the same batch as its versions: an inbound
+	// delete must leave no more index garbage behind than a local one, and this is the
+	// path a relay runs almost exclusively. `keepColumns` spares the cell records this
+	// same batch wrote past the delete (allowResurrection winners) — the scan reads
+	// committed storage, which by now INCLUDES them (the metadata batch above is
+	// already written, so no staged overlay is needed here; each cleanup commits in
+	// its own batch). These batches only delete, so they take no position and need no
+	// place on the commit chain.
+	for (const fact of winners) {
+		if (fact.kind !== 'delete') continue;
+		const { change, resolved } = fact;
+		const cleanupBatch = ctx.kv.batch();
+		await deleteRowVersionsAndLogEntries(ctx, cleanupBatch, change.schema, change.table, change.pk, {
+			keepColumns: resolved.keepColumns,
+		});
+		await cleanupBatch.write();
+	}
+}
+
+/** One thing {@link fileAtNextTick} writes at a position of its own; `hlc` is its origin timestamp. */
+type FactToFile =
+	| { readonly kind: 'migration'; readonly hlc: HLC; readonly pending: PendingSchemaMigration }
+	| { readonly kind: 'delete'; readonly hlc: HLC; readonly change: RowDeletion; readonly resolved: ResolvedChange }
+	| { readonly kind: 'column'; readonly hlc: HLC; readonly change: ColumnChange; readonly resolved: ResolvedChange };
+
+/**
+ * The applied changes to write, with in-batch repeats of one key collapsed to the
+ * max-HLC change. Deletes key by (schema, table, pk); columns by (schema, table, pk,
+ * column) — distinct change-log entry types that never collide.
+ */
+function collapseInBatchRepeats(ctx: SyncContext, resolvedChanges: readonly ResolvedChange[]): FactToFile[] {
 	const deleteWinners = new Map<string, ResolvedChange>();
 	const columnWinners = new Map<string, ResolvedChange>();
 	for (const resolved of resolvedChanges) {
@@ -1323,37 +1365,85 @@ export async function commitChangeMetadata(
 		}
 	}
 
-	const batch = ctx.kv.batch();
-	for (const resolved of deleteWinners.values()) {
-		const change = resolved.change;
-		if (change.type !== 'delete') continue; // homogeneous map; narrows the union
-		commitDeleteMetadata(ctx, batch, change, resolved.oldTombstone);
+	const facts: FactToFile[] = [];
+	for (const resolved of [...deleteWinners.values(), ...columnWinners.values()]) {
+		const { change } = resolved;
+		facts.push(change.type === 'delete'
+			? { kind: 'delete', hlc: change.hlc, change, resolved }
+			: { kind: 'column', hlc: change.hlc, change, resolved });
 	}
-	for (const resolved of columnWinners.values()) {
-		const change = resolved.change;
-		if (change.type !== 'column') continue; // homogeneous map; narrows the union
-		commitColumnMetadata(ctx, batch, change, resolved.oldColumnVersion, resolved.priorErasedByInBatchDelete);
-	}
-	await batch.write();
+	return facts;
+}
 
-	// Column-version cleanup for deletes requires async iteration — once per winning
-	// delete (losers were never written, so there is nothing of theirs to clean). The
-	// row's change-log column entries go in the same batch as its versions: an inbound
-	// delete must leave no more index garbage behind than a local one, and this is the
-	// path a relay runs almost exclusively. `keepColumns` spares the cell records this
-	// same batch wrote past the delete (allowResurrection winners) — the scan reads
-	// committed storage, which by now INCLUDES them (the metadata batch above is
-	// already written, so no staged overlay is needed here; each cleanup commits in
-	// its own batch).
-	for (const resolved of deleteWinners.values()) {
-		const change = resolved.change;
-		if (change.type !== 'delete') continue;
-		const cleanupBatch = ctx.kv.batch();
-		await deleteRowVersionsAndLogEntries(ctx, cleanupBatch, change.schema, change.table, change.pk, {
-			keepColumns: resolved.keepColumns,
-		});
-		await cleanupBatch.write();
+/**
+ * The filing step of an apply: merge the batch's clock, take one tick, and write every
+ * fact at a position off that tick, with the clock, in ONE batch.
+ *
+ * Must run as one entry on the commit chain (`SyncContext.onCommitChain`), and so must
+ * not wait on the chain itself. The chain is what makes commit order equal position
+ * order: without it an apply could take its tick, be overtaken by a later one that
+ * commits first, and then commit its own facts below a position some peer has already
+ * read past, which that peer would then never ask for. Only this step is on the chain.
+ * The apply's data writes run earlier and are not serialized.
+ *
+ * The clock is persisted in the same batch as the positions taken from it: were it
+ * written afterwards, a crash between the two would restart the clock below positions
+ * already on disk, and the next tick could file under them.
+ *
+ * Facts are filed in ORIGIN order. Facts of one transaction share a base HLC, so that
+ * order puts each transaction's facts side by side, its migrations first (DDL takes a
+ * transaction's lowest `opSeq`s). A reader of the log therefore meets a migration
+ * before the data written with it, and finds each transaction's facts of this tick in
+ * one unbroken run of positions, which is what lets a reply be cut between transactions
+ * (`change-grouping.ts`).
+ */
+async function fileAtNextTick(ctx: SyncContext, facts: readonly FactToFile[], watermarkHLC: HLC | undefined): Promise<void> {
+	if (watermarkHLC) ctx.hlcManager.receive(watermarkHLC);    // monotonic merge, idempotent
+
+	const batch = ctx.kv.batch();
+	if (facts.length > 0) {
+		const nextPosition = positionsFrom(ctx.hlcManager.tick());
+		const inOriginOrder = [...facts].sort((a, b) => compareHLC(a.hlc, b.hlc));
+		for (const fact of inOriginOrder) fileFact(ctx, batch, fact, nextPosition());
 	}
+	persistHLCStateBatch(ctx, batch);
+	await batch.write();
+}
+
+function fileFact(ctx: SyncContext, batch: WriteBatch, fact: FactToFile, position: HLC): void {
+	switch (fact.kind) {
+		case 'migration':
+			commitMigrationMetadata(ctx, batch, fact.pending, position);
+			break;
+		case 'delete':
+			commitDeleteMetadata(ctx, batch, fact.change, position, fact.resolved.oldTombstone);
+			break;
+		case 'column':
+			commitColumnMetadata(
+				ctx, batch, fact.change, position, fact.resolved.oldColumnVersion, fact.resolved.priorErasedByInBatchDelete,
+			);
+			break;
+	}
+}
+
+/** Record a migration this batch brought, at its own position. */
+function commitMigrationMetadata(
+	ctx: SyncContext,
+	batch: WriteBatch,
+	{ migration, schemaVersion }: PendingSchemaMigration,
+	position: HLC,
+): void {
+	ctx.schemaMigrations.recordMigrationBatch(batch, migration.schema, migrationObjectKind(migration.type), migration.table, {
+		type: migration.type,
+		// Carry the rename's old name into local storage, or this receiver's own
+		// re-relay/snapshot would ship the rename without it — undecidable downstream.
+		...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
+		...(migration.columns !== undefined ? { columns: migration.columns } : {}),
+		ddl: migration.ddl,
+		hlc: migration.hlc,
+		position,
+		schemaVersion,
+	});
 }
 
 // Grouping keys reuse the pk-identity encoding so in-batch grouping matches the canonical
@@ -1401,32 +1491,35 @@ function keepMaxHLC(
 	}
 }
 
-/** Write a winning delete's tombstone + change-log entry, deleting any prior delete entry. */
+/** Write a winning delete's tombstone + change-log entry at `position`, deleting any prior delete entry. */
 function commitDeleteMetadata(
 	ctx: SyncContext,
 	batch: WriteBatch,
 	change: RowDeletion,
+	position: HLC,
 	oldTombstone: Tombstone | undefined,
 ): void {
 	// Dedupe: a newer tombstone overwrites the prior one, leaving its delete change-log
 	// entry stale — remove it so at most one survives per pk (mirrors the column dedup
 	// and the write path in recordDataEvent).
 	if (oldTombstone) {
-		ctx.changeLog.deleteEntryBatch(batch, oldTombstone.hlc, 'delete', change.schema, change.table, change.pk);
+		ctx.changeLog.deleteEntryBatch(batch, oldTombstone, 'delete', change.schema, change.table, change.pk);
 	}
 	// Persist the incoming change's before-image (when present) onto the tombstone so
 	// a receiver relaying via getChangesSince re-emits it. Only the winning delete's
 	// metadata is written here (in-batch losers never persist), so the surviving
 	// priorRow is the latest delete's row image.
-	ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc, change.priorRow);
-	ctx.changeLog.recordDeletionBatch(batch, change.hlc, change.schema, change.table, change.pk);
+	const filed = { hlc: change.hlc, position };
+	ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, filed, change.priorRow);
+	ctx.changeLog.recordDeletionBatch(batch, filed, change.schema, change.table, change.pk);
 }
 
-/** Write a winning column's version + change-log entry, deleting any prior column entry. */
+/** Write a winning column's version + change-log entry at `position`, deleting any prior column entry. */
 function commitColumnMetadata(
 	ctx: SyncContext,
 	batch: WriteBatch,
 	change: ColumnChange,
+	position: HLC,
 	oldColumnVersion: ColumnVersion | undefined,
 	priorErasedByInBatchDelete = false,
 ): void {
@@ -1434,7 +1527,7 @@ function commitColumnMetadata(
 	// when the prior lineage is erased below — the entry is real storage, and the
 	// winning delete's cleanup skips this column (see ResolvedChange.keepColumns).
 	if (oldColumnVersion) {
-		ctx.changeLog.deleteEntryBatch(batch, oldColumnVersion.hlc, 'column', change.schema, change.table, change.pk, change.column);
+		ctx.changeLog.deleteEntryBatch(batch, oldColumnVersion, 'column', change.schema, change.table, change.pk, change.column);
 	}
 	// Persist the before-image as this replica's local lineage: the version this
 	// write replaced here (`oldColumnVersion`). In causal-order delivery that equals
@@ -1448,15 +1541,9 @@ function commitColumnMetadata(
 	const prior = oldColumnVersion && change.priorHlc !== undefined && !priorErasedByInBatchDelete
 		? { priorHlc: oldColumnVersion.hlc, priorValue: oldColumnVersion.value }
 		: undefined;
-	ctx.columnVersions.setColumnVersionBatch(
-		batch,
-		change.schema,
-		change.table,
-		change.pk,
-		change.column,
-		{ hlc: change.hlc, value: change.value, ...prior },
-	);
-	ctx.changeLog.recordColumnChangeBatch(batch, change.hlc, change.schema, change.table, change.pk, change.column);
+	const version = { hlc: change.hlc, position, value: change.value, ...prior };
+	ctx.columnVersions.setColumnVersionBatch(batch, change.schema, change.table, change.pk, change.column, version);
+	ctx.changeLog.recordColumnChangeBatch(batch, version, change.schema, change.table, change.pk, change.column);
 }
 
 /**

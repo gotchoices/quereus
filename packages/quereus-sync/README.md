@@ -71,7 +71,7 @@ const result = await syncManager.applyChanges(changeSets);
 │  ├── HLCManager (Hybrid Logical Clock)                      │
 │  ├── ColumnVersionStore (LWW metadata)                      │
 │  ├── TombstoneStore (deletion tracking)                     │
-│  ├── ChangeLogStore (HLC-indexed changes)                   │
+│  ├── ChangeLogStore (changes in filing order)               │
 │  ├── PeerStateStore (delta sync state)                      │
 │  ├── SchemaMigrationStore (DDL tracking)                    │
 │  └── SchemaVersionStore (schema conflict resolution)        │
@@ -96,7 +96,17 @@ if (await syncManager.canDeltaSync(sinceHLC)) {
   const result = await syncManager.applyChanges(changeSets);
   // result: { applied, skipped, conflicts, transactions }
 }
+
+// On the receiving side, the next `sinceHLC` is the reply's resume position
+// (`replyWatermark`, exported from this package): where the sender filed its
+// last change, not that change's write time.
+const next = replyWatermark(changeSets);
+if (next) await syncManager.updatePeerSyncState(senderSiteId, next);
 ```
+
+The watermark is a position in the sender's change log, so a change the sender received
+late (an offline device reconnecting) is still delivered to a peer that had already read
+newer ones. See `docs/sync-protocol.md` § Delta Sync Optimization.
 
 ### Snapshot Sync
 

@@ -112,7 +112,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
 
-      await store.setTombstone('main', 'users', [1], hlc);
+      await store.setTombstone('main', 'users', [1], { hlc: hlc });
       const retrieved = await store.getTombstone('main', 'users', [1]);
 
       expect(retrieved).to.not.be.undefined;
@@ -128,7 +128,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
 
-      await store.setTombstone('main', 'users', [1], hlc, [1, 'Alice', null]);
+      await store.setTombstone('main', 'users', [1], { hlc: hlc }, [1, 'Alice', null]);
       const retrieved = await store.getTombstone('main', 'users', [1]);
 
       expect(retrieved).to.not.be.undefined;
@@ -139,7 +139,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
 
-      await store.setTombstone('main', 'users', [1], hlc);
+      await store.setTombstone('main', 'users', [1], { hlc: hlc });
       const retrieved = await store.getTombstone('main', 'users', [1]);
 
       expect(retrieved).to.not.be.undefined;
@@ -154,8 +154,8 @@ describe('Tombstone', () => {
       // First delete records the original image; after a reinsert at the same pk a
       // later delete overwrites the (same-key) tombstone, so the survivor carries
       // the LATEST delete's row image — never a stale earlier one.
-      await store.setTombstone('main', 'users', [1], firstDelete, [1, 'Alice']);
-      await store.setTombstone('main', 'users', [1], secondDelete, [1, 'Alice v2']);
+      await store.setTombstone('main', 'users', [1], { hlc: firstDelete }, [1, 'Alice']);
+      await store.setTombstone('main', 'users', [1], { hlc: secondDelete }, [1, 'Alice v2']);
 
       const retrieved = await store.getTombstone('main', 'users', [1]);
       expect(retrieved!.hlc.wallTime).to.equal(2000n);
@@ -167,7 +167,7 @@ describe('Tombstone', () => {
       const deleteHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 };
       const writeHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
 
-      await store.setTombstone('main', 'users', [1], deleteHLC);
+      await store.setTombstone('main', 'users', [1], { hlc: deleteHLC });
 
       // Write with older HLC should be blocked
       const isBlocked = await store.isDeletedAndBlocking('main', 'users', [1], writeHLC, false);
@@ -179,7 +179,7 @@ describe('Tombstone', () => {
       const deleteHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
       const writeHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 };
 
-      await store.setTombstone('main', 'users', [1], deleteHLC);
+      await store.setTombstone('main', 'users', [1], { hlc: deleteHLC });
 
       // Write with newer HLC should not be blocked when resurrection allowed
       const isBlocked = await store.isDeletedAndBlocking('main', 'users', [1], writeHLC, true);

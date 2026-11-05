@@ -88,6 +88,14 @@ function reconcileSections(
  * leftovers) is skipped — same as the streaming producer.
  */
 export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
+	// The header is a filing position (`metadata/filing-position.ts`): a receiver asks
+	// for everything filed after it. Taken as a fresh tick on the commit chain BEFORE
+	// any scan below, so every fact filed under it is already committed and will be
+	// read, and every later one files above it and is fetched afterwards. Reading the
+	// clock without ticking would not do: a batch that had taken its tick but not yet
+	// written would sit below the header and be in neither the snapshot nor the delta.
+	const hlc = await ctx.nextFilingTick();
+
 	// Collect all column versions, grouped by table generation and row
 	type RowVersions = Map<string, ColumnVersion>;
 	type TableRows = Map<string, RowVersions>;
@@ -134,7 +142,13 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 				// Flat cell records: only the raw pk travels. The sender's own key
 				// identity (the `rows` grouping key) stays local — the receiver derives
 				// its own identity from each entry's pk.
-				columnVersions.push({ column, hlc: cv.hlc, value: cv.value, pk: cv.pk });
+				columnVersions.push({
+					column,
+					hlc: cv.hlc,
+					...(cv.position !== undefined ? { position: cv.position } : {}),
+					value: cv.value,
+					pk: cv.pk,
+				});
 			}
 		}
 
@@ -161,6 +175,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 			table: name.table,
 			pk: ts.pk,
 			hlc: ts.hlc,
+			...(ts.position !== undefined ? { position: ts.position } : {}),
 			createdAt: ts.createdAt,
 			...(ts.priorRow !== undefined ? { priorRow: ts.priorRow } : {}),
 		});
@@ -168,7 +183,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 
 	return {
 		siteId: ctx.getSiteId(),
-		hlc: ctx.getCurrentHLC(),
+		hlc,
 		snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 		tables,
 		schemaMigrations,
@@ -312,7 +327,10 @@ export async function applySnapshot(
 
 			// Apply snapshot's column versions and rebuild change log, filed under the
 			// RECEIVER's derived identity: one cell record + one change-log entry per
-			// reconciled cell.
+			// reconciled cell. Each is filed at the position the SENDER had it at, not at
+			// a new one: the log then has the sender's order, so a peer whose watermark
+			// was taken on the sender is served correctly by this replica too (a
+			// coordinator restored from its own stored snapshot is the case that needs it).
 			const applyBatch = ctx.kv.batch();
 
 			for (const { schema, table, rows } of sections) {
@@ -322,22 +340,8 @@ export async function applySnapshot(
 
 				for (const row of rows.values()) {
 					for (const [column, cell] of row.cells) {
-						ctx.columnVersions.setColumnVersionBatch(
-							applyBatch,
-							schema,
-							table,
-							row.pk,
-							column,
-							{ hlc: cell.hlc, value: cell.value },
-						);
-						ctx.changeLog.recordColumnChangeBatch(
-							applyBatch,
-							cell.hlc,
-							schema,
-							table,
-							row.pk,
-							column,
-						);
+						ctx.columnVersions.setColumnVersionBatch(applyBatch, schema, table, row.pk, column, cell);
+						ctx.changeLog.recordColumnChangeBatch(applyBatch, cell, schema, table, row.pk, column);
 					}
 				}
 			}
@@ -355,13 +359,16 @@ export async function applySnapshot(
 					...(migration.columns !== undefined ? { columns: migration.columns } : {}),
 					ddl: migration.ddl,
 					hlc: migration.hlc,
+					...(migration.position !== undefined ? { position: migration.position } : {}),
 					schemaVersion,
 				});
 			}
 
 			// Re-write the snapshot's tombstones (the clearBatch above wiped the
 			// receiver's existing ones), one per receiver-derived identity, greatest
-			// HLC winning — mirrors the streaming consumer's reconciliation.
+			// HLC winning — mirrors the streaming consumer's reconciliation. Each gets
+			// its change-log entry, at the sender's position like the cells: without
+			// one, this replica could not serve the delete to a peer reading its log.
 			// NOTE: `setTombstoneBatch` stamps `createdAt = Date.now()` internally and
 			// ignores the sender's `ts.createdAt`, so a bootstrapped tombstone's TTL
 			// horizon re-bases to bootstrap time rather than preserved. Accepted phase-1
@@ -372,7 +379,8 @@ export async function applySnapshot(
 				keepMaxHLC(tombstoneWinners, tableScopedRowKey(ts.schema, ts.table, encodePkIdentity(ts.pk, keying)), ts);
 			}
 			for (const ts of tombstoneWinners.values()) {
-				ctx.tombstones.setTombstoneBatch(applyBatch, ts.schema, ts.table, ts.pk, ts.hlc, ts.priorRow);
+				ctx.tombstones.setTombstoneBatch(applyBatch, ts.schema, ts.table, ts.pk, ts, ts.priorRow);
+				ctx.changeLog.recordDeletionBatch(applyBatch, ts, ts.schema, ts.table, ts.pk);
 			}
 
 			await applyBatch.write();

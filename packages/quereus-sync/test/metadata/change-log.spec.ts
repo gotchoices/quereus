@@ -27,7 +27,7 @@ describe('ChangeLogStore', () => {
     it('should record a column change', async () => {
       const hlc: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 0 };
 
-      await store.recordColumnChange(hlc, 'main', 'users', [1], 'name');
+      await store.recordColumnChange({ hlc: hlc }, 'main', 'users', [1], 'name');
 
       // Verify by getting changes since before
       const sinceHLC: HLC = { wallTime: BigInt(500), counter: 0, siteId, opSeq: 0 };
@@ -49,7 +49,7 @@ describe('ChangeLogStore', () => {
     it('should record a deletion', async () => {
       const hlc: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 0 };
 
-      await store.recordDeletion(hlc, 'main', 'users', [1]);
+      await store.recordDeletion({ hlc: hlc }, 'main', 'users', [1]);
 
       const sinceHLC: HLC = { wallTime: BigInt(500), counter: 0, siteId, opSeq: 0 };
       const entries = [];
@@ -68,9 +68,9 @@ describe('ChangeLogStore', () => {
       const hlc2: HLC = { wallTime: BigInt(2000), counter: 1, siteId, opSeq: 0 };
       const hlc3: HLC = { wallTime: BigInt(3000), counter: 1, siteId, opSeq: 0 };
 
-      await store.recordColumnChange(hlc1, 'main', 'users', [1], 'name');
-      await store.recordColumnChange(hlc2, 'main', 'users', [2], 'name');
-      await store.recordColumnChange(hlc3, 'main', 'users', [3], 'name');
+      await store.recordColumnChange({ hlc: hlc1 }, 'main', 'users', [1], 'name');
+      await store.recordColumnChange({ hlc: hlc2 }, 'main', 'users', [2], 'name');
+      await store.recordColumnChange({ hlc: hlc3 }, 'main', 'users', [3], 'name');
 
       // Get changes since hlc1
       const entries = [];
@@ -88,9 +88,9 @@ describe('ChangeLogStore', () => {
       const hlc1: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 0 };
       const hlc2: HLC = { wallTime: BigInt(2000), counter: 1, siteId, opSeq: 0 };
 
-      await store.recordColumnChange(hlc3, 'main', 'users', [3], 'name');
-      await store.recordColumnChange(hlc1, 'main', 'users', [1], 'name');
-      await store.recordColumnChange(hlc2, 'main', 'users', [2], 'name');
+      await store.recordColumnChange({ hlc: hlc3 }, 'main', 'users', [3], 'name');
+      await store.recordColumnChange({ hlc: hlc1 }, 'main', 'users', [1], 'name');
+      await store.recordColumnChange({ hlc: hlc2 }, 'main', 'users', [2], 'name');
 
       const sinceHLC: HLC = { wallTime: BigInt(0), counter: 0, siteId, opSeq: 0 };
       const entries = [];
@@ -111,8 +111,8 @@ describe('ChangeLogStore', () => {
       const op0: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 0 };
       const op1: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 1 };
 
-      await store.recordColumnChange(op0, 'main', 'users', [1], 'a');
-      await store.recordColumnChange(op1, 'main', 'users', [1], 'b');
+      await store.recordColumnChange({ hlc: op0 }, 'main', 'users', [1], 'a');
+      await store.recordColumnChange({ hlc: op1 }, 'main', 'users', [1], 'b');
 
       const entries = [];
       for await (const entry of store.getChangesSince(op0)) {
@@ -133,9 +133,9 @@ describe('ChangeLogStore', () => {
       const op1: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 1 };
       const op2: HLC = { wallTime: BigInt(1000), counter: 1, siteId, opSeq: 2 };
 
-      await store.recordColumnChange(op0, 'main', 'users', [1], 'a');
-      await store.recordColumnChange(op1, 'main', 'users', [1], 'b');
-      await store.recordColumnChange(op2, 'main', 'users', [1], 'c');
+      await store.recordColumnChange({ hlc: op0 }, 'main', 'users', [1], 'a');
+      await store.recordColumnChange({ hlc: op1 }, 'main', 'users', [1], 'b');
+      await store.recordColumnChange({ hlc: op2 }, 'main', 'users', [1], 'c');
 
       const pruned = await store.pruneEntriesBefore(op2);
       expect(pruned).to.equal(2);

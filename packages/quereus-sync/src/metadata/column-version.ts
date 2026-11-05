@@ -9,6 +9,7 @@ import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
 import { buildColumnVersionKey, buildColumnVersionScanBounds, encodePkIdentity, parseColumnVersionKey } from './keys.js';
+import { encodePosition, decodePosition, positionField } from './filing-position.js';
 import type { PkKeyingResolver } from './pk-identity.js';
 import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
@@ -29,9 +30,15 @@ import { writeIdentityBatch, type TableIdentityResolver } from './table-identity
  * this one replaced (its replica-local lineage). They are written together (both
  * present or both absent) and are absent on the first write of a cell and on
  * snapshot-reconstructed cells (a snapshot is a fresh basis with no history).
+ *
+ * `position` is where this replica filed the version in its change log
+ * (`metadata/filing-position.ts`); absent when it equals `hlc`, which is every version
+ * written here. It is what the version's `cl:` entry is keyed by, so whoever replaces
+ * or removes the version needs it to remove that entry.
  */
 export interface ColumnVersion {
   hlc: HLC;
+  position?: HLC;        // filing position, when it differs from hlc
   value: SqlValue;
   pk: SqlValue[];        // raw pk (the row's address; the key holds only the identity)
   priorHlc?: HLC;        // hlc of the version this one replaced
@@ -55,11 +62,12 @@ interface SerializedColumnVersionPayload {
   k: unknown[];        // encodeSqlValue per raw pk cell
   pv?: unknown;        // encodeSqlValue(priorValue) — present iff prior exists
   ph?: SerializedHLC;  // hlcToJson(priorHlc) — present iff prior exists
+  fp?: string;         // encodePosition(position) — present iff it differs from the HLC
 }
 
 /**
  * Serialize a column version for storage.
- * Format: 30 bytes HLC + JSON payload `{ v, k, pv?, ph? }`.
+ * Format: 30 bytes HLC + JSON payload `{ v, k, pv?, ph?, fp? }`.
  *
  * Uint8Array values are encoded as `{"__bin":"<base64>"}` (bigint as
  * `{"__bigint":"..."}`) so they survive the JSON round-trip; the same encoding
@@ -77,6 +85,8 @@ export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
     payload.ph = hlcToJson(cv.priorHlc);
     payload.pv = encodeSqlValue(cv.priorValue ?? null);
   }
+  const { position } = positionField(cv.hlc, cv.position);
+  if (position !== undefined) payload.fp = encodePosition(position);
   const valueBytes = new TextEncoder().encode(JSON.stringify(payload));
 
   const result = new Uint8Array(hlcBytes.length + valueBytes.length);
@@ -87,7 +97,8 @@ export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
 
 /**
  * Deserialize a column version from storage. Tolerant of the before-image being
- * absent (first-writes and snapshot-reconstructed cells carry none).
+ * absent (first-writes and snapshot-reconstructed cells carry none) and of the
+ * position being absent (it then equals the HLC).
  */
 export function deserializeColumnVersion(buffer: Uint8Array): ColumnVersion {
   const hlc = deserializeHLC(buffer.slice(0, 30));
@@ -97,6 +108,7 @@ export function deserializeColumnVersion(buffer: Uint8Array): ColumnVersion {
     cv.priorHlc = hlcFromJson(payload.ph);
     cv.priorValue = decodeSqlValue(payload.pv);
   }
+  if (payload.fp !== undefined) cv.position = decodePosition(payload.fp);
   return cv;
 }
 
@@ -321,13 +333,14 @@ export class ColumnVersionStore {
    * `deleteRowVersionsAndLogEntries`).
    *
    * The returned map is what lets a caller drop the paired `cl:` change-log
-   * entries in the SAME batch — each entry's key embeds the version's HLC, which
-   * is only recoverable from the record being deleted.
+   * entries in the SAME batch — each entry's key embeds the version's filing
+   * position, which is only recoverable from the record being deleted.
    *
    * NOTE: this fully deserializes each cell (a JSON parse of the value) when the
-   * change-log caller only needs the 30-byte HLC prefix. If deleting wide rows or
-   * rows with large blob cells ever shows up as slow, read just the HLC prefix
-   * here instead of reusing `getRowVersions`.
+   * change-log caller only needs the version's HLC and position. If deleting wide
+   * rows or rows with large blob cells ever shows up as slow, store the position
+   * ahead of the JSON payload and read just that head here instead of reusing
+   * `getRowVersions`.
    */
   async deleteRowVersionsBatch(
     batch: WriteBatch,

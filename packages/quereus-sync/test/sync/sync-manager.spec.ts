@@ -7,6 +7,7 @@ import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl, type ConflictEvent, type SyncState } from '../../src/sync/events.js';
 import {
   DEFAULT_SYNC_CONFIG,
+  replyWatermark,
   type SyncConfig,
   type SnapshotChunk,
   type SnapshotHeaderChunk,
@@ -200,7 +201,7 @@ describe('SyncManager', () => {
         const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
         if (sets.length === 0) break;
         collected.push(...sets);
-        sinceHLC = sets[sets.length - 1].hlc;
+        sinceHLC = replyWatermark(sets);
       }
 
       // All three transactions returned exactly once.
@@ -329,7 +330,7 @@ describe('SyncManager', () => {
         const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
         if (sets.length === 0) break;
         collected.push(...sets);
-        sinceHLC = sets[sets.length - 1].hlc;
+        sinceHLC = replyWatermark(sets);
       }
 
       // No repeats: each transaction id appears exactly once.
@@ -840,7 +841,7 @@ describe('SyncManager', () => {
         const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
         if (sets.length === 0) break;
         collected.push(...sets);
-        sinceHLC = sets[sets.length - 1].hlc;
+        sinceHLC = replyWatermark(sets);
       }
 
       // No repeats: each transaction id appears exactly once.

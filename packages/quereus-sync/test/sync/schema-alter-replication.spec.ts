@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { generateTableDDL } from '@quereus/quereus';
-import { compareHLC } from '../../src/clock/hlc.js';
+import { replyWatermark } from '../../src/sync/protocol.js';
 import {
 	COLUMNS_PER_FRESH_INSERT,
 	DEFAULT_ORDERS_DDL,
@@ -321,13 +321,11 @@ describe('alter table replication', () => {
 			expect(await collect(b.db, 'select note from orders where id = 1'))
 				.to.deep.equal([{ note: 'before' }]);
 
-			// Watermark the way a real consumer does — `lastSyncHLC = ChangeSet.hlc`
-			// (each set's MAX fact HLC) — so the next pull is a true incremental
-			// delta: [rename, post-rename row] in one batch. (`getCurrentHLC` reads
-			// clock STATE, which equals the last transaction's base — not past it.)
-			const since = preSets
-				.map(cs => cs.hlc)
-				.reduce((max, h) => (compareHLC(h, max) > 0 ? h : max));
+			// Watermark the way a real consumer does — the reply's resume position
+			// (`replyWatermark`) — so the next pull is a true incremental delta:
+			// [rename, post-rename row] in one batch. (`getCurrentHLC` reads clock
+			// STATE, which equals the last transaction's base — not past it.)
+			const since = replyWatermark(preSets);
 			await localWrite(a, 'alter table orders rename to orders2');
 			await localWrite(a, "insert into orders2 (id, note) values (2, 'after')");
 

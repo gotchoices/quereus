@@ -10,6 +10,7 @@ import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
 import { encodeSqlValue, decodeSqlValue } from './column-version.js';
 import { buildTombstoneKey, buildTombstoneScanBounds, encodePkIdentity } from './keys.js';
+import { type FiledAt, encodePosition, decodePosition, positionField } from './filing-position.js';
 import type { PkKeyingResolver } from './pk-identity.js';
 import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
@@ -21,6 +22,13 @@ const TOMBSTONE_HEAD_BYTES = 38;
  */
 export interface Tombstone {
   hlc: HLC;
+  /**
+   * Where this replica filed the delete in its change log
+   * (`metadata/filing-position.ts`); absent when it equals `hlc`, which is every
+   * delete made here. The tombstone's `cl:` entry is keyed by it, and the delta
+   * floor is raised to it when the tombstone is pruned.
+   */
+  position?: HLC;
   createdAt: number;  // Wall clock time for TTL calculation
   /**
    * The deleted row's ADDRESS — its raw primary-key values, one spelling from
@@ -47,12 +55,13 @@ export interface Tombstone {
 interface SerializedTombstonePayload {
   k: unknown[];   // encodeSqlValue per raw pk cell
   pr?: unknown[]; // encodeSqlValue per priorRow cell — present iff priorRow exists
+  fp?: string;    // encodePosition(position) — present iff it differs from the HLC
 }
 
 /**
  * Serialize a tombstone for storage.
  *
- * Format: 30 bytes HLC + 8 bytes createdAt + JSON payload `{ k, pr? }`
+ * Format: 30 bytes HLC + 8 bytes createdAt + JSON payload `{ k, pr?, fp? }`
  * (see {@link SerializedTombstonePayload}). The payload is unconditional — the
  * pk must always be recoverable from the value.
  */
@@ -64,9 +73,11 @@ export function serializeTombstone(tombstone: Tombstone): Uint8Array {
   const view = new DataView(head.buffer);
   view.setBigUint64(30, BigInt(tombstone.createdAt), false);
 
+  const { position } = positionField(tombstone.hlc, tombstone.position);
   const payload: SerializedTombstonePayload = {
     k: tombstone.pk.map(encodeSqlValue),
     ...(tombstone.priorRow !== undefined ? { pr: tombstone.priorRow.map(encodeSqlValue) } : {}),
+    ...(position !== undefined ? { fp: encodePosition(position) } : {}),
   };
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
   const result = new Uint8Array(head.length + payloadBytes.length);
@@ -76,8 +87,8 @@ export function serializeTombstone(tombstone: Tombstone): Uint8Array {
 }
 
 /**
- * Deserialize a tombstone from storage. The payload's `pr` (before-image) is
- * optional; the pk is required (see {@link serializeTombstone}).
+ * Deserialize a tombstone from storage. The payload's `pr` (before-image) and `fp`
+ * (position) are optional; the pk is required (see {@link serializeTombstone}).
  */
 export function deserializeTombstone(buffer: Uint8Array): Tombstone {
   const hlc = deserializeHLC(buffer.slice(0, 30));
@@ -91,6 +102,7 @@ export function deserializeTombstone(buffer: Uint8Array): Tombstone {
   if (payload.pr !== undefined) {
     tombstone.priorRow = payload.pr.map(decodeSqlValue);
   }
+  if (payload.fp !== undefined) tombstone.position = decodePosition(payload.fp);
   return tombstone;
 }
 
@@ -153,15 +165,18 @@ export class TombstoneStore {
     schemaName: string,
     tableName: string,
     pk: SqlValue[],
-    hlc: HLC,
+    filed: FiledAt,
     priorRow?: Row
   ): Promise<void> {
     await writeIdentityBatch(this.kv, this.tables, batch =>
-      this.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow));
+      this.setTombstoneBatch(batch, schemaName, tableName, pk, filed, priorRow));
   }
 
   /**
-   * Set tombstone in a batch. `priorRow` (optional) is the row's last-known image,
+   * Set tombstone in a batch. `filed` is the delete's origin timestamp plus, when the
+   * delete was filed elsewhere than at that timestamp, its position; passing the same
+   * `filed` to `ChangeLogStore.recordDeletionBatch` keeps the record and its entry in
+   * step. `priorRow` (optional) is the row's last-known image,
    * persisted as best-effort audit/undo metadata. The key's pk IDENTITY is always
    * derived locally — no caller-supplied-identity variant exists (see
    * `ColumnVersionStore.setColumnVersionBatch`). The table generation is ensured
@@ -174,13 +189,19 @@ export class TombstoneStore {
     schemaName: string,
     tableName: string,
     pk: SqlValue[],
-    hlc: HLC,
+    filed: FiledAt,
     priorRow?: Row,
     createdAt: number = Date.now()
   ): void {
     const identity = this.identity(schemaName, tableName, pk);
     const generation = this.tables.ensure(schemaName, tableName, batch);
-    const tombstone: Tombstone = { hlc, createdAt, pk, ...(priorRow !== undefined ? { priorRow } : {}) };
+    const tombstone: Tombstone = {
+      hlc: filed.hlc,
+      ...positionField(filed.hlc, filed.position),
+      createdAt,
+      pk,
+      ...(priorRow !== undefined ? { priorRow } : {}),
+    };
     batch.put(buildTombstoneKey(generation, identity), serializeTombstone(tombstone));
   }
 
@@ -188,7 +209,7 @@ export class TombstoneStore {
    * Delete a tombstone (used when resurrecting a row).
    *
    * NOTE: no production caller. If one is added, it must ALSO delete the paired
-   * `cl:` change-log delete entry (`changeLog.deleteEntryBatch(batch, tombstone.hlc,
+   * `cl:` change-log delete entry (`changeLog.deleteEntryBatch(batch, tombstone,
    * 'delete', schema, table, pk)`) in the same batch — otherwise the entry outlives
    * its target and becomes permanent index garbage, the leak `SyncManagerImpl.
    * pruneTombstones` was fixed to avoid.

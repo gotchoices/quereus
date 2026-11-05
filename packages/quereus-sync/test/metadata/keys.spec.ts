@@ -123,8 +123,8 @@ describe('change-log key encoding', () => {
       expect(parsed!.generation).to.equal(GEN_A);
       expect(parsed!.column).to.equal('name');
       expect(parsed!.identity).to.equal(identity);
-      expect(parsed!.hlc.opSeq).to.equal(99);
-      expect(compareHLC(parsed!.hlc, hlc)).to.equal(0);
+      expect(parsed!.position.opSeq).to.equal(99);
+      expect(compareHLC(parsed!.position, hlc)).to.equal(0);
     });
 
     it('should round-trip a delete entry (no column)', () => {
@@ -137,7 +137,7 @@ describe('change-log key encoding', () => {
       expect(parsed!.column).to.be.undefined;
       expect(parsed!.generation).to.equal(GEN_A);
       expect(parsed!.identity).to.equal(identity);
-      expect(parsed!.hlc.opSeq).to.equal(3);
+      expect(parsed!.position.opSeq).to.equal(3);
     });
 
     it('should produce keys whose byte order matches compareHLC', () => {

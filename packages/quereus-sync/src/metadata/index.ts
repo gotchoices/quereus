@@ -3,6 +3,7 @@
  */
 
 export * from './keys.js';
+export * from './filing-position.js';
 export * from './pk-identity.js';
 export * from './table-identity.js';
 export * from './column-version.js';

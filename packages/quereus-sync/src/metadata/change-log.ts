@@ -1,13 +1,15 @@
 /**
- * HLC-indexed change log for efficient delta sync.
+ * Change log: an index over the live `cv:` / `tb:` records, ordered by FILING POSITION.
  *
- * The change log stores references to changes indexed by HLC timestamp,
- * enabling efficient getChangesSince() queries without scanning all data.
+ * Each entry points at one record and is keyed by where this replica filed that record's
+ * fact (`metadata/filing-position.ts`), so `getChangesSince()` reads facts in the order
+ * they reached this replica without scanning all data. A fact's origin timestamp, which
+ * can be far older than its position when the fact arrived late, is the entry's value.
  */
 
 import type { KVStore, WriteBatch } from '@quereus/store';
 import type { SqlValue } from '@quereus/quereus';
-import { type HLC, compareHLC } from '../clock/hlc.js';
+import { type HLC, compareHLC, serializeHLC, deserializeHLC } from '../clock/hlc.js';
 import {
   buildChangeLogKey,
   buildChangeLogScanBoundsAfter,
@@ -16,6 +18,7 @@ import {
   encodePkIdentity,
   type ChangeLogEntryType,
 } from './keys.js';
+import { type FiledAt, filingPosition } from './filing-position.js';
 import type { PkKeyingResolver } from './pk-identity.js';
 import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
@@ -25,11 +28,20 @@ import { writeIdentityBatch, type TableIdentityResolver } from './table-identity
  * Carries the table GENERATION (resolve it to the table's current name through
  * `TableIdentityStore.nameOf`; `undefined` means a retired table's orphan entry)
  * and the pk IDENTITY (the derived, lossy string the row's records are filed
- * under), NOT the raw pk — the entry's value is empty and the identity cannot be
- * decoded back. Consumers resolve the entry to its live `cv:`/`tb:` record (which
- * holds the raw pk in its value) via the `*ByIdentity` getters.
+ * under), NOT the raw pk, which cannot be decoded back from the identity.
+ * Consumers resolve the entry to its live `cv:`/`tb:` record (which holds the raw
+ * pk in its value) via the `*ByIdentity` getters.
+ *
+ * An entry is live only while its record is filed at the entry's own `position`.
  */
 export interface ChangeLogEntry {
+  /** Where this replica filed the fact: the entry's key, and the order the log is read in. */
+  readonly position: HLC;
+  /**
+   * The fact's origin timestamp. Stored as the entry's value when it differs from
+   * `position`; an empty value means the two are equal (a fact written here, or an
+   * entry written before positions existed).
+   */
   readonly hlc: HLC;
   readonly entryType: ChangeLogEntryType;
   readonly generation: string;
@@ -37,12 +49,29 @@ export interface ChangeLogEntry {
   readonly column?: string;
 }
 
+const NO_VALUE = new Uint8Array(0);
+
+/** An entry's value: the origin timestamp when the fact was filed somewhere else, else nothing. */
+function originValue(filed: FiledAt): Uint8Array {
+  return compareHLC(filingPosition(filed), filed.hlc) === 0 ? NO_VALUE : serializeHLC(filed.hlc);
+}
+
+function parseEntry(key: Uint8Array, value: Uint8Array): ChangeLogEntry | null {
+  const parsed = parseChangeLogKey(key);
+  if (!parsed) return null;
+  return { ...parsed, hlc: value.length === 0 ? parsed.position : deserializeHLC(value) };
+}
+
 /**
- * Change log store for HLC-indexed change tracking.
+ * Change log store, indexed by filing position.
  *
  * Each mutation (column update or row deletion) creates an entry in the
- * change log, keyed by HLC. This allows efficient range scans to find
- * all changes since a given timestamp.
+ * change log, keyed by the position it was filed at. This allows efficient range
+ * scans to find everything filed after a given position.
+ *
+ * Every writer and deleter takes the record's {@link FiledAt} (or the parsed entry,
+ * which is one) rather than a bare HLC: the key is the POSITION, and a caller holding
+ * only an origin timestamp would address the wrong entry for any fact that arrived late.
  *
  * Every pk-taking method derives the key's pk IDENTITY through the per-table
  * {@link PkKeyingResolver} passed at construction and the table component through
@@ -66,14 +95,14 @@ export class ChangeLogStore {
    * the generation mint, when needed, lands with the entry).
    */
   async recordColumnChange(
-    hlc: HLC,
+    filed: FiledAt,
     schema: string,
     table: string,
     pk: SqlValue[],
     column: string
   ): Promise<void> {
     await writeIdentityBatch(this.kv, this.tables, batch =>
-      this.recordColumnChangeBatch(batch, hlc, schema, table, pk, column));
+      this.recordColumnChangeBatch(batch, filed, schema, table, pk, column));
   }
 
   /**
@@ -84,7 +113,7 @@ export class ChangeLogStore {
    */
   recordColumnChangeBatch(
     batch: WriteBatch,
-    hlc: HLC,
+    filed: FiledAt,
     schema: string,
     table: string,
     pk: SqlValue[],
@@ -92,8 +121,7 @@ export class ChangeLogStore {
   ): void {
     const identity = this.identity(schema, table, pk);
     const generation = this.tables.ensure(schema, table, batch);
-    // Value is empty - all info is in the key
-    batch.put(buildChangeLogKey(hlc, 'column', generation, identity, column), new Uint8Array(0));
+    batch.put(buildChangeLogKey(filingPosition(filed), 'column', generation, identity, column), originValue(filed));
   }
 
   /**
@@ -101,13 +129,13 @@ export class ChangeLogStore {
    * {@link recordColumnChange}).
    */
   async recordDeletion(
-    hlc: HLC,
+    filed: FiledAt,
     schema: string,
     table: string,
     pk: SqlValue[]
   ): Promise<void> {
     await writeIdentityBatch(this.kv, this.tables, batch =>
-      this.recordDeletionBatch(batch, hlc, schema, table, pk));
+      this.recordDeletionBatch(batch, filed, schema, table, pk));
   }
 
   /**
@@ -115,45 +143,41 @@ export class ChangeLogStore {
    */
   recordDeletionBatch(
     batch: WriteBatch,
-    hlc: HLC,
+    filed: FiledAt,
     schema: string,
     table: string,
     pk: SqlValue[]
   ): void {
     const identity = this.identity(schema, table, pk);
     const generation = this.tables.ensure(schema, table, batch);
-    batch.put(buildChangeLogKey(hlc, 'delete', generation, identity), new Uint8Array(0));
+    batch.put(buildChangeLogKey(filingPosition(filed), 'delete', generation, identity), originValue(filed));
   }
 
   /**
-   * Get all change log entries after a given HLC.
-   * Returns entries in HLC order (oldest first).
+   * Get all change log entries filed strictly after a given position, in filing order
+   * (oldest first). A fact with an origin timestamp above `sincePosition` is always among
+   * them, because a position is never below its fact's origin.
    */
-  async *getChangesSince(sinceHLC: HLC): AsyncIterable<ChangeLogEntry> {
-    const bounds = buildChangeLogScanBoundsAfter(sinceHLC);
-    for await (const entry of this.kv.iterate(bounds)) {
-      const parsed = parseChangeLogKey(entry.key);
-      if (parsed) {
-        yield parsed;
-      }
-    }
+  async *getChangesSince(sincePosition: HLC): AsyncIterable<ChangeLogEntry> {
+    yield* this.entriesIn(buildChangeLogScanBoundsAfter(sincePosition));
   }
 
   /**
-   * Get all change log entries.
+   * Get all change log entries, in filing order.
    */
   async *getAllChanges(): AsyncIterable<ChangeLogEntry> {
-    const bounds = buildAllChangeLogScanBounds();
+    yield* this.entriesIn(buildAllChangeLogScanBounds());
+  }
+
+  private async *entriesIn(bounds: { gte: Uint8Array; lt: Uint8Array }): AsyncIterable<ChangeLogEntry> {
     for await (const entry of this.kv.iterate(bounds)) {
-      const parsed = parseChangeLogKey(entry.key);
-      if (parsed) {
-        yield parsed;
-      }
+      const parsed = parseEntry(entry.key, entry.value);
+      if (parsed) yield parsed;
     }
   }
 
   /**
-   * Delete change log entries up to a given HLC.
+   * Delete change log entries filed before a given position.
    * Used for pruning old entries after they've been synced to all peers.
    *
    * NOTE: intentionally unwired — no production caller invokes this, and that is
@@ -161,19 +185,19 @@ export class ChangeLogStore {
    * deleted with the `cv:`/`tb:` record they point at, so its size tracks live
    * data), so horizon pruning is now a behaviour change rather than a leak fix:
    * it drops index entries for cells that are still LIVE, which silently breaks
-   * any peer whose `sinceHLC` predates the horizon — their delta scan would start
+   * any peer whose watermark predates the horizon — their delta scan would start
    * past the pruned range and never learn about those cells.
    *
    * Precondition before wiring it up: the server must REFUSE delta sync for a
-   * `sinceHLC` below the pruned range and fall back to a snapshot. The refusal
+   * watermark below the pruned range and fall back to a snapshot. The refusal
    * exists now — `SyncManager.canDeltaSync` compares against the delta floor
    * (`metadata/delta-floor.ts`), the coordinator consults it before serving
    * `get_changes`, and the client recovers via snapshot — but the floor is only
    * raised by `pruneTombstones`. Wiring this up means raising the floor to
-   * `beforeHLC` in the SAME batch as these deletes, exactly as the tombstone
+   * `beforePosition` in the SAME batch as these deletes, exactly as the tombstone
    * prune does. Tracked as `feat-sync-changelog-horizon-pruning`.
    */
-  async pruneEntriesBefore(beforeHLC: HLC): Promise<number> {
+  async pruneEntriesBefore(beforePosition: HLC): Promise<number> {
     const bounds = buildAllChangeLogScanBounds();
     const batch = this.kv.batch();
     let count = 0;
@@ -182,11 +206,11 @@ export class ChangeLogStore {
       const parsed = parseChangeLogKey(entry.key);
       if (!parsed) continue;
 
-      // Prune entries strictly before the boundary HLC. Iteration is in HLC key
-      // order (lexicographic == compareHLC), so the first entry at-or-after the
-      // boundary means every remaining entry is too — stop. Comparing via
+      // Prune entries strictly before the boundary. Iteration is in key order
+      // (lexicographic == compareHLC over positions), so the first entry at-or-after
+      // the boundary means every remaining entry is too — stop. Comparing via
       // compareHLC keeps opSeq (and siteId) participating consistently.
-      if (compareHLC(parsed.hlc, beforeHLC) >= 0) break;
+      if (compareHLC(parsed.position, beforePosition) >= 0) break;
 
       batch.delete(entry.key);
       count++;
@@ -197,12 +221,12 @@ export class ChangeLogStore {
   }
 
   /**
-   * Delete a specific change log entry by raw pk. A name that never filed
-   * anything has no entry to delete.
+   * Delete the change log entry of the record `filed` describes, by raw pk. A name
+   * that never filed anything has no entry to delete.
    */
   deleteEntryBatch(
     batch: WriteBatch,
-    hlc: HLC,
+    filed: FiledAt,
     entryType: ChangeLogEntryType,
     schema: string,
     table: string,
@@ -212,25 +236,23 @@ export class ChangeLogStore {
     const identity = this.identity(schema, table, pk);
     const generation = this.tables.generationOf(schema, table);
     if (generation === undefined) return;
-    this.deleteEntryByIdentityBatch(batch, hlc, entryType, generation, identity, column);
+    this.deleteEntryByIdentityBatch(batch, filed, entryType, generation, identity, column);
   }
 
   /**
-   * Delete a specific change log entry by table generation and pk IDENTITY — for
-   * callers that hold a parsed key rather than a name and raw pk (the tombstone
-   * prune sweep and the change-log repair, whose generation may be retired and so
-   * have no name at all).
+   * Delete the change log entry of the record `filed` describes, by table generation
+   * and pk IDENTITY — for callers that hold a parsed key rather than a name and raw pk
+   * (the tombstone prune sweep and the change-log repair, whose generation may be
+   * retired and so have no name at all).
    */
   deleteEntryByIdentityBatch(
     batch: WriteBatch,
-    hlc: HLC,
+    filed: FiledAt,
     entryType: ChangeLogEntryType,
     generation: string,
     identity: string,
     column?: string
   ): void {
-    const key = buildChangeLogKey(hlc, entryType, generation, identity, column);
-    batch.delete(key);
+    batch.delete(buildChangeLogKey(filingPosition(filed), entryType, generation, identity, column));
   }
 }
-

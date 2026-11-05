@@ -87,6 +87,16 @@ export async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<Snapshot
 	for (const c of chunks) yield c;
 }
 
+/**
+ * A stored record without its filing position, for comparing what two replicas hold of
+ * one fact: the position is where each replica filed it, so it differs between them
+ * (and between one apply and several) while everything else must agree.
+ */
+export function withoutPosition<T extends { position?: unknown }>(record: T): Omit<T, 'position'> {
+	const { position: _position, ...rest } = record;
+	return rest;
+}
+
 export async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
 	const out: Record<string, SqlValue>[] = [];
 	for await (const row of db.eval(sql)) out.push(row);

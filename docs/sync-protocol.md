@@ -19,6 +19,9 @@ interface ChangeSet {
   hlc: HLC;                          // Transaction commit time
   changes: Change[];                 // Column-level changes
   schemaMigrations: SchemaMigration[]; // Schema changes in this tx
+  cursor?: HLC;                      // Where a reader of this set resumes from on the replica
+                                     // that served it; absent when equal to `hlc`
+                                     // (§ Delta Sync Optimization)
 }
 
 /** A single column modification */
@@ -106,6 +109,7 @@ interface SchemaMigration {
                                      // order, so a relay can read a before-image (sync.md § Tombstones)
   ddl: string;                       // The DDL statement
   hlc: HLC;
+  position?: HLC;                    // Snapshots only: where the sender filed it, when not at `hlc`
   schemaVersion: number;             // Monotonic per (object kind, object name) from 1;
                                      // 0 is a baseline (sync-schema.md § Baselines)
 }
@@ -121,12 +125,17 @@ interface SyncManager {
   /** Get current HLC for state comparison */
   getCurrentHLC(): HLC;
 
-  /** All changes since a peer's last known state; omit sinceHLC for initial sync. */
+  /**
+   * Everything this replica filed after `sinceHLC`, in the order it filed it; omit
+   * sinceHLC for initial sync. `sinceHLC` is the watermark of the last reply the peer
+   * applied (`replyWatermark`): a position in THIS replica's change log, not a write time.
+   */
   getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
 
   /**
    * What to push upstream to a peer: facts and migrations this replica wrote, plus held
    * store-and-forward changes not written by that peer. Same bound as getChangesSince.
+   * Here `sinceHLC` is a write time: the greatest `ChangeSet.hlc` the peer acknowledged.
    */
   getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
 
@@ -134,13 +143,13 @@ interface SyncManager {
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
 
   /**
-   * False once a tombstone above sinceHLC has been pruned here — the delete it
+   * False once a tombstone filed above sinceHLC has been pruned here — the delete it
    * backed cannot be delivered, so the peer must take a snapshot. Compares
    * against the delta floor only (no peer state, no wall clock).
    */
   canDeltaSync(sinceHLC: HLC): Promise<boolean>;
 
-  /** The delta floor: greatest pruned-tombstone HLC, or undefined if nothing deliverable was ever pruned. */
+  /** The delta floor: greatest filing position of a pruned tombstone, or undefined if nothing deliverable was ever pruned. */
   getDeltaFloor(): Promise<HLC | undefined>;
 
   /** A full snapshot, for initial sync or TTL-expiration recovery. */
@@ -178,7 +187,7 @@ interface ApplyResult {
 
 interface Snapshot {
   siteId: SiteId;
-  hlc: HLC;
+  hlc: HLC;                // a position in the sender's change log: the receiver asks for what was filed after it
   snapshotFormat: number;  // wire-format stamp; see § Snapshot wire-format version
   // One section per covered table, including a table with no rows left: it is
   // the table's whole contents, so an empty one empties the receiver's table.
@@ -195,7 +204,9 @@ interface TableSnapshot {
   // One flat record per live cell — the table's ONLY payload; only the raw pk
   // travels, and no pre-grouped row images do. The receiver groups cells into
   // rows under its own DERIVED identity. See § Row identity vs. address.
-  columnVersions: ReadonlyArray<{ column: string; hlc: HLC; value: SqlValue; pk: SqlValue[] }>;
+  // `position` is where the sender filed the cell, when not at `hlc`; the receiver
+  // files it at the same position (§ Delta Sync Optimization). Tombstones carry one too.
+  columnVersions: ReadonlyArray<{ column: string; hlc: HLC; position?: HLC; value: SqlValue; pk: SqlValue[] }>;
 }
 
 // ============================================================================
@@ -391,7 +402,7 @@ fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 | Type | Purpose | Payload |
 |------|---------|---------|
 | `handshake` | Authenticate and establish session | `{ siteId, token?, protocolVersion }` |
-| `get_changes` | Request changes since an HLC | `{ sinceHLC? }` (base64) |
+| `get_changes` | Request what the server filed after a position in its change log (the client's received watermark) | `{ sinceHLC? }` (base64) |
 | `apply_changes` | Push local changes to server | `{ changes: ChangeSet[], requestId? }` |
 | `get_snapshot` | Request full snapshot | (none) |
 | `resume_snapshot` | Resume an interrupted snapshot from a saved checkpoint | `{ checkpoint }` (via `serializeSnapshotCheckpoint`) |
@@ -402,7 +413,7 @@ fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 | Type | Purpose | Payload |
 |------|---------|---------|
 | `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId, protocolVersion }` |
-| `changes` | Ordered response to `get_changes` (gap-free; **advances** received watermark) | `{ changeSets: ChangeSet[] }` |
+| `changes` | Ordered response to `get_changes` (gap-free, in the server's filing order; **advances** received watermark to `replyWatermark(changeSets)`) | `{ changeSets: ChangeSet[] }`, each with an optional `cursor` |
 | `snapshot_required` | Refusal of a `get_changes` whose `sinceHLC` is below the server's delta floor — a delete the client needs was pruned, so no delta can be complete. A normal outcome, not an `error` | `{ sinceHLC, deltaFloor }` (base64) |
 | `push_changes` | Fire-and-forget broadcast from another client (applied, but **never** advances the received watermark) | `{ changeSets: ChangeSet[] }` |
 | `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
@@ -447,7 +458,11 @@ mixed-version rolling upgrades ever be required.
 Version history: **v2** added `snapshot_required` as a possible reply to `get_changes`.
 No v1 message shape moved, but a v1 client would log the new reply as an unknown message
 and sit unsynced forever, so it is breaking in effect; coordinator and clients ship
-together.
+together. **v3** added `cursor` to a change set in a `changes` reply and made `sinceHLC`
+on `get_changes` a position in the server's change log rather than a write time
+(§ Delta Sync Optimization). A v2 client would resume from a set's `hlc`, which for a
+change the server received late is below what the client already holds, and request the
+same range without end.
 
 > **NOTE: accepted tradeoff — mixed-version skew is deliberately neither promised nor
 > tested.** A version-skew test (pin one peer at release N, the other at N-1, assert they
@@ -474,16 +489,41 @@ The client state machine:
 
 ### Delta Sync Optimization
 
-To minimize data transfer, clients track sync progress with the server. Every
-watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max over
-`changeSets[].hlc`, via the shared `maxHLC` helper), never a per-change max or a
-batch-slice boundary — so advancing it can only land *between* whole transactions
-([sync-transactions.md § Transaction-Based Change Grouping → Read side](sync-transactions.md#read-side-one-changeset-per-transaction)):
+To minimize data transfer, clients track sync progress with the server, using two
+watermarks that measure two different things. Every change has a timestamp on each of
+two axes:
 
-1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
-2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values, persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
+- **Origin timestamp** (`hlc`): when the change was written, and by whom. Conflict
+  resolution, transaction identity, before-images and the *sent* watermark use it.
+- **Filing position**: where a replica filed the change in its own change log. A replica
+  files what it writes at the change's own HLC, and what it receives at a tick of its
+  own clock taken when the change is committed, so positions rise in the order changes
+  *reach* the replica, whatever their write times, and a position is never below its
+  change's origin timestamp. The *received* watermark, the `sinceHLC` of `get_changes`,
+  the delta floor and a snapshot's header HLC are positions. A position is an HLC value,
+  with an HLC's encoding, but it means something only to the replica that issued it;
+  the received watermark is kept per server for that reason.
+
+The two orders differ whenever changes arrive out of write order: after any offline
+period, and between two devices pushing at about the same time. A device that reconnects
+and pushes an hour-old delete has that delete filed at the server's *current* position,
+so every device that catches up afterwards receives it, including one that had already
+read changes written later. Measured in write time, that device's watermark would already
+be past the delete and no request would ever return it.
+
+A `changes` reply lists its sets in filing order, and each set carries a `cursor`: its
+greatest position, left off when it equals the set's `hlc` (anything the server wrote
+itself). The watermark a reply moves its reader to is the greatest `cursor ?? hlc` among
+its sets, computed by `replyWatermark` (exported from `@quereus/sync`); it can only land
+*between* whole sets
+([sync-transactions.md § Transaction-Based Change Grouping → Read side](sync-transactions.md#read-side-one-changeset-per-transaction)).
+A `cursor` is never passed on: a replica applying a set ignores it and files each change
+at a position of its own. What a device *pushes* carries none, and is tracked by `hlc`:
+
+1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark), to `replyWatermark` of the reply. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
+2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values — write times of its own transactions, the max over the batch via the shared `maxHLC` helper — persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
 3. **Reconnection / restart**: On reconnect the client re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`), pushes everything past it one acknowledged batch at a time, and only then sends `get_changes` with `sinceHLC` from the received watermark. The push goes first because the coordinator answers a connection's messages concurrently: a pull answered from the server's pre-push state hands back history the device already has (a broadcast never advances the received watermark), and after an offline key change that history addresses rows by the old key, which the re-keyed table cannot resolve. A push the server rejects, or one that could not be sent on a socket that is still open, is logged and the pull still follows; a socket that drops stops the sequence, and the reconnect runs it again. A fresh process thus resumes delta-push from the last confirmed HLC instead of replaying its entire local history, and a device with a large offline backlog reports `synced` only once its last batch is acknowledged. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
-4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity — **unless** `sinceHLC` is below its delta floor ([sync.md § Read side → The delta floor](sync-transactions.md#read-side-one-changeset-per-transaction)): a delete the client needs has been pruned, so it answers `snapshot_required` and the client recovers as described under *Client snapshot bootstrap* below. A `get_changes` with no `sinceHLC` is a from-nothing load and is never refused
+4. **Server tracking**: The server uses the client's `sinceHLC` to return only what it filed after that position — whole ChangeSets, in filing order, bounded by `batchSize` at ChangeSet granularity — **unless** `sinceHLC` is below its delta floor ([sync.md § Read side → The delta floor](sync-transactions.md#read-side-one-changeset-per-transaction)): a delete the client needs has been pruned, so it answers `snapshot_required` and the client recovers as described under *Client snapshot bootstrap* below. A `get_changes` with no `sinceHLC` is a from-nothing load and is never refused
 
 The push loop, end to end: a local change triggers the debounced send (50 ms window);
 the client calls `getChangesToPush(serverSiteId, lastSentHLC)` for per-transaction
@@ -508,9 +548,13 @@ is replaced moves the watermark but sends nothing, because the new connection's 
 starts its own pull. An apply that finishes after the connection is gone does not report
 `synced`.
 
-A device pushes only what it wrote (`hlc.siteId` is its own), never what it received. It
+A device pushes only what it wrote (`hlc.siteId` is its own) after its sent watermark,
+never what it received. It
 assumes one coordinator per database: everything it received came through that server, so
 the server has it. So a device that only receives never pushes, and has no sent watermark.
+A device restored from the server's snapshot holds its own earlier writes at the server's
+positions, above its sent watermark; they are recognized by their write time and not
+pushed again.
 A [schema seed](sync-schema.md#seeds-and-the-server) is the exception to that assumption: a
 device applies it locally, and it never reaches the server.
 
@@ -614,7 +658,11 @@ the time of adoption, so they beat older edits of the same key; see
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received
-watermark, so the follow-up `get_changes` starts *after* the snapshot point. Progress
+watermark, so the follow-up `get_changes` starts *after* the snapshot point. The header
+HLC is a position: the server takes it as a fresh clock tick, in the same queue that
+files incoming changes, before it reads anything, so every change filed below it is in
+the snapshot and every later one is filed above it and returned by that `get_changes`.
+It is also always above the delta floor, so the follow-up request is never refused. Progress
 reaches callers three ways: `onSnapshotProgress` (every tick), the `bootstrapping`
 status, and a sync event throttled to table boundaries.
 

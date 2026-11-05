@@ -34,6 +34,7 @@ import { PeerStateStore } from '../metadata/peer-state.js';
 import { DeltaFloorStore } from '../metadata/delta-floor.js';
 import { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
+import { filingPosition } from '../metadata/filing-position.js';
 import { QuarantineStore } from '../metadata/quarantine.js';
 import {
 	BasisLifecycleStore,
@@ -79,10 +80,10 @@ import type {
 } from './protocol.js';
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
+import { persistHLCState, persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { StagedTransactionMetadata } from './staged-transaction-metadata.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
-import { buildTransactionChangeSets } from './change-grouping.js';
+import { buildTransactionChangeSets, filedAtOrigin, filingGroupKey, type FiledChange } from './change-grouping.js';
 import { alterPrimaryKeyColumns } from './migration-ddl.js';
 import { rekeyTableBookkeeping, reportRekeyOutcome, type RekeyCounts } from './rekey-on-pk-change.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
@@ -276,7 +277,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// prior handler's completion so N+1's dedup reads see N's durable writes,
 	// preserving the change-log ordering invariant (docs/sync-transactions.md § Transaction-Based
 	// Change Grouping). Without this, two rapid commits interleave at the first
-	// `await` and a stale change-log entry survives.
+	// `await` and a stale change-log entry survives. Remote applies file their metadata
+	// on the same chain (see onCommitChain): it is the one place a filing position is
+	// both issued and written.
 	private commitChain: Promise<void> = Promise.resolve();
 
 	// Settles when every apply started so far has. See whenAppliesSettled.
@@ -870,6 +873,22 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return this.commitChain;
 	}
 
+	/** See {@link SyncContext.onCommitChain}. */
+	onCommitChain<T>(work: () => Promise<T>): Promise<T> {
+		const running = this.commitChain.then(work);
+		this.commitChain = running.then(() => undefined, () => undefined);
+		return running;
+	}
+
+	/** See {@link SyncContext.nextFilingTick}. */
+	nextFilingTick(): Promise<HLC> {
+		return this.onCommitChain(async () => {
+			const tick = this.hlcManager.tick();
+			await persistHLCState(this);
+			return tick;
+		});
+	}
+
 	/** See {@link SyncContext.whenAppliesSettled}. */
 	whenAppliesSettled(): Promise<void> {
 		return this.appliesInFlight;
@@ -912,7 +931,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * "one transaction = one HLC" boundary — or by a synthetic group from adoption. The
 	 * clock is ticked exactly **once**; every fact of the transaction shares that base
 	 * `(wallTime, counter, siteId)` and differs only in `opSeq` (a contiguous, 0-based
-	 * sub-order). DDL is recorded before DML so migrations sort below the same
+	 * sub-order). Each fact is filed in the change log at that same HLC: for a fact
+	 * written here, the origin timestamp and the filing position are one value
+	 * (`metadata/filing-position.ts`). DDL is recorded before DML so migrations sort
+	 * below the same
 	 * transaction's data facts (docs/sync-schema.md § DDL Application Order). All metadata
 	 * for the transaction — schema migrations, column versions, tombstones, change-log
 	 * entries, and the HLC clock state — lands in a single KV batch.
@@ -1320,14 +1342,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// Dedupe the change-log delete entry the same way columns are deduped: if a
 			// prior tombstone exists for this pk (a delete→reinsert→delete key reuse —
 			// staged by this same transaction, or committed), its stale delete entry
-			// must go, so at most one delete entry survives per pk with HLC equal to
-			// the current tombstone. This keeps collectChangesSince's boundary
-			// detection (keyed on the log HLC) in lockstep with grouping (keyed on the
-			// resolved tombstone HLC) — see its LOAD-BEARING INVARIANT.
-			const existingHlc = staged.tombstoneHlc(schemaName, tableName, pk)
-				?? (await this.tombstones.getTombstone(schemaName, tableName, pk))?.hlc;
-			if (existingHlc) {
-				this.changeLog.deleteEntryBatch(batch, existingHlc, 'delete', schemaName, tableName, pk);
+			// must go, so at most one delete entry survives per pk, the one filed where
+			// the current tombstone is — see collectChangesSince's LOAD-BEARING
+			// INVARIANT. The prior tombstone may have arrived from another replica, so
+			// its entry sits at the tombstone's position, not its HLC.
+			const existing = staged.tombstone(schemaName, tableName, pk)
+				?? await this.tombstones.getTombstone(schemaName, tableName, pk);
+			if (existing) {
+				this.changeLog.deleteEntryBatch(batch, existing, 'delete', schemaName, tableName, pk);
 			}
 
 			const hlc = nextHlc();
@@ -1336,8 +1358,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// it so neither aliases the engine's row buffer; absent when the event
 			// carried no `oldRow` (relayed/synthesized deletes).
 			const priorRow: Row | undefined = oldRow ? [...oldRow] : undefined;
-			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow);
-			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
+			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, { hlc }, priorRow);
+			this.changeLog.recordDeletionBatch(batch, { hlc }, schemaName, tableName, pk);
 			// The row's column versions die here, so their change-log entries must die
 			// with them — otherwise every deleted row leaves one orphan entry per column
 			// behind forever (see deleteRowVersionsAndLogEntries). The cleanup stages
@@ -1348,7 +1370,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				staged: staged.rowState(schemaName, tableName, pk),
 			});
 			staged.noteRowCleared(schemaName, tableName, pk);
-			staged.noteTombstone(schemaName, tableName, pk, hlc);
+			staged.noteTombstone(schemaName, tableName, pk, { hlc });
 
 			const change: RowDeletion = {
 				type: 'delete',
@@ -1400,15 +1422,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			const oldVersion = priors.get(i);
 
 			if (oldVersion) {
-				this.changeLog.deleteEntryBatch(
-					batch,
-					oldVersion.hlc,
-					'column',
-					schemaName,
-					tableName,
-					pk,
-					column
-				);
+				this.changeLog.deleteEntryBatch(batch, oldVersion, 'column', schemaName, tableName, pk, column);
 			}
 
 			const hlc = nextHlc();
@@ -1423,7 +1437,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				: undefined;
 			const version: ColumnVersionData = { hlc, value: newValue, ...prior };
 			this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
-			this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
+			this.changeLog.recordColumnChangeBatch(batch, version, schemaName, tableName, pk, column);
 			staged.noteColumnVersion(schemaName, tableName, pk, column, version);
 
 			const change: ColumnChange = {
@@ -1471,10 +1485,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *
 	 * NOTE: a remote apply writes rows before filing their records, so a local update landing
 	 * in that window stamps the whole row, and the apply's metadata then overwrites those
-	 * cells but leaves their newer change-log entries, one per column where the edited cell
-	 * alone did this before. Each breaks `collectChangesSince`'s invariant that an entry's HLC
-	 * equals its cell's. If a push ever lands inside the window and shows up as clobbered
-	 * concurrent edits, have capture wait or skip while an apply is in flight.
+	 * cells but leaves their change-log entries, one per column where the edited cell
+	 * alone did this before. Each then points at a record filed elsewhere, which
+	 * `resolveLogEntry` reads as stale, so the local edit is served to nobody. If a push
+	 * ever lands inside the window and shows up as clobbered concurrent edits, have capture
+	 * wait or skip while an apply is in flight.
 	 *
 	 * NOTE: a streaming snapshot's header clears this metadata, so a row edited during the
 	 * transfer answers yes here too. A row the snapshot carries is overwritten by its table's
@@ -1510,12 +1525,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// ============================================================================
 
 	/**
-	 * Extract changes for a peer as **one {@link ChangeSet} per source
-	 * transaction** (grouped by HLC identity `(wallTime, counter, siteId)`),
-	 * bounded at transaction granularity by `config.batchSize`. A transaction is
-	 * never split across ChangeSets and two transactions are never merged, so a
-	 * consumer that advances `lastSyncHLC = ChangeSet.hlc` always lands on a real
-	 * commit boundary (docs/sync-transactions.md § Transaction-Based Change Grouping → Read side).
+	 * Extract what this replica filed after `sinceHLC` for a peer, in filing order, as
+	 * one {@link ChangeSet} per source transaction per filing tick, bounded at that
+	 * granularity by `config.batchSize`.
+	 *
+	 * `sinceHLC` is a FILING POSITION on this replica (`metadata/filing-position.ts`),
+	 * not a write time: the peer passes back the watermark of the last reply it applied
+	 * (`replyWatermark`). So a change this replica received late, whose origin timestamp
+	 * is far below the peer's watermark, is still served: it was filed above it. Two
+	 * transactions are never merged, and a transaction is split only where this replica
+	 * filed its facts at two ticks (docs/sync-transactions.md § Transaction-Based Change
+	 * Grouping → Read side).
 	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
 		// A watermark below the delta floor cannot be served in full: a delete
@@ -1528,62 +1548,93 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			);
 		}
 
-		const notFromPeer = (origin: SiteId): boolean => !siteIdEquals(origin, peerSiteId);
-		const dataChanges: Change[] = sinceHLC
+		const notFromPeer = (origin: HLC): boolean => !siteIdEquals(origin.siteId, peerSiteId);
+		const filedAfter = (migration: SchemaMigration): boolean =>
+			!sinceHLC || compareHLC(filingPosition(migration), sinceHLC) > 0;
+		const dataChanges = sinceHLC
 			? await this.collectChangesSince(this.changeLog.getChangesSince(sinceHLC), notFromPeer)
 			: await this.collectAllChanges(peerSiteId);
-		const migrations = await this.collectSchemaMigrations(notFromPeer, sinceHLC);
+		const migrations = await this.collectSchemaMigrations(
+			migration => notFromPeer(migration.hlc) && filedAfter(migration),
+		);
 
 		return this.buildChangeSetsForPeer(peerSiteId, sinceHLC, dataChanges, migrations);
 	}
 
+	/**
+	 * What this replica wrote after `sinceHLC`, which here is an ORIGIN timestamp: the
+	 * sent watermark is the greatest `ChangeSet.hlc` the peer has acknowledged, and the
+	 * sets returned are grouped by transaction and carry no `cursor`.
+	 *
+	 * The scan still starts after `sinceHLC` in the change log, which is ordered by
+	 * filing position: a position is never below its fact's origin timestamp, so nothing
+	 * written after `sinceHLC` sits before that point. The origin test is on each fact
+	 * as well as its site: a replica restored from a snapshot holds its own earlier
+	 * facts at the sender's positions, which are above its sent watermark for good, and
+	 * without the test every handshake would push them again.
+	 */
 	async getChangesToPush(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
-		const writtenHere = (origin: SiteId): boolean => siteIdEquals(origin, this.getSiteId());
+		const siteId = this.getSiteId();
+		const ownAndUnsent = (origin: HLC): boolean =>
+			siteIdEquals(origin.siteId, siteId) && (!sinceHLC || compareHLC(origin, sinceHLC) > 0);
 		// NOTE: walks every change-log key past the watermark, and a device's sent
 		// watermark does not move while it only receives: a quiet device walks the whole
 		// log per handshake (keys only, no record reads), a rarely-writing one re-walks
 		// what it received since its last write. If this shows up, persist a "scanned
 		// through" position per peer.
+		//
+		// NOTE: the scan stops at a batch boundary in FILING order while the sent watermark
+		// moves in ORIGIN order. The two agree for facts written here. A replica that was
+		// restored from one peer's snapshot and then pushes its own restored facts to a
+		// DIFFERENT peer reads them in the first peer's filing order, so a batch cut can
+		// leave an older-origin fact behind the watermark, never pushed to the second peer.
+		// `SyncClient` pushes to one server, which is where such facts came from. If a
+		// replica ever pushes to two, scan its own restored facts in full before cutting.
 		const log = sinceHLC ? this.changeLog.getChangesSince(sinceHLC) : this.changeLog.getAllChanges();
-		const ownChanges = await this.collectChangesSince(log, writtenHere);
-		const ownMigrations = await this.collectSchemaMigrations(writtenHere, sinceHLC);
+		const ownChanges = await this.collectChangesSince(log, ownAndUnsent);
+		const ownMigrations = await this.collectSchemaMigrations(migration => ownAndUnsent(migration.hlc));
 
 		// NOTE: nothing records which peer a held change came from, so a change held from
 		// this same peer goes back to it once, until the sent watermark passes it. That
 		// takes a device that retired a table the server still has, under the non-default
 		// `store-and-forward` disposition. If it matters, record the source peer on the
 		// quarantine entry.
-		return this.buildChangeSetsForPeer(peerSiteId, sinceHLC, ownChanges, ownMigrations);
+		return this.buildChangeSetsForPeer(
+			peerSiteId,
+			sinceHLC,
+			filedAtOrigin(ownChanges.map(filed => filed.change)),
+			ownMigrations.map(({ position: _position, ...migration }) => migration),
+		);
 	}
 
 	/**
 	 * The shared tail of {@link getChangesSince} and {@link getChangesToPush}: add the
-	 * held changes to forward, then group by transaction and bound the result.
+	 * held changes to forward, then group by transaction and filing tick and bound the
+	 * result.
 	 */
 	private async buildChangeSetsForPeer(
 		peerSiteId: SiteId,
 		sinceHLC: HLC | undefined,
-		dataChanges: Change[],
+		dataChanges: FiledChange[],
 		migrations: SchemaMigration[],
 	): Promise<ChangeSet[]> {
 		// Fold forwardable held changes (the `store-and-forward` relay's outbound
 		// half) into the SAME ChangeSet[] return — no new transport surface. Each
-		// keeps its ORIGINAL hlc + siteId, so buildTransactionChangeSets re-forms the
-		// straggler's transaction by deterministicTxnId: a forwarded change rejoins any
-		// applied part of the same straggler txn (e.g. a txn that wrote both a live and
-		// a now-retired-here table), correct by construction.
+		// keeps its ORIGINAL hlc + siteId. A held change was never filed here, so it has
+		// no position of its own and is placed at its origin timestamp: it forms a
+		// ChangeSet with the other held changes of its transaction, separate from any
+		// part of that transaction this replica applied (which sits at the tick it was
+		// filed at).
 		//
 		// BOUND + ORDERING (verify, no extra code): collectChangesSince early-exits its
-		// change-log scan at a transaction cut C; collectForwardableChanges is FULLY
-		// scanned (all `> sinceHLC`). buildTransactionChangeSets re-bounds the UNION at
-		// batchSize at a transaction boundary M ≤ C. Everything ≤ M from BOTH sources is
-		// present (change-log up to C ⊇ ≤ M; forwardable fully scanned ⊇ ≤ M), so the
-		// returned prefix is contiguous, advancing the consumer's watermark to M loses
-		// nothing, and forwardable entries with HLC in (M, …] are re-collected next round
-		// (still `> sinceHLC`). Groups are HLC-ordered, so a forwarded change interleaves
-		// with change-log changes in global HLC order — never out of order.
+		// change-log scan at a group cut C; collectForwardableChanges is FULLY scanned
+		// (all `> sinceHLC`). buildTransactionChangeSets re-bounds the UNION at batchSize
+		// at a group boundary M ≤ C. Everything placed ≤ M from BOTH sources is present
+		// (change-log up to C ⊇ ≤ M; forwardable fully scanned ⊇ ≤ M), so advancing the
+		// consumer's watermark to M skips nothing that was collected, and forwardable
+		// entries placed in (M, …] are re-collected next round (still `> sinceHLC`).
 		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC);
-		const changes = forwardable.length > 0 ? [...dataChanges, ...forwardable] : dataChanges;
+		const changes = forwardable.length > 0 ? [...dataChanges, ...filedAtOrigin(forwardable)] : dataChanges;
 
 		return buildTransactionChangeSets(
 			changes,
@@ -1600,39 +1651,43 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Delta extraction: the facts in `logEntries` (an HLC-ordered change-log scan)
-	 * from a wanted origin, bounded at **scan time** to whole transactions whose
-	 * cumulative data-change count reaches `batchSize`.
+	 * Delta extraction: the facts in `logEntries` (a change-log scan, which is in filing
+	 * order) from a wanted origin, bounded at **scan time** to whole groups whose
+	 * cumulative data-change count reaches `batchSize`. A group is one transaction's
+	 * facts filed at one tick (`change-grouping.ts`), the unit a `ChangeSet` carries.
 	 *
 	 * The origin check comes before the batch counter, so a run of unwanted entries
 	 * spends no budget and cannot produce an empty result while wanted facts remain:
 	 * an empty result always means nothing wanted is left.
 	 *
-	 * The change-log scan is keyed by `(wallTime, counter, siteId, opSeq)`, so a
-	 * transaction's facts arrive contiguously and transactions arrive in commit
-	 * order. That lets us stop scanning as soon as enough WHOLE transactions have
-	 * accumulated, instead of draining the entire iterator into memory and letting
-	 * {@link buildTransactionChangeSets} truncate afterward (the pre-
-	 * `sync-getchangessince-bounded-extraction` behavior, where `batchSize` capped
-	 * the response but not the scan). The bound here mirrors that grouping step
-	 * exactly — whole transactions accumulate until the cumulative data-change count
-	 * reaches `batchSize`, never splitting a transaction — so the grouped response
-	 * is byte-identical; only the scan footprint shrinks.
+	 * The scan can stop as soon as enough WHOLE groups have accumulated, instead of
+	 * draining the entire iterator into memory and letting
+	 * {@link buildTransactionChangeSets} truncate afterward, because of how facts are
+	 * filed: a transaction written here takes one clock tick, and a batch received from
+	 * elsewhere takes one tick in which each transaction's facts get a run of `opSeq`s to
+	 * themselves (`commitChangeMetadata`). So in key order a group's facts are contiguous,
+	 * and the group changes exactly when the entry's transaction or its tick does. A
+	 * transaction alone is not a boundary test: two applies can each file part of one
+	 * transaction, with other transactions' facts filed in between. The bound here
+	 * mirrors the grouping step exactly — whole groups accumulate until the cumulative
+	 * data-change count reaches `batchSize`, never splitting one — so the grouped
+	 * response is identical; only the scan footprint shrinks.
 	 *
-	 * LOAD-BEARING INVARIANT: boundary detection keys off `logEntry.hlc`, but the
-	 * grouper keys off the *resolved* version's HLC ({@link resolveLogEntry} returns
-	 * `cv.hlc` / `tombstone.hlc`). These agree only when each non-null-resolving log
-	 * entry's HLC equals its resolved version's HLC, which holds for BOTH entry types
-	 * because each is deduped on overwrite — at most one entry survives per key, and
-	 * its HLC equals the current version's:
+	 * LOAD-BEARING INVARIANT: every entry that resolves to a change is keyed by that
+	 * change's record's own filing position, and carries its origin timestamp. The
+	 * boundary test here reads the entry; the grouper reads the same two values back
+	 * through the {@link FiledChange} built from it. A reply's resume position is the
+	 * greatest position it carries, so an entry that resolved to a record filed
+	 * elsewhere would let that position pass facts the reply does not hold.
+	 * {@link resolveLogEntry} enforces it by reading such an entry as stale, and the
+	 * writers keep it true by removing a record's entry whenever the record is replaced:
 	 *   - COLUMN: an overwrite deletes the prior `(pk, column)` entry (see
-	 *     {@link recordColumnVersions} and `commitChangeMetadata`), so the survivor's
-	 *     HLC is the current `cv.hlc`.
+	 *     {@link recordColumnVersions} and `commitChangeMetadata`).
 	 *   - DELETE: a newer tombstone deletes the prior `pk` delete entry (see
 	 *     {@link recordDataEvent} and `commitChangeMetadata`), so a
-	 *     delete→reinsert→delete key reuse no longer leaves a stale entry that
-	 *     re-attributes to a later tombstone HLC; the survivor's HLC is the current
-	 *     `tombstone.hlc`.
+	 *     delete→reinsert→delete key reuse leaves one entry, at the current tombstone.
+	 *   - Both delete by the prior RECORD's position (`ChangeLogStore` takes the record,
+	 *     not an HLC), which for a fact that arrived late is not its HLC.
 	 *
 	 * The overwrite dedup above covers entries written across SEPARATE writes/applies
 	 * (each later one sees the prior committed version). The apply path additionally
@@ -1643,65 +1698,63 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * of a key were batched.
 	 *
 	 * (Schema migrations are still fully scanned by {@link collectSchemaMigrations};
-	 * the `sm:` range is not HLC-ordered, but migrations are few and the grouping
-	 * step drops any that sort past the bounded fact watermark.)
+	 * the `sm:` range is not in filing order, but migrations are few and the grouping
+	 * step drops any filed past the bounded fact watermark.)
 	 */
 	private async collectChangesSince(
 		logEntries: AsyncIterable<ChangeLogEntry>,
-		isWantedOrigin: (origin: SiteId) => boolean,
-	): Promise<Change[]> {
+		isWantedOrigin: (origin: HLC) => boolean,
+	): Promise<FiledChange[]> {
 		const batchSize = this.config.batchSize;
-		const changes: Change[] = [];
-		// Data-change count over fully-scanned (whole) transactions. The in-flight
-		// transaction's own count is held separately until its boundary is crossed,
-		// so it is only folded in once the transaction is known to be complete.
+		const changes: FiledChange[] = [];
+		// Data-change count over fully-scanned (whole) groups. The in-flight group's
+		// own count is held separately until its boundary is crossed, so it is only
+		// folded in once the group is known to be complete.
 		let completedChangeCount = 0;
-		let currentTxnId: string | null = null;
-		let currentTxnChangeCount = 0;
+		let currentGroup: string | null = null;
+		let currentGroupChangeCount = 0;
 
 		for await (const logEntry of logEntries) {
 			// A transaction is wholly one site's, so filtering by origin drops whole
-			// transactions cleanly (no half-empty ChangeSet).
-			if (!isWantedOrigin(logEntry.hlc.siteId)) continue;
+			// groups cleanly (no half-empty ChangeSet).
+			if (!isWantedOrigin(logEntry.hlc)) continue;
 
-			// deterministicTxnId excludes opSeq, so it is exactly the transaction
-			// identity. Facts of one transaction are contiguous in the HLC-ordered
-			// scan, so a change of id means the prior transaction is complete and can
-			// be folded into the bound.
-			const txnId = deterministicTxnId(logEntry.hlc);
-			if (currentTxnId !== null && txnId !== currentTxnId) {
-				completedChangeCount += currentTxnChangeCount;
-				// Enough whole transactions accumulated — stop before touching the next
-				// one. buildTransactionChangeSets re-applies the same bound, so feeding
-				// it this prefix yields the same ChangeSets the full scan would have.
+			const group = filingGroupKey(logEntry);
+			if (currentGroup !== null && group !== currentGroup) {
+				completedChangeCount += currentGroupChangeCount;
+				// Enough whole groups accumulated — stop before touching the next one.
+				// buildTransactionChangeSets re-applies the same bound, so feeding it
+				// this prefix yields the same ChangeSets the full scan would have.
 				if (completedChangeCount >= batchSize) break;
-				currentTxnChangeCount = 0;
+				currentGroupChangeCount = 0;
 			}
-			currentTxnId = txnId;
+			currentGroup = group;
 
 			const change = await this.resolveLogEntry(logEntry);
 			if (!change) continue;
-			changes.push(change);
-			currentTxnChangeCount++;
+			changes.push({ change, position: logEntry.position });
+			currentGroupChangeCount++;
 		}
 		return changes;
 	}
 
 	/**
 	 * Resolve a change-log entry to the live {@link Change} it references, or
-	 * `null` when the underlying column version / tombstone is gone — a stale log
-	 * entry (e.g. a column overwritten, or a row deleted after the entry was
-	 * written) — or when the entry's table generation has been RETIRED (the table
-	 * was dropped, and its records with it, so the entry waits for
-	 * {@link repairChangeLog}). The authoritative HLC, value AND pk come from the
-	 * current version record, not the log key — the key carries only the lossy pk
-	 * identity — and the change is addressed by the table's CURRENT name, which is
-	 * how a fact recorded before a rename ships under the name the peer will know
-	 * it by.
+	 * `null` when the entry is stale: the underlying column version / tombstone is
+	 * gone (a row deleted after the entry was written), the record now there is filed
+	 * at another position (it was replaced and this entry was left behind), or the
+	 * entry's table generation has been RETIRED (the table was dropped, and its
+	 * records with it). A stale entry waits for {@link repairChangeLog}. The
+	 * authoritative HLC, value AND pk come from the current version record, not the
+	 * log key — the key carries only the lossy pk identity — and the change is
+	 * addressed by the table's CURRENT name, which is how a fact recorded before a
+	 * rename ships under the name the peer will know it by.
 	 */
 	private async resolveLogEntry(logEntry: ChangeLogEntry): Promise<Change | null> {
 		const name = this.tableIdentity.nameOf(logEntry.generation);
 		if (!name) return null;
+		const filedHere = (record: { hlc: HLC; position?: HLC }): boolean =>
+			compareHLC(filingPosition(record), logEntry.position) === 0;
 
 		if (logEntry.entryType === 'column') {
 			const cv = await this.columnVersions.getColumnVersionByIdentity(
@@ -1709,7 +1762,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				logEntry.identity,
 				logEntry.column!,
 			);
-			if (!cv) return null;
+			if (!cv || !filedHere(cv)) return null;
 
 			const columnChange: ColumnChange = {
 				type: 'column',
@@ -1727,7 +1780,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 
 		const tombstone = await this.tombstones.getTombstoneByIdentity(logEntry.generation, logEntry.identity);
-		if (!tombstone) return null;
+		if (!tombstone || !filedHere(tombstone)) return null;
 
 		const deletion: RowDeletion = {
 			type: 'delete',
@@ -1744,12 +1797,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	/**
 	 * Full extraction (initial sync / delta-from-zero): every column version and
-	 * tombstone not originating from the peer. Ordering is owned by
+	 * tombstone not originating from the peer, each with the position its record says
+	 * it is filed at, so the reply is ordered and cut exactly as a change-log read would
+	 * order and cut it and its watermark continues into one. Ordering is owned by
 	 * {@link buildTransactionChangeSets}, so no pre-sort is needed here.
 	 *
 	 * Unlike {@link collectChangesSince}, this path cannot early-exit at scan time:
-	 * the `cv:`/`tb:` scans are keyed by table/pk, NOT by HLC, so transactions are
-	 * interleaved arbitrarily and no transaction boundary is reachable without a
+	 * the `cv:`/`tb:` scans are keyed by table/pk, NOT by position, so groups are
+	 * interleaved arbitrarily and no group boundary is reachable without a
 	 * full scan + sort. It is left unbounded because it is the from-zero path of a
 	 * read serving a peer: a large initial range is expected to be served by a
 	 * snapshot rather than this delta path (docs/sync.md). {@link getChangesToPush}
@@ -1759,8 +1814,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * they describe an incarnation no peer should receive, and shipping a dropped
 	 * table's tombstone would delete the row of its same-named successor.
 	 */
-	private async collectAllChanges(peerSiteId: SiteId): Promise<Change[]> {
-		const changes: Change[] = [];
+	private async collectAllChanges(peerSiteId: SiteId): Promise<FiledChange[]> {
+		const changes: FiledChange[] = [];
 
 		const cvBounds = buildAllColumnVersionsScanBounds();
 		for await (const entry of this.kv.iterate(cvBounds)) {
@@ -1782,7 +1837,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				hlc: cv.hlc,
 				...(cv.priorHlc !== undefined ? { priorHlc: cv.priorHlc, priorValue: cv.priorValue } : {}),
 			};
-			changes.push(columnChange);
+			changes.push({ change: columnChange, position: filingPosition(cv) });
 		}
 
 		const tbBounds = buildAllTombstonesScanBounds();
@@ -1803,7 +1858,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				hlc: tombstone.hlc,
 				...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
 			};
-			changes.push(deletion);
+			changes.push({ change: deletion, position: filingPosition(tombstone) });
 		}
 
 		return changes;
@@ -1824,20 +1879,26 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *  - **Echo exclusion** — drop a change whose origin (`change.hlc.siteId`) is the
 	 *    peer itself, so a straggler's fact is never echoed back to its own author.
 	 *  - **Watermark filter** — when `sinceHLC` is defined (delta path), keep only
-	 *    `compareHLC(change.hlc, sinceHLC) > 0`. REQUIRED: the consumer advances its
-	 *    per-peer `lastSyncHLC` to `max(returned ChangeSet.hlc)`, so a round that
-	 *    returned a forwarded change with HLC ≤ the watermark would REGRESS it and
-	 *    trigger a re-scan/re-deliver flood. Filtering `> sinceHLC` keeps the merged
-	 *    response a safe contiguous prefix — exactly the change-log contract. When
-	 *    `sinceHLC` is undefined (from-zero / {@link collectAllChanges} path) there is
-	 *    no lower bound, so all (origin ≠ peer) are kept.
+	 *    `compareHLC(change.hlc, sinceHLC) > 0`. A held change was never filed, so it
+	 *    has no position here and is placed in the reply at its origin timestamp. On a
+	 *    pull, `sinceHLC` is a filing position, which is at or above every origin
+	 *    timestamp this replica had seen when it was issued; comparing the two filters
+	 *    out more than a position would, and never lets a reply carry a change at or
+	 *    below the watermark the consumer already holds. That matters because the
+	 *    consumer moves its watermark to the reply's greatest resume position: a
+	 *    change at or below the old watermark could not move it, and the same reply
+	 *    would be served again on every request. When `sinceHLC` is undefined
+	 *    (from-zero / {@link collectAllChanges} path) there is no lower bound, so all
+	 *    (origin ≠ peer) are kept.
 	 *
-	 * Accepted limitation (documented intent, not a defect): a straggler whose change
-	 * is causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`)
-	 * is NOT relayed via this delta path — the same scalar-watermark limitation the
-	 * base delta layer already has. store-and-forward targets the transitional
-	 * uneven-retirement window, where the straggler's writes are recent enough to
-	 * exceed holder watermarks; quarantine already prevents write loss outside it.
+	 * Accepted limitation (documented intent, not a defect): a held change written
+	 * before the peer's watermark (`HLC ≤ sinceHLC`) is NOT relayed via this delta
+	 * path. This is a limit of held changes alone. A change this replica APPLIED is
+	 * filed at the position it arrived at and reaches every peer however old it is; a
+	 * held one has no arrival position to be read by. store-and-forward targets the
+	 * transitional uneven-retirement window, where the straggler's writes are recent
+	 * enough to exceed holder watermarks; quarantine already prevents write loss
+	 * outside it.
 	 *
 	 * Snapshot carve-out: forwardable entries are DELTA-ONLY. The snapshot collectors
 	 * scan only `cv:`/`tb:`/`sm:` (never `qt:`), since a snapshot transfers the
@@ -1868,28 +1929,25 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Collect schema migrations after `sinceHLC` from a wanted origin.
-	 * Each migration shares its transaction's base HLC, so the grouping step
-	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
+	 * Collect the schema migrations `isWanted` keeps, each with the position it is
+	 * filed at. A migration shares its transaction's base HLC and was filed in the
+	 * same tick as that transaction's data facts, below them, so the grouping step
+	 * rejoins it with them (or forms a DDL-only ChangeSet).
 	 *
-	 * The `sm:` range is keyed by `(schema, kind, object, version)`, not by HLC, so
+	 * The `sm:` range is keyed by `(schema, kind, object, version)`, not by position, so
 	 * this read cannot early-exit the way {@link collectChangesSince} does — the whole
 	 * range is drained even when the fact side stops early. That is acceptable because
 	 * migrations are few, and {@link buildTransactionChangeSets} drops any migration
-	 * that sorts past the bounded fact watermark (its DDL-only group falls beyond the
-	 * `batchSize` cut), so over-scanning here costs work but never correctness. A
+	 * filed past the bounded fact watermark (its group falls beyond the `batchSize`
+	 * cut), so over-scanning here costs work but never correctness. A
 	 * peer with a pathological volume of un-synced DDL is the one case this leaves
 	 * unbounded; see the bounded-extraction ticket's handoff.
 	 */
 	private async collectSchemaMigrations(
-		isWantedOrigin: (origin: SiteId) => boolean,
-		sinceHLC?: HLC,
+		isWanted: (migration: SchemaMigration) => boolean,
 	): Promise<SchemaMigration[]> {
 		const all = await this.schemaMigrations.listAllMigrations();
-		return all.filter(migration => {
-			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) return false;
-			return isWantedOrigin(migration.hlc.siteId);
-		});
+		return all.filter(isWanted);
 	}
 
 	// ============================================================================
@@ -1919,7 +1977,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *
 	 * Applies in flight must finish BEFORE the entry joins the chain, not inside it: an
 	 * apply writes rows before their records, so adoption would stamp a remote row as a
-	 * local one, and an apply waits on the chain again before filing its metadata, so
+	 * local one, and an apply files its metadata as an entry on the chain too, so
 	 * waiting for it from inside would deadlock. From the append on, a new apply queues
 	 * behind this entry, because `applyChanges` waits on the chain first thing. No `await`
 	 * may separate the wait below from the append.
@@ -1928,12 +1986,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	private async adoptOnCommitChain(): Promise<AdoptedRows> {
 		await this.appliesDrained();
-		const adopting = this.commitChain.then(() => withIdentityRecovery(
+		return this.onCommitChain(() => withIdentityRecovery(
 			this.tableIdentity,
 			() => adoptUnrecordedRowsImpl(this, batch => this.recordCommitBatch(batch)),
 		));
-		this.commitChain = adopting.then(() => undefined, () => undefined);
-		return adopting;
 	}
 
 	/**
@@ -2010,9 +2066,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * tombstone is what {@link getChangesToPush} sends (see {@link isUndeliveredOwnDelete}).
 	 *
 	 * The delta floor (`metadata/delta-floor.ts`) is raised to the greatest
-	 * pruned tombstone HLC in this SAME batch: a peer whose watermark is below it
-	 * can no longer be served a complete delta, and a crash between the deletes
-	 * and the raise would let such a peer sync past the gap silently.
+	 * pruned tombstone's filing POSITION in this SAME batch: a peer whose watermark is
+	 * below it can no longer be served a complete delta, and a crash between the
+	 * deletes and the raise would let such a peer sync past the gap silently. The
+	 * position, not the HLC: a delete that arrived late has an old HLC and a recent
+	 * position, and a peer that has read past the HLC but not the position still needs it.
 	 *
 	 * NOTE: a replica that writes locally but never pushes (a `readOnly` client, a peer
 	 * others only pull from, a device that never connects) keeps its own tombstones
@@ -2023,7 +2081,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const now = Date.now();
 		let count = 0;
 		const batch = this.kv.batch();
-		let maxPrunedHLC: HLC | undefined;
+		let maxPrunedPosition: HLC | undefined;
 		// Read once: each peer's watermark only rises, so a stale value keeps more, never less.
 		const minSentWatermark = await this.peerStates.getMinSentWatermark();
 
@@ -2034,15 +2092,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			if (expired && !this.isUndeliveredOwnDelete(tombstone.hlc, minSentWatermark)) {
 				batch.delete(entry.key);
-				if (!maxPrunedHLC || compareHLC(tombstone.hlc, maxPrunedHLC) > 0) {
-					maxPrunedHLC = tombstone.hlc;
+				const position = filingPosition(tombstone);
+				if (!maxPrunedPosition || compareHLC(position, maxPrunedPosition) > 0) {
+					maxPrunedPosition = position;
 				}
 				const parsed = parseTombstoneKey(entry.key);
 				if (parsed) {
 					// Generation + identity delete: the parsed key already carries both, so
 					// neither a name nor a schema (which a since-dropped table — a retired
 					// generation — no longer has) is needed. Expired orphans prune too.
-					this.changeLog.deleteEntryByIdentityBatch(batch, tombstone.hlc, 'delete', parsed.generation, parsed.identity);
+					this.changeLog.deleteEntryByIdentityBatch(batch, tombstone, 'delete', parsed.generation, parsed.identity);
 				} else {
 					console.warn('[Sync] Unparseable tombstone key during prune — its change-log entry is left orphaned');
 				}
@@ -2050,8 +2109,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			}
 		}
 
-		if (maxPrunedHLC) {
-			await this.deltaFloor.raiseBatch(batch, maxPrunedHLC);
+		if (maxPrunedPosition) {
+			await this.deltaFloor.raiseBatch(batch, maxPrunedPosition);
 		}
 		await batch.write();
 		return count;
@@ -2101,7 +2160,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * what makes it an orphan), so deleting it changes nothing observable. That
 	 * includes every entry of a RETIRED table generation: a drop deletes the table's
 	 * `cv:`/`tb:` records ({@link TableIdentityStore.retire}) but leaves their index
-	 * entries, which only a scan of the HLC-first log can find, to this sweep. Full
+	 * entries, which only a scan of the position-first log can find, to this sweep. Full
 	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix orphans
 	 * (or one already repaired) resolves every entry and deletes nothing, so a
 	 * caught-up replica pays only the scan.
@@ -2128,7 +2187,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			this.changeLog.deleteEntryByIdentityBatch(
 				batch,
-				logEntry.hlc,
+				logEntry,
 				logEntry.entryType,
 				logEntry.generation,
 				logEntry.identity,

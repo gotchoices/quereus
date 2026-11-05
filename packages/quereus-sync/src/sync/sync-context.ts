@@ -12,6 +12,7 @@ import type { SiteId } from '../clock/site.js';
 import type { ColumnVersionStore } from '../metadata/column-version.js';
 import type { TombstoneStore } from '../metadata/tombstones.js';
 import type { ChangeLogStore } from '../metadata/change-log.js';
+import type { FiledAt } from '../metadata/filing-position.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import type { QuarantineStore } from '../metadata/quarantine.js';
 import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
@@ -75,6 +76,27 @@ export interface SyncContext {
 	 * generation for the new name (see `applyChanges`).
 	 */
 	whenCommitsSettled(): Promise<void>;
+
+	/**
+	 * Run `work` as one entry on the commit chain, the single queue local capture
+	 * records on, and resolve with its result. Everything that takes a clock tick to use
+	 * as a filing position (`metadata/filing-position.ts`) and writes at it does both
+	 * inside one entry, so positions reach storage in the order they were issued: a
+	 * reader that has passed a position can never have a lower one committed behind it.
+	 *
+	 * `work` must not wait on the chain itself ({@link whenCommitsSettled}, or another
+	 * call to this), which would wait on its own entry. A failure reaches the caller and
+	 * leaves the chain usable.
+	 */
+	onCommitChain<T>(work: () => Promise<T>): Promise<T>;
+
+	/**
+	 * A fresh clock tick taken as its own entry on the commit chain, with the clock
+	 * persisted before it is handed out: every fact filed below the tick is already
+	 * committed, and every later one files above it, across a restart too. A snapshot
+	 * reads its header from this, so "everything up to the header" is exact.
+	 */
+	nextFilingTick(): Promise<HLC>;
 
 	/**
 	 * Resolves once every remote apply started so far has finished, failed ones
@@ -162,8 +184,8 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * change-log entries that index them, into the caller's `batch`. The caller
  * owns the write — nothing is committed here.
  *
- * The `cl:` change log is a derived HLC-ordered index over live `cv:`/`tb:`
- * records: `collectChangesSince` resolves each entry back to its record and drops
+ * The `cl:` change log is a derived index over live `cv:`/`tb:` records, in filing
+ * order: `collectChangesSince` resolves each entry back to its record and drops
  * the entry when that record is gone. So once a row's column versions are deleted,
  * their `cl:` entries can never produce output again — they are pure garbage that
  * still costs a KV lookup per delta scan. Deleting them with their target is what
@@ -188,7 +210,8 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * the row (see `staged-transaction-metadata.ts`): the committed scan cannot see
  * cell records the transaction has only STAGED into `batch`, so the column set
  * here is (committed scan) ∪ (staged live columns), each `cl:` removal keyed by
- * the staged HLC where one exists (the committed entry's removal was already
+ * the staged record's position where one exists (the committed entry's removal was
+ * already
  * staged when the cell was rewritten). A cleared row's committed columns not
  * re-staged since are skipped — the clear that set `rowCleared` staged their
  * removals already. Absent on the inbound path, whose batch is committed before
@@ -210,17 +233,17 @@ export async function deleteRowVersionsAndLogEntries(
 
 	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk, keepColumns);
 
-	// `cl:` entry HLC per column: committed HLCs, overridden by the staged HLC
-	// where this transaction rewrote the cell.
-	const entryHlcByColumn = new Map<string, HLC>();
+	// Which record each column's `cl:` entry indexes: the committed one, overridden by
+	// the staged one where this transaction rewrote (or re-filed) the cell.
+	const entryByColumn = new Map<string, FiledAt>();
 	for (const [column, version] of removed) {
 		if (staged?.rowCleared && !staged.stagedColumns.has(column)) continue;
-		entryHlcByColumn.set(column, version.hlc);
+		entryByColumn.set(column, version);
 	}
 	if (staged) {
-		for (const [column, hlc] of staged.stagedColumns) {
+		for (const [column, filed] of staged.stagedColumns) {
 			if (keepColumns?.has(column)) continue;
-			entryHlcByColumn.set(column, hlc);
+			entryByColumn.set(column, filed);
 			if (!removed.has(column)) {
 				// Staged-only cell (this transaction created it): no committed record
 				// for the scan to find, so stage its removal explicitly. Batch ordering
@@ -230,8 +253,8 @@ export async function deleteRowVersionsAndLogEntries(
 		}
 	}
 
-	for (const [column, hlc] of entryHlcByColumn) {
-		ctx.changeLog.deleteEntryBatch(batch, hlc, 'column', schema, table, pk, column);
+	for (const [column, filed] of entryByColumn) {
+		ctx.changeLog.deleteEntryBatch(batch, filed, 'column', schema, table, pk, column);
 	}
 }
 

@@ -30,7 +30,8 @@ export type SnapshotKeyingResolver = (schema: string, table: string) => PkKeying
 export interface ReconciledRow {
 	pk: SqlValue[];
 	pkHlc: HLC;
-	cells: Map<string, { hlc: HLC; value: SqlValue }>;
+	/** Each cell's winning entry; `position` is the SENDER's filing position, kept as sent. */
+	cells: Map<string, { hlc: HLC; value: SqlValue; position?: HLC }>;
 }
 
 /**
@@ -113,7 +114,11 @@ export function reconcileCell(
 
 	const cell = row.cells.get(entry.column);
 	if (!cell || compareHLC(entry.hlc, cell.hlc) > 0) {
-		row.cells.set(entry.column, { hlc: entry.hlc, value: entry.value });
+		row.cells.set(entry.column, {
+			hlc: entry.hlc,
+			value: entry.value,
+			...(entry.position !== undefined ? { position: entry.position } : {}),
+		});
 	}
 }
 

@@ -45,7 +45,10 @@
  *
  * In both, each `cv:` row group is re-filed under the new identity with the new pk in
  * its value, and its `cl:` entries move with it — each old entry's key is rebuilt from
- * the record's own `hlc`, so no change-log scan is needed. A record moving in never
+ * the record's own filing position, so no change-log scan is needed. A re-filed record
+ * KEEPS that position (`metadata/filing-position.ts`): a key redefinition changes where
+ * a fact is addressed, not when it reached this replica, so a peer that had already read
+ * past it is not sent it again and one that had not still finds it. A record moving in never
  * overwrites a newer record at its target ({@link CellContest}): a relay's rows are not
  * checked for uniqueness, so two old groups can land on one new identity, and a
  * duplicate apply of the same key change can be running alongside.
@@ -71,7 +74,8 @@
 
 import { quoteIdentifier, type Database, type Row, type SqlValue } from '@quereus/quereus';
 import type { WriteBatch } from '@quereus/store';
-import { compareHLC, type HLC } from '../clock/hlc.js';
+import { compareHLC } from '../clock/hlc.js';
+import type { FiledAt } from '../metadata/filing-position.js';
 import { deserializeColumnVersion, type ColumnVersion } from '../metadata/column-version.js';
 import { deserializeTombstone, type Tombstone } from '../metadata/tombstones.js';
 import {
@@ -444,7 +448,7 @@ function refileRowGroup(
 		// have removed them a step later) — so nothing can address them now.
 		for (const { key, column, cv } of group.cells) {
 			batch.delete(key);
-			ctx.changeLog.deleteEntryByIdentityBatch(batch, cv.hlc, 'column', plan.generation, group.identity, column);
+			ctx.changeLog.deleteEntryByIdentityBatch(batch, cv, 'column', plan.generation, group.identity, column);
 		}
 		counts.rowsDropped++;
 		return;
@@ -454,19 +458,21 @@ function refileRowGroup(
 	if (newIdentity === group.identity) {
 		// The same identity under both keys: nothing moves, but each cell holds its place
 		// against any older one moving in.
-		for (const { column, cv } of group.cells) cells.keep(newIdentity, column, cv.hlc);
+		for (const { column, cv } of group.cells) cells.keep(newIdentity, column, cv);
 		return;
 	}
 
 	for (const { key, column, cv } of group.cells) {
 		batch.delete(key);
-		ctx.changeLog.deleteEntryByIdentityBatch(batch, cv.hlc, 'column', plan.generation, group.identity, column);
+		ctx.changeLog.deleteEntryByIdentityBatch(batch, cv, 'column', plan.generation, group.identity, column);
+		// Everything but the retired pk travels: the version's HLC, value, before-image,
+		// and the position it is filed at.
 		const { pk: _retiredPk, ...version } = cv;
-		cells.move(newIdentity, column, cv.hlc, () => {
+		cells.move(newIdentity, column, cv, () => {
 			// Through the name-keyed writers, so the new identity is derived exactly as any
 			// other write derives it (there is deliberately no caller-supplied-identity writer).
 			ctx.columnVersions.setColumnVersionBatch(batch, schema, table, newPk, column, version);
-			ctx.changeLog.recordColumnChangeBatch(batch, cv.hlc, schema, table, newPk, column);
+			ctx.changeLog.recordColumnChangeBatch(batch, version, schema, table, newPk, column);
 			staged?.noteColumnVersion(schema, table, newPk, column, version);
 		});
 	}
@@ -484,7 +490,7 @@ function refileRowGroup(
  * surviving record (the LOAD-BEARING INVARIANT of `collectChangesSince`).
  */
 class CellContest {
-	private readonly slots = new Map<string, { hlc: HLC; put?: () => void }>();
+	private readonly slots = new Map<string, { filed: FiledAt; put?: () => void }>();
 
 	constructor(
 		private readonly ctx: SyncContext,
@@ -493,16 +499,16 @@ class CellContest {
 	) {}
 
 	/** A record already filed at `identity` that stays there. */
-	keep(identity: string, column: string, hlc: HLC): void {
-		this.contest(identity, column, { hlc });
+	keep(identity: string, column: string, filed: FiledAt): void {
+		this.contest(identity, column, { filed });
 	}
 
 	/** A record moving to `identity`, written by `put` if it wins its slot. Its old record is already deleted. */
-	move(identity: string, column: string, hlc: HLC, put: () => void): void {
-		this.contest(identity, column, { hlc, put });
+	move(identity: string, column: string, filed: FiledAt, put: () => void): void {
+		this.contest(identity, column, { filed, put });
 	}
 
-	private contest(identity: string, column: string, candidate: { hlc: HLC; put?: () => void }): void {
+	private contest(identity: string, column: string, candidate: { filed: FiledAt; put?: () => void }): void {
 		const slot = joinKeyParts(identity, column);
 		const incumbent = this.slots.get(slot);
 		if (incumbent === undefined) {
@@ -511,12 +517,12 @@ class CellContest {
 		}
 		// The newer wins; between equals — the same fact, met twice — the one that stays,
 		// which costs no write.
-		const order = compareHLC(candidate.hlc, incumbent.hlc);
+		const order = compareHLC(candidate.filed.hlc, incumbent.filed.hlc);
 		const candidateWins = order > 0 || (order === 0 && candidate.put === undefined && incumbent.put !== undefined);
 		const loser = candidateWins ? incumbent : candidate;
 		if (loser.put === undefined) {
 			// A stayer that lost: the winner's put overwrites its record, but not its entry.
-			this.ctx.changeLog.deleteEntryByIdentityBatch(this.batch, loser.hlc, 'column', this.generation, identity, column);
+			this.ctx.changeLog.deleteEntryByIdentityBatch(this.batch, loser.filed, 'column', this.generation, identity, column);
 		}
 		if (candidateWins) this.slots.set(slot, candidate);
 	}
@@ -558,7 +564,7 @@ async function rekeyTombstones(
 
 		// From here on the old record goes, whatever becomes of the tombstone.
 		batch.delete(entry.key);
-		ctx.changeLog.deleteEntryByIdentityBatch(batch, tombstone.hlc, 'delete', plan.generation, parsed.identity);
+		ctx.changeLog.deleteEntryByIdentityBatch(batch, tombstone, 'delete', plan.generation, parsed.identity);
 
 		const liveOwner = newIdentity === undefined ? undefined : live.oldByNew.get(newIdentity);
 		if (newPk === undefined || newIdentity === undefined || (liveOwner !== undefined && liveOwner !== parsed.identity)) {
@@ -578,10 +584,11 @@ async function rekeyTombstones(
 
 	for (const { tombstone, newPk } of winners.values()) {
 		puts.push(() => {
-			// `createdAt` carried over: a re-filed tombstone keeps its original TTL clock.
-			ctx.tombstones.setTombstoneBatch(batch, schema, table, newPk, tombstone.hlc, tombstone.priorRow, tombstone.createdAt);
-			ctx.changeLog.recordDeletionBatch(batch, tombstone.hlc, schema, table, newPk);
-			staged?.noteTombstone(schema, table, newPk, tombstone.hlc);
+			// `createdAt` carried over: a re-filed tombstone keeps its original TTL clock,
+			// and (as `tombstone` carries it) the position it was filed at.
+			ctx.tombstones.setTombstoneBatch(batch, schema, table, newPk, tombstone, tombstone.priorRow, tombstone.createdAt);
+			ctx.changeLog.recordDeletionBatch(batch, tombstone, schema, table, newPk);
+			staged?.noteTombstone(schema, table, newPk, tombstone);
 		});
 		counts.tombstonesRekeyed++;
 	}
