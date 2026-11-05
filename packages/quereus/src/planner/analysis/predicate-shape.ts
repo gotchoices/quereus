@@ -49,7 +49,9 @@ export type ColumnIndexResolver = (expr: AST.Expression) => number | undefined;
  * is the stored row image, so NEW-qualified references are same-row facts.
  * Self-table qualifiers (`t.col` on the owning table) resolve the same way.
  * `old.<col>` references are NOT same-row; check-extraction screens those out
- * wholesale (`containsOldRowImageRef`) before this resolver ever sees them.
+ * wholesale (`containsOldRowImageRef`) before this resolver ever sees them. It does
+ * the same for a read of a declared mutation-context variable, which this resolver
+ * would otherwise take for a same-named column.
  */
 export function columnIndexFromExpr(
 	expr: AST.Expression,

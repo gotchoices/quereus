@@ -607,3 +607,43 @@ create table AcCtxReq (a integer primary key) with context (who integer);
 alter table AcCtxReq add column c integer null default (who);
 -- error: ALTER TABLE supplies no context
 
+-- Test 27: a CHECK reading a context variable constrains a per-statement value, so the
+-- optimizer may draw no column fact from it. A row that contradicts the column reading
+-- of `who > 0` is legal here and must not be folded out of a query. Every spelling that
+-- enforcement compiles to the variable counts, including the self-qualified one.
+create table FactBare (a integer primary key, who integer null, check (who > 0)) with context (who integer null);
+insert into FactBare values (1, -1);
+select * from FactBare where who <= 0
+→ [{"a":1,"who":-1}]
+
+create table FactQual (a integer primary key, who integer null, check (context.who > 0)) with context (who integer null);
+insert into FactQual values (1, -1);
+select * from FactQual where who <= 0
+→ [{"a":1,"who":-1}]
+
+create table FactSelf (a integer primary key, who integer null, check (FactSelf.who > 0)) with context (who integer null);
+insert into FactSelf values (1, -1);
+select * from FactSelf where who <= 0
+→ [{"a":1,"who":-1}]
+
+create table FactSupplied (a integer primary key, who integer null, check (who > 0)) with context (who integer);
+insert into FactSupplied with context who = 5 values (1, -1);
+select * from FactSupplied where who <= 0
+→ [{"a":1,"who":-1}]
+
+-- A variable sharing no column's name is screened too: `b` does not determine `a` when
+-- the rest of the sum varies per statement, so these two rows stay two groups.
+create table FactFree (id integer primary key, a integer, b integer, check (a = b + who)) with context (who integer null);
+insert into FactFree with context who = 1 values (1, 2, 1);
+insert into FactFree with context who = 2 values (2, 3, 1);
+select b, a, count(*) as c from FactFree group by b, a order by a
+→ [{"b":1,"a":2,"c":1},{"b":1,"a":3,"c":1}]
+
+-- The screen is per conjunct and per spelling: `new.who` reaches the column and `b > 0`
+-- reads no variable, so both still lift beside a conjunct that reads the variable.
+create table FactKept (a integer primary key, who integer null, b integer null, check (who > 0 and new.who > 0 and b > 0)) with context (who integer null);
+select op from query_plan('select * from FactKept where who <= 0') where op = 'EMPTYRELATION'
+→ [{"op":"EMPTYRELATION"}]
+select op from query_plan('select * from FactKept where b <= 0') where op = 'EMPTYRELATION'
+→ [{"op":"EMPTYRELATION"}]
+

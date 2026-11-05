@@ -57,6 +57,7 @@ function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
 			tableSchema.columnIndexMap,
 			allDeterministic,
 			tableSchema.columns,
+			new Set((tableSchema.mutationContext ?? []).map(variable => variable.name.toLowerCase())),
 		);
 		cache.set(tableSchema, cached);
 	}
@@ -102,12 +103,17 @@ export function getTrustedCheckExtraction(
  * the enforcement comparison it derives from is value-discriminating
  * ({@link isValueDiscriminatingAstComparison}) — non-BINARY collations over
  * textual operands pass value-different rows, so their facts would over-claim.
+ *
+ * `contextVariables` holds the lower-cased names of the table's declared
+ * mutation-context variables ({@link containsContextVariableRef}). Omit it where no
+ * context exists, as for a hoisted assertion.
  */
 export function extractCheckConstraints(
 	checks: ReadonlyArray<RowConstraintSchema>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	isDeterministic: (fnName: string, argc: number) => boolean,
 	columns: ReadonlyArray<DeclaredColumnInfo>,
+	contextVariables: ReadonlySet<string> = new Set(),
 ): CheckExtraction {
 	const fds: FunctionalDependency[] = [];
 	const equivPairs: Array<readonly [number, number]> = [];
@@ -118,7 +124,7 @@ export function extractCheckConstraints(
 		if (!check.expr) continue;
 		if (!isRowInvariantCheck(check)) continue;
 		if (containsNonDeterministicCall(check.expr, isDeterministic)) continue;
-		walkConjunction(check.expr, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
+		walkConjunction(check.expr, columnIndexMap, columns, contextVariables, fds, equivPairs, constantBindings, domainConstraints);
 	}
 
 	return { fds, equivPairs, constantBindings, domainConstraints };
@@ -139,8 +145,9 @@ export function extractCheckConstraints(
  *    (`validateChecksOverExistingRows`, schema/constraint-builder.ts — ADD
  *    CONSTRAINT, ADD COLUMN, maintained tables) plus the
  *    `permitsGrandfatheredCheckViolators` consumer gate. That scan applies the
- *    screens of THIS gate (mask, per-conjunct `old.`, `new.` reading), so it
- *    validates exactly what is lifted here; change one, change the other.
+ *    mask, per-conjunct `old.` and `new.`-reading screens of THIS gate, so nothing
+ *    is lifted here that it did not validate; change one, change the other. The
+ *    context-variable leg below narrows only the lift.
  *
  * 2. Not deferred. A deferred check is enforced at commit, so
  *    same-transaction reads can observe violating rows. No SQL today can set
@@ -162,6 +169,13 @@ export function extractCheckConstraints(
  * `new.<col>` stays allowed: NEW is the stored row image, so NEW-qualified
  * references are same-row (see `columnIndexFromExpr`, whose bare-name
  * resolution deliberately tolerates the qualifier).
+ *
+ * The fourth leg — no read of a declared mutation-context variable — is screened
+ * per-AND-conjunct the same way, for the same ternary-logic reason
+ * ({@link containsContextVariableRef}). Such a conjunct constrains a per-statement
+ * value, so it is no fact about the stored row, whether or not a column shares the
+ * variable's name: `check (who > 0)` over a same-named column says nothing about
+ * that column, and `check (a = b + who)` does not make `b` determine `a`.
  *
  * Exported for the ALTER-side existing-row CHECK scan
  * (`validateRowInvariantChecksOverExistingRows` in `schema/constraint-builder.ts`),
@@ -199,10 +213,50 @@ export function containsOldRowImageRef(expr: AST.Expression): boolean {
 	return false;
 }
 
+/**
+ * True when any node in `expr`'s subtree is named like a declared mutation-context
+ * variable and is spelled in a way that enforcement compiles to that variable. Like
+ * {@link containsOldRowImageRef} this is depth-blind: a bare name inside a subquery
+ * may really bind to the subquery's own source, in which case a conjunct is skipped
+ * needlessly. That is sound, since skipping a conjunct only forgoes its facts.
+ */
+function containsContextVariableRef(expr: AST.Expression, contextVariables: ReadonlySet<string>): boolean {
+	for (const node of walkAstNodes(expr)) {
+		if (readsContextVariable(node, contextVariables)) return true;
+	}
+	return false;
+}
+
+/**
+ * `new.<name>` is the one spelling that reaches a same-named column. A self-qualified
+ * `<table>.<name>` does not: enforcement strips it to the bare form
+ * (`stripSelfQualifierInSchemaExpression`), which the variable then captures.
+ * `context.<name>` with an undeclared name fails the set lookup, so a table literally
+ * named `context` keeps the facts of its self-qualified columns.
+ *
+ * NOTE: on a table literally named `new`, the same strip folds `new.who` to the bare
+ * form too, so it reads the variable yet is still lifted here. Closing that needs the
+ * meaning of a self-qualified name settled first, since the strip is the cause.
+ */
+function readsContextVariable(node: AST.AstNode, contextVariables: ReadonlySet<string>): boolean {
+	if (node.type === 'identifier') {
+		const ref = node as AST.IdentifierExpr;
+		return !ref.schema && contextVariables.has(ref.name.toLowerCase());
+	}
+	if (node.type !== 'column') return false;
+	const ref = node as AST.ColumnExpr;
+	// The walk also yields the result columns of an `in (select …)`, which share this
+	// node type but carry `expr` rather than a name; their `expr` is walked on its own.
+	if (typeof ref.name !== 'string' || !contextVariables.has(ref.name.toLowerCase())) return false;
+	// A schema-qualified `main.new.a` is a three-part table reference, not the row image.
+	return ref.schema !== undefined || ref.table?.toLowerCase() !== 'new';
+}
+
 function walkConjunction(
 	expr: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
 	columns: ReadonlyArray<DeclaredColumnInfo>,
+	contextVariables: ReadonlySet<string>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
@@ -220,6 +274,8 @@ function walkConjunction(
 		// a transition constraint, not a stored-row invariant — skip it while
 		// letting sibling conjuncts extract (see isRowInvariantCheck doc).
 		if (containsOldRowImageRef(cur)) continue;
+		// Per-conjunct context screen: same shape, same reasoning (see isRowInvariantCheck doc).
+		if (containsContextVariableRef(cur, contextVariables)) continue;
 		recognize(cur, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 }

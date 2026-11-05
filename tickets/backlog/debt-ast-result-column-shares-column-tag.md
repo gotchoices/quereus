@@ -90,3 +90,20 @@ Whatever tag scheme is chosen, the acceptance test is behavioural, not textual: 
 query with a subquery inside every clause that gets AST-walked (ORDER BY, GROUP BY,
 HAVING, a CHECK body, an assertion body, a partial-index predicate) must plan without
 a `TypeError`.
+
+## Further evidence
+
+**Confirmed at `collectColumnNames`, which the Evidence section lists as an open question.** A CHECK with `in (select …)` nested under a comparison is accepted by `create table`, and then every statement that plans a reference to the table fails, reads included:
+
+```sql
+create table y (x integer primary key);
+create table t (id integer primary key, a integer null, b integer null, check (a = (b in (select x from y))));
+select * from t;
+-- Planning error: Cannot read properties of undefined (reading 'toLowerCase')
+```
+
+Measured on the `dist` build. Calling `extractCheckConstraints` directly gives this stack: `columnIndexFromExpr` ← `collectColumnNames` ← `astOperandContribution` ← `isValueDiscriminatingAstComparison` ← `handleEquality`. It gets that far because `containsNonDeterministicCall` rejects `subquery` and `exists` nodes, but an `in` carries its subquery as a plain `select` node.
+
+Fixing only the tag would turn this crash into a wrong fact. `collectColumnNames` would then find the single column `b`, and `handleEquality` would lift `b → a`, which is false because `y` can change. That last step comes from reading the code and was not run. The fix needs `containsNonDeterministicCall` to reject `in (select …)` as well.
+
+**Another guard to remove when the tags are split:** `readsContextVariable` in `planner/analysis/check-extraction.ts`, added by `bug-check-facts-read-context-variable-as-column`. Without it, `check (code not in (select code from forbidden))` failed the same way on a table with no context variables.
