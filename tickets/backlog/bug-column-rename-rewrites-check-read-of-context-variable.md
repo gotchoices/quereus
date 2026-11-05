@@ -25,7 +25,7 @@ insert into t with context who = 5 values (2, -9);   -- rejected: CHECK constrai
 
 Dropping the column fails the same way, for the same cause: `alter table t drop column who` is refused with `it is referenced by CHECK constraint 'k'`, although the CHECK reads the variable and only a `new.who` reference would need the column.
 
-Expected: renaming leaves a bare reference to a declared variable alone and rewrites `new.who`; a drop is refused only by a reference that reaches the column. The bare-name rule also applies to a column DEFAULT, which shares this walker through `renameColumnInColumnExpressions` and was not measured. A generated column's bare name always means the column (`docs/sql-ddl.md`), so that case must stay as it is.
+Expected: renaming leaves a bare reference to a declared variable alone and rewrites `new.who` and `t.who`; a drop is refused only by a reference that reaches the column. `bug-self-qualified-check-reads-context-variable` makes `t.who` reach the column, so rewriting it to `t.w` and refusing its drop are both correct once that lands, and the `check (t.who > 0)` case below stops being a wrong rewrite. Only rows stored under the former meaning can still be affected. The bare-name rule also applies to a column DEFAULT, which shares this walker through `renameColumnInColumnExpressions` and was not measured. A generated column's bare name always means the column (`docs/sql-ddl.md`), so that case must stay as it is.
 
 ## Further measurements
 

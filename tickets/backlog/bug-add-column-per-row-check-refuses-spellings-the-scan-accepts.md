@@ -21,6 +21,6 @@ Measured on the memory module, with `create table t (a integer primary key, b in
 
 ## Expected behavior
 
-Both routes accept the same CHECKs. A conjunct containing `old.<column>` owes stored rows nothing and is skipped, while its other conjuncts are still judged. A self-qualified name means what it means on a write. On a table that declares mutation context, `<table>.<name>` of a variable reads the variable, as `docs/sql-alter.md` states under *Existing-row validation of a CHECK*.
+Both routes accept the same CHECKs. A conjunct containing `old.<column>` owes stored rows nothing and is skipped, while its other conjuncts are still judged. A self-qualified name means what it means on a write. On a table that declares mutation context, `<table>.<column>` reaches the column even when a variable shares the name, as decided in `bug-self-qualified-check-reads-context-variable`, which also updates `docs/sql-alter.md` under *Existing-row validation of a CHECK*.
 
 The partial operation mask, the third difference between these routes, is already fixed in `buildAddColumnChecks`.
