@@ -280,6 +280,6 @@ export async function ingestExternalRowChangeBatch(
 		// non-RESTRICT mid-batch throw (a cascade DML tripping CHECK / NOT NULL / a
 		// connection error), so a subsequent normal statement re-enforces RESTRICT.
 		if (applyForeignKeyActions) db._setFkRestrictSuppressed(priorSuppress);
-		releaseMutex();
+		await releaseMutex();
 	}
 }

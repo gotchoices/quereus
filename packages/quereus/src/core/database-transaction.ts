@@ -45,7 +45,7 @@ export interface TransactionManagerContext {
 	runGlobalAssertions(sink?: AssertionViolation[]): Promise<void>;
 	/** Fire post-commit watchers (Database.watch). Errors logged, never rolled
 	 *  back. Invoked after all connections commit but before the change log
-	 *  is cleared. */
+	 *  is cleared. Does not wait for the promises handlers return. */
 	runPostCommitWatchers(): Promise<void>;
 	/** Called after a successful commit, before the change log is cleared. The callback
 	 *  materializes per-table committed row counts only if a consumer wants them. */

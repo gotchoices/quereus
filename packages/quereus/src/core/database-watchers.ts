@@ -6,6 +6,12 @@
  * they run **after** commit (the change log is still alive, the
  * connections have all committed), and handler errors are logged but
  * never roll the commit back.
+ *
+ * The commit calls each handler but does not wait for a promise it returns. The
+ * promise goes to `WatcherManagerContext.deferWatchHandler`, and the statement
+ * that committed waits for it after releasing the execution mutex, so a handler
+ * can await a statement on the same database. See `docs/change-scope.md`
+ * § Handler ordering.
  */
 
 import { createLogger } from '../common/logger.js';
@@ -47,6 +53,9 @@ export interface WatcherManagerContext {
 	getChangedTuples(base: string, columnIndices: readonly number[], pkIndices: readonly number[]): SqlValue[][];
 	registerCaptureSpec(baseTable: string, spec: { extraColumns: ReadonlySet<number> }): () => void;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
+	/** Hands over an asynchronous handler's promise for the statement that committed
+	 *  to wait on after it releases the execution mutex. The promise never rejects. */
+	deferWatchHandler(settled: Promise<void>): void;
 }
 
 interface ActiveSubscription {
@@ -54,9 +63,11 @@ interface ActiveSubscription {
 	/** Tables this subscription watches (lowercased `schema.table`). */
 	readonly tables: ReadonlySet<string>;
 	/** The underlying kernel subscription. Retained so external-change
-	 *  invalidation can synthesize a global `apply` directly, bypassing the
-	 *  commit change-log dependency. */
+	 *  invalidation can read its relations and synthesize a global fire,
+	 *  bypassing the commit change-log dependency. */
 	readonly delta: DeltaSubscription;
+	/** Fires the handler and returns its promise, if it returned one. */
+	readonly fire: (input: DeltaApplyInput) => Promise<void> | undefined;
 	/** Removes the subscription from the kernel. */
 	disposeFromExecutor(): void;
 	/** Disposes capture-spec demand registered for this subscription. */
@@ -130,15 +141,17 @@ export class WatcherManager {
 			},
 			registerCaptureSpec: (base, spec) => this.ctx.registerCaptureSpec(base, spec),
 			getCurrentTxnId: () => this.currentTxnId,
+			deferHandler: settled => this.ctx.deferWatchHandler(settled),
 		};
 
-		const { subscription, captureDisposers } = subscriptionFromChangeScope(scope, handler, id, helperCtx);
+		const { subscription, fire, captureDisposers } = subscriptionFromChangeScope(scope, handler, id, helperCtx);
 		const disposeFromExecutor = this.executor.register(subscription);
 
 		const entry: ActiveSubscription = {
 			id,
 			tables,
 			delta: subscription,
+			fire,
 			disposeFromExecutor,
 			captureDisposers,
 			disposed: false,
@@ -158,7 +171,8 @@ export class WatcherManager {
 	}
 
 	/** Fire all subscriptions impacted by the current commit. Errors from
-	 *  any single subscription's apply are logged and swallowed.
+	 *  any single subscription's apply are logged and swallowed. Resolves once
+	 *  every handler has been called, without waiting for the promises they return.
 	 *
 	 *  Must be called by the TransactionManager after a successful commit
 	 *  but before the change log is cleared. */
@@ -188,8 +202,9 @@ export class WatcherManager {
 	 * tuples, reusing the same `apply` logic the post-commit path drives. A
 	 * `full` watch fires with empty hits; a `rows`/`rowsByGroup` watch surfaces
 	 * all its registered literal values as possibly-changed; `groups` fires with
-	 * empty hits. No-op when no subscription matches. Per-subscription `apply`
-	 * errors are logged and swallowed — same contract as {@link runPostCommit}.
+	 * empty hits. No-op when no subscription matches. Per-subscription errors are
+	 * logged and swallowed — same contract as {@link runPostCommit}. Takes no
+	 * execution mutex, so unlike a commit it waits for each handler in turn.
 	 */
 	async notifyExternalTableChange(fqName: string): Promise<void> {
 		if (this.active.size === 0) return;
@@ -199,31 +214,43 @@ export class WatcherManager {
 		const matching = this.subscriptionsForTable(fqName);
 		if (matching.length === 0) return;
 
-		this.currentTxnId = this.mintTxnId();
-		try {
-			for (const entry of matching) {
-				if (entry.disposed) continue;
+		const txnId = this.mintTxnId();
+		for (const entry of matching) {
+			if (entry.disposed) continue;
 
-				const globalRelations = new Set<string>();
-				for (const [relKey, base] of entry.delta.relationToBase) {
-					if (base === fqName) globalRelations.add(relKey);
-				}
-				if (globalRelations.size === 0) continue;
-
-				const input: DeltaApplyInput = {
-					perRelationTuples: new Map(),
-					globalRelations,
-				};
-				try {
-					await entry.delta.apply(input);
-				} catch (err) {
-					// Mirror runPostCommit: a single subscription's apply must never
-					// reject into the external caller.
-					log('External-change apply for %s threw: %O', entry.id, err);
-				}
+			const globalRelations = new Set<string>();
+			for (const [relKey, base] of entry.delta.relationToBase) {
+				if (base === fqName) globalRelations.add(relKey);
 			}
+			if (globalRelations.size === 0) continue;
+
+			const input: DeltaApplyInput = {
+				perRelationTuples: new Map(),
+				globalRelations,
+			};
+			try {
+				await this.fireWithTxnId(entry, input, txnId);
+			} catch (err) {
+				// Mirror runPostCommit: a single subscription's apply must never
+				// reject into the external caller.
+				log('External-change apply for %s threw: %O', entry.id, err);
+			}
+		}
+	}
+
+	/**
+	 * Fires one subscription under `txnId`, restoring the current id before returning.
+	 * This pass holds no mutex, so a commit can run between its handlers, including
+	 * one a handler awaits. Keeping the id set only for the synchronous call means
+	 * neither pass can overwrite the id the other one reads.
+	 */
+	private fireWithTxnId(entry: ActiveSubscription, input: DeltaApplyInput, txnId: string): Promise<void> | undefined {
+		const prior = this.currentTxnId;
+		this.currentTxnId = txnId;
+		try {
+			return entry.fire(input);
 		} finally {
-			this.currentTxnId = '';
+			this.currentTxnId = prior;
 		}
 	}
 

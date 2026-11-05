@@ -32,6 +32,7 @@ function makeCtx(opts: {
 			};
 		},
 		getCurrentTxnId: () => opts.txnId ?? 'txn:test',
+		deferHandler: () => { /* no handler here returns a promise */ },
 	};
 	return { ctx, captures };
 }

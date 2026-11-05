@@ -285,10 +285,18 @@ export interface SubscriptionFromChangeScopeContext {
 	/** Return a stable transaction id for the current commit. The watcher
 	 *  subscription includes this on every emitted `WatchEvent`. */
 	getCurrentTxnId(): string;
+	/** Receives the promise of an asynchronous handler that `subscription.apply`
+	 *  fired, which `apply` does not wait for. The promise never rejects: a
+	 *  rejection has already been logged. */
+	deferHandler(settled: Promise<void>): void;
 }
 
 export interface SubscriptionFromChangeScopeResult {
 	subscription: DeltaSubscription;
+	/** Fires as `subscription.apply` does, but returns an asynchronous handler's
+	 *  promise instead of deferring it, for a caller that waits for it itself. Reads
+	 *  the transaction id synchronously. The promise never rejects. */
+	fire(input: DeltaApplyInput): Promise<void> | undefined;
 	/** Capture-spec dispose handles to release on `unsubscribe`. */
 	captureDisposers: Array<() => void>;
 }
@@ -442,7 +450,11 @@ export function subscriptionFromChangeScope(
 		plans.push({ watch, relKey, base, literalValues });
 	});
 
-	const apply = async (input: DeltaApplyInput): Promise<void> => {
+	const logHandlerFailure = (err: unknown): void => {
+		log('Watch handler %s threw: %O', id, err);
+	};
+
+	const fire = (input: DeltaApplyInput): Promise<void> | undefined => {
 		const matched: MatchedWatch[] = [];
 
 		for (const plan of plans) {
@@ -506,17 +518,18 @@ export function subscriptionFromChangeScope(
 			if (observable) matched.push({ watch, hits });
 		}
 
-		if (matched.length === 0) return;
+		if (matched.length === 0) return undefined;
 
 		const event = { matched, txnId: ctx.getCurrentTxnId() };
 		try {
 			const r = handler(event);
 			if (r && typeof (r as Promise<void>).then === 'function') {
-				await r;
+				return Promise.resolve(r).catch(logHandlerFailure);
 			}
 		} catch (err) {
-			log('Watch handler %s threw: %O', id, err);
+			logHandlerFailure(err);
 		}
+		return undefined;
 	};
 
 	const subscription: DeltaSubscription = {
@@ -525,10 +538,15 @@ export function subscriptionFromChangeScope(
 		bindings,
 		relationToBase,
 		pkIndicesByBase,
-		apply,
+		// The commit must not wait for a handler's promise: a handler may be awaiting
+		// a statement, and that statement needs the execution mutex the commit holds.
+		apply: async (input) => {
+			const pending = fire(input);
+			if (pending) ctx.deferHandler(pending);
+		},
 		dispose: () => { /* capture disposers handled by caller */ },
 	};
-	return { subscription, captureDisposers };
+	return { subscription, fire, captureDisposers };
 }
 
 /**

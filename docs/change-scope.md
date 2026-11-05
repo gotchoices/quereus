@@ -396,8 +396,8 @@ received over a network.
   `database.watch` or `subscription.unsubscribe` during a fire is legal;
   the kernel iterates a snapshot of subscriptions per commit, so the
   new/removed subscription takes effect on the next commit, not the
-  current one. Awaiting a statement is not safe: see
-  [Handlers run under the execution mutex](#handlers-run-under-the-execution-mutex).
+  current one. Awaiting a statement is safe too, with the ordering described in
+  [Handler ordering](#handler-ordering).
 
 ### `hits` semantics
 
@@ -447,15 +447,15 @@ commit back); watchers observe. A handler that throws — synchronously
 or via a rejected Promise — has its error logged and swallowed. The
 commit has already succeeded by the time the handler runs.
 
-### Handlers run under the execution mutex
+### Handler ordering
 
-The commit awaits any promise a handler returns, and the writing
-statement holds the execution mutex until its commit finishes. A handler
-that awaits a statement on the same database therefore hangs that
-database permanently: the statement waits for the mutex and the mutex
-waits for the handler. To query after a change, start the query without
-awaiting it, so that it queues and runs once the commit has finished and
-the mutex is free.
+A handler is called during the commit, before the change log is cleared and before any later statement can start. Until its first `await`, a handler therefore runs in commit order, ahead of every later statement. A handler that returns nothing keeps this guarantee in full.
+
+The commit does not wait for a promise a handler returns. The execution mutex is released first, then the statement that committed waits for its own handlers' promises, so `await db.exec(...)` still means those handlers have finished. A handler can therefore await a statement on the same database, including a write.
+
+After its first `await`, an asynchronous handler has no ordering against other work on the database: later statements may run, a query it awaits may see commits later than the one that fired it, and other handlers may run alongside it, including itself for a later commit. A handler that needs its own events in order must queue them itself. `event.txnId` identifies the commit and `hits` still describes it.
+
+A handler that never settles, or that awaits the promise of the statement that fired it, stalls only that statement's promise. The database keeps running.
 
 ### Schema-change invalidation
 
@@ -490,7 +490,8 @@ global-fallback rules above (`full`/`groups` → empty `hits`;
 the consumer an extra re-query; it never misses a change. A no-op when no
 subscription matches; per-handler errors are logged and swallowed, never
 rejecting into the caller (same contract as the post-commit path).
-Handlers fire serially and are awaited. A future optional `changedKeys`
+Handlers fire serially and are awaited; the call holds no execution mutex,
+so they can await statements. A future optional `changedKeys`
 argument could add a precise key-scoped variant without breaking callers.
 
 ### `Subscription.id` shape

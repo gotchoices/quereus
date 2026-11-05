@@ -1062,10 +1062,11 @@ await stmt.finalize();
 The handler fires once per successful commit and receives every
 `MatchedWatch` for that transaction in a single event. Handler
 errors are logged but do not roll the commit back (assertions enforce;
-watchers observe). A handler that awaits a statement on the same database
-hangs it, because the commit awaits the handler while holding the
-[execution mutex](change-scope.md#handlers-run-under-the-execution-mutex);
-start such a statement without awaiting it. See [change-scope.md](change-scope.md) for the
+watchers observe). A handler may await a statement on the same database,
+and `await db.exec(...)` still means the handlers that statement fired have
+finished. After its first `await`, though, a handler has no ordering against
+other work on the database: see
+[Handler ordering](change-scope.md#handler-ordering). See [change-scope.md](change-scope.md) for the
 full firing semantics, schema-change invalidation policy, and the
 list of v1 limitations.
 

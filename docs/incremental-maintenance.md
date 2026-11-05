@@ -17,7 +17,7 @@ Two consumers are **live** today:
 - **Assertions** — a `CREATE ASSERTION` predicate re-checked at COMMIT against only
   the rows that changed (pre-commit; a violation rolls the COMMIT back).
 - **`Database.watch`** — reactive callbacks fired post-commit when matching rows
-  change (fire-and-forget; a throwing handler is logged, never fatal).
+  change (the commit does not wait for them; a throwing handler is logged, never fatal).
 
 Engineered to plug in next on the same surface: reactive signals and triggers, and
 the [lens layer](lens.md)'s set-level constraint maintenance/enforcement where no
@@ -539,7 +539,9 @@ example of the plug-in pattern below:
   narrowing, `groups` → `group`) and registering capture demand for any non-PK
   key/group columns.
 - The manager runs its executor **after** commit, so a throwing handler is logged
-  and dropped rather than rolling anything back.
+  and dropped rather than rolling anything back. The commit does not wait for a
+  handler's promise; the statement that committed waits after releasing the execution
+  mutex (see [Handler ordering](change-scope.md#handler-ordering)).
 - Schema changes (`table_removed` / `table_modified`) invalidate affected
   subscriptions; `unsubscribe()` releases the kernel registration and all
   capture-spec demand.

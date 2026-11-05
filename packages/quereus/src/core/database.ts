@@ -195,6 +195,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	private execMutexDepth = 0;
 	/**
+	 * Promises of the asynchronous watch handlers fired during the current mutex hold;
+	 * null when no hold is active. One list per hold, because a list shared across holds
+	 * would make a handler's own write wait on the handler that is waiting for that write.
+	 */
+	private watchHandlersOfHold: Promise<void>[] | null = null;
+	/**
 	 * Live mutex-free committed-read scopes → their abort controllers.
 	 * {@link close} aborts each and awaits its `done` before tearing down shared
 	 * state, so no read is left iterating a schema being cleared.
@@ -703,9 +709,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * All statement execution is serialized through this mutex to prevent
 	 * concurrent transactions from interfering with each other.
 	 * This matches SQLite's behavior of serializing database access.
+	 *
+	 * The release function frees the mutex before returning. Its promise settles once
+	 * the watch handlers fired during this hold have finished, and never rejects, so
+	 * awaiting it in a `finally` cannot replace the error a statement threw.
 	 * @internal
 	 */
-	async _acquireExecMutex(): Promise<() => void> {
+	async _acquireExecMutex(): Promise<() => Promise<void>> {
 		const previousMutex = this.execMutex;
 		let releaseMutex: () => void;
 		this.execMutex = new Promise<void>(resolve => {
@@ -729,13 +739,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// re-entrant caller can detect it (see _isExecuting). The wrapper decrements
 		// at most once even if release is invoked more than once.
 		this.execMutexDepth++;
+		const watchHandlers: Promise<void>[] = [];
+		this.watchHandlersOfHold = watchHandlers;
 		let released = false;
-		return () => {
+		return async () => {
 			if (!released) {
 				released = true;
 				this.execMutexDepth--;
+				this.watchHandlersOfHold = null;
 			}
 			releaseMutex!();
+			await Promise.all(watchHandlers);
 		};
 	}
 
@@ -868,7 +882,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		try {
 			return await executor();
 		} finally {
-			releaseMutex();
+			await releaseMutex();
 		}
 	}
 
@@ -888,7 +902,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// NOTE: this release follows awaits in `finally` blocks, so it relies on
 			// spec-conformant return() handling; hosts that drop it are refused by
 			// ensureAsyncGeneratorCleanupSupported() before any statement runs.
-			releaseMutex();
+			await releaseMutex();
 		}
 	}
 
@@ -3006,9 +3020,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * a single {@link WatchEvent}. Handler errors are caught and logged —
 	 * they do not roll the commit back (assertions own that contract).
 	 *
-	 * The commit awaits the handler while holding the execution mutex, so a
-	 * handler that awaits a statement on this database hangs it. Start such a
-	 * statement without awaiting it; see `docs/change-scope.md`.
+	 * The commit calls the handler but does not wait for a promise it returns. The
+	 * statement that committed waits for it after releasing the execution mutex, so
+	 * a handler may await a statement on this database. After its first `await`, a
+	 * handler has no ordering against other work; see `docs/change-scope.md`
+	 * § Handler ordering.
 	 *
 	 * Validation is synchronous:
 	 * - Throws if `scope.unboundParameters` is non-empty (caller must
@@ -3032,6 +3048,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  and before the change log is cleared. */
 	public async runPostCommitWatchers(): Promise<void> {
 		await this.watcherManager.runPostCommit();
+	}
+
+	/** @internal Keeps an asynchronous watch handler's promise for the current mutex hold.
+	 *  Every commit path holds the mutex; with none held, the handler still runs and
+	 *  logs its own failure, and nothing waits for it. */
+	public deferWatchHandler(settled: Promise<void>): void {
+		this.watchHandlersOfHold?.push(settled);
 	}
 
 	/** @internal Invoked by the TransactionManager in the same post-commit window as

@@ -197,10 +197,11 @@ export interface WatchEvent {
 }
 
 /**
- * Handler signature for `Database.watch`. May be sync or async. A
- * Promise return is awaited before the watcher proceeds to the next
- * subscription; rejections are logged and swallowed (watcher errors
- * do not roll back the commit — assertions own that contract).
+ * Handler signature for `Database.watch`. May be sync or async. The commit
+ * does not wait for a returned Promise; the statement that committed waits
+ * for it after releasing the execution mutex, so a handler may await a
+ * statement on the same database. Rejections are logged and swallowed (watcher
+ * errors do not roll back the commit — assertions own that contract).
  */
 export type WatchHandler = (event: WatchEvent) => void | Promise<void>;
 

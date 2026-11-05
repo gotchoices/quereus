@@ -67,7 +67,7 @@ describe('Database exec-mutex re-entrancy signal (_isExecuting)', () => {
 		const release = await db._acquireExecMutex();
 		expect(db._isExecuting(), 'true while the mutex is held').to.equal(true);
 
-		release();
+		void release();
 		expect(db._isExecuting(), 'false after release').to.equal(false);
 	});
 
@@ -75,15 +75,15 @@ describe('Database exec-mutex re-entrancy signal (_isExecuting)', () => {
 		db = new Database();
 
 		const releaseA = await db._acquireExecMutex();
-		releaseA();
-		releaseA(); // second call must be a no-op for the depth counter
+		void releaseA();
+		void releaseA(); // second call must be a no-op for the depth counter
 		expect(db._isExecuting(), 'double-release leaves the signal at not-executing').to.equal(false);
 
 		// A subsequent acquisition still reports held — the counter did not wrap below zero.
 		const releaseB = await db._acquireExecMutex();
 		expect(db._isExecuting(), 'next acquisition still reports held after a prior double-release')
 			.to.equal(true);
-		releaseB();
+		void releaseB();
 		expect(db._isExecuting()).to.equal(false);
 
 		// The engine still executes normally after the abuse.
