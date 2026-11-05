@@ -1891,14 +1891,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *    (from-zero / {@link collectAllChanges} path) there is no lower bound, so all
 	 *    (origin ≠ peer) are kept.
 	 *
-	 * Accepted limitation (documented intent, not a defect): a held change written
-	 * before the peer's watermark (`HLC ≤ sinceHLC`) is NOT relayed via this delta
-	 * path. This is a limit of held changes alone. A change this replica APPLIED is
-	 * filed at the position it arrived at and reaches every peer however old it is; a
-	 * held one has no arrival position to be read by. store-and-forward targets the
-	 * transitional uneven-retirement window, where the straggler's writes are recent
-	 * enough to exceed holder watermarks; quarantine already prevents write loss
-	 * outside it.
+	 * Known gap: a held change written before the peer's watermark (`HLC ≤ sinceHLC`)
+	 * is NOT relayed via this delta path. This is a limit of held changes alone. A
+	 * change this replica APPLIED is filed at the position it arrived at and reaches
+	 * every peer however old it is; a held one has no arrival position to be read by,
+	 * so one that arrives after a reader's last pull, written before it, is skipped for
+	 * that reader. The limit was accepted while applied changes shared it; they no
+	 * longer do. Tracked as backlog/bug-sync-held-change-late-arrival-not-relayed.
 	 *
 	 * Snapshot carve-out: forwardable entries are DELTA-ONLY. The snapshot collectors
 	 * scan only `cv:`/`tb:`/`sm:` (never `qt:`), since a snapshot transfers the

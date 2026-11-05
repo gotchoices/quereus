@@ -12,10 +12,8 @@ import {
   PROTOCOL_VERSION,
   compareHLC,
   createHLC,
-  generateSiteId,
   replyWatermark,
   siteIdFromBase64,
-  siteIdToBase64,
   serializeSnapshotCheckpoint,
   serializeChangeSet,
   deserializeChangeSet,
@@ -33,7 +31,7 @@ const TEST_DATABASE_ID = 'default:s_test-scenario';
 
 // Valid 22-character base64url site IDs (16 bytes each)
 const TEST_SITE_ID_1 = 'AAAAAAAAAAAAAAAAAAAAAA'; // 16 zero bytes
-const TEST_SITE_ID_2 = 'AAAAAAAAAAAAAAAAAAAAAB'; // slightly different
+const TEST_SITE_ID_2 = 'AAAAAAAAAAAAAAAAAAAAAQ'; // 15 zero bytes, then 0x01
 
 describe('WebSocket Handler', () => {
   let server: CoordinatorServer;
@@ -604,9 +602,8 @@ describe('Get Changes below the delta floor', () => {
       expect(r1.type).to.equal('apply_result');
 
       // The reader catches up before the delete arrives: its watermark is where the
-      // coordinator filed the insert, which the reply's cursor names. A site of its own:
-      // TEST_SITE_ID_2 decodes to the writer's bytes, and a reply leaves out the reader's own changes.
-      await handshake(reader, siteIdToBase64(generateSiteId()));
+      // coordinator filed the insert, which the reply's cursor names.
+      await handshake(reader, TEST_SITE_ID_2);
       const caughtUp = await sendAndReceive(reader, { type: 'get_changes' });
       expect(caughtUp.type).to.equal('changes');
       const preDelete = serializeHLCForTransport(

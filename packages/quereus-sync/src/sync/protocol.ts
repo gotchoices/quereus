@@ -236,12 +236,14 @@ function migrationStreamKey(key: MigrationOrderKey): string {
 // ============================================================================
 
 /**
- * Exactly one source transaction's worth of changes.
+ * One source transaction's changes, as the serving replica filed them.
  *
- * A ChangeSet **is** one commit: `getChangesSince` emits one ChangeSet per source
- * transaction (grouped by HLC identity `(wallTime, counter, siteId)`), never
- * splitting a commit across ChangeSets and never merging two commits into one. All
- * changes within a ChangeSet are applied atomically.
+ * Two commits are never merged into one ChangeSet. What a replica wrote itself, and
+ * what it pushes (`getChangesToPush`), is one ChangeSet per transaction (grouped by HLC
+ * identity `(wallTime, counter, siteId)`). A `getChangesSince` reply splits a
+ * transaction only where the serving replica filed its facts at two clock ticks (part
+ * applied, the rest held and replayed later): those arrive as two ChangeSets with the
+ * same `transactionId`. All changes within a ChangeSet are applied atomically.
  */
 export interface ChangeSet {
   /** Origin replica (the single site that produced this transaction). */
@@ -254,9 +256,10 @@ export interface ChangeSet {
    */
   readonly transactionId: string;
   /**
-   * The transaction's commit boundary: its **maximum** fact HLC (the last
-   * `opSeq`). A consumer that sets `lastSyncHLC = ChangeSet.hlc` and re-fetches
-   * resumes strictly *after* the whole transaction.
+   * The transaction's commit boundary: the **maximum** fact HLC this set carries (the
+   * last `opSeq`). A write time: it decides which write wins and is what the sent
+   * watermark counts. It is NOT where a reader of a `getChangesSince` reply resumes
+   * from; that is {@link replyWatermark}, which reads `cursor`.
    */
   readonly hlc: HLC;
   /** Data changes in this transaction, in `opSeq` (intra-transaction write) order. */

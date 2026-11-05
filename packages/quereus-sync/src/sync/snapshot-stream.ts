@@ -903,12 +903,14 @@ export async function applySnapshotStream(
 				}
 
 				// Update HLC
-				// NOTE: on a RESUMED transfer the data was read after the original header was
-				// issued, so a copied position can be above the header merged here. This
-				// replica's next tick still files above it unless its clock runs behind the
-				// sender's by more than the time since. If a replica restored from a resumed
-				// stream ever serves a delta that skips its own later writes, merge the
-				// greatest copied position here as well (validating its drift first).
+				// NOTE: the sender reads its records after it issues the header, so a fact it
+				// files during the transfer (always on a RESUMED one, whose header is the
+				// original's) is copied at a position above the header merged here. The same
+				// holds for the non-streaming `applySnapshot`. This replica's next tick still
+				// files above it unless its clock runs behind the sender's by more than the
+				// time since. If a replica restored from a snapshot ever serves a delta that
+				// skips its own later writes, merge the greatest copied position here as well
+				// (validating its drift first).
 				if (snapshotHLC) {
 					ctx.hlcManager.receive(snapshotHLC);
 					await persistHLCState(ctx);
