@@ -67,7 +67,8 @@ export function readsColumnsOf(reader: RelationalPlanNode, producer: RelationalP
  * because a `ProjectNode`'s output never carries an outer column's id: it keeps
  * a plain column's id only when its source publishes that id, and mints a fresh one
  * otherwise. Nodes above a projection republish what it outputs, so an outer id
- * reaching this set would hide the correlation from every caller.
+ * reaching this set would hide the correlation from every caller. `ReturningNode` is
+ * the deliberate exception; see the NOTE at its attribute derivation.
  *
  * `seen` dedupes node visits within one top-level call. A relational node reaches
  * its inputs through BOTH `getChildren()` and `getRelations()` — for a join those

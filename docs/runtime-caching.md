@@ -129,7 +129,9 @@ marked CTE **exactly once per statement execution**, matching standard SQL
   instance, but that is not guaranteed — the constant-folding pass rebuilds a
   node reachable from two parents once per parent path — so the buffer key is
   the CTE's `tableDescriptor`, an identity object minted when the CTE is built
-  and threaded through every rebuild. All copies therefore agree on the key.
+  and threaded through every rebuild. All copies therefore agree on the key, and
+  the advisory sums references per descriptor so a split CTE still counts as
+  multi-referenced.
 - The buffer lives on the per-execution `RuntimeContext`
   (`ctx.cteMaterializations`, a `Map<TableDescriptor, Promise<Row[]>>`; recursive
   CTEs key the same map by their working-table descriptor). The first
@@ -163,6 +165,9 @@ re-running it can change the result:
   values, and sharing would freeze the first row.
 
 `NOT MATERIALIZED` is honored in both cases, because it asks for per-reference runs.
+A writing scalar subquery in such a body still writes once per statement and replays
+the first row's value, the same as anywhere else (`emitScalarSubquery`), so the error
+for a writing body does not recommend the hint.
 A body that does not read the outer row keeps its one buffer, even when the subquery
 around it is correlated.
 

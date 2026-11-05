@@ -1092,7 +1092,7 @@ order by start_node, end_node, length(path);
 #### 3.7.3 Optimization and Performance
 
 **Materialization Hints:**
-`materialized` stores the CTE's rows once per statement execution and every reference reads them. `not materialized` runs the body once per reference. Without a hint, a CTE referenced two or more times is stored and one referenced once is not:
+`materialized` stores the CTE's rows once per statement execution and every reference reads them. `not materialized` runs the body once per reference. Without a hint, a CTE referenced two or more times is stored and one referenced once is not. A recursive CTE referenced two or more times, and a CTE whose body is an `insert`, `update` or `delete`, are always stored regardless of hint:
 ```sql
 with recursive 
   large_cte as materialized (select ...),
@@ -1105,7 +1105,8 @@ A stored result lasts for the whole statement, so a CTE inside a subquery that r
 | CTE that reads an outer column, and would be stored | Behavior |
 |---|---|
 | Deterministic and read-only | Runs once per reference, even when hinted `materialized`; results are the same as sharing |
-| Non-deterministic, or writes data | Error at planning; write `not materialized` to run it once per reference |
+| Non-deterministic | Error at planning; write `not materialized` to run it once per reference |
+| Writes data through a scalar subquery | Error at planning |
 | Recursive, referenced two or more times | Error at planning |
 
 **Recursion Limits:**

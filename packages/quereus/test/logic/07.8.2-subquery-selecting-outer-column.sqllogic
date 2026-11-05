@@ -99,6 +99,14 @@ select a, (with c as (select t.b + random() as x from u) select c1.x + c2.x from
 select a, (with c as materialized (select t.b + random() as x from u) select x from c) as v from t;
 -- error: CTE 'c' reads a column of an outer query
 
+-- Writing body: refused before anything is written.
+create table wlog (id integer primary key, v integer null);
+select a, (with c as materialized (select (insert into wlog values (t.a, t.b) returning v) as x from u) select x from c) as v from t;
+-- error: CTE 'c' reads a column of an outer query and writes data
+select count(*) as n from wlog;
+→ [{"n":0}]
+drop table wlog;
+
 -- `not materialized` asks for per-reference runs, so it stays allowed.
 select a, (with c as not materialized (select t.b + random() as x from u) select count(*) from c c1 join c c2 on 1=1) as v from t order by a;
 → [{"a":1,"v":1},{"a":2,"v":1},{"a":3,"v":1}]
@@ -107,12 +115,27 @@ select a, (with c as not materialized (select t.b + random() as x from u) select
 select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+1) select max(c1.x + c2.x) from c c1 join c c2 on 1=1) as v from t;
 -- error: Recursive CTE 'c' reads a column of an outer query
 
+-- A constant expression in the body makes folding split the WITH query into one copy per
+-- reference, which must still count as two references.
+select a, (with c as (select t.b + random() + (1 + 1) as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t;
+-- error: CTE 'c' reads a column of an outer query
+
+-- The `with recursive` keyword on a member that does not recurse changes nothing.
+select a, (with recursive c as (select t.b + random() as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t;
+-- error: CTE 'c' reads a column of an outer query
+
 -- ===== A WITH body that does not read the outer row keeps its one buffer =====
 
 -- random() differs per run, so one distinct non-null value across all outer rows and
 -- both references shows a single run.
 select count(distinct v) as n from (
 	select (with c as (select random() as r from u) select c1.r from c c1 join c c2 on c1.r = c2.r where t.b is not null) as v from t
+) s;
+→ [{"n":1}]
+
+-- Same, with the body split into one copy per reference by constant folding.
+select count(distinct v) as n from (
+	select (with c as (select random() + (1 + 1) as r from u) select c1.r from c c1 join c c2 on c1.r = c2.r where t.b is not null) as v from t
 ) s;
 → [{"n":1}]
 

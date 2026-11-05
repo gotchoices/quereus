@@ -26,7 +26,7 @@ with c as (select random() as x from u) select (select max(x) from c) = (select 
 
 ## Cause
 
-`buildFrom` keeps one `CTEReferenceNode` per name and alias in `cteReferenceCache`, so both mentions in the second statement reuse a single node. `MaterializationAdvisory` decides by counting a `CTENode`'s parents, sees one, and leaves the body streaming, while each mention still emits and runs it. The advisory's doc comment already notes this undercount, because it is why a data-modifying WITH is marked at build time instead.
+`buildFrom` keeps one `CTEReferenceNode` per name and alias in `cteReferenceCache`, so both mentions in the second statement reuse a single node. `MaterializationAdvisory` decides by summing parents per WITH query across its plan copies, sees one, and leaves the body streaming, while each mention still emits and runs it. Constant folding can split the shared reference node, so the same statement with a constant expression in the body, such as `random() + (1 + 1)`, already counts two and is stored. The advisory's doc comment already notes this undercount, because it is why a data-modifying WITH is marked at build time instead.
 
 ## Related behaviour
 
