@@ -37,4 +37,4 @@ export {
 	bodyExposesRenamedColumn,
 	bodyPublishesColumnNamed,
 } from './rename/column-rename.js';
-export { stripSelfQualifierInSchemaExpression, requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename/self-qualifier-strip.js';
+export { OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression, requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename/self-qualifier-strip.js';

@@ -609,8 +609,7 @@ alter table AcCtxReq add column c integer null default (who);
 
 -- Test 27: a CHECK reading a context variable constrains a per-statement value, so the
 -- optimizer may draw no column fact from it. A row that contradicts the column reading
--- of `who > 0` is legal here and must not be folded out of a query. Every spelling that
--- enforcement compiles to the variable counts, including the self-qualified one.
+-- of `who > 0` is legal here and must not be folded out of a query.
 create table FactBare (a integer primary key, who integer null, check (who > 0)) with context (who integer null);
 insert into FactBare values (1, -1);
 select * from FactBare where who <= 0
@@ -621,10 +620,13 @@ insert into FactQual values (1, -1);
 select * from FactQual where who <= 0
 → [{"a":1,"who":-1}]
 
+-- A self-qualified name is enforced against the column, but rows stored while it read the
+-- variable were never judged against the column, so no fact is drawn from it either.
 create table FactSelf (a integer primary key, who integer null, check (FactSelf.who > 0)) with context (who integer null);
 insert into FactSelf values (1, -1);
-select * from FactSelf where who <= 0
-→ [{"a":1,"who":-1}]
+-- error: CHECK constraint failed
+select op from query_plan('select * from FactSelf where who <= 0') where op = 'EMPTYRELATION'
+→ []
 
 -- A variable sharing no column's name is screened too: `b` does not determine `a` when
 -- the rest of the sum varies per statement, so these two rows stay two groups.
@@ -703,12 +705,13 @@ alter table AvShadow add column e integer null default 1 check (new.who > 0);
 alter table AvShadow add column e integer null default (new.who) check (new.who > 0);
 -- error: CHECK constraint failed
 
--- A self-qualified name reads what a write reads, which is the variable, including inside a
--- subquery: reading the column would find -1 in AvLookup. Other self-qualified names still
--- reach their columns.
+-- A self-qualified name reaches the column, as on a write, including inside a subquery, where
+-- it finds -1 in AvLookup. Other self-qualified names reach their columns too.
 insert into AvLookup values (-1);
 alter table AvShadow add constraint k3 check (AvShadow.who > 0);
+-- error: existing rows in 'AvShadow' violate
 alter table AvShadow add constraint k4 check (not exists (select 1 from AvLookup where k = AvShadow.who));
+-- error: existing rows in 'AvShadow' violate
 alter table AvShadow add constraint k5 check (AvShadow.c > 1);
 -- error: existing rows in 'AvShadow' violate
 
@@ -718,6 +721,25 @@ insert into context values (1, -1);
 alter table context add constraint k1 check (context.who > 0);
 alter table context add constraint k2 check (context.a > 1);
 -- error: existing rows in 'context' violate
+-- Three parts name the table, so this reaches the column.
+alter table context add constraint k3 check (main.context.who > 0);
+-- error: existing rows in 'context' violate
+
+-- A NOT NULL variable the CHECK does not read does not stop ALTER judging the column.
+create table AvSelfReq (a integer primary key, who integer null) with context (who integer);
+insert into AvSelfReq values (1, -1);
+alter table AvSelfReq add constraint k check (AvSelfReq.who > 0);
+-- error: existing rows in 'AvSelfReq' violate
+alter table AvSelfReq add constraint k check (AvSelfReq.who < 0);
+
+-- On a table named `new`, all three spellings reach the column.
+create table "new" (a integer primary key, who integer null) with context (who integer null);
+insert into "new" values (1, -1);
+alter table "new" add constraint k1 check ("new".who > 0);
+-- error: existing rows in 'new' violate
+alter table "new" add constraint k2 check (main."new".who > 0);
+-- error: existing rows in 'new' violate
+drop table "new";
 
 -- The internal name a shadowed column is scanned under stays clear of a real column using it.
 create table AvCollide (a integer primary key, "__quereus_shadowed_who" integer null, who integer null) with context (who integer null);
@@ -774,3 +796,83 @@ insert into AvMask values (1, 5);
 alter table AvMask add column c integer null default (new.b) check on update (c > 100);
 select a, b, c from AvMask
 → [{"a":1,"b":5,"c":5}]
+
+-- Test 29: a CHECK that names a shadowed column through its table tests the column, whatever
+-- the variable holds, and judges the row image the operation judges.
+create table SqPair (a integer primary key, who integer null, check (SqPair.who > 0)) with context (who integer null);
+insert into SqPair with context who = 5 values (1, -1);
+-- error: CHECK constraint failed
+insert into SqPair with context who = -5 values (2, 5);
+update SqPair with context who = 5 set who = -1;
+-- error: CHECK constraint failed
+update SqPair with context who = -5 set who = 6;
+select a, who from SqPair
+→ [{"a":2,"who":6}]
+
+create table SqSchema (a integer primary key, who integer null, check (main.SqSchema.who > 0)) with context (who integer null);
+insert into SqSchema with context who = 5 values (1, -1);
+-- error: CHECK constraint failed
+insert into SqSchema with context who = -5 values (2, 5);
+select a, who from SqSchema
+→ [{"a":2,"who":5}]
+
+create table SqDelete (a integer primary key, who integer null, check on delete (SqDelete.who > 0)) with context (who integer null);
+insert into SqDelete values (1, -1), (2, 3);
+delete from SqDelete with context who = 5 where a = 1;
+-- error: CHECK constraint failed
+delete from SqDelete with context who = -5 where a = 2;
+select a, who from SqDelete
+→ [{"a":1,"who":-1}]
+
+-- The variable is not read, so a NOT NULL one need not be supplied.
+create table SqReq (a integer primary key, who integer null, check (SqReq.who > 0)) with context (who integer);
+insert into SqReq values (1, 5);
+insert into SqReq values (2, -5);
+-- error: CHECK constraint failed
+select a, who from SqReq
+→ [{"a":1,"who":5}]
+
+-- A table literally named `new`: the row that would otherwise be lost to a query is refused.
+create table "new" (a integer primary key, who integer null, check (new.who > 0)) with context (who integer null);
+insert into "new" values (1, -1);
+-- error: CHECK constraint failed
+drop table "new";
+
+-- On the table named `context` from Test 28, whose `k1` is `context.who > 0`, two parts read the
+-- variable and three parts the column.
+insert into context with context who = -5 values (2, 5);
+-- error: CHECK constraint failed
+alter table context add constraint k4 check (main.context.who > -2);
+insert into context with context who = 5 values (2, -3);
+-- error: CHECK constraint failed
+insert into context with context who = 5 values (2, -1);
+select a, who from context order by a
+→ [{"a":1,"who":-1},{"a":2,"who":-1}]
+
+-- Inside a subquery the name stays the outer row's column, even where the subquery's own source
+-- has a column of that name, or is itself named `new`.
+create table SqPeer (k integer primary key, who integer null);
+insert into SqPeer values (1, 7);
+create table SqSub (a integer primary key, who integer null, check (exists (select 1 from SqPeer where SqPeer.who = SqSub.who))) with context (who integer null);
+insert into SqSub with context who = 7 values (1, 8);
+-- error: CHECK constraint failed
+insert into SqSub with context who = 8 values (2, 7);
+select a, who from SqSub
+→ [{"a":2,"who":7}]
+
+create table "new" (k integer primary key, who integer null);
+insert into "new" values (1, 7);
+create table SqNew (a integer primary key, who integer null, check (exists (select 1 from "new" where "new".who = SqNew.who))) with context (who integer null);
+insert into SqNew with context who = 7 values (1, 8);
+-- error: CHECK constraint failed
+insert into SqNew with context who = 8 values (2, 7);
+select a, who from SqNew
+→ [{"a":2,"who":7}]
+drop table SqNew;
+drop table "new";
+
+-- A CTE body cannot correlate to the written row, so the name stays unresolved there, as an
+-- unshadowed name does, rather than judging every row on the first row's value.
+create table SqCte (a integer primary key, who integer null, check ((with c as (select SqCte.who as x from SqPeer) select max(x) from c) > 0)) with context (who integer null);
+insert into SqCte values (1, 5), (2, -5);
+-- error: SqCte.who isn't a column

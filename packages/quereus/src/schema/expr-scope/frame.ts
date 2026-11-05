@@ -25,13 +25,20 @@ export interface ScopeFrame {
 	 */
 	hasOpaque: boolean;
 	/**
+	 * Marks the second kind of {@link hasOpaque} frame: a body that cannot correlate to
+	 * the written row (CTE / derived-table / DML bodies). A frame that merely holds an
+	 * opaque source still correlates; it only cannot answer a capture question. Implies
+	 * {@link hasOpaque}.
+	 */
+	barrier: boolean;
+	/**
 	 * Marks a subtree whose names resolve in a naming environment this walk does not
 	 * model at all (view write-through metadata: a result column's `with inverse`
 	 * clause, a select's trailing `with defaults` clause, both evaluated against the
 	 * written view row where `new.<output column>` is the naming environment).
 	 * NOTHING below a sealed frame can reach the seed — not even the `new.` /
 	 * owning-table spellings that an opaque frame still lets through, since the
-	 * classifiers check those AFTER the frame loop. Implies {@link hasOpaque}.
+	 * classifiers check those AFTER the frame loop. Implies {@link barrier}.
 	 */
 	sealed: boolean;
 	/** Lowercase CTE names declared at this level (consulted by nested FROMs). */
@@ -39,13 +46,14 @@ export interface ScopeFrame {
 }
 
 export function emptyScopeFrame(): ScopeFrame {
-	return { bound: new Set(), realSources: [], hasOpaque: false, sealed: false, cteNames: new Set() };
+	return { bound: new Set(), realSources: [], hasOpaque: false, barrier: false, sealed: false, cteNames: new Set() };
 }
 
 /** A frame that binds nothing but blocks every unqualified-capture question. */
 export function opaqueScopeFrame(): ScopeFrame {
 	const frame = emptyScopeFrame();
 	frame.hasOpaque = true;
+	frame.barrier = true;
 	return frame;
 }
 
@@ -75,6 +83,14 @@ export function sealedScopeFrame(): ScopeFrame {
 export function hasSealedFrame(stack: ReadonlyArray<ScopeFrame>): boolean {
 	for (let i = 1; i < stack.length; i++) {
 		if (stack[i].sealed) return true;
+	}
+	return false;
+}
+
+/** Whether any frame above the seed is a barrier — see {@link ScopeFrame.barrier}. */
+export function hasBarrierFrame(stack: ReadonlyArray<ScopeFrame>): boolean {
+	for (let i = 1; i < stack.length; i++) {
+		if (stack[i].barrier) return true;
 	}
 	return false;
 }

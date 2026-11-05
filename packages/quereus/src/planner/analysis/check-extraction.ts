@@ -197,8 +197,9 @@ export function isRowInvariantCheck(check: RowConstraintSchema): boolean {
  * in-lists are all covered — so an `old.` ref inside any non-AND structure
  * (OR disjunct, BETWEEN bound, IN list, compound operand) screens out the
  * entire conjunct it appears in. Conservative edge: a table literally named
- * `old` using self-qualified `old.col` refs also matches — sound, since the
- * enforcement scope keys `old.<col>` to the OLD image there too.
+ * `old` using self-qualified `old.col` refs also matches, though enforcement folds
+ * those to the row the operation judges rather than the OLD image. Skipping the
+ * conjunct stays sound, since that only forgoes its facts.
  *
  * Exported for the existing-row CHECK scan (`storedRowPredicate` in
  * `schema/constraint-builder.ts`), which screens conjuncts with THIS predicate so
@@ -215,8 +216,8 @@ export function containsOldRowImageRef(expr: AST.Expression): boolean {
 
 /**
  * True when any node in `expr`'s subtree is named like a declared mutation-context
- * variable and is spelled in a way that enforcement compiles to that variable. Like
- * {@link containsOldRowImageRef} this is depth-blind: a bare name inside a subquery
+ * variable and is spelled in a way no fact may be drawn from ({@link readsContextVariable}).
+ * Like {@link containsOldRowImageRef} this is depth-blind: a bare name inside a subquery
  * may really bind to the subquery's own source, in which case a conjunct is skipped
  * needlessly. That is sound, since skipping a conjunct only forgoes its facts.
  */
@@ -228,15 +229,13 @@ function containsContextVariableRef(expr: AST.Expression, contextVariables: Read
 }
 
 /**
- * `new.<name>` is the one spelling that reaches a same-named column. A self-qualified
- * `<table>.<name>` does not: enforcement strips it to the bare form
- * (`stripSelfQualifierInSchemaExpression`), which the variable then captures.
+ * `new.<name>` is the one spelling a fact is drawn from when a variable has that name.
+ * Enforcement reads a same-named column through a self-qualified `<table>.<name>` too
+ * (`stripSelfQualifierInSchemaExpression`), but that spelling is still screened.
  * `context.<name>` with an undeclared name fails the set lookup, so a table literally
  * named `context` keeps the facts of its self-qualified columns.
  *
- * NOTE: on a table literally named `new`, the same strip folds `new.who` to the bare
- * form too, so it reads the variable yet is still lifted here. Closing that needs the
- * meaning of a self-qualified name settled first, since the strip is the cause.
+ * NOTE: accepted tradeoff — rows stored while <table>.<name> read the variable were never validated against the column, so no fact is lifted from this spelling even though enforcement now reads the column; revisit if a re-validation of stored rows ever exists.
  */
 function readsContextVariable(node: AST.AstNode, contextVariables: ReadonlySet<string>): boolean {
 	if (node.type === 'identifier') {

@@ -13,7 +13,7 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
+import { OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 import { mutationContextVarNames, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
@@ -72,8 +72,12 @@ export function buildConstraintChecks(
 
   // Bare column names a mutation context variable claims. The unqualified form is left
   // to the context variable (the documented WITH CONTEXT precedence); the shadowed
-  // column stays reachable as `new.<col>` / `old.<col>`.
+  // column stays reachable as `new.<col>` / `old.<col>`, and as `<table>.<col>`, which
+  // the strip below folds to the qualified name registered in place of the bare one.
   const shadowedByContext = mutationContextVarNames(contextAttributes);
+  const shadowedColumns = new Set(
+    tableSchema.columns.map(column => column.name.toLowerCase()).filter(name => shadowedByContext.has(name)),
+  );
 
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {
@@ -100,6 +104,8 @@ export function buildConstraintChecks(
     // Register column symbols (similar to current emitConstraintCheck logic)
     tableSchema.columns.forEach((tableColumn, tableColIndex) => {
       const colNameLower = tableColumn.name.toLowerCase();
+      // Which row image the operation judges is decided by this registration alone.
+      const ownRowKey = shadowedColumns.has(colNameLower) ? `${OWN_ROW_QUALIFIER}.${colNameLower}` : colNameLower;
 
       // Register NEW.col and unqualified col (defaults to NEW for INSERT/UPDATE, OLD for DELETE)
       const newAttrId = newAttrIdByCol[colNameLower];
@@ -118,10 +124,9 @@ export function buildConstraintChecks(
         constraintScope.registerSymbol(`${writeRowCorr}.${colNameLower}`, (exp, s) =>
           new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
 
-        // For INSERT/UPDATE, unqualified column defaults to NEW — unless a mutation
-        // context variable claims the bare name.
-        if ((operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) && !shadowedByContext.has(colNameLower)) {
-          constraintScope.registerSymbol(colNameLower, (exp, s) =>
+        // For INSERT/UPDATE, unqualified column defaults to NEW.
+        if (operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) {
+          constraintScope.registerSymbol(ownRowKey, (exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
         }
       }
@@ -136,10 +141,9 @@ export function buildConstraintChecks(
         constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
           new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttrId, tableColIndex));
 
-        // For DELETE, unqualified column defaults to OLD — unless a mutation context
-        // variable claims the bare name.
-        if (operation === RowOpFlag.DELETE && !shadowedByContext.has(colNameLower)) {
-          constraintScope.registerSymbol(colNameLower, (exp, s) =>
+        // For DELETE, unqualified column defaults to OLD.
+        if (operation === RowOpFlag.DELETE) {
+          constraintScope.registerSymbol(ownRowKey, (exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttrId, tableColIndex));
         }
       }
@@ -172,7 +176,7 @@ export function buildConstraintChecks(
       // peers' parent-chain fallback.
       let constraintExpr = constraint.expr;
       const stripped = cloneExpr(constraint.expr);
-      if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource)) {
+      if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource, shadowedColumns)) {
         constraintExpr = stripped;
       }
 

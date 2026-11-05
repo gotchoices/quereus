@@ -1,11 +1,19 @@
 import type * as AST from '../../parser/ast.js';
 import { eq, type ResolveColumnInSource } from './shared.js';
-import { hasSealedFrame, type ScopeFrame } from '../expr-scope/frame.js';
+import { hasBarrierFrame, hasSealedFrame, type ScopeFrame } from '../expr-scope/frame.js';
 import { walkSchemaExpressionScope } from '../expr-scope/walk.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // Self-qualifier strip (schema-authored row expressions)
 // ──────────────────────────────────────────────────────────────────────
+
+/**
+ * The qualifier a CHECK's scope registers a shadowed column under: one whose name a
+ * mutation-context variable also claims, so the bare name is the variable's. The strip
+ * folds `<table>.<name>` to it. Spelled so that no FROM source a user could write inside
+ * a CHECK subquery rebinds it, and lowercase because scope keys are.
+ */
+export const OWN_ROW_QUALIFIER = '__quereus_own_row__';
 
 interface StripState {
 	/** Lowercase owning-table name (the implicit seed binding). */
@@ -13,6 +21,7 @@ interface StripState {
 	/** Lowercase default schema name. */
 	defaultSchema: string;
 	resolve: ResolveColumnInSource;
+	shadowedColumns?: ReadonlySet<string>;
 	changed: boolean;
 }
 
@@ -44,6 +53,13 @@ interface StripState {
  * `frame.ts`), shared with the generated-column reference collector; this file
  * supplies only the per-column action.
  *
+ * `shadowedColumns` holds the lowercase names of columns a mutation-context variable
+ * shares a name with, for a CHECK. The bare form of such a name is the variable, so
+ * `<table>.<name>` folds to {@link OWN_ROW_QUALIFIER} instead, which the CHECK's scope
+ * registers against the row the operation judges. That target is qualified, so no
+ * subquery source can capture it, and it keeps `from "new" where "new".who = t.who`
+ * from comparing the subquery's column with itself, as folding to `new.` would.
+ *
  * Mutates `expr` in place (callers pass a clone of the stored expression,
  * never the schema's own AST) and returns whether anything was rewritten.
  */
@@ -52,12 +68,14 @@ export function stripSelfQualifierInSchemaExpression(
 	tableName: string,
 	defaultSchemaName: string,
 	resolveColumnInSource: ResolveColumnInSource,
+	shadowedColumns?: ReadonlySet<string>,
 ): boolean {
 	if (!expr) return false;
 	const state: StripState = {
 		tableName: tableName.toLowerCase(),
 		defaultSchema: defaultSchemaName.toLowerCase(),
 		resolve: resolveColumnInSource,
+		shadowedColumns,
 		changed: false,
 	};
 	walkSchemaExpressionScope(
@@ -89,8 +107,20 @@ function stripColumnQualifier(
 	// `tableSchema.schemaName`), so no path resolution applies: `main.t.qty` in
 	// an expression on `temp.t` is not a self-reference.
 	if (!(col.schema === undefined || eq(col.schema, state.defaultSchema))) return;
-	// Strip only when no intervening frame could capture the unqualified name.
 	const colLower = col.name.toLowerCase();
+	if (state.shadowedColumns?.has(colLower)) {
+		// `context.<name>` with no schema always reaches the variable, including on a table
+		// literally named `context`.
+		if (qualifier === 'context' && col.schema === undefined) return;
+		// Left qualified to fail as an unshadowed name does: such a body cannot correlate to
+		// the written row, since a materialized CTE keeps one buffer per execution.
+		if (hasBarrierFrame(stack)) return;
+		col.table = OWN_ROW_QUALIFIER;
+		col.schema = undefined;
+		state.changed = true;
+		return;
+	}
+	// Strip only when no intervening frame could capture the unqualified name.
 	for (let i = 1; i < stack.length; i++) {
 		const frame = stack[i];
 		if (frame.hasOpaque) return;
@@ -162,16 +192,18 @@ export function requalifyOwnRowRefsInSchemaExpression(
 /**
  * What a table's declared mutation-context variables change about the own-row spellings.
  *
- * `new.<name>` reaches the column, under the name the scan's source exposes it by when a
- * variable shares it. A self-qualified `<table>.<name>` of a variable reads the variable,
- * as on a write, where {@link stripSelfQualifierInSchemaExpression} folds it to the bare
- * form the variable captures. It is rewritten to `context.<name>` rather than to the bare
- * form, because a subquery's own source could capture a bare name.
+ * `new.<name>` and `<table>.<name>` reach a same-named column, under the name the scan's
+ * source exposes it by. A `<table>.<name>` of a variable that is no column reads the
+ * variable, as does `context.<name>` with no schema on a table literally named `context`.
+ * On a write, {@link stripSelfQualifierInSchemaExpression} folds the former to the bare form
+ * the variable captures. Here both become `context.<name>` rather than the bare form,
+ * because a subquery's own source could capture a bare name.
  *
- * NOTE: where a subquery source has a column of that name, the write path keeps the
- * qualifier and every write fails with `<table>.<name> isn't a column`, so this scan accepts
- * a CHECK that no write can plan, as CREATE TABLE does. If ALTER should refuse it, this is
- * the site that would ask the catalog, as {@link stripColumnQualifier} does.
+ * NOTE: where a subquery source has a column named like a variable that is no column of this
+ * table, the write path keeps the qualifier and every write fails with `<table>.<name> isn't
+ * a column`, so this scan accepts a CHECK that no write can plan, as CREATE TABLE does. The
+ * same holds for a self-qualified name inside a CTE or derived-table body. If ALTER should
+ * refuse these, this is the site that would ask the catalog, as {@link stripColumnQualifier} does.
  */
 export interface OwnRowContextVariables {
 	/** Lowercase names of the declared variables. */
@@ -206,24 +238,33 @@ function requalifyOwnRowRef(
 	for (let i = stack.length - 1; i >= 1; i--) {
 		if (stack[i].bound.has(qualifier)) return;
 	}
-	if (qualifier === 'new') {
-		// A schema-qualified `main.new.a` is a three-part table reference, never a row
-		// image — the same rule the rename walkers apply.
-		if (col.schema !== undefined) return;
-	} else {
-		if (qualifier !== state.tableName) return;
-		// A qualified self-reference must name the OWNING table's schema exactly
-		// (see `stripColumnQualifier`).
-		if (!(col.schema === undefined || eq(col.schema, state.defaultSchema))) return;
-		if (state.contextVariables?.names.has(col.name.toLowerCase())) {
-			col.table = 'context';
-			col.schema = undefined;
-			state.changed = true;
-			return;
-		}
+	// A qualified self-reference must name the OWNING table's schema exactly
+	// (see `stripColumnQualifier`).
+	const selfQualified = qualifier === state.tableName
+		&& (col.schema === undefined || eq(col.schema, state.defaultSchema));
+	// A schema-qualified `main.new.a` is a three-part table reference, never a row
+	// image — the same rule the rename walkers apply.
+	const rowImage = qualifier === 'new' && col.schema === undefined;
+	if (!selfQualified && !rowImage) return;
+	if (selfQualified && selfQualifiedNameIsVariable(col, qualifier, state.contextVariables)) {
+		col.table = 'context';
+		col.schema = undefined;
+		state.changed = true;
+		return;
 	}
 	col.table = state.alias;
 	col.name = state.contextVariables?.shadowedColumns.get(col.name.toLowerCase()) ?? col.name;
 	col.schema = undefined;
 	state.changed = true;
+}
+
+/** Whether a self-qualified own-row spelling reads a variable rather than a column. See {@link OwnRowContextVariables}. */
+function selfQualifiedNameIsVariable(
+	col: AST.ColumnExpr,
+	qualifier: string,
+	contextVariables: OwnRowContextVariables | undefined,
+): boolean {
+	const nameLower = col.name.toLowerCase();
+	if (!contextVariables?.names.has(nameLower)) return false;
+	return !contextVariables.shadowedColumns.has(nameLower) || (qualifier === 'context' && col.schema === undefined);
 }
