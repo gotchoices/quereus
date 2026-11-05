@@ -97,9 +97,15 @@ export interface DatabaseInternal {
 	 * Registers an active VirtualTable connection for transaction management.
 	 *
 	 * When registered, the connection will:
-	 * - Receive `begin()` calls if a transaction is already active
+	 * - Receive `begin()`, then the open savepoint depths, if a transaction is
+	 *   active and not closing
 	 * - Participate in `commit()` and `rollback()` operations
 	 * - Be tracked for the lifetime of the transaction
+	 *
+	 * Registered while a transaction is closing (during its commit or rollback),
+	 * the connection receives no calls for that transaction and joins at the next
+	 * begin. A `begin()` that rejects rejects this call and leaves the connection
+	 * unregistered. See docs/module-authoring-transactions.md § Connection lifecycle.
 	 *
 	 * @param connection The connection to register
 	 */

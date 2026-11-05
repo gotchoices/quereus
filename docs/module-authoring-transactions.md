@@ -2,7 +2,7 @@
 
 > **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
 
-What a module owes DDL issued inside an open transaction, the `IssuerRowSources` bundle a wrapper module passes when the pending rows live outside the target module, and how a module registers, evicts, reuses, and adopts connections for transaction coordination. A satellite of [Virtual Table Module Authoring Guide](module-authoring.md).
+What a module owes DDL issued inside an open transaction, the `IssuerRowSources` bundle a wrapper module passes when the pending rows live outside the target module, how a module registers, evicts, reuses, and adopts connections for transaction coordination, and the sequence of calls the engine promises a registered connection. A satellite of [Virtual Table Module Authoring Guide](module-authoring.md).
 
 ## DDL inside an open transaction
 
@@ -156,7 +156,7 @@ class MyTable extends VirtualTable {
 
 | Method | Description |
 |--------|-------------|
-| `registerConnection(conn)` | Registers a connection for transaction management. If a transaction is already active, `begin()` is called on the connection and the active savepoint stack is replayed by calling `createSavepoint(depth)` for each open depth, so subsequent `releaseSavepoint` / `rollbackToSavepoint` broadcasts targeting earlier depths are in-range on the new connection. |
+| `registerConnection(conn)` | Registers a connection for transaction management. If a transaction is active and not closing, `begin()` is called on the connection and the active savepoint stack is replayed by calling `createSavepoint(depth)` for each open depth, so subsequent `releaseSavepoint` / `rollbackToSavepoint` broadcasts targeting earlier depths are in-range on the new connection. A `begin()` that rejects rejects the registration and leaves the connection unregistered. A connection registered while a transaction is closing joins at the next begin — see [Connection lifecycle](#connection-lifecycle). |
 | `unregisterConnection(id)` | Unregisters a connection. May be deferred during implicit transactions. |
 | `getConnection(id)` | Gets a connection by ID. |
 | `getConnectionsForTable(name)` | Gets all connections for a table. Matches the qualified name *or* the bare table name, so it can reach a same-named table in another schema. Useful for connection reuse. |
@@ -233,3 +233,42 @@ Implement the hook when a table's uncommitted state lives on the connection and 
 - You coordinate with external systems that have their own transaction semantics
 
 **Note:** The `DatabaseInternal` interface is marked `@internal` and may change between versions. It's intended for tight integration scenarios like storage backends and isolation layers.
+
+## Connection lifecycle
+
+> **Invariant:** [TXN-001](invariants.md#txn-001--a-registered-connection-gets-one-commit-or-rollback-per-begin)
+
+The engine drives a connection passed to `registerConnection` through a fixed sequence of calls. A module may rely on it, and a module that throws on a call outside it is behaving correctly.
+
+- Every `begin`, `commit`, `rollback` and savepoint call holds the execution mutex.
+- Calls on one connection never overlap.
+- A connection receives `begin`, then savepoint calls at in-range depths, then exactly one `commit` or `rollback`, before the next `begin`. A `commit` that rejects leaves the connection open, and `rollback` follows.
+- With no statement running and the database in autocommit, every registered connection is idle.
+
+In range means `createSavepoint(d)` names the depth one past the deepest savepoint the connection holds (0 after `begin`), and `releaseSavepoint(d)` / `rollbackToSavepoint(d)` name a depth it holds. A release drops depth `d` and everything above it; a rollback-to keeps `d` and drops what is above it.
+
+Two consequences shape how a module is written:
+
+- **A connection registered while a transaction is closing receives no calls for that transaction.** Closing covers the whole of a commit or rollback: commit-time assertion and deferred-constraint evaluation, the commit loop, post-commit watchers, and the rollbacks. The connection joins at the next `begin`. Until then it reads committed rows, which is the right answer for a table the closing transaction did not write; a table it did write already has a connection, which the module should reuse. A module that writes through such a connection during a commit drives that write itself, as the isolation layer's flush does through `VirtualTable.begin` and `commit`.
+- **A `begin` that rejects fails the statement that caused it, and the connection stays idle.** When the `begin` came from `registerConnection`, the connection is not left registered. When it came from the start of a transaction, the connections already begun are rolled back and the database stays in autocommit.
+
+The engine commits one connection ahead of its transaction in two places: a `refresh materialized view` of a maintained table that declares constraints, and an `alter table … set maintained` that retypes, recollates or tightens a column. It begins that connection again at once and replays the open savepoint depths, so the connection sees `begin`, `commit`, `begin`, and then the transaction's own `commit` or `rollback`. If the early `commit` rejects, the whole transaction is rolled back.
+
+### Checking a module against the lifecycle
+
+`installConnectionLifecycleCheck(db)` watches every connection `db` registers from then on and compares each call with the sequence above:
+
+```typescript
+import { Database, installConnectionLifecycleCheck } from '@quereus/quereus';
+
+const db = new Database();
+const lifecycle = installConnectionLifecycleCheck(db); // before the module registers a connection
+db.registerModule('mine', myModule);
+
+await db.exec('insert into t values (1)');
+lifecycle.assertClean(); // throws, listing every violation
+```
+
+A call outside the sequence is recorded in `lifecycle.violations` and then thrown, before the connection's own method runs. It is recorded as well as thrown because the engine swallows some of these throws on its error paths. `assertClean()` also fails when a registered connection is still open with no statement running and the database in autocommit. Like `installCommitStall`, the patch is permanent for the life of the database, so use one the test owns. The engine's own SQL logic tests run under the check on both the memory and the store backend.
+
+The check sees only calls on the object passed to `registerConnection`. Calls a wrapper makes on the connections inside it — `IsolatedConnection` on its overlay and underlying connections, `StoreTable.commit` on the store's shared coordinator — are the wrapper's own business, and a wrapper that wants them checked has to check them itself.

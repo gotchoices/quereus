@@ -18,7 +18,7 @@ This document is the **hub**: the retrieve boundary, the capability APIs in outl
 | [Module Capability Negotiation](module-capabilities.md) | The inventory of every negotiation surface on the `VirtualTableModule` contract: how each one is signaled, the engine's fallback when a module omits it, the DDL transactionality tiers, and the per-arm `alterTable` mandate. |
 | [Committed-Snapshot Reads](module-committed-reads.md) | The `readCommittedSnapshot` declaration: the obligation it takes on, the implementation shapes that meet it, what a wrapper module owes a snapshot-safe underlying, and the conformance harness. |
 | [Schema Changes (`SchemaChangeInfo`)](module-authoring-schema-changes.md) | Every `alterTable` arm and its per-arm mandate, the `ddl` emit-iff-set rule, the engine-side rebuild fallback when a module cannot honor an arm natively, and the optional `alterTags` hook. |
-| [Module Transactions and Connections](module-authoring-transactions.md) | The obligations of DDL inside an open transaction, the `IssuerRowSources` bundle a wrapper passes down, and connection registration, eviction, reuse, and adoption. |
+| [Module Transactions and Connections](module-authoring-transactions.md) | The obligations of DDL inside an open transaction, the `IssuerRowSources` bundle a wrapper passes down, connection registration, eviction, reuse, and adoption, and the lifecycle the engine promises a registered connection. |
 
 ## Overview
 

@@ -1480,10 +1480,11 @@ export async function attachMaintainedDerivation(
 			// PENDING layer. So commit the reconcile eagerly first (refresh-parity
 			// commit-first semantics — the structural ops above are already
 			// non-transactional, so the reshaping attach is DDL-grade atomicity
-			// regardless; the later coordinated commit no-ops). Then mirror
-			// reshapeBackingInPlace's post batch: re-register the catalog after EACH
-			// op so a mid-batch throw cannot strand catalog/module divergence.
-			await conn.commit();
+			// regardless). The early commit re-begins the connection, so it stays a
+			// participant and the coordinated commit closes that second begin. Then
+			// mirror reshapeBackingInPlace's post batch: re-register the catalog after
+			// EACH op so a mid-batch throw cannot strand catalog/module divergence.
+			await db._commitConnectionEarly(conn);
 			reconcileCommitted = true;
 			for (const op of reshapePlan.postReconcileOps) {
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
@@ -1750,7 +1751,9 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
  * which throws the maintained-table-attributed CONSTRAINT diagnostic on the first
  * violator BEFORE the swap is committed (the failing statement unwinds and the
  * pending reconcile is discarded by statement-level rollback — the pre-refresh
- * COMMITTED contents stay intact), then `conn.commit()`.
+ * COMMITTED contents stay intact), then commits that one connection ahead of the
+ * transaction (`Database._commitConnectionEarly`, which re-begins it so the
+ * transaction's own commit or rollback still closes it exactly once).
  *
  * The commit is **commit-first parity** and load-bearing two ways: (1)
  * `replaceContents` already swaps committed state (a `begin; refresh; rollback`
@@ -1847,7 +1850,7 @@ export async function rebuildBacking(
 	// the wrong-semantics gap. The attach reshape path passes the same preview at its
 	// own call site, so both arms reject identically.
 	await validateDeclaredConstraintsOverContents(db, backing, validationColumns);
-	await conn.commit();
+	await db._commitConnectionEarly(conn);
 }
 
 /**

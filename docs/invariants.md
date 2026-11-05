@@ -1237,3 +1237,20 @@ of all table data rather than relying on this.
 ## LENS — Lens
 
 Reserved.
+
+## TXN — Transactions
+
+### TXN-001 — A registered connection gets one commit or rollback per begin
+
+- code: `packages/quereus/src/core/database-transaction.ts` — `TransactionManager`
+- code: `packages/quereus/src/core/database.ts` — `registerConnection`
+- guard: `packages/quereus/src/vtab/test-support/connection-lifecycle-check.ts` — `installConnectionLifecycleCheck` (run over the logic corpus on both backends by `packages/quereus/test/logic.spec.ts`)
+- doc: [Module Transactions and Connections § Connection lifecycle](module-authoring-transactions.md#connection-lifecycle)
+
+On a connection passed to `Database.registerConnection`, every `begin`, `commit`, `rollback`
+and savepoint call the engine makes holds the execution mutex, and calls on one connection
+never overlap. The connection receives `begin`, then savepoint calls at in-range depths, then
+exactly one `commit` or `rollback`, before the next `begin`. A `commit` that rejects leaves it
+open, and `rollback` follows; a `begin` that rejects leaves it idle. With no statement running,
+an engine in autocommit means every registered connection is idle. Only the registered object
+is covered: calls a wrapper connection makes on the connections inside it are its own.

@@ -43,8 +43,6 @@ export interface TransactionManagerContext {
 	 *  mode), violations are collected into it and the commit proceeds instead
 	 *  of throwing on the first violation. */
 	runGlobalAssertions(sink?: AssertionViolation[]): Promise<void>;
-	/** Run deferred row constraints before commit */
-	runDeferredRowConstraints(): Promise<void>;
 	/** Fire post-commit watchers (Database.watch). Errors logged, never rolled
 	 *  back. Invoked after all connections commit but before the change log
 	 *  is cleared. */
@@ -123,8 +121,21 @@ export class TransactionManager {
 	/** Per-base-table projection capture demand registered by DeltaExecutor consumers. */
 	private captureDemand = new Map<string, TableCaptureDemand>();
 
-	/** Flag to prevent new connections from starting transactions during constraint evaluation */
-	private evaluatingDeferredConstraints = false;
+	/**
+	 * Connections this manager has begun and not yet committed or rolled back. Every
+	 * engine commit and rollback call is made through it, which is what keeps each
+	 * connection to exactly one of them per begin (docs/invariants.md TXN-001).
+	 * Emptied when a transaction ends. A connection removed from the registry while
+	 * open stays in the set but is filtered out by {@link openParticipants}.
+	 */
+	private readonly openConnections = new Set<VirtualTableConnection>();
+	/**
+	 * True for the whole of {@link commitTransaction} and {@link rollbackTransaction}:
+	 * assertion and deferred-constraint evaluation, the commit loop, post-commit
+	 * watchers, the rollbacks. A connection registered meanwhile receives no calls
+	 * for the closing transaction and joins at the next begin.
+	 */
+	private closingTransaction = false;
 	/** Flag indicating we're in a coordinated multi-connection commit */
 	private inCoordinatedCommit = false;
 
@@ -171,21 +182,14 @@ export class TransactionManager {
 		return this.transactionSource === 'implicit';
 	}
 
-	/** Check if we should skip auto-beginning transactions on newly registered connections */
-	isEvaluatingDeferredConstraints(): boolean {
-		return this.evaluatingDeferredConstraints;
-	}
-
 	/** Check if we're in a coordinated commit (allows sibling layer validation) */
 	isInCoordinatedCommit(): boolean {
 		return this.inCoordinatedCommit;
 	}
 
 	/**
-	 * Current savepoint stack depth (number of active savepoints). Used by
-	 * `Database.registerConnection` to replay the active stack onto connections
-	 * registered mid-transaction so that subsequent rollback-to / release calls
-	 * targeting earlier depths are in-range on the new connection.
+	 * Current savepoint stack depth (number of active savepoints). The depths
+	 * {@link joinConnection} replays onto a connection that joins mid-transaction.
 	 */
 	getActiveSavepointDepth(): number {
 		return this.savepointStack.length;
@@ -225,24 +229,130 @@ export class TransactionManager {
 		// Start batching events for this transaction
 		this.ctx.getEventEmitter().startBatch();
 
-		// Begin transaction on all active connections
-		const connections = this.ctx.getAllConnections();
-		for (const connection of connections) {
-			try {
-				await connection.begin();
-			} catch (error) {
-				errorLog(`Error beginning transaction on connection ${connection.connectionId}: %O`, error);
-				throw error;
-			}
-		}
-
+		// Marked active before any connection begins, so a connection registered while
+		// another's begin() is awaited joins through joinConnection rather than being
+		// missed by the snapshot this loop iterates.
 		this.inTransaction = true;
 		this.isAutocommit = false;
 		this.transactionSource = source;
 
+		try {
+			for (const connection of this.ctx.getAllConnections()) {
+				await this.joinConnection(connection);
+			}
+		} catch (error) {
+			// The connections already begun are owed a rollback, and the caller must
+			// not be left inside a transaction only some connections joined.
+			await this.rollbackTransaction();
+			throw error;
+		}
+
 		if (source === 'explicit') {
 			this.clearChangeLog();
 		}
+	}
+
+	/**
+	 * Brings a registered connection into the active transaction: `begin()`, then
+	 * the active savepoint depths. Does nothing when no transaction is active, when
+	 * the active one is closing (the connection then joins at the next begin), or
+	 * when the connection is already open. A rejected `begin()` propagates and
+	 * leaves the connection idle.
+	 */
+	async joinConnection(connection: VirtualTableConnection): Promise<void> {
+		if (!this.inTransaction || this.openConnections.has(connection)) return;
+		if (this.closingTransaction) {
+			debugLog(`Connection ${connection.connectionId} registered while its transaction is closing; it joins at the next begin.`);
+			return;
+		}
+
+		// Marked open before the await, so a second join of the same object cannot begin it twice.
+		this.openConnections.add(connection);
+		try {
+			await connection.begin();
+		} catch (error) {
+			this.openConnections.delete(connection);
+			errorLog(`Error beginning transaction on connection ${connection.connectionId}: %O`, error);
+			throw error;
+		}
+		await this.replaySavepoints(connection);
+	}
+
+	/**
+	 * Replays the active savepoint stack onto a connection that has just begun, so
+	 * release / rollback-to broadcasts targeting earlier depths are in range on it.
+	 * Modules that register connections lazily (memory, isolation, any vtab whose
+	 * connection appears on first read or write) would otherwise see an empty stack
+	 * while the engine broadcasts depths above zero.
+	 */
+	private async replaySavepoints(connection: VirtualTableConnection): Promise<void> {
+		const activeDepth = this.savepointStack.length;
+		for (let depth = 0; depth < activeDepth; depth++) {
+			try {
+				await connection.createSavepoint(depth);
+			} catch (error) {
+				// NOTE: a rejected replay leaves this connection short of savepoint depths, so a
+				// later release / rollback-to broadcast is out of range on it. No in-tree module's
+				// createSavepoint rejects; if one appears, fail the registration and roll this
+				// connection back instead of continuing.
+				errorLog(`Error replaying savepoint depth ${depth} on connection ${connection.connectionId}: %O`, error);
+			}
+		}
+	}
+
+	/** The registered connections that are open, in registration order. */
+	private openParticipants(): VirtualTableConnection[] {
+		return this.ctx.getAllConnections().filter(connection => this.openConnections.has(connection));
+	}
+
+	/**
+	 * Commits each open participant in turn — sequentially, to avoid races with
+	 * layer promotion. A connection leaves the open set when its commit resolves.
+	 * One whose commit rejects stays in it, so the caller's rollback reaches that
+	 * connection and those not yet committed, and none that already committed.
+	 */
+	private async commitOpenConnections(): Promise<void> {
+		// Relaxes layer validation for sibling layers while the loop runs.
+		this.inCoordinatedCommit = true;
+		try {
+			for (const connection of this.openParticipants()) {
+				try {
+					await connection.commit();
+				} catch (error) {
+					errorLog(`Error committing transaction on connection ${connection.connectionId}: %O`, error);
+					throw error;
+				}
+				this.openConnections.delete(connection);
+			}
+		} finally {
+			this.inCoordinatedCommit = false;
+		}
+	}
+
+	/**
+	 * Rolls back every open participant. Each call is isolated, so one that throws,
+	 * synchronously included, cannot keep the others from being reached. Failures
+	 * are logged, never rethrown.
+	 */
+	private async rollbackOpenConnections(): Promise<void> {
+		await Promise.all(this.openParticipants().map(async connection => {
+			this.openConnections.delete(connection);
+			try {
+				await connection.rollback();
+			} catch (error) {
+				errorLog(`Error rolling back transaction on connection ${connection.connectionId}: %O`, error);
+			}
+		}));
+	}
+
+	/** Returns the manager to autocommit. Runs in a `finally` on every path that ends a transaction. */
+	private resetToAutocommit(): void {
+		this.inTransaction = false;
+		this.isAutocommit = true;
+		this.transactionSource = null;
+		this.closingTransaction = false;
+		this.openConnections.clear();
+		this.clearChangeLog();
 	}
 
 	/**
@@ -257,15 +367,13 @@ export class TransactionManager {
 
 		debugLog(`Committing ${this.transactionSource} transaction.`);
 
-		// Snapshot connections before evaluating deferred constraints
-		const connectionsToCommit = this.ctx.getAllConnections();
-
 		// Consume the pending report-mode sink read-and-clear: even if this commit
 		// fails for another reason (a connection commit error, a deferred row
 		// constraint), the NEXT ordinary commit must throw on violation as usual.
 		const assertionSink = this.pendingCommitAssertionSink;
 		this.pendingCommitAssertionSink = null;
 
+		this.closingTransaction = true;
 		let commitSucceeded = false;
 		try {
 			// Evaluate global assertions and deferred row constraints BEFORE
@@ -274,24 +382,10 @@ export class TransactionManager {
 			// (default) the first violation throws into the catch below and rolls
 			// back, discarding batched events.
 			await this.ctx.runGlobalAssertions(assertionSink ?? undefined);
-			await this.ctx.runDeferredRowConstraints();
+			await this.ctx.getDeferredConstraints().runDeferredRows();
 
-			// Mark coordinated commit to relax layer validation for sibling layers
-			this.inCoordinatedCommit = true;
-			try {
-				// Commit sequentially to avoid race conditions with layer promotion
-				for (const connection of connectionsToCommit) {
-					try {
-						await connection.commit();
-					} catch (error) {
-						errorLog(`Error committing transaction on connection ${connection.connectionId}: %O`, error);
-						throw error;
-					}
-				}
-				commitSucceeded = true;
-			} finally {
-				this.inCoordinatedCommit = false;
-			}
+			await this.commitOpenConnections();
+			commitSucceeded = true;
 
 			// Fire post-commit watchers while the change log is still alive.
 			// Errors are swallowed inside the manager — watchers do not roll
@@ -317,16 +411,13 @@ export class TransactionManager {
 			// maintained synchronously at the DML boundary, so its backing table is
 			// already current and committed in lockstep with the source write.
 		} catch (e) {
-			// On pre-commit assertion failure (or commit error), rollback all connections
-			const conns = this.ctx.getAllConnections();
-			await Promise.allSettled(conns.map(c => c.rollback()));
+			// A failed assertion, deferred constraint or connection commit: roll back
+			// what is still open. Connections that already committed stay committed.
+			await this.rollbackOpenConnections();
 			this.notifyRolledBack();
 			throw e;
 		} finally {
-			this.inTransaction = false;
-			this.isAutocommit = true;
-			this.transactionSource = null;
-			this.clearChangeLog();
+			this.resetToAutocommit();
 
 			// Flush or discard batched events based on commit success
 			if (commitSucceeded) {
@@ -353,27 +444,49 @@ export class TransactionManager {
 		// here would release the execution mutex with `inTransaction` still true and
 		// the next queued caller would run inside a transaction nobody owns — the
 		// exact stranding an atomic `exec` batch exists to prevent.
+		this.closingTransaction = true;
 		try {
-			// Rollback all active connections
-			const connections = this.ctx.getAllConnections();
-			const rollbackPromises = connections.map(async (connection) => {
-				try {
-					await connection.rollback();
-				} catch (error) {
-					errorLog(`Error rolling back transaction on connection ${connection.connectionId}: %O`, error);
-				}
-			});
-
-			await Promise.allSettled(rollbackPromises);
+			await this.rollbackOpenConnections();
 
 			// Discard batched events on rollback
 			this.ctx.getEventEmitter().discardBatch();
 		} finally {
-			this.inTransaction = false;
-			this.isAutocommit = true;
-			this.transactionSource = null;
-			this.clearChangeLog();
+			this.resetToAutocommit();
 			this.notifyRolledBack();
+		}
+	}
+
+	/**
+	 * Commits one connection ahead of its transaction, for a caller whose later
+	 * steps read that connection's rows as committed, then brings it back into the
+	 * transaction. The connection sees begin, commit, begin, and later the
+	 * transaction's own commit or rollback: one of those per begin.
+	 *
+	 * A failure rolls the whole transaction back and rethrows. A connection whose
+	 * commit rejected can only take a rollback, so failing the statement alone
+	 * would leave an explicit transaction running on a connection that can no
+	 * longer take part in it.
+	 *
+	 * NOTE: a rejected re-begin is reported the same way as a rejected commit, though
+	 * the rows are committed by then. No in-tree module's begin rejects; if one does
+	 * and a caller needs to tell the two apart, report which step failed.
+	 */
+	async commitConnectionEarly(connection: VirtualTableConnection): Promise<void> {
+		if (!this.openConnections.has(connection)) {
+			throw new QuereusError(
+				`Internal error: early commit of connection ${connection.connectionId}, which is not open in the current transaction`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		try {
+			await connection.commit();
+			this.openConnections.delete(connection);
+			await this.joinConnection(connection);
+		} catch (error) {
+			errorLog(`Error committing connection ${connection.connectionId} ahead of its transaction: %O`, error);
+			await this.rollbackTransaction();
+			throw error;
 		}
 	}
 
@@ -421,22 +534,6 @@ export class TransactionManager {
 		if (this.transactionSource === 'implicit') {
 			debugLog('Upgrading implicit transaction to explicit (savepoint encountered).');
 			this.transactionSource = 'explicit';
-		}
-	}
-
-	// ============================================================================
-	// Deferred Constraint Evaluation
-	// ============================================================================
-
-	/**
-	 * Run deferred row constraints with proper flag management.
-	 */
-	async runDeferredRowConstraints(): Promise<void> {
-		this.evaluatingDeferredConstraints = true;
-		try {
-			await this.ctx.getDeferredConstraints().runDeferredRows();
-		} finally {
-			this.evaluatingDeferredConstraints = false;
 		}
 	}
 

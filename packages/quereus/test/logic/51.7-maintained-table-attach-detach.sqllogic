@@ -466,3 +466,42 @@ select id, x from rmv order by id;
 
 drop materialized view rmv;
 drop table rsrc;
+
+-- ===================================
+-- 13. connection lifecycle across the early commit (docs/invariants.md TXN-001)
+-- ===================================
+-- Refresh of a constraint-bearing maintained table, and a reshaping attach, each
+-- commit one connection ahead of the transaction. The harness's lifecycle check
+-- fails the file if that connection is then committed a second time without a
+-- begin, or handed a savepoint depth it does not hold.
+
+-- refresh of a CHECK-bearing maintained table commits its connection early
+create table lc_src (id integer primary key, v integer);
+insert into lc_src values (1, 1), (2, 2);
+create table lc_mt (id integer primary key, v integer check (v > 0)) maintained as select id, v from lc_src;
+-- run
+refresh materialized view lc_mt;
+-- run
+select id, v from lc_mt order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2}]
+
+-- a retyping attach inside a savepoint: the early commit must leave later savepoint calls in range
+create table lc_tgt (id integer primary key, v text);
+create table lc_base (id integer primary key, v integer);
+insert into lc_base values (1, 5);
+-- run
+begin;
+savepoint lc_s;
+-- run
+alter table lc_tgt set maintained as select id, v from lc_base;
+-- run
+release lc_s;
+commit;
+-- run
+select id, v from lc_tgt order by id;
+→ [{"id":1,"v":5}]
+
+drop materialized view lc_tgt;
+drop table lc_base;
+drop materialized view lc_mt;
+drop table lc_src;

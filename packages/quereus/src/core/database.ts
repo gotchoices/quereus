@@ -2211,15 +2211,6 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.deferredConstraints.enqueue(baseTable, constraintName, row, descriptor, evaluator, connectionId, contextRow, contextDescriptor);
 	}
 
-	public async runDeferredRowConstraints(): Promise<void> {
-		await this.transactionManager.runDeferredRowConstraints();
-	}
-
-	/** @internal Check if we should skip auto-beginning transactions on newly registered connections */
-	public _isEvaluatingDeferredConstraints(): boolean {
-		return this.transactionManager.isEvaluatingDeferredConstraints();
-	}
-
 	/** @internal Check if we're in a coordinated commit (allows sibling layer validation) */
 	public _inCoordinatedCommit(): boolean {
 		return this.transactionManager.isInCoordinatedCommit();
@@ -2704,41 +2695,39 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * @internal Registers an active VirtualTable connection for transaction management.
+	 * Inside a transaction that is not closing, the connection joins it: `begin()`,
+	 * then the active savepoint depths. Registered while a transaction is closing, it
+	 * receives no calls for that transaction and joins at the next begin. See
+	 * docs/module-authoring-transactions.md § Connection lifecycle.
+	 *
+	 * A rejected `begin()` rejects the registration and leaves the connection
+	 * unregistered: one that never began gets no commit, so keeping it registered
+	 * would silently drop whatever the module then wrote through it.
+	 *
 	 * @param connection The connection to register
 	 */
 	async registerConnection(connection: VirtualTableConnection): Promise<void> {
 		this.activeConnections.set(connection.connectionId, connection);
 		log(`Registered connection ${connection.connectionId} for table ${connection.tableName}`);
 
-		// If we're already in a transaction (implicit or explicit),
-		// start a transaction on this new connection UNLESS we're evaluating deferred constraints
-		// (during which subqueries should read committed state without creating new transaction layers)
-		if (this.transactionManager.isInTransaction() && !this.transactionManager.isEvaluatingDeferredConstraints()) {
-			try {
-				await connection.begin();
-				log(`Started transaction on newly registered connection ${connection.connectionId}`);
-			} catch (error) {
-				errorLog(`Error starting transaction on newly registered connection ${connection.connectionId}: %O`, error);
-				// Don't throw here - just log the error to avoid breaking connection registration
+		try {
+			await this.transactionManager.joinConnection(connection);
+		} catch (error) {
+			if (this.activeConnections.get(connection.connectionId) === connection) {
+				this.activeConnections.delete(connection.connectionId);
 			}
-
-			// Replay the active savepoint stack onto this connection so subsequent
-			// release/rollback-to broadcasts targeting earlier depths are in-range.
-			// Without this, modules that register connections lazily (memory, isolation,
-			// any vtab whose connection appears on first read/write) see an empty stack
-			// while the DB broadcasts depths > 0 — silently no-op'ing on a real depth.
-			const activeDepth = this.transactionManager.getActiveSavepointDepth();
-			for (let depth = 0; depth < activeDepth; depth++) {
-				try {
-					await connection.createSavepoint(depth);
-				} catch (error) {
-					errorLog(`Error replaying savepoint depth ${depth} on newly registered connection ${connection.connectionId}: %O`, error);
-					// Continue replaying remaining depths — see comment above on registration robustness.
-				}
-			}
-		} else if (this.transactionManager.isEvaluatingDeferredConstraints()) {
-			log(`Skipped transaction begin on connection ${connection.connectionId} (evaluating deferred constraints)`);
+			throw error;
 		}
+	}
+
+	/**
+	 * @internal Commits one connection ahead of the open transaction and brings it
+	 * back into it. For engine paths whose later steps read that connection's rows
+	 * as committed; a failure rolls the whole transaction back. See
+	 * `TransactionManager.commitConnectionEarly`.
+	 */
+	async _commitConnectionEarly(connection: VirtualTableConnection): Promise<void> {
+		await this.transactionManager.commitConnectionEarly(connection);
 	}
 
 	/**

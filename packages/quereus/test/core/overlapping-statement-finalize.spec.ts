@@ -125,7 +125,8 @@ describe('overlapping statements and the implicit transaction', () => {
 	}
 
 	it('a failing commit rejects the writer and not the overlapping select', async () => {
-		await db.registerConnection(new CountingConnection('failing', new Error('commit failed')));
+		const failing = new CountingConnection('failing', new Error('commit failed'));
+		await db.registerConnection(failing);
 		const entered = stall.arm();
 		const writer = collect(db.eval(INSERT));
 		await entered;
@@ -137,7 +138,9 @@ describe('overlapping statements and the implicit transaction', () => {
 		expect((await rejectionOf(writer)).message).to.equal('commit failed');
 		await read;
 		expect(connection.commits).to.equal(1);
-		expect(connection.rollbacks).to.equal(1);
+		// Rollback goes to the connection whose commit failed, not to one that already committed.
+		expect(connection.rollbacks).to.equal(0);
+		expect(failing.rollbacks).to.equal(1);
 	});
 
 	for (const { name, act } of BYSTANDERS) {

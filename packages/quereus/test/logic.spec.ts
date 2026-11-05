@@ -8,6 +8,7 @@ import { Database } from '../src/core/database.js';
 import { QuereusError } from '../src/common/errors.js';
 import { safeJsonStringify } from '../src/util/serialization.js';
 import { CollectingInstructionTracer } from '../src/runtime/types.js';
+import { installConnectionLifecycleCheck, type ConnectionLifecycleCheck } from '../src/vtab/test-support/connection-lifecycle-check.js';
 import { formatPlanTree, formatPlanSummary, type PlanDisplayOptions } from '../src/planner/debug.js';
 import {
 	parseRequiredCapabilities,
@@ -517,6 +518,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 
 		describe(`File: ${file}`, () => {
 			let db: Database;
+			let lifecycleCheck: ConnectionLifecycleCheck;
 			let testStorePath: string | null = null;
 			let leveldbModule: any = null;
 
@@ -526,6 +528,8 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 				}
 
 				db = new Database();
+				// Installed before any module registers a connection, so every one is watched.
+				lifecycleCheck = installConnectionLifecycleCheck(db);
 
 				// Set trace_plan_stack option if enabled
 				if (TEST_OPTIONS.tracePlanStack) {
@@ -592,6 +596,18 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					expectedResultJson = null;
 					expectedErrorSubstring = null;
 					currentParams = null;
+				};
+
+				/**
+				 * Fails the file if the block that just ran broke the connection lifecycle
+				 * contract (docs/invariants.md TXN-001), whatever its SQL outcome.
+				 */
+				const assertConnectionLifecycle = (lineNum: number) => {
+					try {
+						lifecycleCheck.assertClean();
+					} catch (e: any) {
+						throw new Error(`[${file}:${lineNum}] ${e.message}`);
+					}
 				};
 
 				/**
@@ -762,6 +778,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 
 							if (currentSql.trim()) {
 								await executeExpectingError(currentSql.trim(), expectedErrorSubstring, lineNumber);
+								assertConnectionLifecycle(lineNumber);
 								resetState();
 							}
 						} else if (trimmedLine.toLowerCase().startsWith('-- params:')) {
@@ -776,6 +793,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 							// Run accumulated SQL as setup immediately
 							if (currentSql.trim()) {
 								await executeSetup(currentSql.trim(), lineNumber);
+								assertConnectionLifecycle(lineNumber);
 								resetState();
 							}
 						}
@@ -789,6 +807,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 						// Execute immediately with result expectation
 						if (currentSql.trim()) {
 							await executeExpectingResults(currentSql.trim(), expectedResultJson, lineNumber, currentParams);
+							assertConnectionLifecycle(lineNumber);
 							resetState();
 						}
 						continue; // Don't add to SQL
@@ -812,6 +831,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 				// Process any remaining SQL at the end of the file (treat as setup)
 				if (currentSql.trim()) {
 					await executeSetup(currentSql.trim(), lineNumber);
+					assertConnectionLifecycle(lineNumber);
 				}
 			});
 		});

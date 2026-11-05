@@ -4,6 +4,19 @@ import { MaybePromise } from "../common/types.js";
  * Generic interface for VirtualTable connections that support transactions.
  * This allows different vtab modules to implement their own connection strategies
  * while providing a consistent interface for transaction operations.
+ *
+ * What the engine promises a connection passed to `Database.registerConnection`
+ * (docs/invariants.md TXN-001; docs/module-authoring-transactions.md § Connection lifecycle):
+ *
+ * - Every `begin`, `commit`, `rollback` and savepoint call holds the execution mutex.
+ * - Calls on one connection never overlap.
+ * - A connection receives `begin`, then savepoint calls at in-range depths, then
+ *   exactly one `commit` or `rollback`, before the next `begin`. A `commit` that
+ *   rejects leaves the connection open, and `rollback` follows. A `begin` that
+ *   rejects leaves it idle.
+ * - With no statement running and the database in autocommit, the connection is idle.
+ *
+ * `installConnectionLifecycleCheck` checks a module's test runs against this.
  */
 export interface VirtualTableConnection {
 	/** Unique identifier for this connection */

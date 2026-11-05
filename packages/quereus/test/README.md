@@ -62,6 +62,7 @@ node --import ./packages/quereus/register.mjs node_modules/mocha/bin/mocha.js 'p
   - `90–99`, `100+` — error paths, exotic edge cases, mutation kills.
 - Use a decimal sub-number to slot between adjacent files (`06.2.1-…` between `06.2-…` and `06.3-…`); don't renumber existing files.
 - Tests represent expected behavior when features are fully implemented. A failing test is a roadmap item, not a regression to silence.
+- Every block also runs under the connection lifecycle check (`installConnectionLifecycleCheck`, see `docs/module-authoring-transactions.md` § Connection lifecycle). A block whose SQL results match still fails its file with `Connection lifecycle violation: …` if the engine committed a connection twice, rolled back one it never began, or left one open after the block. That is an engine or module defect, not a fixture problem. A downstream harness gets the same check by installing it on its database and calling `assertClean()` after each block.
 
 ### `-- requires-capability:` directive
 

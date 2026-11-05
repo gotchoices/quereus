@@ -74,6 +74,8 @@ export type {
 export { runCommittedReadConformance } from './vtab/test-support/committed-read-conformance.js';
 export type { CommitStall, CommitStallHandle } from './vtab/test-support/commit-stall.js';
 export { installCommitStall, settleMacrotasks } from './vtab/test-support/commit-stall.js';
+export type { ConnectionLifecycleCheck } from './vtab/test-support/connection-lifecycle-check.js';
+export { installConnectionLifecycleCheck } from './vtab/test-support/connection-lifecycle-check.js';
 
 // Virtual Table Event Hooks
 export type {
