@@ -57,3 +57,7 @@ The existing-row CHECK scan holds its own copy of this reading: `requalifyOwnRow
 ## How reversible this is
 
 Choosing a meaning changes which writes a CHECK accepts, so rows stored under the old meaning can violate the new one, and nothing re-validates them. The optimizer screen can stay either way: it would only forgo a fact. Lifting facts from `<table>.<name>` again would need those stored rows accounted for.
+
+## Decided by the maintainer 2026-11-04
+
+The proposed text above is accepted: `<table>.<column>` always reaches the column, which also settles the table literally named `new`. Rows stored under the old meaning are not re-validated, so say so in the docs and in the handoff for the release notes. Check a column DEFAULT too, since it was not measured.
