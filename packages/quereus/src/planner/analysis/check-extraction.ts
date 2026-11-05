@@ -201,6 +201,10 @@ export function isRowInvariantCheck(check: RowConstraintSchema): boolean {
  * those to the row the operation judges rather than the OLD image. Skipping the
  * conjunct stays sound, since that only forgoes its facts.
  *
+ * NOTE: the existing-row scan skips that conjunct too, three-part `main."old".col`
+ * included, so ALTER accepts a violating row on a table named `old`; no fact is lifted, so
+ * the row stays visible. If that table name matters, test `schema === undefined` here.
+ *
  * Exported for the existing-row CHECK scan (`storedRowPredicate` in
  * `schema/constraint-builder.ts`), which screens conjuncts with THIS predicate so
  * the set it validates can never be narrower than the set lifted here.

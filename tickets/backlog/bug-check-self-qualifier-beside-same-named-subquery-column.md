@@ -28,3 +28,7 @@ The same CHECK spelled `new.b` works, and with a source that has no column `b` t
 A self-qualified name in a CHECK reaches the row's column wherever it appears, unless an inner FROM rebinds the qualifier.
 
 `bug-self-qualified-check-reads-context-variable` introduces a reserved qualifier for this, used only for a column that shares its name with a context variable, which cannot be captured by a subquery's source. Using it for every self-qualified name in a CHECK would close this bug, and might remove the catalog lookup from the strip. Generated columns share the strip and are likely to behave the same way, which was not measured.
+
+That reserved qualifier has landed as `OWN_ROW_QUALIFIER`. Its branch in `stripColumnQualifier` deliberately stops at CTE, derived-table and DML bodies (`hasBarrierFrame`), which a wider use has to keep: a materialized CTE holds one buffer per execution, so correlating into it would judge every row on the first row's value.
+
+Also measured here: `check (exists (select 1 from generate_series(1, f.b) g where g.value = 2))` fails every write with `f.b isn't a column`, and works when `b` shares its name with a context variable. The reserved qualifier would close this function-argument shape too.

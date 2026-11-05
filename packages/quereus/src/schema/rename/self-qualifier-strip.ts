@@ -10,8 +10,12 @@ import { walkSchemaExpressionScope } from '../expr-scope/walk.js';
 /**
  * The qualifier a CHECK's scope registers a shadowed column under: one whose name a
  * mutation-context variable also claims, so the bare name is the variable's. The strip
- * folds `<table>.<name>` to it. Spelled so that no FROM source a user could write inside
- * a CHECK subquery rebinds it, and lowercase because scope keys are.
+ * folds `<table>.<name>` to it. Spelled to be implausible as a FROM alias, and lowercase
+ * because scope keys are.
+ *
+ * NOTE: nothing refuses a user alias of this spelling, and one inside a CHECK subquery
+ * captures the fold, so the CHECK compares that source's column with itself. If aliases
+ * ever get a reserved prefix, include this one.
  */
 export const OWN_ROW_QUALIFIER = '__quereus_own_row__';
 

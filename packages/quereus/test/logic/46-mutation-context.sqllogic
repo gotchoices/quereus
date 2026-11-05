@@ -732,13 +732,15 @@ alter table AvSelfReq add constraint k check (AvSelfReq.who > 0);
 -- error: existing rows in 'AvSelfReq' violate
 alter table AvSelfReq add constraint k check (AvSelfReq.who < 0);
 
--- On a table named `new`, all three spellings reach the column.
-create table "new" (a integer primary key, who integer null) with context (who integer null);
+-- On a table named `new`, both spellings reach the column, and a name that is only a variable
+-- reads the variable, which is NULL here, so the row passes.
+create table "new" (a integer primary key, who integer null) with context (who integer null, ghost integer null);
 insert into "new" values (1, -1);
 alter table "new" add constraint k1 check ("new".who > 0);
 -- error: existing rows in 'new' violate
 alter table "new" add constraint k2 check (main."new".who > 0);
 -- error: existing rows in 'new' violate
+alter table "new" add constraint k3 check (new.ghost > 0);
 drop table "new";
 
 -- The internal name a shadowed column is scanned under stays clear of a real column using it.
