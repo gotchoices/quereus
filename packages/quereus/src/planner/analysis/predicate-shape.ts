@@ -145,32 +145,37 @@ export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
 
 /**
  * Depth-first iteration over every AST node in `root`'s subtree. Children are
- * discovered reflectively (any object/array property carrying a `type` field)
- * rather than via a typed visitor table, so soundness-sensitive walkers (the
- * collation gate, the non-determinism screen, the MV body-function capture)
- * cannot silently miss node kinds a visitor enumeration forgot. Accepts any
- * `AstNode`, so a whole statement (e.g. a materialized view's body `QueryExpr`)
- * walks the same way a bare expression does.
+ * discovered reflectively rather than via a typed visitor table, so
+ * soundness-sensitive walkers (the collation gate, the non-determinism screen, the
+ * MV body-function capture) cannot silently miss node kinds a visitor enumeration
+ * forgot. Accepts any `AstNode`, so a whole statement (e.g. a materialized view's
+ * body `QueryExpr`) walks the same way a bare expression does.
+ *
+ * Containers with no `type` of their own (a CASE's when/then pairs, an ORDER BY
+ * item, a window specification) are walked through but not yielded: an expression
+ * inside one is as much a part of the subtree as any other.
  */
 export function* walkAstNodes(root: AST.AstNode): IterableIterator<AST.AstNode> {
-	const stack: AST.AstNode[] = [root];
+	const stack: unknown[] = [root];
 	while (stack.length > 0) {
-		const node = stack.pop()!;
-		yield node;
-		for (const key of Object.keys(node)) {
-			const v = (node as unknown as Record<string, unknown>)[key];
-			if (!v) continue;
-			if (Array.isArray(v)) {
-				for (const item of v) {
-					if (item && typeof item === 'object' && 'type' in item) {
-						stack.push(item as AST.AstNode);
-					}
-				}
-			} else if (typeof v === 'object' && 'type' in (v as object)) {
-				stack.push(v as AST.AstNode);
-			}
+		const value = stack.pop();
+		if (Array.isArray(value)) {
+			for (const item of value) stack.push(item);
+			continue;
+		}
+		if (!isPlainObject(value)) continue;
+		if (typeof value.type === 'string') yield value as unknown as AST.AstNode;
+		for (const key of Object.keys(value)) {
+			if (key !== 'loc') stack.push(value[key]);
 		}
 	}
+}
+
+/** Excludes a literal's non-AST object values, such as a blob's `Uint8Array`. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	if (value === null || typeof value !== 'object') return false;
+	const proto = Object.getPrototypeOf(value) as unknown;
+	return proto === Object.prototype || proto === null;
 }
 
 /**

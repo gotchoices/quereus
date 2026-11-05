@@ -681,3 +681,14 @@ select count(*) as cnt from rd_sib;
 → [{"cnt":1}]
 
 drop table rd_sib;
+
+-- === A column read only in a CASE arm still counts toward a CHECK's dependency ===
+-- `c` chooses the arm, so `b` alone does not determine `a` and these rows stay two groups.
+create table case_fd (id integer primary key, a integer, b integer, c integer, check (a = case when c > 0 then b else b + 1 end));
+
+insert into case_fd values (1, 1, 1, 1), (2, 2, 1, -1);
+
+select b, a, count(*) as cnt from case_fd group by b, a order by a;
+→ [{"b":1,"a":1,"cnt":1},{"b":1,"a":2,"cnt":1}]
+
+drop table case_fd;

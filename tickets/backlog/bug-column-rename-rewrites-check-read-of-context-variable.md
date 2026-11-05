@@ -26,3 +26,25 @@ insert into t with context who = 5 values (2, -9);   -- rejected: CHECK constrai
 Dropping the column fails the same way, for the same cause: `alter table t drop column who` is refused with `it is referenced by CHECK constraint 'k'`, although the CHECK reads the variable and only a `new.who` reference would need the column.
 
 Expected: renaming leaves a bare reference to a declared variable alone and rewrites `new.who`; a drop is refused only by a reference that reaches the column. The bare-name rule also applies to a column DEFAULT, which shares this walker through `renameColumnInColumnExpressions` and was not measured. A generated column's bare name always means the column (`docs/sql-ddl.md`), so that case must stay as it is.
+
+## Further measurements
+
+Measured during the review of `bug-check-facts-read-context-variable-as-column`, on the `dist` build, memory module. These confirm the DEFAULT case above and add two more.
+
+**The rename brings back that ticket's wrong result.** The optimizer no longer draws a column fact from a CHECK that reads a variable, but the rewritten CHECK reads the column, so the fact returns and covers rows stored under the old meaning:
+
+```sql
+create table t (a integer primary key, who integer null, check (who > 0)) with context (who integer null);
+insert into t values (1, -1);
+alter table t rename column who to w;
+select * from t;                  -- [{"a":1,"w":-1}]
+select * from t where w <= 0;     -- [] (wrong: should return the row)
+```
+
+`check (t.who > 0)` does the same, and its rewritten form is `t.w > 0`. `check (context.who > 0)` is left alone and returns the row correctly.
+
+**A DEFAULT breaks outright.** With `b integer null default (who)`, the same rename stores `default w`, and the next `insert into t (a) with context who = 7 values (1)` fails with `Column not found: w`.
+
+**Renaming a column to a variable's name has the opposite effect.** With `check (x > 0)` and a variable `who`, `alter table t rename column x to who` is accepted and the stored CHECK becomes `who > 0`, which now reads the variable. `insert into t values (2, -1)` is then accepted, so the column is no longer constrained. The optimizer draws no fact here, so queries stay correct. A `new.x` in a DEFAULT becomes `new.who` and keeps working.
+
+Expected for this last case is not stated above: the rename must keep the CHECK reading the column, for instance by refusing the rename or by rewriting to `new.who`.

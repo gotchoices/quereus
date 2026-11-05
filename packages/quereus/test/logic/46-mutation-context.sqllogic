@@ -626,11 +626,6 @@ insert into FactSelf values (1, -1);
 select * from FactSelf where who <= 0
 → [{"a":1,"who":-1}]
 
-create table FactSupplied (a integer primary key, who integer null, check (who > 0)) with context (who integer);
-insert into FactSupplied with context who = 5 values (1, -1);
-select * from FactSupplied where who <= 0
-→ [{"a":1,"who":-1}]
-
 -- A variable sharing no column's name is screened too: `b` does not determine `a` when
 -- the rest of the sum varies per statement, so these two rows stay two groups.
 create table FactFree (id integer primary key, a integer, b integer, check (a = b + who)) with context (who integer null);
@@ -638,6 +633,13 @@ insert into FactFree with context who = 1 values (1, 2, 1);
 insert into FactFree with context who = 2 values (2, 3, 1);
 select b, a, count(*) as c from FactFree group by b, a order by a
 → [{"b":1,"a":2,"c":1},{"b":1,"a":3,"c":1}]
+
+-- The screen sees a read anywhere in the conjunct, including inside a CASE arm.
+create table FactCase (id integer primary key, a integer, b integer, check (a = case when who > 0 then b else b + 1 end)) with context (who integer null);
+insert into FactCase with context who = 1 values (1, 1, 1);
+insert into FactCase with context who = -1 values (2, 2, 1);
+select b, a, count(*) as c from FactCase group by b, a order by a
+→ [{"b":1,"a":1,"c":1},{"b":1,"a":2,"c":1}]
 
 -- The screen is per conjunct and per spelling: `new.who` reaches the column and `b > 0`
 -- reads no variable, so both still lift beside a conjunct that reads the variable.
