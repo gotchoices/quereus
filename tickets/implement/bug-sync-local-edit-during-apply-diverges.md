@@ -96,7 +96,7 @@ Without step 1, a local timestamp can be below the incoming one in the last thre
 
 ## Reproduction tests
 
-Put these with `sync-serialize-applies`' overlapping-apply test (e.g. `test/sync/concurrent-apply.spec.ts`). The receiver helper:
+Put these with `sync-serialize-applies`' overlapping-apply test (e.g. `test/sync/concurrent-apply.spec.ts`). That file already has the receiver helper as landed: `makeReceiver()` takes no argument and returns `{ db, manager, hook }`, and its `beforeEach` builds one receiver per test. Reuse it rather than the sketch below, which shows the same wrapping:
 
 ```ts
 async function makeReceiver(hook: { before?: () => Promise<void>; after?: () => Promise<void> }) {
