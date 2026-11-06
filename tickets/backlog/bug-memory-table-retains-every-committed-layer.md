@@ -50,3 +50,7 @@ Retained memory is bounded by the rows the table holds plus the layers some live
 ## Repro
 
 Run a prepared single-row `update` in autocommit 40,000 times against one memory table, forcing GC and sampling `process.memoryUsage().heapUsed` every 10,000 statements. Count the chain with `for (l = manager.currentCommittedLayer; l; l = l.getParent())`. Retained heap grows linearly with the statement count, as in the table above.
+
+## Second arm: the layer-collapse code is now a no-op
+
+Since `TransactionLayer.freeze` detaches every head `commitTransaction` installs, `MemoryTableManager.tryCollapseLayers` (run on every `disconnect`) and `promoteCommittedHead` can only re-detach trees that already have no base. `freeze` skips the detach only for a layer with a derived child, and promotion refuses that layer too. Whatever releases committed layers should replace this code rather than sit beside it. Delete `tryCollapseLayers`, `promoteCommittedHead`, the `disconnect` call to it, its guard tests in `test/vtab/layer-derived-child-guard.spec.ts` and `test/vtab/layer-collapse-mutated-base.spec.ts`, and the "Automatic Promotion" text in `docs/memory-table.md#layer-management`, or fold them into the new release mechanism.
