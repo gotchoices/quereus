@@ -541,7 +541,7 @@ the privileged per-table surface the engine drives MV maintenance through:
   `replace-all` yields the minimal keyed diff). Later reads on `conn` must
   observe the applied ops (reads-own-writes).
 - `replaceContents(rows, onDuplicateKey?)` — atomically replace the
-  **committed** contents (create-fill / refresh); throw `onDuplicateKey()` (or a
+  **committed** contents (the create-fill of a new backing); throw `onDuplicateKey()` (or a
   generic `CONSTRAINT`) on a duplicate PK; concurrent readers see pre- or
   post-swap state, never partial.
 - `scanEffective(conn, { equalityPrefix?, descending? })` — reads-own-writes

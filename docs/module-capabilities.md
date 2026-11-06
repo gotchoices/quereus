@@ -106,9 +106,10 @@ silently over-promise.
   The materialized-view verbs consult the **backing-host** module — the `using <module>(…)`
   host, else the `memory` default, *not* the session default module. `refresh` is gated
   even though it mostly rewrites rows: its reshape arm reconciles a shifted body shape with
-  module `alterTable` ops, and both of its arms commit the contents swap (a `begin; refresh;
-  rollback` does not undo the refresh), so its effect escapes the enclosing transaction the
-  same way the schema statements' do.
+  module `alterTable` ops and commits the rebuilt rows early, so its effect escapes the
+  enclosing transaction the same way the schema statements' do. Which arm a refresh takes
+  depends on how the sources changed, so the whole verb is gated. (The data-only arm is
+  transactional: `begin; refresh; rollback` undoes it.)
 
 Engine-only schema objects (`create view`, `create assertion`, `declare schema`) are out
 of the gate's scope: they touch no module, and the engine's own schema is transient by

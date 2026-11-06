@@ -118,6 +118,12 @@ export class TransactionManager {
 	/** Stack of active savepoint names (ordered by creation) */
 	private savepointStack: string[] = [];
 
+	/**
+	 * Actions registered by {@link onUndo}, layered exactly like the change log: index 0
+	 * holds the work done outside any savepoint, and each savepoint pushes one more.
+	 */
+	private undoLayers: Array<Array<() => void>> = [[]];
+
 	/** Per-base-table projection capture demand registered by DeltaExecutor consumers. */
 	private captureDemand = new Map<string, TableCaptureDemand>();
 
@@ -353,6 +359,7 @@ export class TransactionManager {
 		this.closingTransaction = false;
 		this.openConnections.clear();
 		this.clearChangeLog();
+		this.undoLayers = [[]];
 	}
 
 	/**
@@ -414,6 +421,7 @@ export class TransactionManager {
 			// A failed assertion, deferred constraint or connection commit: roll back
 			// what is still open. Connections that already committed stay committed.
 			await this.rollbackOpenConnections();
+			this.runUndoActions(this.undoLayers.flat());
 			this.notifyRolledBack();
 			throw e;
 		} finally {
@@ -451,8 +459,34 @@ export class TransactionManager {
 			// Discard batched events on rollback
 			this.ctx.getEventEmitter().discardBatch();
 		} finally {
+			const undone = this.undoLayers.flat();
 			this.resetToAutocommit();
+			this.runUndoActions(undone);
 			this.notifyRolledBack();
+		}
+	}
+
+	/**
+	 * Registers an action to run if the work done so far in the open transaction is
+	 * undone: by a rollback, a failed commit, or a `rollback to savepoint` that discards
+	 * the savepoint layer the action was registered in. A commit drops it unrun, and so
+	 * does a `release` (the action moves to the enclosing layer). For state the
+	 * connections cannot roll back — a catalog flag — whose change describes rows they
+	 * can. Ignored outside a transaction. Actions run newest first; one that throws is
+	 * logged and does not stop the rest.
+	 */
+	onUndo(action: () => void): void {
+		if (!this.inTransaction) return;
+		this.undoLayers[this.undoLayers.length - 1].push(action);
+	}
+
+	private runUndoActions(actions: ReadonlyArray<() => void>): void {
+		for (let i = actions.length - 1; i >= 0; i--) {
+			try {
+				actions[i]();
+			} catch (err) {
+				errorLog('Undo action threw: %O', err);
+			}
 		}
 	}
 
@@ -894,6 +928,9 @@ export class TransactionManager {
 		this.changeLogLayers = [];
 		this.savepointStack = [];
 		this.ctx.getDeferredConstraints().clear();
+		// The savepoint stack is gone, so the undo layers collapse with it; the actions
+		// stay — the work they compensate is still part of the open transaction.
+		this.undoLayers = [this.undoLayers.flat()];
 	}
 
 	// ============================================================================
@@ -975,6 +1012,7 @@ export class TransactionManager {
 	/** Begin a new savepoint layer for change tracking */
 	private beginSavepointLayer(): void {
 		this.changeLogLayers.push(new Map());
+		this.undoLayers.push([]);
 		this.ctx.getDeferredConstraints().beginLayer();
 		this.ctx.getEventEmitter().beginSavepointLayer();
 	}
@@ -982,6 +1020,7 @@ export class TransactionManager {
 	/** Rollback the current savepoint layer */
 	private rollbackSavepointLayer(): void {
 		this.changeLogLayers.pop();
+		if (this.undoLayers.length > 1) this.runUndoActions(this.undoLayers.pop()!);
 		this.ctx.getDeferredConstraints().rollbackLayer();
 		this.ctx.getEventEmitter().rollbackSavepointLayer();
 	}
@@ -1005,6 +1044,11 @@ export class TransactionManager {
 			for (const [pkKey, rec] of rowMap) {
 				this.mergeRecordInto(target, table, pkKey, rec);
 			}
+		}
+
+		if (this.undoLayers.length > 1) {
+			const released = this.undoLayers.pop()!;
+			this.undoLayers[this.undoLayers.length - 1].push(...released);
 		}
 
 		this.ctx.getDeferredConstraints().releaseLayer();

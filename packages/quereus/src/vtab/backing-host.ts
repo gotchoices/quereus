@@ -87,13 +87,11 @@
  * colliding pair includes a written image. See the memory host's
  * `enforceSecondaryUniqueOnMaintenance` (reference) and the store host's
  * `StoreTable.enforceSecondaryUniqueForMaintenance`. `replaceContents` remains
- * validation-free (PK identity aside): create/import (`materializeView`) carries
- * MV-sugar backings, which declare no constraints, and the refresh path
- * (`rebuildBacking`) only calls `replaceContents` when the maintained table
- * declares no applicable CHECK/FK — a constraint-bearing refresh instead routes
- * through `applyMaintenance('replace-all')` + the engine's bulk
- * `validateDeclaredConstraintsOverContents` scan (the stale-refresh
- * re-validation path), so `replaceContents` never has constraints to validate.
+ * validation-free (PK identity aside): its one caller, create/import
+ * (`materializeView`), carries MV-sugar backings, which declare no constraints.
+ * The refresh path (`rebuildBacking`) routes through `applyMaintenance('replace-all')`
+ * + the engine's bulk `validateDeclaredConstraintsOverContents` scan, so
+ * `replaceContents` never has constraints to validate.
  *
  * ## Concurrency
  *
@@ -165,9 +163,9 @@ import type { BTreeKeyForPrimary } from './memory/types.js';
  *   differs is an `update`, an identical row at the same key is skipped (no storage
  *   churn, no emitted change), and an old key absent from the new set is a `delete`.
  *   It is the wholesale, **transactional** backing replacement the full-rebuild MV
- *   arm needs — applied to the *pending* transaction state so it commits/rolls-back
- *   in lockstep with the source write, unlike the
- *   {@link BackingHost.replaceContents} CREATE/REFRESH primitive.
+ *   arm and `refresh materialized view` need — applied to the *pending* transaction
+ *   state so it commits/rolls-back in lockstep with the transaction, unlike the
+ *   {@link BackingHost.replaceContents} create-fill primitive.
  *
  * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
  * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
@@ -238,8 +236,8 @@ export interface BackingHost {
 	 *  maintained-table-attributed CONSTRAINT error on a collision (see
 	 *  § Constraint validation above). */
 	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]>;
-	/** Atomically replace the COMMITTED contents with `rows` (create-fill /
-	 *  refresh). Throws `onDuplicateKey()` (or a generic CONSTRAINT) on a
+	/** Atomically replace the COMMITTED contents with `rows` (the create-fill
+	 *  of a new backing). Throws `onDuplicateKey()` (or a generic CONSTRAINT) on a
 	 *  duplicate PK among `rows`. Concurrent readers see pre- or post-swap
 	 *  state, never partial. */
 	replaceContents(rows: readonly Row[], onDuplicateKey?: () => QuereusError): Promise<void>;

@@ -379,6 +379,23 @@ select id, x from fo2a order by id;
 select x, id from fo2b order by x;
 → [{"x":99,"id":1}]
 
+-- A producer's REFRESH cascades its diff to a live consumer. The collation change on `g`
+-- (read only by rc1's WHERE) leaves both levels stale, so row 2 drifts into `rc` alone.
+-- Refreshing the consumer first rebuilds it from rc1's stale rows and makes it live; the
+-- producer's refresh then brings in row 2, which must reach rc2 — rc2 is not stale, so
+-- nothing else would ever put it there.
+create table rc (id integer primary key, v integer not null, g text not null default 'keep');
+create materialized view rc1 as select id, v from rc where g <> 'skip';
+create materialized view rc2 as select id, v * 10 as w from rc1;
+insert into rc (id, v) values (1, 1);
+alter table rc alter column g set collate nocase;
+insert into rc (id, v) values (2, 2);
+refresh materialized view rc2;
+refresh materialized view rc1;
+insert into rc (id, v) values (3, 3);
+select id, w from rc2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
 -- Mid-transaction visibility through the chain + whole-chain atomic rollback. The
 -- new row is visible at the deepest level before commit (reads-own-writes rides the
 -- per-statement backing connections), and rollback reverts every level in lockstep.

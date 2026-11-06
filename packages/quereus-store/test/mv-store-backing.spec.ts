@@ -293,11 +293,11 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(await rows(db, 'select id, v from mv')).to.deep.equal([{ id: 1, v: 10 }]);
 		});
 
-		it('refresh inside an explicit transaction behaves exactly like the memory backing (DDL-commits parity)', async () => {
+		it('refresh inside an explicit transaction behaves exactly like the memory backing', async () => {
 			// Run the identical scenario against a store-backed and a memory-backed
-			// MV (same store source) and require the SAME observable outcome:
-			// `replaceContents`' commit-first posture is the store analogue of
-			// memory's `replaceBaseLayer` in-flight-layer drain.
+			// MV (same store source) and require the SAME observable outcome: the
+			// refresh's `replace-all` is pending on both hosts and rolls back with the
+			// transaction.
 			const run = async (usingClause: string): Promise<{ mv: unknown; src: unknown }> => {
 				const arm = new Database();
 				const armProvider = createProvider();
@@ -325,11 +325,10 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(store, 'store and memory backings observe the same refresh-in-txn outcome').to.deep.equal(memory);
 		});
 
-		it('refresh inside a savepoint does not throw and matches memory arm (DDL-commits parity)', async () => {
+		it('refresh inside a savepoint does not throw and matches memory arm', async () => {
 			// Mirror the refresh-in-txn parity test but with a savepoint wrapping the
-			// insert + refresh. The backing coordinator's stack is cleared by the
-			// DDL-commit in replaceContents; the subsequent rollback-to-s1 broadcast
-			// must warn-and-return rather than throw (regression guard).
+			// insert + refresh: the rollback-to-s1 broadcast must unwind the refresh's
+			// pending rows on both hosts without throwing.
 			const run = async (usingClause: string): Promise<{ mv: unknown; src: unknown }> => {
 				const arm = new Database();
 				const armProvider = createProvider();
@@ -341,8 +340,8 @@ describe('materialized views `using store` (end-to-end)', () => {
 					await arm.exec('begin');
 					await arm.exec('savepoint s1');
 					await arm.exec('insert into src values (2, 20)');
-					await arm.exec('refresh materialized view mv'); // DDL-commits: clears backing stack
-					await arm.exec('rollback to s1');               // must not throw; degrades to DDL-commits
+					await arm.exec('refresh materialized view mv');
+					await arm.exec('rollback to s1');               // must not throw
 					await arm.exec('commit');
 					return {
 						mv: await rows(arm, 'select id, v from mv order by id'),
@@ -506,33 +505,30 @@ describe('materialized views `using store` (end-to-end)', () => {
 			});
 		});
 
-		describe('commit-first parity on the store backing (an enclosing rollback does not undo a refresh)', () => {
-			// The constraint-bearing branch ends in an early commit of the
-			// resolved attach connection — a DIFFERENT commit mechanism than the MV-sugar
-			// store path's `replaceContents` (pinned above in the `refresh` block) and than
-			// the memory constraint-bearing branch (pinned engine-wide in the memory spec's
-			// `commit-first parity` case). Neither covers a STORE constraint-bearing refresh
-			// committing through the coordinator under an enclosing transaction, so pin that
-			// the swap is durable past the outer `rollback` here — exact parity with both.
+		describe('a refresh is part of its transaction on the store backing', () => {
+			// Store analogue of the memory spec's `a refresh is part of its transaction`
+			// block: the refresh's `replace-all` rides the store coordinator's pending
+			// transaction, so an enclosing rollback restores the committed store rows, and
+			// the refresh's undo action marks mt stale again.
 			beforeEach(async () => {
-				await db.exec('create table src (id integer primary key, v text not null) using store');
+				await db.exec(`create table src (id integer primary key, v text not null, g text not null default 'keep') using store`);
 				await db.exec(`create table mt (id integer primary key, v text not null, check (v <> 'poison'))
-					using store maintained as select id, v from src`);
-				await db.exec(`insert into src values (1, 'a')`);
-				await db.exec('alter table src add column pad integer null'); // stale + plan detached
-				await db.exec(`insert into src (id, v) values (2, 'b')`);      // conforming drift, unmaintained
+					using store maintained as select id, v from src where g <> 'skip'`);
+				await db.exec(`insert into src (id, v) values (1, 'a')`);
+				// A collation change on `g`, read only by the body's WHERE: stale + plan
+				// detached, while the body's output shape (so the data-only arm) is unchanged.
+				await db.exec('alter table src alter column g set collate nocase');
+				expect(isStale('mt'), 'the collation change marked mt stale').to.equal(true);
+				await db.exec(`insert into src (id, v) values (2, 'b')`); // conforming drift, unmaintained
 			});
 
-			it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {
+			it('an enclosing rollback restores the committed store rows and leaves the table stale', async () => {
 				await db.exec('begin');
 				await db.exec('refresh materialized view mt');
 				await db.exec('rollback');
 
-				// The early commit swapped the store backing independently of the outer txn.
-				expect(await rows(db, 'select id, v from mt order by id'))
-					.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
-				expect(isStale('mt'), 'a successful refresh clears stale even under an enclosing rollback')
-					.to.equal(false);
+				expect(await rows(db, 'select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 'a' }]);
+				expect(isStale('mt'), 'a rolled-back refresh leaves mt stale').to.equal(true);
 			});
 		});
 

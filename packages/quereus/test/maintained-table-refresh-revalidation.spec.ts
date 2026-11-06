@@ -652,11 +652,11 @@ describe('Maintained-table refresh re-validation', () => {
 		// keys it under BINARY: 'a' and 'A' are distinct source rows but collide on the
 		// backing key. Seeded with only 'a' (so create-fill is a clean set); after the
 		// table goes stale, the unmaintained 'A' drift makes the recomputed set collide,
-		// which both refresh branches must reject with the IDENTICAL "must be a set"
-		// diagnostic (`materializedViewNotASetError`).
+		// which a refresh must reject with the create-fill's "must be a set" diagnostic
+		// (`materializedViewNotASetError`) whether or not the table declares constraints.
 		const DUP_MESSAGE = 'body produces duplicate rows';
 
-		it('a constraint-less refresh rejects duplicate derived keys (replaceContents fast path)', async () => {
+		it('a constraint-less refresh rejects duplicate derived keys', async () => {
 			await db.exec(`
 				create table src (k text primary key, v text, g text not null default 'keep');
 				create materialized view mv as select k collate nocase as k, v from src where g <> 'skip';
@@ -725,13 +725,12 @@ describe('Maintained-table refresh re-validation', () => {
 		});
 	});
 
-	describe('commit-first parity (an enclosing rollback does not undo a refresh)', () => {
-		// `replaceContents` swaps COMMITTED state, so a refresh is durable past an
-		// enclosing `rollback` today. The constraint-bearing branch's early
-		// commit must preserve that EXACT behavior rather than tying the swap
-		// to the outer transaction — otherwise the two refresh branches would diverge
-		// on transactional semantics. (Verified to match the constraint-less path.)
-		it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {
+	describe('a refresh is part of its transaction', () => {
+		// The rebuilt rows land in the transaction's pending state, so a rollback restores
+		// the pre-refresh rows. `stale` is catalog state the rollback cannot restore, so the
+		// refresh registers an undo action that marks the table stale again — exactly when
+		// the work it describes is undone, and not when an unrelated later statement fails.
+		beforeEach(async () => {
 			await db.exec(`
 				create table src (id integer primary key, v text not null, g text not null default 'keep');
 				create table mt (id integer primary key, v text not null, check (v <> 'poison'))
@@ -740,16 +739,28 @@ describe('Maintained-table refresh re-validation', () => {
 			`);
 			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, v) values (2, 'b')`);
+		});
 
+		it('an enclosing rollback restores the pre-refresh rows and leaves the table stale', async () => {
 			await db.exec('begin');
 			await db.exec('refresh materialized view mt');
+			expect(await readAll('select id, v from mt order by id'), 'the refresh is visible inside its transaction')
+				.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
 			await db.exec('rollback');
 
-			// The backing swap committed independently of the outer transaction.
+			expect(await readAll('select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 'a' }]);
+			expect(isStale('mt'), 'a rolled-back refresh leaves mt stale').to.equal(true);
+		});
+
+		it('a later failed statement in the same transaction does not undo the refresh', async () => {
+			await db.exec('begin');
+			await db.exec('refresh materialized view mt');
+			await expectError(`insert into src (id, v) values (1, 'dup')`, 'UNIQUE');
+			await db.exec('commit');
+
 			expect(await readAll('select id, v from mt order by id'))
 				.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
-			expect(isStale('mt'), 'a successful refresh clears stale even under an enclosing rollback')
-				.to.equal(false);
+			expect(isStale('mt'), 'the failed insert rolled back only its own statement').to.equal(false);
 		});
 	});
 });

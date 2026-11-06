@@ -517,9 +517,10 @@ export class MaterializedViewManager {
 	 * every MV whose body reads it (MV-over-MV — in the unified model a base MV's
 	 * backing is a table under its own name, so a dependent's
 	 * {@link sourceBasesFor} contains that qualified name). A sequential refresh
-	 * sweep over this order is correct because refresh is commit-first per MV: a
-	 * base MV's backing commits before a dependent's body re-reads it
-	 * ({@link Database.refreshAllMaterializedViews}).
+	 * sweep over this order is correct because a dependent's body reads its base
+	 * MV's refreshed rows: the sweep commits each refresh before the next
+	 * ({@link Database.refreshAllMaterializedViews}), and a refresh's writes are
+	 * visible to its own transaction either way.
 	 *
 	 * Edges are `sourceBasesFor(mv)` intersected with the MV-key set (a non-MV
 	 * source is no ordering constraint); Kahn's algorithm produces the order.
@@ -786,6 +787,22 @@ export class MaterializedViewManager {
 		if (plan.derivedRowValidator) {
 			await validateDerivedChanges(this.ctx, plan, plan.derivedRowValidator, backingChanges, cache);
 		}
+		await this.enforceRecordAndCascade(plan, backingChanges, cache, deferred, residualBatch, depth);
+	}
+
+	/**
+	 * The tail of {@link postApplyBackingChanges}, for changes `M`'s own image has already
+	 * been validated against: parent-side referential enforcement, change-log recording,
+	 * then the MV-over-MV cascade.
+	 */
+	private async enforceRecordAndCascade(
+		plan: MaintenancePlan,
+		backingChanges: readonly BackingRowChange[],
+		cache: BackingConnectionCache | undefined,
+		deferred: Set<string> | undefined,
+		residualBatch: ResidualKeyBatch | undefined,
+		depth: number,
+	): Promise<void> {
 		await enforceParentSideReferentialActions(this.ctx, plan, backingChanges);
 		const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 		this.recordMaintenanceChanges(plan, backingBase, backingChanges);
@@ -794,6 +811,44 @@ export class MaterializedViewManager {
 		for (const bc of backingChanges) {
 			await this.maintainRowTime(backingBase, bc, cache, deferred, residualBatch, depth);
 		}
+	}
+
+	/**
+	 * Route a `refresh materialized view` rebuild's realized diff (the `replace-all`
+	 * keyed diff `rebuildBacking` returns) through the same pipeline a maintenance write
+	 * takes, so a refresh is visible to everything downstream: assertions and watchers
+	 * (the change log), tables whose foreign keys reference `mv` (parent-side actions),
+	 * and maintained tables built on `mv` (the cascade, drained here like a statement's
+	 * end-of-statement flush). Called once the refreshed MV's plan is re-registered, so
+	 * the plan binds the live (possibly reshaped) record.
+	 *
+	 * The front half of {@link postApplyBackingChanges} is skipped. Its per-row
+	 * validation: the refresh already checked every stored row, a superset of this diff
+	 * — the NOT-NULL seeded-PK guard over the recomputed rows, and the bulk declared
+	 * CHECK/FK scan over the reconciled contents. Re-checking would also be wrong on the
+	 * reshape arm, whose diff images predate the post-reconcile retype. Its coarsening
+	 * collision telemetry: a refresh rejects colliding coarsened keys outright
+	 * (`assertRefreshRowsAreSet`), so an `update` in its diff is a row replaced over
+	 * time, not two source identities merged — reporting it would be a false collision
+	 * (docs/materialized-views.md § Coarsened backing keys).
+	 *
+	 * Cost is bounded by the diff, which scales with how far the stored rows had
+	 * drifted: an unchanged refresh yields no changes and does nothing here.
+	 */
+	async propagateRefreshChanges(mv: MaintainedTableSchema, changes: readonly BackingRowChange[]): Promise<void> {
+		if (changes.length === 0) return;
+		const key = mvKey(mv.schemaName, mv.name);
+		const plan = this.rowTime.get(key);
+		if (!plan) {
+			throw new QuereusError(
+				`Internal error: materialized view '${mv.schemaName}.${mv.name}' has no row-time plan after its refresh re-registered it`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const deferred = new Set<string>();
+		const residualBatch: ResidualKeyBatch = new Map();
+		await this.enforceRecordAndCascade(plan, changes, undefined, deferred, residualBatch, 0);
+		await this.flushDeferredMaintenance(deferred, residualBatch);
 	}
 
 	/**
@@ -822,19 +877,22 @@ export class MaterializedViewManager {
 	 * indices, but keying off the evaluator's own source keeps the agreement structural
 	 * rather than coincidental.
 	 *
-	 * Bounded by the realized per-statement delta, exactly like user DML: the bulk fills
-	 * (`materializeView` create-fill, `rebuildBacking` refresh) write the host directly and
-	 * never route through {@link postApplyBackingChanges}, and a value-identical upsert
-	 * reports no {@link BackingRowChange} at all, so a no-op maintenance records nothing.
-	 * Savepoints need no special handling — `_record*` writes the current change-log layer,
-	 * which `ROLLBACK TO` discards.
+	 * Bounded by the realized per-statement delta, exactly like user DML: the create-fill
+	 * (`materializeView`) writes the host directly and never routes through here, and a
+	 * value-identical upsert reports no {@link BackingRowChange} at all, so a no-op
+	 * maintenance records nothing. Savepoints need no special handling — `_record*` writes
+	 * the current change-log layer, which `ROLLBACK TO` discards.
 	 *
-	 * One DDL-scale exception: `attachMaintainedDerivation` writes the ATTACHED table
-	 * directly (unrecorded) but deliberately cascades its whole-set reconcile delta onward
-	 * (`materialized-view-helpers.ts` § "Cascade the GENUINE reconcile changes"), so a
-	 * CONSUMER maintained table records one entry per reconciled row for that one statement.
-	 * That is the intent — the consumer's content genuinely changed, so an assertion over it
-	 * should see the attach — but it is O(consumer rows) in a single transaction.
+	 * Two whole-table writers record their realized diff, both DDL-scale:
+	 *  - `refresh materialized view` ({@link propagateRefreshChanges}) records the refreshed
+	 *    table's keyed diff — one entry per row that changed, so O(drift), and O(table) for
+	 *    a refresh that rewrites most of it.
+	 *  - `attachMaintainedDerivation` writes the ATTACHED table directly (unrecorded) but
+	 *    cascades its whole-set reconcile delta onward (`materialized-view-helpers.ts` §
+	 *    "Cascade the GENUINE reconcile changes"), so a CONSUMER maintained table records
+	 *    one entry per reconciled row for that one statement.
+	 * Both are the intent — the content genuinely changed, so an assertion over it should
+	 * see the statement.
 	 *
 	 * Deliberately NOT gated on the ingestion seam's `captureChanges` facet
 	 * (`Database.ingestExternalRowChanges`): that flag governs the rows the CALLER reports
@@ -842,13 +900,14 @@ export class MaterializedViewManager {
 	 * writes, which no external caller can have captured. See `docs/mv-ingestion.md`.
 	 */
 	// NOTE: change-log entries here are bounded by the REALIZED delta, which for a
-	// bounded-delta arm is O(rows touched). A full-rebuild MV whose body reshuffles many
-	// rows on a small source write (a window-function ranking, say) realizes a wide diff
-	// and so records a wide change-log slice per statement. Fine at current shapes; if a
-	// full-rebuild MV's change-log volume ever shows up as a memory or COMMIT-dispatch
-	// cost, record a single table-granular invalidation for the `'full-rebuild'` arm
-	// instead of per-row entries (assertions would then re-evaluate globally, which the
-	// evaluator already falls back to).
+	// bounded-delta arm is O(rows touched). Two sources realize a wide diff: a full-rebuild
+	// MV whose body reshuffles many rows on a small source write (a window-function
+	// ranking, say), and a `refresh materialized view` over a table that drifted far (or
+	// whose body now derives mostly different rows). Each records a wide change-log slice
+	// in one transaction. Fine at current shapes; if that volume ever shows up as a memory
+	// or COMMIT-dispatch cost, record a single table-granular invalidation for those
+	// writers instead of per-row entries (assertions would then re-evaluate globally,
+	// which the evaluator already falls back to).
 	private recordMaintenanceChanges(
 		plan: MaintenancePlan,
 		backingBase: string,

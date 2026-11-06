@@ -702,10 +702,9 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		// `replaceContents` runs NO derived-row constraint validation: this caller's
 		// backing is the MV-sugar shape (`buildBackingTableSchema` hard-codes empty
 		// checkConstraints and carries no foreignKeys), so there is nothing to
-		// validate. The constraint-bearing refresh path that DOES need validation
-		// over a `replaceContents`-style whole-set swap runs it in `rebuildBacking`
-		// (pending-layer `replace-all` + `validateDeclaredConstraintsOverContents`),
-		// not here.
+		// validate. The refresh path, whose table may declare constraints, swaps
+		// through `rebuildBacking` instead (pending-layer `replace-all` +
+		// `validateDeclaredConstraintsOverContents`).
 		await host.replaceContents(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
 	} catch (e) {
 		// Roll back: drop the table, do not attach a derivation.
@@ -943,8 +942,8 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
  * `onDuplicate` overrides the default attach-time diagnostic with a caller-built
  * one (receiving the rendered colliding key values) — the refresh path threads
  * {@link materializedViewNotASetError} through {@link assertRefreshRowsAreSet} so
- * its constraint-bearing branch rejects duplicates identically to the
- * `replaceContents` fast path, single-sourcing the collation-aware dup detection.
+ * it rejects duplicates with the same diagnostic the create-fill's
+ * `replaceContents` raises, single-sourcing the collation-aware dup detection.
  *
  * The declared key collation names resolve against the OWNING database
  * (`db.getCollationResolver()`), so a database-replaced `NOCASE` — or a custom
@@ -984,14 +983,13 @@ function assertDerivedRowsAreSet(
 }
 
 /**
- * Refresh's duplicate-derived-key reject — the constraint-bearing
- * {@link rebuildBacking} branch's parity with the `replaceContents` fast path,
- * which rejects duplicate backing PKs via {@link materializedViewNotASetError}.
- * `applyMaintenance('replace-all')` would otherwise silently LWW-merge colliding
- * keys, so this raises the IDENTICAL diagnostic BEFORE the pending-layer reconcile,
- * keeping the two refresh branches indistinguishable on duplicate handling.
- * Delegates to {@link assertDerivedRowsAreSet} so the collation-aware detection
- * stays single-sourced.
+ * Refresh's duplicate-derived-key reject — {@link rebuildBacking}'s parity with the
+ * create-fill's `replaceContents`, which rejects duplicate backing PKs via
+ * {@link materializedViewNotASetError}. `applyMaintenance('replace-all')` would
+ * otherwise silently LWW-merge colliding keys, so this raises the IDENTICAL
+ * diagnostic BEFORE the pending-layer reconcile. Delegates to
+ * {@link assertDerivedRowsAreSet} so the collation-aware detection stays
+ * single-sourced.
  */
 function assertRefreshRowsAreSet(
 	rows: readonly Row[],
@@ -1064,10 +1062,9 @@ async function resolveAttachConnection(db: Database, host: BackingHost, qualifie
  * presence is neither a user INSERT nor UPDATE), or any child-side FK.
  *
  * The FK term is additionally gated on `pragma foreign_keys`: with enforcement off
- * the bulk FK scan no-ops, so an FK-only maintained table keeps the zero-overhead
- * `replaceContents` fast path rather than spinning up a connection for a no-op scan.
- * A table also declaring an applicable CHECK always takes the validating branch
- * regardless of the pragma.
+ * the bulk FK scan no-ops, so an FK-only maintained table skips the scan rather than
+ * preparing a no-op one. A table also declaring an applicable CHECK is always
+ * scanned regardless of the pragma.
  */
 function hasApplicableConstraints(db: Database, mt: TableSchema): boolean {
 	const hasCheck = mt.checkConstraints.some(
@@ -1497,8 +1494,8 @@ export async function attachMaintainedDerivation(
 			// must validate the RECONCILED body rows, not the stale backing — but the
 			// module's alterTable scans COMMITTED contents (memory's alterColumn walks
 			// the base layer) while the reconcile above sits in the connection's
-			// PENDING layer. So commit the reconcile eagerly first (refresh-parity
-			// commit-first semantics — the structural ops above are already
+			// PENDING layer. So commit the reconcile eagerly first (as the refresh
+			// reshape arm does — the structural ops above are already
 			// non-transactional, so the reshaping attach is DDL-grade atomicity
 			// regardless). The early commit re-begins the connection, so it stays a
 			// participant and the coordinated commit closes that second begin. The flag
@@ -1684,7 +1681,8 @@ export function assertNoMutationContextOnMaintainedTable(
  *    constraints and defaults intact) and the shared {@link attachMaintainedDerivation}
  *    core runs — attach-to-empty: the reconcile diff against an empty table IS
  *    the fill, applied to the connection's pending state so it commits in
- *    lockstep with the statement (no `replaceContents` commit-first caveat);
+ *    lockstep with the statement (unlike the MV-sugar create-fill's committed
+ *    `replaceContents` swap);
  *  - any failure past registration (duplicate derived keys, a maintenance gate)
  *    drops the just-created table — the schema is left exactly as before.
  *
@@ -1752,64 +1750,70 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 	}
 }
 
+/** How {@link rebuildBacking} lands the recomputed rows. */
+export interface RebuildBackingOptions {
+	/**
+	 * Commit the rebuilt rows on their connection before returning. The reshape arm
+	 * only: its post-reconcile ops read committed contents. Every other refresh leaves
+	 * the rows in the transaction, so they commit or roll back with it.
+	 */
+	commitEarly: boolean;
+	/**
+	 * The reshape arm's column preview ({@link previewReshapedColumns}) — the
+	 * type/collation attributes the reshape's still-pending post-reconcile ops are
+	 * about to land — forwarded to the declared-constraint scan so the CHECK / FK
+	 * resolve against the final declared shape. Omitted on every other path (and on a
+	 * reshape that shifts neither attribute).
+	 */
+	validationColumns?: readonly ColumnSchema[];
+}
+
 /**
  * Full-rebuild of a maintained table's contents: re-run the body to completion
- * and swap the table to the recomputed set. The always-correct path the two
- * `refresh materialized view` arms funnel through — the fast (data-only) path
- * (`backingShapeMatches` ⇒ direct `rebuildBacking`) and the reshape arm
- * (`reshapeBackingInPlace`, between its pre- and post-reconcile structural ops).
- * It is used by NOTHING else: create/import (`materializeView`) calls
- * `replaceContents` directly, and the incremental manager's full-rebuild arm
- * (`applyFullRebuild` in `core/database-materialized-views.ts`) does its own
- * `applyMaintenance` + per-delta validation (`validateDerivedChanges`).
+ * and replace the table's rows with the recomputed set, returning the realized
+ * keyed diff. The always-correct path the two `refresh materialized view` arms
+ * funnel through — the fast (data-only) path (`backingShapeMatches` ⇒ direct
+ * `rebuildBacking`) and the reshape arm (`reshapeBackingInPlace`, between its pre-
+ * and post-reconcile structural ops). It is used by NOTHING else: create/import
+ * (`materializeView`) calls `replaceContents` directly, and the incremental
+ * manager's full-rebuild arm (`applyFullRebuild` in
+ * `core/database-materialized-views.ts`) does its own `applyMaintenance` + per-delta
+ * validation (`validateDerivedChanges`).
  *
- * **Constraint-bearing branch.** When the maintained table declares ≥1 applicable
+ * The swap is the attach core's: reject duplicate derived keys
+ * ({@link assertRefreshRowsAreSet}, the "must be a set" diagnostic), land the
+ * recomputed set in the transaction connection's PENDING layer via
+ * `applyMaintenance('replace-all')` — the minimal keyed diff, so an unchanged
+ * refresh writes and returns nothing — then, when the table declares an applicable
  * CHECK or (FK-enforcement-on) child-side FK ({@link hasApplicableConstraints}),
- * the swap mirrors the attach core instead of calling `replaceContents`: reject
- * duplicate derived keys ({@link assertRefreshRowsAreSet} — parity with
- * `replaceContents`'s set gate), land the recomputed set in the connection's
- * PENDING layer via `applyMaintenance('replace-all')`, run the eager bulk
- * anti-join / `not (<check>)` scan ({@link validateDeclaredConstraintsOverContents})
- * which throws the maintained-table-attributed CONSTRAINT diagnostic on the first
- * violator BEFORE the swap is committed (the failing statement unwinds and the
- * pending reconcile is discarded by statement-level rollback — the pre-refresh
- * COMMITTED contents stay intact), then commits that one connection ahead of the
+ * run the bulk anti-join / `not (<check>)` scan
+ * ({@link validateDeclaredConstraintsOverContents}), which throws the
+ * maintained-table-attributed CONSTRAINT diagnostic on the first violator. A throw
+ * leaves the reconcile in the pending layer for the caller's savepoint (or the
+ * implicit transaction) to discard, so the pre-refresh contents stay intact.
+ *
+ * The caller sends the returned diff downstream (`Database._propagateRefreshChanges`).
+ * Being pending, the rows commit or roll back with the transaction — except under
+ * `commitEarly` (the reshape arm), which commits this one connection ahead of the
  * transaction (`Database._commitConnectionEarly`, which re-begins it so the
- * transaction's own commit or rollback still closes it exactly once).
+ * transaction's own commit or rollback still closes it exactly once) after the scan.
  *
- * The commit is **commit-first parity** and load-bearing two ways: (1)
- * `replaceContents` already swaps committed state (a `begin; refresh; rollback`
- * does NOT undo a refresh today), so committing here preserves that exact
- * observable behavior; (2) on the reshape arm, `reshapeBackingInPlace`'s
- * post-reconcile data-validating ops (retype/recollate/tighten-NOT-NULL) scan
- * COMMITTED contents after this returns, so they must see the rebuilt rows —
- * `replaceContents` gives that implicitly, the pending-layer branch matches it by
- * committing (as the attach reshape path does before its own post-reconcile ops).
+ * The real-world trigger for the scan is a STALE table: a body-relevant source
+ * change released the MV's row-time plan, subsequent source writes drifted
+ * unvalidated, and a refresh recomputes that drifted set — so this scan is where a
+ * declared CHECK/FK is enforced over rows that never crossed the maintenance
+ * boundary. A continuously-maintained table re-derives an already-validated set, so
+ * the scan is redundant-but-cheap there. Constraint-less maintained tables and every
+ * MV-sugar backing skip it.
  *
- * The real-world trigger is a STALE table: a body-relevant source change released
- * the MV's row-time plan, subsequent source writes drifted unvalidated, and a
- * refresh recomputes that drifted set — so this scan is where a declared CHECK/FK
- * is enforced over rows that never crossed the maintenance boundary. A
- * continuously-maintained table re-derives an already-validated set, so the scan
- * is redundant-but-cheap there.
- *
- * Constraint-less maintained tables and every MV-sugar backing take the untouched
- * `replaceContents` fast path — no connection, no scan, byte-for-byte the prior
- * behavior. The caller is responsible for staleness re-validation when relevant;
- * this helper assumes the derivation body plans. Throws if the table is missing
- * from the catalog.
- *
- * `validationColumns` is the reshape arm's column preview
- * ({@link previewReshapedColumns}) — the type/collation attributes the reshape's
- * still-pending post-reconcile ops are about to land — forwarded to the scan so
- * the CHECK / FK resolve against the final declared shape. `undefined` on every
- * other path (and on a reshape that shifts neither attribute).
+ * The caller is responsible for staleness re-validation when relevant; this helper
+ * assumes the derivation body plans. Throws if the table is missing from the catalog.
  */
 export async function rebuildBacking(
 	db: Database,
 	mv: MaintainedTableSchema,
-	validationColumns?: readonly ColumnSchema[],
-): Promise<void> {
+	options: RebuildBackingOptions,
+): Promise<BackingRowChange[]> {
 	const bodySql = astToString(mv.derivation.selectAst);
 	const rows: Row[] = await collectBodyRows(db, mv.schemaName, bodySql);
 
@@ -1822,34 +1826,24 @@ export async function rebuildBacking(
 	}
 	const host = resolveBackingHost(db, backing);
 
-	// Loud-error guard (covers BOTH branches below — neither validates column NOT NULL):
+	// Loud-error guard (the swap below validates no column NOT NULL):
 	// a backing column declared NOT NULL that is also a physical-PK member cannot legally
 	// hold the recomputed NULL a nullable source now produces. The ordering-seeded physical
 	// PK (computeBackingPrimaryKey) pins such a column NOT NULL even after its source column
 	// dropped NOT NULL — the reshape masks the loosening of a physical-PK column rather than
 	// emitting it — so at this point the only still-NOT-NULL columns that can
 	// carry source-nullable data are the physical-PK ones. Storing the NULL would make the
-	// backing schema declare NOT NULL while holding a NULL; reject it before either swap.
+	// backing schema declare NOT NULL while holding a NULL; reject it before the swap.
 	// NOTE: narrow loud guard until `debt-mv-ordering-seed-to-materialized-index` replaces
 	// ordering-seeding with a materialized index. While a source NULL persists in the seeded
 	// column the MV stays un-refreshable (drop + recreate the view without `order by <col>`).
 	assertNoNullInNotNullSeededPk(backing, rows, mv.schemaName, mv.name);
 
-	if (!isMaintainedTable(backing) || !hasApplicableConstraints(db, backing)) {
-		// Fast path: nothing declared to validate (every MV-sugar backing, and a
-		// constraint-less table-form maintained table). `replaceContents` swaps
-		// COMMITTED contents and runs no derived-row validation — byte-for-byte the
-		// historical path. (A pragma-off FK-only table also lands here: its bulk FK
-		// scan would no-op anyway — see hasApplicableConstraints.)
-		await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
-		return;
-	}
-
-	// Constraint-bearing branch: pending-layer replace-all + eager bulk scan, then a
-	// commit-first commit (see the docstring). `shapePk` is the live backing's
-	// physical key — re-derived shape matches it on the fast path, and on the reshape
-	// arm the catalog was already re-registered with the post-reshape PK before this
-	// runs, so the live `primaryKeyDefinition` is the correct keying either way.
+	// `shapePk` is the live backing's physical key — re-derived shape matches it on the
+	// fast path, and on the reshape arm the catalog was already re-registered with the
+	// post-reshape PK before this runs, so the live `primaryKeyDefinition` is the
+	// correct keying either way. `replace-all` would LWW-merge colliding keys, so the
+	// set gate runs first.
 	const shapePk = backing.primaryKeyDefinition.map(c => ({
 		index: c.index,
 		collation: c.collation ?? backing.columns[c.index]?.collation,
@@ -1857,22 +1851,19 @@ export async function rebuildBacking(
 	assertRefreshRowsAreSet(rows, shapePk, db.getCollationResolver(), mv.schemaName, mv.name);
 
 	const conn = await resolveAttachConnection(db, host, `${mv.schemaName}.${mv.name}`);
-	await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
-	// Throws the maintained-table-attributed diagnostic BEFORE the commit; on a
-	// violation the failing statement unwinds and discards the pending reconcile,
-	// leaving the pre-refresh committed contents intact (the MV stays stale, so the
-	// next read re-validates rather than serving the rejected set).
-	//
-	// On the reshape arm `validationColumns` carries the attributes the reshape is
-	// about to land ({@link previewReshapedColumns}), so a CHECK / FK is evaluated
-	// under the column's FINAL type and collation even though the `retype` /
-	// `recollate` module ops still run post-reconcile in reshapeBackingInPlace. That
-	// keeps this commit's ordering exactly as it was — the scan stays before the
-	// commit, the post-reconcile ops still scan committed contents — while removing
-	// the wrong-semantics gap. The attach reshape path passes the same preview at its
-	// own call site, so both arms reject identically.
-	await validateDeclaredConstraintsOverContents(db, backing, validationColumns);
-	await db._commitConnectionEarly(conn);
+	const changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
+	if (isMaintainedTable(backing) && hasApplicableConstraints(db, backing)) {
+		// On the reshape arm `validationColumns` carries the attributes the reshape is
+		// about to land ({@link previewReshapedColumns}), so a CHECK / FK is evaluated
+		// under the column's FINAL type and collation even though the `retype` /
+		// `recollate` module ops still run post-reconcile in reshapeBackingInPlace. The
+		// scan stays before that arm's early commit, so a violator is rejected with
+		// nothing committed. The attach reshape path passes the same preview at its own
+		// call site, so both arms reject identically.
+		await validateDeclaredConstraintsOverContents(db, backing, options.validationColumns);
+	}
+	if (options.commitEarly) await db._commitConnectionEarly(conn);
+	return changes;
 }
 
 /**
@@ -2769,6 +2760,12 @@ function inexpressibleReshapeError(schemaName: string, name: string, reason: str
 	);
 }
 
+/** A completed in-place reshape: the reshaped record and the reconcile's realized diff. */
+export interface ReshapedBacking {
+	live: MaintainedTableSchema;
+	changes: BackingRowChange[];
+}
+
 /**
  * Identity-preserving reshape of a maintained table whose re-derived body shape
  * shifted — the refresh path's replacement for the former drop+recreate. Classify
@@ -2781,7 +2778,7 @@ export async function reshapeBacking(
 	db: Database,
 	mv: MaintainedTableSchema,
 	shape: BackingShape,
-): Promise<MaintainedTableSchema> {
+): Promise<ReshapedBacking> {
 	const classification = classifyBackingReshape(mv, shape);
 	if (!classification.expressible) {
 		throw inexpressibleReshapeError(mv.schemaName, mv.name, classification.reason);
@@ -2804,7 +2801,7 @@ export async function reshapeBacking(
  * metadata survives; consumer maintained tables go stale via the single
  * `table_modified` and recover by their own refresh, exactly as for any source
  * alter. Returns the reshaped maintained table for the caller to re-register
- * maintenance on.
+ * maintenance on, with step 3's realized diff for the caller to send downstream.
  *
  * **Why the data-validating ops defer.** A retype (physical convert), a recollate
  * (re-key + unique re-validate), and a NOT NULL tighten each scan the rows and
@@ -2814,9 +2811,8 @@ export async function reshapeBacking(
  * change whose data-fix was never maintained in) and spuriously throw a
  * MISMATCH/CONSTRAINT on a reshape the fresh body satisfies. Deferring them past
  * the reconcile validates the re-derived body rows instead. This is sound because
- * the reconcile's insert paths do NOT validate values against the column schema
- * (`MemoryTable.replaceBaseLayer` PK-extracts + inserts raw; the store backing-host
- * `replaceContents` puts serialized rows by keyed diff), so a body value conforming
+ * the reconcile's `applyMaintenance('replace-all')` does NOT validate values against
+ * the column schema (both hosts write the body rows as given), so a body value conforming
  * to the NEW attribute enters the still-OLD-typed column unvalidated, and the
  * post-reconcile op then converts/re-keys/asserts the clean body data successfully.
  * The added-NULLABLE / deferred-tighten behavior for new NOT NULL columns is the
@@ -2835,7 +2831,7 @@ async function reshapeBackingInPlace(
 	mv: MaintainedTableSchema,
 	shape: BackingShape,
 	plan: ReshapePlan,
-): Promise<MaintainedTableSchema> {
+): Promise<ReshapedBacking> {
 	const sm = db.schemaManager;
 	const schema = sm.getSchemaOrFail(mv.schemaName);
 	const backing = schema.getTable(mv.name);
@@ -2872,8 +2868,15 @@ async function reshapeBackingInPlace(
 	// Data reconcile: re-run the body and swap contents (the identity-preserving
 	// data-only path — same host, same incarnation). The column preview lets that
 	// path's declared-constraint scan resolve against the type/collation the
-	// post-reconcile ops below will land, not the ones they replace.
-	await rebuildBacking(db, live, previewReshapedColumns(live, shape));
+	// post-reconcile ops below will land, not the ones they replace. The rows commit
+	// early because those ops read committed contents.
+	// NOTE: accepted limitation — this arm's rebuilt rows are committed before the
+	// transaction ends, so an assertion that rejects them at COMMIT fails the commit
+	// but cannot take them back, and a rollback leaves them (the refresh re-marks the
+	// view stale instead). The structural ops above are non-transactional anyway, so
+	// the arm is DDL-grade. Revisit if module column ops ever become transactional.
+	const changes = await rebuildBacking(db, live,
+		{ commitEarly: true, validationColumns: previewReshapedColumns(live, shape) });
 
 	// Post-reconcile data-validating ops (retype / recollate / tighten NOT NULL): the
 	// reconciled body rows satisfy the new attribute where the discarded backing
@@ -2909,7 +2912,7 @@ async function reshapeBackingInPlace(
 		oldObject: backing,
 		newObject: live,
 	});
-	return live;
+	return { live, changes };
 }
 
 /**

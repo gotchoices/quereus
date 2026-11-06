@@ -191,7 +191,7 @@ covering structure answers it.
 > `rows: Row[]`. It is the transactional backing replacement the always-correct
 > **full-rebuild** maintenance arm consumes: a body for which no incremental arm is sound is
 > maintained by recomputing it wholesale per writing statement. That replacement must commit/roll-back in lockstep with the source write, so it
-> targets the backing's **pending** `TransactionLayer` — it cannot use the CREATE/REFRESH
+> targets the backing's **pending** `TransactionLayer` — it cannot use the create-fill
 > `replaceBaseLayer` primitive, which swaps the committed *base* layer and would not roll back
 > on an aborted statement. `applyMaintenanceToLayer` (`vtab/memory/layer/manager.ts`) realizes
 > it as a **keyed diff by backing PK** against the layer's current rows: it snapshots the old
@@ -428,22 +428,28 @@ on it:
 - **Watchers over MV-over-MV chains.** `analyzeChangeScope` projects an MV reference to its
   *direct* sources only, so a watch on `mv2` (over `mv1` over `w`) lands on `main.mv1`.
 
-Recording is bounded by the realized per-statement delta, exactly like user DML: the bulk
-fills (`materializeView` create-fill, `rebuildBacking` refresh) call the host directly and
-never route through `postApplyBackingChanges`, and a value-identical upsert reports no
-`BackingRowChange` at all. Savepoints need no special handling — the records land in the
-current layer and are discarded by `ROLLBACK TO` along with the backing write they describe.
+Recording is bounded by the realized per-statement delta, exactly like user DML: the
+create-fill (`materializeView`) calls the host directly and never routes through
+`postApplyBackingChanges`, and a value-identical upsert reports no `BackingRowChange` at
+all. Savepoints need no special handling — the records land in the current layer and are
+discarded by `ROLLBACK TO` along with the backing write they describe.
 
-`attachMaintainedDerivation` (`alter table … set maintained as …`) is the one DDL-scale
-exception: it writes the attached table directly, but deliberately cascades its whole-set
-reconcile delta to consumer maintained tables, so a consumer records one entry per
-reconciled row in that single statement. Intended — the consumer's content really did
-change — but O(consumer rows) in one transaction.
+Two DDL-scale writers record a whole-table diff:
 
-One gap this does **not** close: `REFRESH MATERIALIZED VIEW` swaps committed contents via
-`replaceContents` (or a direct `applyMaintenance('replace-all')` on the constraint-bearing
-branch) without routing through `postApplyBackingChanges`, so a refresh that re-derives
-violating content does not trip an assertion at that commit.
+- **`REFRESH MATERIALIZED VIEW`** lands the recomputed rows with `applyMaintenance('replace-all')`
+  and sends the realized keyed diff through `propagateRefreshChanges` — change-log
+  recording, parent-side referential enforcement, and the cascade to consumer maintained
+  tables (see [materialized-views.md § REFRESH](materialized-views.md#refresh-materialized-view)).
+  A refresh that re-derives violating content therefore fails its commit on the assertion.
+  The diff scales with how far the stored rows had drifted: an unchanged refresh records
+  nothing, and one that rewrites most of the table records O(table) entries.
+- **`attachMaintainedDerivation`** (`alter table … set maintained as …`) writes the attached
+  table directly (unrecorded), but cascades its whole-set reconcile delta to consumer
+  maintained tables, so a consumer records one entry per reconciled row in that single
+  statement — O(consumer rows) in one transaction.
+
+Both are intended: the content really did change, so an assertion over it should see the
+statement.
 
 ### Reading changes at COMMIT
 

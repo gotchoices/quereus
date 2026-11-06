@@ -1160,12 +1160,8 @@ DROP TABLE dg_named;
 -- Row-time maintenance writes the backing through the privileged BackingHost surface,
 -- which does not touch the change log — so maintenance records each REALIZED backing
 -- delta into it explicitly (MaterializedViewManager.recordMaintenanceChanges). Without
--- that recording, every violating commit below succeeded silently.
---
--- Note: `REFRESH MATERIALIZED VIEW` deliberately stays outside this — it swaps committed
--- contents wholesale without routing through row-time maintenance, so a refresh that
--- re-derives violating content does not trip an assertion at that commit. That is a
--- separate, pre-existing gap, not covered here.
+-- that recording, every violating commit below succeeded silently. `REFRESH MATERIALIZED
+-- VIEW` records its realized diff the same way (see the refresh case below).
 
 -- --- Projection MV: a write to the SOURCE trips the assertion ---
 
@@ -1344,6 +1340,33 @@ select id, n from amv_mt order by id;
 drop assertion amv_mt_pos;
 drop table amv_mt;
 drop table amv_src;
+-- run
+
+-- --- A REFRESH that re-derives violating rows trips the assertion ---
+-- The collation change on `g` (read only by the body's WHERE) leaves arf_mv stale, so
+-- the -2 row drifts into the source unmaintained. The refresh brings it into the view,
+-- the assertion rejects that commit, and the rollback undoes the refresh.
+
+create table arf_src (id integer primary key, v integer not null, g text not null default 'keep');
+create materialized view arf_mv as select id, v from arf_src where g <> 'skip';
+create assertion arf_nonneg check (not exists (select 1 from arf_mv where v < 0));
+insert into arf_src (id, v) values (1, 1);
+commit;
+-- run
+
+alter table arf_src alter column g set collate nocase;
+insert into arf_src (id, v) values (2, -2);
+-- run
+
+refresh materialized view arf_mv;
+-- error: Integrity assertion failed: arf_nonneg
+
+select id, v from arf_mv order by id;
+→ [{ "id": 1, "v": 1 }]
+
+drop assertion arf_nonneg;
+drop materialized view arf_mv;
+drop table arf_src;
 -- run
 
 -- --- Partial (WHERE-filtered) MV: a row LEAVING the view's scope records a DELETE ---

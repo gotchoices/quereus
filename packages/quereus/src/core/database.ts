@@ -3309,6 +3309,23 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.materializedViewManager.markMaterializedViewStale(mv);
 	}
 
+	/** @internal Run `action` if the open transaction's work so far is undone (rollback,
+	 *  failed commit, or a `rollback to savepoint` covering it); a commit drops it. For
+	 *  catalog state that describes rows a rollback restores. See
+	 *  `TransactionManager.onUndo`. */
+	public _onTransactionUndo(action: () => void): void {
+		this.transactionManager.onUndo(action);
+	}
+
+	/** @internal Send a refresh's realized backing diff through the pipeline every other
+	 *  maintained write takes: change-log recording, parent-side referential enforcement,
+	 *  and the cascade to maintained tables built on this one. Call after the refreshed
+	 *  MV's row-time plan is re-registered. See `database-materialized-views.ts` §
+	 *  propagateRefreshChanges. */
+	public async _propagateRefreshChanges(mv: MaintainedTableSchema, changes: readonly BackingRowChange[]): Promise<void> {
+		await this.materializedViewManager.propagateRefreshChanges(mv, changes);
+	}
+
 	/**
 	 * Refresh every maintained table (materialized view) in source-dependency
 	 * order, bringing each backing current with its sources. The convergence
@@ -3319,20 +3336,22 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * bounded-delta MV is full-rebuilt here too — convergence does not depend on
 	 * delta replay, and the full rebuild re-reads the complete source through the
 	 * vtab regardless of how its rows arrived (out-of-band direct-storage writes
-	 * included). MV-over-MV chains converge base-first: refresh is commit-first per
-	 * MV, so a base MV's backing is committed before a dependent's body re-reads it.
+	 * included). MV-over-MV chains converge base-first: a base MV's refresh commits
+	 * before a dependent's body re-reads it. A dependent that is still live is
+	 * brought current by its base's refresh (the refresh cascades its diff), so its
+	 * own refresh then changes nothing.
 	 *
 	 * NOT atomic across the sweep — the whole sweep is deliberately NOT wrapped in
-	 * one explicit transaction (refresh is commit-first per MV, so an enclosing
-	 * transaction would not make it atomic anyway). Each MV ensures/commits its own
-	 * implicit transaction exactly as the single-MV `refresh` does, so a failure
-	 * partway leaves earlier MVs converged; the caller (snapshot bootstrap) retries
-	 * the whole load idempotently.
+	 * one explicit transaction, which would hold every MV's rebuilt rows pending at
+	 * once. Each MV ensures/commits its own implicit transaction exactly as the
+	 * single-MV `refresh` does, so a failure partway leaves earlier MVs converged;
+	 * the caller (snapshot bootstrap) retries the whole load idempotently.
 	 *
 	 * An engine convergence primitive, NOT a SQL statement: the
 	 * `ddl_transaction_policy = 'strict'` gate that refuses `refresh materialized
 	 * view` inside an explicit transaction does not apply here. A caller that opens
-	 * its own `begin` around the sweep still gets the commit-first behavior above.
+	 * its own `begin` around the sweep runs every refresh inside it, so its commit or
+	 * rollback decides them all (a reshaping refresh's rows aside, which commit early).
 	 *
 	 * Serialized via the exec mutex like any statement — do NOT call from within
 	 * statement execution or a vtab callback (deadlock; same constraint as
@@ -3351,8 +3370,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const refreshed: Array<{ schemaName: string; name: string }> = [];
 		await this._withMutex(async () => {
 			// Per-MV implicit-transaction scope mirrors `exec`'s per-statement boundary:
-			// each refresh commits independently (commit-first), so a mid-sweep failure
-			// leaves the already-refreshed MVs converged rather than rolling them back.
+			// each refresh commits independently, so a mid-sweep failure leaves the
+			// already-refreshed MVs converged rather than rolling them back.
 			for (const mv of order) {
 				try {
 					await this._ensureTransaction();
