@@ -915,7 +915,7 @@ async function runAddColumn(
 		// before the whole install loop below, so on a column declaring several kinds a
 		// CHECK violation is reported ahead of a UNIQUE or FK one.
 		if (!backfill && inlineChecks.length > 0) {
-			await validateBackfillAgainstChecks(rctx, columnOnlySchema, inlineChecks);
+			await validateBackfillAgainstChecks(rctx, columnOnlySchema, columnDef.name, inlineChecks);
 		}
 
 		// Starts as the column-only schema so a column with no inline constraint needs no
@@ -1096,6 +1096,14 @@ async function remapEventsForRevertedAddColumn(
  * `ruleFilterContradiction` fold this scan's own `not (<check_expr>)` to EmptyRelation.
  * Any row matching `not (<check_expr>)` is a violation and aborts the ALTER.
  *
+ * The same scan then runs over every state a rollback could restore, a violation there
+ * refusing as `BUSY` (`add column <name>`). Those states are read AFTER the module's
+ * `addColumn`, so each carries the new column as the module wrote it into that state: the
+ * memory module backfills its base and every layer; the store, unwrapped, flushes its
+ * buffered writes before rewriting rows, which leaves nothing to restore; under the
+ * isolation layer the underlying's rows and the overlay's savepoint frames are both
+ * reshaped in place. The caller's revert then drops the column, as for any violation.
+ *
  * Each constraint is built with the same builder and taken-name set the module uses
  * when it installs it, so the name a violation reports is the one the catalog would
  * have carried.
@@ -1103,6 +1111,7 @@ async function remapEventsForRevertedAddColumn(
 async function validateBackfillAgainstChecks(
 	rctx: RuntimeContext,
 	columnOnlySchema: TableSchema,
+	columnName: string,
 	newCheckConstraints: ReadonlyArray<AST.TableConstraint>,
 ): Promise<void> {
 	const takenNames = collectTableConstraintNames(columnOnlySchema);
@@ -1118,7 +1127,7 @@ async function validateBackfillAgainstChecks(
 		}
 		return buildCheckConstraintSchema(cc, columnOnlySchema.checkConstraints.length + i, takenNames);
 	});
-	await validateRowInvariantChecksOverExistingRows(rctx.db, columnOnlySchema, checks, (check) =>
+	await validateRowInvariantChecksOverExistingRows(rctx.db, columnOnlySchema, checks, `add column ${columnName}`, (check) =>
 		new QuereusError(
 			`CHECK constraint '${check.name}' violated by backfilled rows in ALTER TABLE ADD COLUMN on '${columnOnlySchema.name}'`,
 			StatusCode.CONSTRAINT,

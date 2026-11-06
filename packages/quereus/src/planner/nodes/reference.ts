@@ -26,6 +26,17 @@ import type { TableAccessCapable } from '../framework/characteristics.js';
 import type { ColumnReferenceCapable } from '../framework/characteristics.js';
 
 /** Represents a reference to a table in the global schema. */
+/** Fresh attributes for a scan of `tableSchema`'s rows, one per column. */
+export function tableSchemaAttributes(tableSchema: TableSchema): Attribute[] {
+	return tableSchema.columns.map((column) => ({
+		id: PlanNode.nextAttrId(),
+		name: column.name,
+		type: columnSchemaToScalarType(column),
+		sourceRelation: `${tableSchema.schemaName}.${tableSchema.name}`,
+		relationName: tableSchema.name
+	}));
+}
+
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
 	override readonly nodeType = PlanNodeType.TableReference;
 	readonly isTableAccessCapable = true as const;
@@ -62,16 +73,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		super(scope, estimatedCostOverride ?? 1);
 		this.plannedRows = plannedRowCount(tableSchema, schemaManager?.getRowCountSources());
 		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema));
-		this.attributesCache = new Cached(() => {
-			// Create attributes from table schema columns
-			return this.tableSchema.columns.map((column) => ({
-				id: PlanNode.nextAttrId(),
-				name: column.name,
-				type: columnSchemaToScalarType(column),
-				sourceRelation: `${this.tableSchema.schemaName}.${this.tableSchema.name}`,
-				relationName: this.tableSchema.name
-			}));
-		});
+		this.attributesCache = new Cached(() => tableSchemaAttributes(this.tableSchema));
 	}
 
 	getType(): RelationType {

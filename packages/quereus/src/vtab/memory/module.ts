@@ -24,6 +24,7 @@ import { PRIMARY_INDEX_NAME } from '../index-descriptor.js';
 import { combineConjunctive } from '../../planner/stats/selectivity-combine.js';
 import { costedRows } from '../../planner/util/row-estimates.js';
 import { normalizeCollationName } from '../../util/comparison.js';
+import type { RestorableRowStates } from '../rollback-states.js';
 import type { ColumnStatistics, TableStatistics } from '../../planner/stats/catalog-stats.js';
 
 const logger = createMemoryTableLoggers('module');
@@ -1341,6 +1342,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// `carryStatisticsAcrossColumnRename`). Revisit if the difference ever shows up as a
 		// plan discrepancy between backends.
 		return manager.tableSchema;
+	}
+
+	/** `VirtualTableModule.restorableRowStates`: see {@link MemoryTableManager.restorableRowStates}. */
+	async restorableRowStates(_db: Database, schemaName: string, tableName: string, _ddl: string): Promise<RestorableRowStates | undefined> {
+		return this.tables.get(`${schemaName}.${tableName}`.toLowerCase())?.restorableRowStates();
 	}
 
 	/**

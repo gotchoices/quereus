@@ -251,30 +251,24 @@ export class MemoryTableConnection {
 	}
 
 	/**
-	 * The layer each OPEN savepoint would reinstate as this connection's read view on `rollback
-	 * to` it, oldest first: an eager entry restores its snapshot, a lazy marker the layer it
-	 * captured. Each layer's merged primary tree IS the rows the transaction would see after that
-	 * rollback — the states a row-validating DDL judges for `BUSY`
-	 * (`MemoryTableManager.restorableStates`; docs/memory-table.md § DDL and transactions, rule 1).
+	 * Per OPEN savepoint, indexed by its depth: the layer `rollback to` it would reinstate as this
+	 * connection's read view when that layer holds this connection's own uncommitted rows — an
+	 * eager entry's snapshot, or a lazy marker taken while an eager snapshot served as the read
+	 * view — else undefined: a lazy marker that captured a committed view restores the committed
+	 * rows (`ensureSchemaChangeSafety` re-points exactly those markers at the committed head).
+	 * Each layer's merged primary tree IS the rows the transaction would see after that rollback —
+	 * the states a row-validating DDL judges for `BUSY` (`MemoryTableManager.restorableStates`;
+	 * docs/memory-table.md § DDL and transactions, rule 1).
 	 *
+	 * Indexed by depth because the database replays its savepoint stack onto a connection that
+	 * joins late (`TransactionManager.joinConnection`), so stack index and database depth agree.
 	 * Only open savepoints: `RELEASE` pops its entry, and a released savepoint cannot be rolled
 	 * back to, so its snapshot is not a restorable state even though it stays in the layer chain
-	 * (which is why this walks the stack, not the chain). Deduplicated by identity — nested lazy
-	 * markers can capture one layer. The manager's base is not excluded here, since this class
-	 * does not know it; the caller filters it (after `ensureSchemaChangeSafety` re-points lazy
-	 * markers, a marker's captured layer is either the base — the committed state, judged on its
-	 * own — or this connection's own eager snapshot).
+	 * (which is why this walks the stack, not the chain).
 	 */
-	public savepointRestoreLayers(): Layer[] {
-		const seen = new Set<Layer>();
-		const out: Layer[] = [];
-		for (const entry of this.savepointStack) {
-			const layer = entry.snapshot ?? entry.readLayer;
-			if (seen.has(layer)) continue;
-			seen.add(layer);
-			out.push(layer);
-		}
-		return out;
+	public savepointRestoreLayersByDepth(): (Layer | undefined)[] {
+		return this.savepointStack.map(entry =>
+			entry.snapshot ?? (entry.readSnapshot !== null ? entry.readLayer : undefined));
 	}
 
 	/** Ends savepoint bookkeeping. Only called where the transaction itself is ending. */

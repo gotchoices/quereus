@@ -1,7 +1,7 @@
 import { createLogger } from '../common/logger.js';
 import { type SqlValue, StatusCode, type Row, type SqlParameters, type StatementOptions, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
 import { MisuseError, QuereusError, throwIfAborted } from '../common/errors.js';
-import type { Database } from './database.js';
+import type { Database, ExistingRowScanPlanning } from './database.js';
 import { isRelationType, type ColumnDef, type ScalarType } from '../common/datatype.js';
 import { Parser } from '../parser/parser.js';
 import type { Statement as ASTStatement } from '../parser/ast.js';
@@ -20,7 +20,7 @@ import type { VirtualTable } from '../vtab/table.js';
 import type { TableSchema } from '../schema/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
-import type { BuildTimeDependencyTracker, SchemaDependency } from '../planner/planning-context.js';
+import type { BuildTimeDependencyTracker, RowSourceOverrides, SchemaDependency } from '../planner/planning-context.js';
 import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
@@ -135,6 +135,15 @@ export class Statement {
 	 * own to register the variables in. Keep it that way.
 	 */
 	_noEnvelopeContextTable?: TableSchema;
+	/**
+	 * @internal Tables this statement reads from the given rows instead of from their module (see
+	 * `PlanningContext.rowSourceOverrides`). Set right after `db.prepare(...)`, under the same
+	 * deferred-compile reasoning as {@link _schemaPathOverride}, by exactly one site: the
+	 * existing-row CHECK scan run over each state a rollback could restore
+	 * (`validateChecksOverExistingRows`, `schema/constraint-builder.ts`), so that pass re-runs the
+	 * very SQL the effective pass ran.
+	 */
+	_rowSourceOverrides?: RowSourceOverrides;
 	/**
 	 * @internal When true, this statement emits with scalar fusion disabled, so its
 	 * instruction graph is the full, faithful sub-program form. Set right after
@@ -352,7 +361,7 @@ export class Statement {
 			const parameterTypes = this.establishParameterTypes();
 
 			// Pass parameter types directly to planning
-			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride, this._noEnvelopeContextTable);
+			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride, this.existingRowScanPlanning());
 			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
 			// before the access-path optimizer folds `col = ?` comparisons into index
 			// seeks (which erases the comparison node). See validateParameterTypes.
@@ -1145,8 +1154,12 @@ export class Statement {
 	 */
 	private getAnalysisPlan(): BlockNode {
 		const currentAst = this.getAstStatement();
-		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.establishParameterTypes(), this._schemaPathOverride, this._noEnvelopeContextTable);
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.establishParameterTypes(), this._schemaPathOverride, this.existingRowScanPlanning());
 		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
+	}
+
+	private existingRowScanPlanning(): ExistingRowScanPlanning {
+		return { noEnvelopeContextTable: this._noEnvelopeContextTable, rowSourceOverrides: this._rowSourceOverrides };
 	}
 
 	/**

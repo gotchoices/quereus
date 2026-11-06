@@ -19,6 +19,7 @@ import type {
 	Database,
 	IssuerRowSources,
 	KeyNormalizerResolver,
+	RestorableRowStates,
 	TableIndexSchema,
 	TableSchema,
 } from '@quereus/quereus';
@@ -36,6 +37,7 @@ import { buildFullScanBounds, buildIndexStoreName } from './key-builder.js';
 import { StoreModuleSchemaSync } from './store-module-schema-sync.js';
 import { DEFAULT_MAX_BATCH_BYTES } from './store-module-base.js';
 import {
+	bufferedRestorableRowStates,
 	buildIndexEntries,
 	effectiveDdlRows,
 	populateIndexStore,
@@ -84,6 +86,16 @@ interface SchemaDdlProgress {
 }
 
 export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
+	/**
+	 * `VirtualTableModule.restorableRowStates`: the states this module's own buffered writes could
+	 * roll back to (`bufferedRestorableRowStates`), or undefined for a table that is not connected
+	 * here — such a table has buffered nothing. `getTable`, not a reconnect: this must not mutate.
+	 */
+	async restorableRowStates(_db: Database, schemaName: string, tableName: string, _ddl: string): Promise<RestorableRowStates | undefined> {
+		const table = this.getTable(schemaName, tableName);
+		return table ? bufferedRestorableRowStates(table) : undefined;
+	}
+
 	/**
 	 * Creates an index on a store-backed table.
 	 *

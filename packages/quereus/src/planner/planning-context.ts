@@ -6,6 +6,18 @@ import type { Scope } from './scopes/scope.js';
 import type { PlanNode, ScalarPlanNode, TableDescriptor } from './nodes/plan-node.js';
 import type { CTEScopeNode } from './nodes/cte-node.js';
 import type { CTEReferenceNode } from './nodes/cte-reference-node.js';
+import type { RestorableRows } from '../vtab/rollback-states.js';
+
+/**
+ * Rows a statement reads in place of a table's module, keyed by {@link rowSourceOverrideKey} —
+ * see `Statement._rowSourceOverrides`.
+ */
+export type RowSourceOverrides = ReadonlyMap<string, RestorableRows>;
+
+/** The key {@link RowSourceOverrides} files a table under: how name resolution identifies it. */
+export function rowSourceOverrideKey(schemaName: string, tableName: string): string {
+	return `${schemaName}.${tableName}`.toLowerCase();
+}
 
 /**
  * Debug options for query planning and execution.
@@ -228,6 +240,14 @@ export interface PlanningContext {
 
   /** maps a RelationalPlanNode to its column scope during building */
   readonly outputScopes: Map<PlanNode, Scope>;
+
+  /**
+   * Tables whose FROM references plan as a scan of the given rows instead of the module
+   * (`buildTableSource`, planner/building/table.ts). Set only for a statement carrying
+   * `Statement._rowSourceOverrides`; inherited by every derived context through the usual
+   * spread, so a subquery or view body reading the same table reads the same rows.
+   */
+  readonly rowSourceOverrides?: RowSourceOverrides;
 
   /**
    * Optional schema search path for resolving unqualified table names.

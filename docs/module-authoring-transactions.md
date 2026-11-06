@@ -64,7 +64,7 @@ export interface IssuerRowSources {
 createIndex?(db, schemaName, tableName, indexSchema, rows?: IssuerRowSources): Promise<void>;
 alterTable?(db, schemaName, tableName, change, rows?: IssuerRowSources): Promise<TableSchema>;
 createIndex?(indexSchema, rows?: IssuerRowSources): Promise<void>;   // VirtualTable, instance level
-savepointRowSources?(): readonly EffectiveRowSource[];             // VirtualTable, the staging table's half
+savepointRowSources?(): readonly (EffectiveRowSource | undefined)[]; // VirtualTable, the staging table's half
 ```
 
 **Who supplies it.** Only a wrapper module that holds the issuing connection's pending rows
@@ -76,8 +76,10 @@ the ones it rewrote, plus the ones it added) and the same merge over the overlay
 stood at each open savepoint* as `savepoints`, read off the staging table through
 `VirtualTable.savepointRowSources` (the memory module implements it; a staging module without it
 cannot serve row-validating DDL under open savepoints, and the isolation layer refuses such a DDL
-with `BUSY` rather than leave a rollback state unjudged). Savepoints taken before the overlay
-existed restore the committed state and are not listed. A *foreign* connection's overlay never
+with `BUSY` rather than leave a rollback state unjudged). `savepointRowSources` is indexed by
+savepoint depth, with `undefined` where `rollback to` that savepoint restores the staging table's
+committed state — a savepoint taken before the overlay held anything; those restore the wrapped
+module's committed rows and are not listed in `savepoints`. A *foreign* connection's overlay never
 contributes — its staged duplicates are its own problem at commit time, exactly as a concurrent
 duplicate insert would be. It is one bundle rather than two optional parameters so a wrapper
 cannot hand down the effective rows and forget the rollback states.
@@ -125,6 +127,62 @@ cannot hand down the effective rows and forget the rollback states.
 Every stream is re-callable because a single `ALTER` may validate more than once (one pass per
 UNIQUE constraint covering the altered column, per state). Row order is unspecified — every
 consumer is a set-shaped check.
+
+### When the engine judges the rows: `restorableRowStates`
+
+Some row-validating DDL is judged by the engine, not the module: the existing-row CHECK scan of
+`ALTER TABLE … ADD CONSTRAINT … CHECK` and of an inline CHECK on `ALTER TABLE … ADD COLUMN`
+(`validateRowInvariantChecksOverExistingRows`, `schema/constraint-builder.ts`), which runs
+`select 1 from <t> where not (<check>) limit 1` through the ordinary read path. That path sees only
+the effective rows, so a module whose DDL survives a rollback reports the other states through an
+optional module-level hook:
+
+```ts
+interface RestorableRowStates {
+	/** What a whole-transaction `rollback` restores: the committed rows. */
+	readonly transaction: RestorableRows;
+	/** What `rollback to` each open savepoint restores, indexed by savepoint depth; a savepoint
+	 *  taken before the table had any work restores (and may share) `transaction`. */
+	readonly savepoints: readonly RestorableRows[];
+}
+
+restorableRowStates?(db, schemaName, tableName, ddl): Promise<RestorableRowStates | undefined>;
+```
+
+The engine runs the effective scan first (a violation there is `CONSTRAINT`), then the very same
+SQL once per distinct state with the table's rows replaced by that state's
+(`Statement._rowSourceOverrides`, which plans the table as a literal over the supplied rows), and
+refuses with `BUSY` through `judgeRestorableStates` when one would violate the new CHECK. Re-running
+the same SQL keeps types, collations, NULL handling and the `new.` / context-variable rules
+identical by construction, and because the rows are not a module scan no CHECK or assertion is
+lifted from the table's declaration over them. The optimizer lifting a declared row-invariant
+CHECK into a fact about every stored row is why this matters: accepted, a restored violator
+would vanish from every query that filters for it.
+
+The contract:
+
+*   Return `undefined` when the issuing connection has no open work on the table — every state
+    then equals the effective rows, and the common case pays no second scan.
+*   Read-only: no drain, no flush, no other mutation. `ADD CONSTRAINT` calls the hook *before*
+    `alterTable`; `ADD COLUMN` calls it *after* `alterTable(addColumn)`, so each state already
+    carries the new column as the module wrote it into that state. Rows are in the table's
+    current column layout.
+*   Index `savepoints` by the database's savepoint depth so two tables' states can be paired by
+    rollback point (a foreign key pairs a child's state with its parent's). A released savepoint
+    has no entry.
+*   A state the module holds but cannot report must refuse, not pass: the isolation layer, over
+    an overlay module without `savepointRowSources`, throws `rolledBackRowsWouldViolate(ddl, …)`
+    under open savepoints. `ddl` is the statement as the user wrote it (`add constraint pos
+    check`, `add check`, `add column w`).
+*   A module whose DDL rolls back with its data needs no hook; one declaring
+    `permitsGrandfatheredCheckViolators` is not judged at all.
+
+The bundled implementations: the memory module reports its committed head and each open
+savepoint's layer for the DDL connection; the store, unwrapped, its committed entries and each
+savepoint's prefix of the coordinator's op log (nothing when it buffers nothing for the table —
+and `ADD COLUMN` flushes first, so it then reports nothing); the isolation layer, when the issuer
+has staged rows, the underlying's rows as `transaction` and the overlay's frames merged with them
+as `savepoints`, else whatever the underlying reports.
 
 ## Connection Registration
 

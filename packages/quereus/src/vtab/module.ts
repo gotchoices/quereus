@@ -13,6 +13,7 @@ import type { Schema } from '../schema/schema.js';
 import type { ViewSchema } from '../schema/view.js';
 import type { LensDeploymentSnapshot } from '../schema/lens.js';
 import type { Row, SqlValue } from '../common/types.js';
+import type { RestorableRowStates } from './rollback-states.js';
 
 /**
  * A module's own answer to "how many rows does this table hold right now?" — see
@@ -581,6 +582,33 @@ export interface VirtualTableModule<
 		change: SchemaChangeInfo,
 		rows?: IssuerRowSources,
 	): Promise<TableSchema>;
+
+	/**
+	 * The rows `tableName` would show the connection `db` is running after each rollback the open
+	 * transaction could still perform, or undefined when that connection has no open work on the
+	 * table (every state then equals the rows it can see now, so there is nothing extra to judge).
+	 *
+	 * Read by the row-validating DDL the ENGINE judges rather than the module — the existing-row
+	 * CHECK scan of `add constraint … check` and `add column … check` — which re-runs its scan
+	 * over each state and refuses with `BUSY` when one would violate the new rule
+	 * (`rolledBackRowsWouldViolate`; docs/module-authoring-transactions.md § DDL inside an open
+	 * transaction). Rows are in the table's current column layout: called after the module's own
+	 * `alterTable` for `add column`, before it for `add constraint`.
+	 *
+	 * Read-only: must not drain, flush or otherwise mutate. `ddl` names the statement as the user
+	 * wrote it, for the one refusal a module raises itself — a state it holds but cannot report
+	 * (the isolation layer over an overlay module without `VirtualTable.savepointRowSources`)
+	 * must refuse, not pass.
+	 *
+	 * Optional; a module without it is not judged (status quo), which is correct for a module
+	 * whose DDL rolls back with its data.
+	 */
+	restorableRowStates?(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		ddl: string,
+	): Promise<RestorableRowStates | undefined>;
 
 	/**
 	 * Apply a metadata-tag edit: `alter table … set / add / drop tags` on the table, a

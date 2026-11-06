@@ -1,7 +1,7 @@
 /**
  * The bare store module (no isolation wrapper) vs. rollback, for the DDL that stays inside the
- * open transaction: `create [unique] index`, `add constraint … unique`, and a `set not null` that
- * sees no NULL.
+ * open transaction: `create [unique] index`, `add constraint … unique` / `… check`, and a
+ * `set not null` that sees no NULL.
  *
  * DDL survives a rollback while the rows it judged do not, and here those rows live in the
  * coordinator's op log. So each statement judges the committed rows and each open savepoint's
@@ -192,6 +192,37 @@ describe('Bare store DDL vs. the states a rollback could restore', () => {
 			});
 		});
 	}
+
+	describe('add constraint … check', () => {
+		// The engine runs this scan, not the store; the store reports its states through
+		// `restorableRowStates`, read off the coordinator's op log.
+		beforeEach(async () => {
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+		});
+
+		it('refuses when a committed row the transaction deleted would break it', async () => {
+			await db.exec(`insert into t values (1, -1), (2, 5)`);
+
+			await db.exec(`begin`);
+			await db.exec(`delete from t where id = 1`);
+			await expectRefusedBusy(`alter table t add constraint pos check (v > 0)`);
+			await db.exec(`rollback`);
+
+			// Accepted, the declared CHECK would let the optimizer fold this filter to nothing.
+			expect(await ids(`select id from t where v <= 0`)).to.deep.equal([1]);
+		});
+
+		it('refuses when only an open savepoint holds the violating row', async () => {
+			await db.exec(`insert into t values (1, 1)`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, -2)`);
+			await db.exec(`savepoint s`);
+			await db.exec(`delete from t where id = 2`);
+			await expectRefusedBusy(`alter table t add check (v > 0)`);
+			await db.exec(`rollback`);
+		});
+	});
 
 	describe('create index over rows the transaction overwrote', () => {
 		beforeEach(async () => {

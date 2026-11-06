@@ -21,6 +21,7 @@ import { spineCloneAst } from '../../util/ast-spine-clone.js';
 import { createEventLoopPacer, type EventLoopPacer } from '../../util/event-loop.js';
 import { assertModuleCanRebuild } from './alter-table.js';
 import { rejectCheckViolatedByExistingRows } from './add-constraint.js';
+import { describeAddCheck } from '../../vtab/rollback-states.js';
 import { rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 
 const log = createLogger('runtime:emit:declare');
@@ -841,7 +842,7 @@ async function revalidateChecksOverRecreatedObjects(db: Database, schemaName: st
 	if (recreated.size === 0) return undefined;
 	for (const reaching of findChecksReachingObjects(db, recreated)) {
 		try {
-			await rejectCheckViolatedByExistingRows(db, reaching.table, reaching.check);
+			await rejectCheckViolatedByExistingRows(db, reaching.table, reaching.check, describeAddCheck(reaching.check.name));
 		} catch (e) {
 			log('CHECK over a recreated object failed on %s: %O', reaching.table.name, e);
 			return recreatedObjectBrokeCheck(reaching, schemaName, e);

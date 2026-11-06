@@ -255,9 +255,9 @@ illegal. But DDL is not undone by `ROLLBACK` or `ROLLBACK TO SAVEPOINT` (rule 2)
 was judged against are, and the DDL statement is the last point that can report the conflict. So
 the same check then runs, on its own, over each *restorable state*: the base (what a
 whole-transaction rollback restores) and the layer each **open** savepoint would reinstate (what
-`rollback to` restores — `MemoryTableConnection.savepointRestoreLayers`, which walks the savepoint
-*stack* rather than the layer chain, because a released savepoint cannot be rolled back to and its
-snapshot is not a restorable state even though it stays in the chain). A violation confined to a
+`rollback to` restores — `MemoryTableConnection.savepointRestoreLayersByDepth`, which walks the
+savepoint *stack* rather than the layer chain, because a released savepoint cannot be rolled back
+to and its snapshot is not a restorable state even though it stays in the chain). A violation confined to a
 restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rows this
 transaction has deleted or overwritten would violate it if the transaction rolled back. Commit the
 pending writes first, then retry.` (`rolledBackRowsWouldViolate` in `vtab/rollback-states.ts`,
@@ -281,6 +281,13 @@ effective rows *and* the savepoint states as one bundle (`IssuerRowSources`, see
 the manager's base is then exactly the committed rows, and a wrapper's frame is judged as-is for
 `SET NOT NULL` because no rewrite of the manager reaches it. The cross-backend cases are pinned
 in `41.2.4-ddl-rollback-states.sqllogic`.
+
+`ALTER TABLE ... ADD CONSTRAINT ... CHECK` and an inline CHECK on `ALTER TABLE ... ADD COLUMN`
+follow the same rule, but the engine runs their existing-row scan, not the manager: the manager
+reports its states through `MemoryTableModule.restorableRowStates` (the committed head and each
+open savepoint's layer, by depth — read before the drain for `ADD CONSTRAINT`, after the backfill
+for `ADD COLUMN`, so the restored rows already carry the column's DEFAULT), and the engine re-runs
+the CHECK scan over each (docs/module-authoring-transactions.md § When the engine judges the rows).
 
 Every `ALTER COLUMN` that can make two previously-distinct rows collide is validated the same
 way, once per uniqueness-enforcing index covering the altered column (`indexEnforcesUnique` —

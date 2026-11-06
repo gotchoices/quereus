@@ -14,6 +14,7 @@ import type {
 	IssuerRowSources,
 	KeyNormalizer,
 	KeyNormalizerResolver,
+	RestorableRowStates,
 	Row,
 	SqlValue,
 	TableIndexSchema,
@@ -368,13 +369,34 @@ export interface RollbackState {
  */
 export async function rollbackStates(table: StoreTable, rows: IssuerRowSources | undefined): Promise<RollbackState[]> {
 	if (!rows) {
-		const scans = await table.bufferedRollbackScans();
-		return scans.map(scan => ({ rows: () => rowsFromEntries(scan()), backfilled: true }));
+		const own = await bufferedRestorableRowStates(table);
+		return own ? [own.transaction, ...own.savepoints].map(stream => ({ rows: stream, backfilled: true })) : [];
 	}
 	return [
 		{ rows: () => rowsFromEntries(table.iterateCommittedEntries(buildFullScanBounds())), backfilled: true },
 		...rows.savepoints.map(frame => ({ rows: frame, backfilled: false })),
 	];
+}
+
+/** {@link RestorableRowStates} as the store's decoded KV scans: async streams throughout. */
+interface BufferedRowStates extends RestorableRowStates {
+	readonly transaction: EffectiveRowSource;
+	readonly savepoints: readonly EffectiveRowSource[];
+}
+
+/**
+ * `VirtualTableModule.restorableRowStates` for a store table holding its own buffered writes: the
+ * committed rows and each open savepoint's prefix of the coordinator's op log
+ * (`StoreTableBase.bufferedRollbackScans`). The coordinator's savepoint stack is module-wide and
+ * replayed per depth, so its index is the database's savepoint depth. Undefined when nothing is
+ * buffered for the table — always so behind the isolation wrapper, which stages every pending
+ * write itself.
+ */
+export async function bufferedRestorableRowStates(table: StoreTable): Promise<BufferedRowStates | undefined> {
+	const [committed, ...savepoints] = await table.bufferedRollbackScans();
+	if (!committed) return undefined;
+	const decoded = (scan: () => AsyncIterable<KVEntry>): EffectiveRowSource => () => rowsFromEntries(scan());
+	return { transaction: decoded(committed), savepoints: savepoints.map(decoded) };
 }
 
 /**

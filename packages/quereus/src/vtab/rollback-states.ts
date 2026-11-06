@@ -9,6 +9,34 @@ import { QuereusError } from '../common/errors.js';
 export type RestorableRows = () => Iterable<Row> | AsyncIterable<Row>;
 
 /**
+ * Every state a rollback could return one table to, as its module reports them
+ * (`VirtualTableModule.restorableRowStates`) to a row-validating DDL the ENGINE judges: the
+ * existing-row CHECK scan, and the foreign key scan that pairs a child's state with its parent's.
+ * Rows are in the table's current column layout — after any change the module has already
+ * applied for the statement asking.
+ */
+export interface RestorableRowStates {
+	/** What a whole-transaction `rollback` restores: the committed rows. */
+	readonly transaction: RestorableRows;
+	/**
+	 * What `rollback to` each open savepoint restores, indexed by the database's savepoint depth
+	 * (the index passed to `VirtualTable.savepoint`), so states of two tables can be paired by
+	 * rollback point. A savepoint taken before this table had any work restores the committed
+	 * rows, and its entry is then {@link transaction} itself; entries may share one stream. A
+	 * released savepoint cannot be rolled back to and has no entry.
+	 */
+	readonly savepoints: readonly RestorableRows[];
+}
+
+/**
+ * The distinct streams of `states`, committed rows first — what a judge that needs no pairing
+ * by rollback point walks, so a stream several savepoints share is scanned once.
+ */
+export function distinctRestorableRows(states: RestorableRowStates): RestorableRows[] {
+	return [...new Set([states.transaction, ...states.savepoints])];
+}
+
+/**
  * The refusal every row-validating DDL raises when a state a rollback could return the table to
  * — its committed rows, or the rows as they stood at an open savepoint — would violate the rule
  * the DDL declares. DDL survives a rollback on the bundled backends (the `non-transactional`
@@ -47,6 +75,11 @@ export function describeAlterColumn(change: AlterColumnAttributes): string {
 		: change.setDefault === null ? 'drop default'
 		: 'set default';
 	return `alter column ${change.columnName} ${attribute}`;
+}
+
+/** The `add constraint … check` statement as the user wrote it, for {@link rolledBackRowsWouldViolate}. */
+export function describeAddCheck(constraintName: string | undefined): string {
+	return constraintName ? `add constraint ${constraintName} check` : 'add check';
 }
 
 /**

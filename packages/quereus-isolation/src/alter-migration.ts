@@ -667,7 +667,8 @@ async function assertNoMarkerAtNullKeyInSavepointFrames(
 	ctx: SetNotNullBackfillContext,
 	tableName: string,
 ): Promise<void> {
-	for (const frame of overlay.savepointRowSources?.() ?? []) {
+	for (const frame of new Set(overlay.savepointRowSources?.() ?? [])) {
+		if (!frame) continue;
 		for await (const row of frame()) {
 			if (row[tombstoneIdx] === 1 && row[ctx.colIndex] === null) {
 				throw rolledBackRowsWouldViolate(`alter column ${ctx.colName} set not null`, tableName);

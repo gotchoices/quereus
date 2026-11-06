@@ -27,7 +27,7 @@ import type { RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import type { RowDescriptor } from '../planner/nodes/plan-node.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import type { PlanningContext } from '../planner/planning-context.js';
+import type { PlanningContext, RowSourceOverrides } from '../planner/planning-context.js';
 import { BuildTimeDependencyTracker } from '../planner/planning-context.js';
 import { ParameterScope } from '../planner/scopes/param.js';
 import { GlobalScope } from '../planner/scopes/global.js';
@@ -88,6 +88,15 @@ const warnLog = log.extend('warn');
 export interface BuildPlanResult {
 	plan: BlockNode;
 	schemaDependencies: BuildTimeDependencyTracker;
+}
+
+/**
+ * @internal What only the existing-row validation scans plan with — see
+ * {@link Statement._noEnvelopeContextTable} and {@link Statement._rowSourceOverrides}.
+ */
+export interface ExistingRowScanPlanning {
+	readonly noEnvelopeContextTable?: TableSchema;
+	readonly rowSourceOverrides?: RowSourceOverrides;
 }
 
 /**
@@ -2652,9 +2661,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * probe — whose `schemaDependencies` are discarded (the read TVF already discards the body
 	 * plan's), so a fresh tracker per call is correct.
 	 *
-	 * `noEnvelopeContextTable` — see {@link Statement._noEnvelopeContextTable}.
+	 * `scan` — see {@link ExistingRowScanPlanning}.
 	 */
-	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], noEnvelopeContextTable?: TableSchema): PlanningContext {
+	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], scan?: ExistingRowScanPlanning): PlanningContext {
 		const globalScope = new GlobalScope(this.schemaManager);
 
 		// If we received parameter values, infer their types
@@ -2674,20 +2683,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			db: this,
 			schemaManager: this.schemaManager,
 			parameters: paramsOrTypes instanceof Map ? {} : (paramsOrTypes ?? {}),
-			scope: noEnvelopeContextTable ? noEnvelopeCheckScope(parameterScope, noEnvelopeContextTable) : parameterScope,
+			scope: scan?.noEnvelopeContextTable ? noEnvelopeCheckScope(parameterScope, scan.noEnvelopeContextTable) : parameterScope,
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
-			schemaPath
+			schemaPath,
+			rowSourceOverrides: scan?.rowSourceOverrides,
 		};
 	}
 
-	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. `noEnvelopeContextTable` — see {@link _buildProbeContext}. */
-	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], noEnvelopeContextTable?: TableSchema): BuildPlanResult {
-		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride, noEnvelopeContextTable);
+	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. `scan` — see {@link ExistingRowScanPlanning}. */
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[], scan?: ExistingRowScanPlanning): BuildPlanResult {
+		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride, scan);
 		const plan = buildBlock(ctx, statements);
 		return { plan, schemaDependencies: ctx.schemaDependencies };
 	}

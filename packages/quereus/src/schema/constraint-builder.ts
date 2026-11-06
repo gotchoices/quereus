@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, collectDeclaredConstraintNames, disambiguateAutoConstraintName, requireVtabModule } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -28,6 +28,8 @@ import { resolveComparisonCollation } from '../planner/analysis/comparison-colla
 import { containsOldRowImageRef, isRowInvariantCheck } from '../planner/analysis/check-extraction.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename-rewriter.js';
+import { rowSourceOverrideKey } from '../planner/planning-context.js';
+import { distinctRestorableRows, judgeRestorableStates, type RestorableRows } from '../vtab/rollback-states.js';
 
 const log = createLogger('schema:constraint-builder');
 
@@ -536,6 +538,23 @@ export async function validateChecksOverExistingRows(
 	checks: ReadonlyArray<RowConstraintSchema>,
 	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
 ): Promise<void> {
+	await scanChecksOverRows(db, tableSchema, checks, onViolation);
+}
+
+/**
+ * The scan behind {@link validateChecksOverExistingRows}, over the table's effective rows — or,
+ * with `rows`, over those rows in the table's place: the same SQL, planned with the table read
+ * from `rows` (`Statement._rowSourceOverrides`), so types, collations, NULL handling and the
+ * `new.` / context-variable rules are the effective pass's by construction. A subquery in the
+ * CHECK that reads the same table reads `rows` too.
+ */
+async function scanChecksOverRows(
+	db: Database,
+	tableSchema: TableSchema,
+	checks: ReadonlyArray<RowConstraintSchema>,
+	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
+	rows?: RestorableRows,
+): Promise<void> {
 	const contextVariables = scanContextVariables(tableSchema);
 	const source = storedRowSourceSql(tableSchema, contextVariables);
 	for (const check of checks) {
@@ -552,6 +571,7 @@ export async function validateChecksOverExistingRows(
 		// every CHECK the DML builders compile.
 		stmt._schemaPathOverride = [tableSchema.schemaName];
 		if (contextVariables) stmt._noEnvelopeContextTable = tableSchema;
+		if (rows) stmt._rowSourceOverrides = new Map([[rowSourceOverrideKey(tableSchema.schemaName, tableSchema.name), rows]]);
 		try {
 			for await (const _row of stmt._iterateRowsRaw()) {
 				throw onViolation?.(check, exprSql) ?? new QuereusError(
@@ -567,23 +587,51 @@ export async function validateChecksOverExistingRows(
 
 /**
  * {@link validateChecksOverExistingRows} restricted to the CHECKs that are row
- * invariants by the optimizer's own gate ({@link isRowInvariantCheck}) — the
- * ALTER-path entry point (`ADD CONSTRAINT … CHECK`, `ADD COLUMN … CHECK`). The
- * rows an ALTER meets were stored under every write path, and a partial-mask
- * CHECK lets a row be legally stored in violation of it (inserted under an
- * update-only one, updated under an insert-only one), so those rows owe it
- * nothing — and the optimizer lifts nothing from it, so accepting leaves no
- * wrong-result risk open. Gating on the same predicate the lift uses is what keeps
- * everything lifted validated; change one, change the other. The optimizer lifts less
- * than this validates: nothing from a conjunct reading a mutation-context variable.
+ * invariants by the optimizer's own gate ({@link isRowInvariantCheck}), and run over
+ * every state a rollback could return the table to as well — the ALTER-path entry
+ * point (`ADD CONSTRAINT … CHECK`, `ADD COLUMN … CHECK`).
+ *
+ * Row invariants only: the rows an ALTER meets were stored under every write path, and
+ * a partial-mask CHECK lets a row be legally stored in violation of it (inserted under
+ * an update-only one, updated under an insert-only one), so those rows owe it nothing —
+ * and the optimizer lifts nothing from it, so accepting leaves no wrong-result risk
+ * open. Gating on the same predicate the lift uses is what keeps everything lifted
+ * validated; change one, change the other. The optimizer lifts less than this
+ * validates: nothing from a conjunct reading a mutation-context variable.
+ *
+ * Every restorable state: DDL survives a rollback on the bundled backends while the
+ * rows it was judged against do not, and the lifted CHECK is a fact about every stored
+ * row, so a violator a rollback restores would vanish from every query that asks for
+ * it. A violation the transaction can see keeps its `CONSTRAINT` (that pass runs
+ * first); one confined to a state the module reports
+ * (`VirtualTableModule.restorableRowStates`) refuses as `BUSY` (`judgeRestorableStates`),
+ * with `ddl` naming the statement. A module without the hook, or with no open work on
+ * the table, pays no second scan.
+ *
+ * NOTE: a CHECK whose subquery reads ANOTHER table judges each state of this table against that
+ * table's current rows, not against the rows it would hold after the same rollback. Such a CHECK
+ * is never lifted (`planner/analysis/check-extraction.ts`), so nothing vanishes from queries, and
+ * a later write to that other table is not re-judged against this CHECK either. If pairing by
+ * rollback point is ever wanted, override both tables, pairing their `savepoints` entries by depth.
  */
 export async function validateRowInvariantChecksOverExistingRows(
 	db: Database,
 	tableSchema: TableSchema,
 	checks: ReadonlyArray<RowConstraintSchema>,
+	ddl: string,
 	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
 ): Promise<void> {
-	await validateChecksOverExistingRows(db, tableSchema, checks.filter(isRowInvariantCheck), onViolation);
+	const invariants = checks.filter(isRowInvariantCheck);
+	if (invariants.length === 0) return;
+	await scanChecksOverRows(db, tableSchema, invariants, onViolation);
+	const states = await requireVtabModule(tableSchema).restorableRowStates?.(db, tableSchema.schemaName, tableSchema.name, ddl);
+	if (!states) return;
+	await judgeRestorableStates(
+		distinctRestorableRows(states),
+		rows => scanChecksOverRows(db, tableSchema, invariants, onViolation, rows),
+		ddl,
+		tableSchema.name,
+	);
 }
 
 /**

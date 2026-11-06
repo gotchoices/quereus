@@ -299,13 +299,13 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	/**
-	 * The rows each open savepoint of this instance's connection would restore, oldest first
+	 * The rows each open savepoint of this instance's connection would restore, by savepoint depth
 	 * (`VirtualTable.savepointRowSources`). Read by the isolation layer off its overlay staging
 	 * table — whose connection is the one the database replays the transaction's savepoint stack
-	 * onto — to hand the wrapped module the savepoint states it must judge. No connection means
-	 * nothing staged and nothing to restore.
+	 * onto, so its stack index is the database's depth — to hand the wrapped module the savepoint
+	 * states it must judge. No connection means nothing staged and nothing to restore.
 	 */
-	savepointRowSources(): readonly EffectiveRowSource[] {
+	savepointRowSources(): readonly (EffectiveRowSource | undefined)[] {
 		if (!this.connection) return [];
 		return this.manager.savepointRowSources(this.connection);
 	}

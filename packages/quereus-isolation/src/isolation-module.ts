@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, TagChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, TagChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, IssuerRowSources, DatabaseInternal, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile, RestorableRowStates } from '@quereus/quereus';
 import { describeAlterColumn, rolledBackRowsWouldViolate, MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -1166,6 +1166,24 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		ddl: string | undefined,
 		tableName: string,
 	): IssuerRowSources {
+		const { effective, savepointsByDepth } = this.overlayRowSources(db, underlyingTable, overlayState, ddl, tableName);
+		const savepoints = [...new Set(savepointsByDepth)].filter((frame): frame is EffectiveRowSource => frame !== undefined);
+		return { effective, savepoints };
+	}
+
+	/**
+	 * {@link effectiveRowsFor}'s streams before it flattens them: the effective rows, and per open
+	 * savepoint depth the merge over the overlay frame `rollback to` it would restore — undefined
+	 * where that frame is the overlay's empty committed state, so the rollback restores the
+	 * underlying's committed rows. Depths naming one frame share one stream.
+	 */
+	private overlayRowSources(
+		db: Database,
+		underlyingTable: VirtualTable,
+		overlayState: ConnectionOverlayState,
+		ddl: string | undefined,
+		tableName: string,
+	): { effective: EffectiveRowSource; savepointsByDepth: (EffectiveRowSource | undefined)[] } {
 		const schema = underlyingTable.tableSchema;
 		if (!schema) {
 			throw new QuereusError('Isolation layer: underlying table has no schema', StatusCode.INTERNAL);
@@ -1182,12 +1200,45 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			if (ddl !== undefined && (db as DatabaseInternal).getActiveSavepointDepth() > 0) {
 				throw rolledBackRowsWouldViolate(ddl, tableName);
 			}
-			return { effective, savepoints: [] };
+			return { effective, savepointsByDepth: [] };
 		}
 		const tombstoneIndex = resolveTombstoneIndex(overlayTable, tombstoneColumn);
-		const savepoints = overlayTable.savepointRowSources()
-			.map(frame => mergedWith(() => collectEntriesFromRows(frame(), tombstoneIndex, pkIndices)));
-		return { effective, savepoints };
+		const merged = new Map<EffectiveRowSource, EffectiveRowSource>();
+		const savepointsByDepth = overlayTable.savepointRowSources().map(frame => {
+			if (!frame) return undefined;
+			let source = merged.get(frame);
+			if (!source) {
+				source = mergedWith(() => collectEntriesFromRows(frame(), tombstoneIndex, pkIndices));
+				merged.set(frame, source);
+			}
+			return source;
+		});
+		return { effective, savepointsByDepth };
+	}
+
+	/**
+	 * `VirtualTableModule.restorableRowStates`, for the engine-judged row-validating DDL (the
+	 * existing-row CHECK scan). With nothing staged by the issuing connection the underlying holds
+	 * whatever open work there is, so it answers (behind this layer, nothing: writes reach it only
+	 * at commit). Otherwise the whole-transaction rollback restores the underlying's own rows —
+	 * this layer stages every pending write, so they are the committed rows — and each open
+	 * savepoint restores the same merge over the overlay as it stood then
+	 * ({@link overlayRowSources}); a savepoint taken before the overlay had work restores the
+	 * committed rows. An overlay module that cannot report its frames refuses under open
+	 * savepoints, exactly as {@link effectiveRowsFor} does.
+	 */
+	async restorableRowStates(db: Database, schemaName: string, tableName: string, ddl: string): Promise<RestorableRowStates | undefined> {
+		const overlayState = this.getConnectionOverlay(db, schemaName, tableName);
+		if (!overlayState || overlayState.poison || !overlayState.hasChanges) {
+			return this.underlying.restorableRowStates?.(db, schemaName, tableName, ddl);
+		}
+		const state = this.getUnderlyingState(schemaName, tableName);
+		const transaction = this.committedRowsOf(state);
+		if (!state || !transaction) {
+			throw new QuereusError(`Isolation layer: underlying table '${schemaName}.${tableName}' cannot be scanned for its committed rows`, StatusCode.INTERNAL);
+		}
+		const { savepointsByDepth } = this.overlayRowSources(db, state.underlyingTable, overlayState, ddl, tableName);
+		return { transaction, savepoints: savepointsByDepth.map(frame => frame ?? transaction) };
 	}
 
 	/**

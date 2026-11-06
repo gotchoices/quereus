@@ -253,3 +253,133 @@ insert into rh values (3, 'a');
 -- error: UNIQUE constraint failed
 
 drop table rh;
+
+-- ===================================
+-- I. a committed row the transaction deleted would break the new CHECK. Accepted, the CHECK would
+--    hide the restored row from every query that filters for it (the optimizer trusts it).
+-- ===================================
+
+create table ri (id integer primary key, v integer);
+insert into ri values (1, -1), (2, 5);
+-- run
+
+begin;
+-- run
+delete from ri where id = 1;
+-- run
+alter table ri add constraint pos check (v > 0);
+-- error: commit the pending writes first
+
+rollback;
+-- run
+select id, v from ri where v <= 0;
+→ [{"id":1,"v":-1}]
+
+delete from ri where id = 1;
+-- run
+alter table ri add constraint pos check (v > 0);
+-- run
+insert into ri values (3, -3);
+-- error: CHECK constraint failed
+
+drop table ri;
+
+-- ===================================
+-- J. only an open savepoint holds the row that would break the new CHECK.
+-- ===================================
+
+create table rj (id integer primary key, v integer);
+insert into rj values (1, 1);
+-- run
+
+begin;
+-- run
+insert into rj values (2, -2);
+-- run
+savepoint s;
+-- run
+delete from rj where id = 2;
+-- run
+alter table rj add check (v > 0);
+-- error: commit the pending writes first
+
+rollback to savepoint s;
+-- run
+select id, v from rj where v <= 0;
+→ [{"id":2,"v":-2}]
+
+rollback;
+-- run
+drop table rj;
+
+-- ===================================
+-- K. (legal) the savepoint that held the violating row is RELEASED, so the CHECK lands.
+-- ===================================
+
+create table rk (id integer primary key, v integer);
+insert into rk values (1, 1);
+-- run
+
+begin;
+-- run
+insert into rk values (2, -2);
+-- run
+savepoint s;
+-- run
+delete from rk where id = 2;
+-- run
+release savepoint s;
+-- run
+alter table rk add check (v > 0);
+-- run
+commit;
+-- run
+
+select id, v from rk order by id;
+→ [{"id":1,"v":1}]
+insert into rk values (3, -3);
+-- error: CHECK constraint failed
+
+drop table rk;
+
+-- ===================================
+-- L. a violating row the transaction can see keeps CONSTRAINT, though a committed one also violates.
+-- ===================================
+
+create table rl (id integer primary key, v integer);
+insert into rl values (1, -1), (2, 5);
+-- run
+
+begin;
+-- run
+delete from rl where id = 2;
+-- run
+alter table rl add check (v > 0);
+-- error: CHECK constraint failed
+
+rollback;
+-- run
+drop table rl;
+
+-- ===================================
+-- M. ADD COLUMN with an inline CHECK: the backfilled DEFAULT lands on a committed row the
+--    transaction deleted, which a rollback would restore.
+-- ===================================
+
+create table rm (id integer primary key, v integer);
+insert into rm values (1, 1);
+-- run
+
+begin;
+-- run
+delete from rm where id = 1;
+-- run
+alter table rm add column w integer default -1 check (w > 0);
+-- error: commit the pending writes first
+
+rollback;
+-- run
+select * from rm;
+→ [{"id":1,"v":1}]
+
+drop table rm;

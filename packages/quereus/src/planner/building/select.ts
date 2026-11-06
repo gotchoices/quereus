@@ -4,7 +4,7 @@ import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
 import { SingleRowNode } from '../nodes/single-row.js';
-import { buildTableReference } from './table.js';
+import { buildTableSource } from './table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { isViewSchema } from '../../schema/view.js';
 import { AliasedScope } from '../scopes/aliased.js';
@@ -498,8 +498,9 @@ function registerColumnScope(
  * - Joins - builds the join structure
  * - Table functions - creates a table function call node
  *
- * For a simple table reference, this calls buildTableReference which
- * returns a TableReferenceNode for that table.
+ * For a simple table reference, this calls buildTableSource, which plans the
+ * table's module scan (a RetrieveNode over a TableReferenceNode), or a scan of
+ * the rows the statement supplies for that table.
  *
  * @param fromClause The FROM clause AST node to process
  * @param ctx The planning context
@@ -558,7 +559,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 		} else {
 			// Check if this is a view. An unqualified name resolves through the
 			// schema search path — one path entry at a time, that schema's tables
-			// and views checked together — exactly as `buildTableReference` below
+			// and views checked together — exactly as `buildTableSource` below
 			// resolves a plain table name.
 			const resolvedItem = parentContext.db.schemaManager.findSchemaItem(
 				fromClause.table.name,
@@ -688,7 +689,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					}
 				}
 
-				let tableNode: RelationalPlanNode = buildTableReference(fromClause, parentContext);
+				let tableNode: RelationalPlanNode = buildTableSource(fromClause, parentContext);
 
 				if (fromClause.alias) {
 					tableNode = new AliasNode(parentContext.scope, tableNode, fromClause.alias.toLowerCase());
@@ -699,7 +700,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			} else {
 				// Regular table
-				let tableNode: RelationalPlanNode = buildTableReference(fromClause, parentContext);
+				let tableNode: RelationalPlanNode = buildTableSource(fromClause, parentContext);
 
 				// Wrap with AliasNode if aliased to update relationName on attributes
 				if (fromClause.alias) {

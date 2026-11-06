@@ -12,6 +12,7 @@ import { assertConstraintNameFree, collectTableConstraintNames, requireVtabModul
 import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateRowInvariantChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { describeAddCheck } from '../../vtab/rollback-states.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
 import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 
@@ -105,7 +106,7 @@ async function runAddCheckEngineSide(
 
 	// Existing rows must already satisfy the CHECK — BEFORE `schema.addTable` below, for
 	// the reason spelled out on `rejectCheckViolatedByExistingRows`.
-	await rejectCheckViolatedByExistingRows(rctx.db, tableSchema, constraintSchema);
+	await rejectCheckViolatedByExistingRows(rctx.db, tableSchema, constraintSchema, describeAddCheck(constraint.name));
 
 	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
 	const updatedTableSchema: TableSchema = {
@@ -250,6 +251,7 @@ async function runAddConstraintViaModule(
 			rctx.db,
 			tableSchema,
 			buildCheckConstraintSchema(constraint, tableSchema.checkConstraints.length, collectTableConstraintNames(tableSchema)),
+			describeAddCheck(constraint.name),
 		);
 	}
 
@@ -287,7 +289,11 @@ async function runAddConstraintViaModule(
 /**
  * Rejects `ADD CONSTRAINT … CHECK` when a row already in the table violates it — with
  * `CONSTRAINT`, leaving the catalog, the module's cached schema and any persistence
- * exactly as they were. Shared by both arms above.
+ * exactly as they were. Shared by both arms above. When only a row a rollback could
+ * restore violates it (a committed row the transaction deleted, or one an open
+ * savepoint still holds), the refusal is `BUSY` instead: DDL survives that rollback,
+ * the row comes back, and the lift below would hide it. `ddl` names the statement for
+ * that refusal (`describeAddCheck`).
  *
  * MUST run before the constraint is declared anywhere the planner can see it — ahead of
  * `module.alterTable` (which updates the module's cached schema) and of `schema.addTable`
@@ -322,9 +328,10 @@ export async function rejectCheckViolatedByExistingRows(
 	db: Database,
 	tableSchema: TableSchema,
 	check: RowConstraintSchema,
+	ddl: string,
 ): Promise<void> {
 	if (db._isSchemaUnwinding()) return;
 	const module = requireVtabModule(tableSchema);
 	if (module.getCapabilities?.().permitsGrandfatheredCheckViolators === true) return;
-	await validateRowInvariantChecksOverExistingRows(db, tableSchema, [check]);
+	await validateRowInvariantChecksOverExistingRows(db, tableSchema, [check], ddl);
 }

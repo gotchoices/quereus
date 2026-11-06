@@ -7,6 +7,7 @@ import { Cached } from '../../util/cached.js';
 import { formatScalarType } from '../../util/plan-formatter.js';
 import { Row } from '../../common/types.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+import type { RestorableRows } from '../../vtab/rollback-states.js';
 
 /**
  * Represents a VALUES clause, producing a relation from literal rows.
@@ -217,8 +218,12 @@ export class TableLiteralNode extends PlanNode implements ZeroAryRelationalNode 
 
 	constructor(
 		scope: Scope,
-		// Each inner array is a row, consisting of literal values for each cell.
-		public readonly rows: ReadonlyArray<Row> | AsyncIterable<Row>,
+		/**
+		 * The rows: literal cells, a single-shot stream (the const-folder's deferred
+		 * materialization), or a re-callable source called once per execution (a table whose rows
+		 * the statement supplies — `buildTableSource`, planner/building/table.ts).
+		 */
+		public readonly rows: ReadonlyArray<Row> | AsyncIterable<Row> | RestorableRows,
 		// The number of rows in the literal.
 		public readonly rowCount: number | undefined,
 		// The relation type defining the structure and column types

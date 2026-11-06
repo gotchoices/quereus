@@ -7,6 +7,7 @@ import { emitPlanNode } from '../emitters.js';
 import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import type { EmissionContext } from '../emission-context.js';
+import type { RestorableRows } from '../../vtab/rollback-states.js';
 
 export function emitSingleRow(_plan: SingleRowNode, _ctx: EmissionContext): Instruction {
 	async function* run(_rctx: RuntimeContext): AsyncIterable<Row> {
@@ -56,7 +57,13 @@ export function emitTableLiteral(plan: TableLiteralNode, _ctx: EmissionContext):
 		yield* plan.rows as AsyncIterable<Row>;
 	}
 
-	const run = plan.rows instanceof Array ? runArray : runAsyncIterable;
+	async function* runSource(_rctx: RuntimeContext): AsyncIterable<Row> {
+		yield* (plan.rows as RestorableRows)();
+	}
+
+	const run = plan.rows instanceof Array ? runArray
+		: typeof plan.rows === 'function' ? runSource
+		: runAsyncIterable;
 
 	return {
 		params: [],

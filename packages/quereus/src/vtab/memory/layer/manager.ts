@@ -32,7 +32,7 @@ import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 import type { EffectiveRowSource, IssuerRowSources } from '../../module.js';
-import { judgeRestorableStates } from '../../rollback-states.js';
+import { distinctRestorableRows, judgeRestorableStates, type RestorableRows, type RestorableRowStates } from '../../rollback-states.js';
 import { convertRowAtIndex, mapRows, mapRowsAsync, type RowMapper } from './row-convert.js';
 import { buildAlterColumnPlan, describeAlterColumn, planColumnAttributeChange, type AlterColumnChange, type AlterColumnPlan, type EffectiveRows, type RestorableState } from './alter-column.js';
 
@@ -2728,7 +2728,7 @@ export class MemoryTableManager {
 	 * effective rows get, a violation rewrapped as `BUSY` (docs/memory-table.md § DDL and
 	 * transactions, rule 1; `judgeRestorableStates`). The base is what a whole-transaction
 	 * rollback restores; unwrapped, each open savepoint restores the layer
-	 * {@link MemoryTableConnection.savepointRestoreLayers} names. A wrapper that stages the
+	 * {@link MemoryTableConnection.savepointRestoreLayersByDepth} names. A wrapper that stages the
 	 * transaction's rows outside this manager hands the savepoint states down instead
 	 * (`IssuerRowSources.savepoints`): the base is then exactly the committed rows the wrapper
 	 * cannot see, and this manager's own markers (all lazy, re-pointed at the base) add nothing.
@@ -2744,23 +2744,17 @@ export class MemoryTableManager {
 	 *
 	 * NOTE: with `rows` supplied this manager's own savepoint markers are not judged — under the
 	 * wrapper they are all lazy and re-pointed at the base, which is judged. If a wrapper ever
-	 * lets the underlying hold its own open work, merge `savepointRestoreLayers(connection)` in.
+	 * lets the underlying hold its own open work, merge `restorableRowStates()` in.
 	 */
 	private restorableStates(rows?: IssuerRowSources): RestorableState[] {
-		const connection = this.ddlConnection();
-		if (!rows && !connection?.hasOpenWork()) return [];
-		const base: RestorableState = { rows: () => iteratePrimaryRows(this.baseLayer.primaryTree), backfilled: true };
-		if (rows) return [base, ...rows.savepoints.map(source => ({ rows: source, backfilled: false }))];
-		return [base, ...this.savepointRestoreLayers(connection).map(layer => ({ rows: () => this.layerRows(layer), backfilled: true }))];
-	}
-
-	/**
-	 * The layers a `rollback to savepoint` on `connection` could reinstate, oldest first, base
-	 * excluded — the base is the whole-rollback state and is judged on its own.
-	 */
-	private savepointRestoreLayers(connection: MemoryTableConnection | undefined): Layer[] {
-		if (!connection) return [];
-		return connection.savepointRestoreLayers().filter(layer => layer !== this.baseLayer);
+		if (rows) {
+			const base: RestorableState = { rows: () => iteratePrimaryRows(this.baseLayer.primaryTree), backfilled: true };
+			return [base, ...rows.savepoints.map(source => ({ rows: source, backfilled: false }))];
+		}
+		// After the drain the committed head IS the base, so these are the base and each
+		// distinct savepoint layer.
+		const own = this.restorableRowStates();
+		return own ? distinctRestorableRows(own).map(stream => ({ rows: stream, backfilled: true })) : [];
 	}
 
 	/** The rows `layer`'s merged view holds — what a connection reading through it sees. */
@@ -2769,17 +2763,53 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * `VirtualTable.savepointRowSources` for `connection`: the rows each open savepoint would
-	 * restore, oldest first, as re-callable async streams. Read by a wrapper module (the isolation
-	 * layer) off its staging table, so the savepoint states of a transaction it stages can be
-	 * judged by the wrapped module. Resolves each layer's tree per call, not up front — an ALTER on
-	 * this table replaces layer trees, and a stream built before it must not read a stale one.
+	 * Per open savepoint of `connection`, by depth: `ownLayer(layer)` for a savepoint that would
+	 * reinstate a layer holding the connection's own rows, `committed` for one that restores the
+	 * committed rows ({@link MemoryTableConnection.savepointRestoreLayersByDepth}). One stream per
+	 * distinct layer, so depths that name the same layer share it.
 	 */
-	public savepointRowSources(connection: MemoryTableConnection): EffectiveRowSource[] {
-		return this.savepointRestoreLayers(connection).map(layer => {
+	private savepointStatesByDepth<S>(connection: MemoryTableConnection, committed: S, ownLayer: (layer: Layer) => S): S[] {
+		const byLayer = new Map<Layer, S>();
+		return connection.savepointRestoreLayersByDepth().map(layer => {
+			if (!layer) return committed;
+			let state = byLayer.get(layer);
+			if (state === undefined) {
+				state = ownLayer(layer);
+				byLayer.set(layer, state);
+			}
+			return state;
+		});
+	}
+
+	/**
+	 * `VirtualTable.savepointRowSources` for `connection`: the rows each open savepoint would
+	 * restore, by depth, as re-callable async streams — undefined where it restores the committed
+	 * rows. Read by a wrapper module (the isolation layer) off its staging table, so the savepoint
+	 * states of a transaction it stages can be judged by the wrapped module. Resolves each layer's
+	 * tree per call, not up front — an ALTER on this table replaces layer trees, and a stream
+	 * built before it must not read a stale one.
+	 */
+	public savepointRowSources(connection: MemoryTableConnection): (EffectiveRowSource | undefined)[] {
+		return this.savepointStatesByDepth<EffectiveRowSource | undefined>(connection, undefined, layer => {
 			const rows = (): Iterable<Row> => this.layerRows(layer);
 			return async function* () { yield* rows(); };
 		});
+	}
+
+	/**
+	 * `VirtualTableModule.restorableRowStates` for this table: the committed rows and each open
+	 * savepoint's rows of the DDL connection, or undefined when it holds no open work here.
+	 *
+	 * Called BEFORE `ensureSchemaChangeSafety` on the `add constraint` path and must not drain, so
+	 * the committed rows are the committed head, not the base (which the drain has not yet brought
+	 * up to date). Each stream is a SYNC walk, for the reason given on {@link effectiveDdlRows}.
+	 */
+	public restorableRowStates(): RestorableRowStates | undefined {
+		const connection = this.ddlConnection();
+		if (!connection?.hasOpenWork()) return undefined;
+		const transaction: RestorableRows = () => this.layerRows(this._currentCommittedLayer);
+		const savepoints = this.savepointStatesByDepth<RestorableRows>(connection, transaction, layer => () => this.layerRows(layer));
+		return { transaction, savepoints };
 	}
 
 	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean, rows?: IssuerRowSources): Promise<void> {

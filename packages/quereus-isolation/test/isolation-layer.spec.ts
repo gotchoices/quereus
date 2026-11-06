@@ -7967,6 +7967,12 @@ describe('row-validating DDL over an overlay module that cannot report its savep
 		expect((err as QuereusError).message).to.match(/commit the pending writes first/i);
 		expect((err as QuereusError).message, 'names the user table').to.not.match(/_overlay_/);
 
+		// The CHECK scan the engine runs reaches the same refusal, through `restorableRowStates`.
+		let checkErr: unknown;
+		try { await db.exec(`alter table t add check (v <> 'z')`); } catch (e) { checkErr = e; }
+		expect(checkErr).to.be.instanceOf(QuereusError);
+		expect((checkErr as QuereusError).code).to.equal(StatusCode.BUSY);
+
 		// A DDL that judges no rows needs no frames.
 		await db.exec(`create index ix_plain on t (v)`);
 
