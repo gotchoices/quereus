@@ -597,6 +597,22 @@ export interface ApplyToStoreOptions {
   readonly bootstrapFinalize?: boolean;
   /** Bootstrapped base tables (for the finalize coarse watch notification). */
   readonly bootstrapTables?: ReadonlyArray<{ schema: string; table: string }>;
+  /**
+   * Whether a local commit since the apply began makes an incoming change lose: with
+   * `column`, a column value for that cell; with `column` undefined, a delete of that row
+   * (the row was deleted or inserted locally, which also makes every column of it lose).
+   * The apply files no record for what this reports, so the data write must not write it
+   * either: drop each such column value, and each such delete, before building the row's
+   * write, and write nothing for a row left with no changes.
+   *
+   * The answer moves as local commits land, so ask it in the same exec-mutex hold as the
+   * row write (`Database.ingestExternalRowWrite`): a commit between the question and the
+   * write would make the answer stale. Supplied by the wire apply and the held-change drain;
+   * absent for snapshots. A host-supplied `applyToStore` that ignores it still works, but a
+   * local edit made during the apply can then be overwritten in the row while its records
+   * keep the local value (docs/sync-transactions.md § Local writes during an apply).
+   */
+  readonly supersededLocally?: (schema: string, table: string, pk: SqlValue[], column?: string) => boolean;
 }
 
 /**

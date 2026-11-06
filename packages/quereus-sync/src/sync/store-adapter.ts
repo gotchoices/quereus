@@ -4,7 +4,7 @@
  * Implements the ApplyToStoreCallback interface over the store module's
  * external row-write entry point (`StoreTable.applyExternalRowChanges` —
  * table-owned key encoding, secondary-index and stats maintenance) plus the
- * engine's batch ingestion seam (`Database.ingestExternalRowChanges` — change
+ * engine's batch ingestion seam (`Database.ingestExternalRowWrite` — change
  * capture for `Database.watch` + global assertions, materialized-view
  * maintenance, opt-in parent-side FK actions).
  *
@@ -35,18 +35,25 @@
  *   4. Module data events are emitted from the effective changes with
  *      `remote: true` (so the SyncManager never re-records inbound changes),
  *      carrying accurate `oldRow` before-images and derived `changedColumns`.
- *   5. After all tables' storage writes, ONE seam call reports the
- *      accumulated effective changes: `db.ingestExternalRowChanges(batch,
- *      { applyForeignKeyActions, assertionFailureMode: 'report' })` — capture +
- *      MV facets default on, commit-time global assertions in REPORT mode (a
- *      violation is collected into the result and the batch still commits).
- *      Changes recorded in `result.errors` are excluded from the batch.
+ *   5. ONE seam call reports the accumulated effective changes of every table:
+ *      `db.ingestExternalRowWrite(write, { applyForeignKeyActions,
+ *      assertionFailureMode: 'report' })` — capture + MV facets default on,
+ *      commit-time global assertions in REPORT mode (a violation is collected
+ *      into the result and the batch still commits). Changes recorded in
+ *      `result.errors` are excluded from the batch. Steps 2–4 ARE that `write`:
+ *      they run inside the seam's exec-mutex hold, so no local statement can
+ *      commit between a row's pre-read and its write, nor between the write and
+ *      the pipeline. That is also where `ApplyToStoreOptions.supersededLocally`
+ *      is asked: a change a local commit since the apply began makes lose is
+ *      dropped before its row's op is built. Row-validating DDL (step 1) runs
+ *      after this call, since `db.exec` takes the same mutex.
  *
  * Snapshot bootstrap (per-call, not sticky): a known-complete wholesale load
  * defers MV maintenance and watch capture for the whole transfer and converges
  * once at the end.
  *   - `bootstrap` flush: steps 1–4 run unchanged (storage rows applied, remote
- *     module events emitted) but step 5 — the seam call — is SKIPPED. MV
+ *     module events emitted, outside any mutex hold) but step 5 — the seam
+ *     call — is SKIPPED. MV
  *     maintenance + capture are deferred to the finalize and FK actions are off
  *     for a wholesale load, so the only seam facet skipping the call drops
  *     outright is commit-time GLOBAL ASSERTION evaluation over the bootstrapped
@@ -130,7 +137,7 @@ import { parseMigrationDDL } from './migration-ddl.js';
  * Options for creating a SyncStoreAdapter.
  */
 export interface SyncStoreAdapterOptions {
-  /** The Quereus database: DDL execution + `ingestExternalRowChanges` reporting. */
+  /** The Quereus database: DDL execution + `ingestExternalRowWrite` reporting. */
   db: Database;
   /**
    * The store module owning the synced tables. Each table is resolved per
@@ -215,79 +222,27 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     const { beforeData, afterData } = partitionSchemaChanges(schemaChanges);
     await applySchemaPhase(beforeData);
 
-    // Effective changes accumulated across all tables, in apply order,
-    // for the single end-of-invocation seam call. The order here is
-    // table-grouped (first-appearance opSeq); it is NOT a dependency
-    // order and the FK-actions facet does not require one — both FK
-    // helpers re-read post-write storage applied above.
-    const seamBatch: ExternalRowChange[] = [];
-
-    // Apply data changes per table; the resolved StoreTable owns key
-    // encoding, store resolution, and secondary-index maintenance.
     const changesByTable = groupChangesByTable(dataChanges);
-    for (const [, tableChanges] of changesByTable) {
-      const { schema: schemaName, table: tableName } = tableChanges[0];
-      try {
-        const table = storeModule.getTableForExternalWrite(db, schemaName, tableName);
-        if (!table) {
-          throw new Error(`Table not found for external write: ${schemaName}.${tableName}`);
-        }
-
-        // One ExternalRowOp per row group: multiple same-row changes collapse
-        // to a single effective op, so the seam's same-row before-image
-        // chaining rule is satisfied trivially (oldRow = true pre-batch image).
-        // Rows group by pk IDENTITY (key collation + semantic transform), so two
-        // spellings of one row ('apple'/'APPLE' under nocase) collapse to ONE op
-        // — matching how the store itself keys them.
-        // NOTE: resolves the keying fresh per table per apply invocation; if apply
-        // batches ever get hot enough for this to show up, cache per TableSchema
-        // object like metadata/pk-identity.ts's resolver does.
-        const pkIdentity = makePkIdentityEncoder(table.getSchema(), db.getKeyNormalizerResolver());
-        const ops: ExternalRowOp[] = [];
-        for (const rowChanges of groupChangesByRow(tableChanges, pkIdentity).values()) {
-          ops.push(await buildRowOp(table, rowChanges));
-        }
-
-        const effective = await table.applyExternalRowChanges(ops);
-        emitEffectiveChanges(events, table.getSchema(), effective);
-        // On a bootstrap flush the seam is skipped (deferred to finalize), so
-        // there is no batch to accumulate — don't build one.
-        if (!applyOptions.bootstrap) {
-          for (const change of effective) {
-            seamBatch.push({ schemaName, tableName, change });
-          }
-        }
-        result.dataChangesApplied += tableChanges.length;
-      } catch (error) {
-        // Errored changes are excluded from the seam batch; earlier tables'
-        // applied changes still report below.
-        for (const change of tableChanges) {
-          result.errors.push({
-            change,
-            error: toError(error),
-          });
-        }
-      }
-    }
-
-    // Row-validating DDL runs here, against the rows this batch just landed —
-    // the whole point of the split. It precedes the seam call so the seam
-    // observes the batch's FINAL schema.
-    await applySchemaPhase(afterData);
-
-    // One seam call per invocation, after all storage writes. Driven in
-    // assertion REPORT mode: a commit-time global-assertion violation over the
-    // inbound batch is COLLECTED and returned (not thrown), and the batch still
-    // commits — derived effects (MV deltas, watch capture) for the violating row
-    // land on this FIRST attempt, so there is no divergence and no retry. The
-    // returned violations are copied into the result for the consumer to surface
-    // to the host (see admission.ts). Empty on a bootstrap flush (the batch was
-    // never built — maintenance is deferred to the end-of-snapshot
-    // `bootstrapFinalize` convergence). A genuine per-change storage failure
-    // (collected in `result.errors`) still aborts the apply — that path is
-    // orthogonal.
-    if (seamBatch.length > 0) {
-      const seamResult = await db.ingestExternalRowChanges(seamBatch, {
+    const writeRows = (): Promise<ExternalRowChange[]> =>
+      writeTableRows(db, storeModule, events, changesByTable, applyOptions, result);
+    if (applyOptions.bootstrap) {
+      // A bootstrap flush skips the seam (maintenance is deferred to the
+      // `bootstrapFinalize` convergence) and carries no `supersededLocally`, so its
+      // write needs no mutex hold either.
+      await writeRows();
+    } else if (changesByTable.size > 0) {
+      // ONE seam call per invocation, with every table's storage write run inside its
+      // exec-mutex hold: no local statement can commit between a row's pre-read, the
+      // `supersededLocally` answers, and the write, nor between the write and the
+      // pipeline that reports it. Driven in assertion REPORT mode: a commit-time
+      // global-assertion violation over the inbound batch is COLLECTED and returned
+      // (not thrown), and the batch still commits — derived effects (MV deltas, watch
+      // capture) for the violating row land on this FIRST attempt, so there is no
+      // divergence and no retry. The returned violations are copied into the result
+      // for the consumer to surface to the host (see admission.ts). A genuine
+      // per-change storage failure (collected in `result.errors`) still aborts the
+      // apply — that path is orthogonal.
+      const seamResult = await db.ingestExternalRowWrite(writeRows, {
         applyForeignKeyActions,
         assertionFailureMode: 'report',
       });
@@ -296,8 +251,107 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
       }
     }
 
+    // Row-validating DDL runs here, against the rows this batch just landed — the
+    // whole point of the split. It runs after the seam because `db.exec` takes the
+    // exec mutex the seam holds for the row writes; none of these alterations changes
+    // a row's shape, so the seam reports the same rows either way.
+    await applySchemaPhase(afterData);
+
     return result;
   };
+}
+
+/**
+ * Apply each table's data changes to committed storage and emit their remote module
+ * events, collecting a table's failure into `result.errors` (earlier tables' writes
+ * still stand). Returns the effective changes, in apply order, for the seam: the order
+ * is table-grouped (first-appearance opSeq), NOT a dependency order, and the FK-actions
+ * facet does not require one — both FK helpers re-read post-write storage.
+ *
+ * Whatever `options.supersededLocally` reports is dropped first
+ * ({@link withoutSupersededChanges}); for its answers to hold, the caller runs this
+ * inside the seam's exec-mutex hold.
+ */
+async function writeTableRows(
+  db: Database,
+  storeModule: StoreModule,
+  events: StoreEventEmitter,
+  changesByTable: ReadonlyMap<string, DataChangeToApply[]>,
+  options: ApplyToStoreOptions,
+  result: ApplyToStoreResult,
+): Promise<ExternalRowChange[]> {
+  const seamBatch: ExternalRowChange[] = [];
+  for (const [, tableChanges] of changesByTable) {
+    const { schema: schemaName, table: tableName } = tableChanges[0];
+    try {
+      const toWrite = withoutSupersededChanges(tableChanges, options.supersededLocally);
+      if (toWrite.length === 0) continue;
+      // The resolved StoreTable owns key encoding, store resolution, and
+      // secondary-index maintenance.
+      const table = storeModule.getTableForExternalWrite(db, schemaName, tableName);
+      if (!table) {
+        throw new Error(`Table not found for external write: ${schemaName}.${tableName}`);
+      }
+
+      // One ExternalRowOp per row group: multiple same-row changes collapse
+      // to a single effective op, so the seam's same-row before-image
+      // chaining rule is satisfied trivially (oldRow = true pre-batch image).
+      // Rows group by pk IDENTITY (key collation + semantic transform), so two
+      // spellings of one row ('apple'/'APPLE' under nocase) collapse to ONE op
+      // — matching how the store itself keys them.
+      // NOTE: resolves the keying fresh per table per apply invocation; if apply
+      // batches ever get hot enough for this to show up, cache per TableSchema
+      // object like metadata/pk-identity.ts's resolver does.
+      const pkIdentity = makePkIdentityEncoder(table.getSchema(), db.getKeyNormalizerResolver());
+      const ops: ExternalRowOp[] = [];
+      for (const rowChanges of groupChangesByRow(toWrite, pkIdentity).values()) {
+        ops.push(await buildRowOp(table, rowChanges));
+      }
+
+      const effective = await table.applyExternalRowChanges(ops);
+      emitEffectiveChanges(events, table.getSchema(), effective);
+      for (const change of effective) {
+        seamBatch.push({ schemaName, tableName, change });
+      }
+      result.dataChangesApplied += toWrite.length;
+    } catch (error) {
+      // Errored changes are excluded from the seam batch; earlier tables'
+      // applied changes still report.
+      for (const change of tableChanges) {
+        result.errors.push({
+          change,
+          error: toError(error),
+        });
+      }
+    }
+  }
+  return seamBatch;
+}
+
+/**
+ * One table's changes minus what a local commit since the apply began makes lose
+ * ({@link ApplyToStoreOptions.supersededLocally}): each such column value, and each such
+ * delete. A column change left with no columns is dropped, so a row left with no
+ * changes gets no op. A change that carried no columns to begin with is kept as it was.
+ */
+function withoutSupersededChanges(
+  changes: DataChangeToApply[],
+  superseded: ApplyToStoreOptions['supersededLocally'],
+): DataChangeToApply[] {
+  if (!superseded) return changes;
+  const kept: DataChangeToApply[] = [];
+  for (const change of changes) {
+    const { schema, table, pk } = change;
+    if (change.type === 'delete') {
+      if (!superseded(schema, table, pk)) kept.push(change);
+    } else if (!change.columns) {
+      kept.push(change);
+    } else {
+      const columns = Object.entries(change.columns).filter(([column]) => !superseded(schema, table, pk, column));
+      if (columns.length > 0) kept.push({ ...change, columns: Object.fromEntries(columns) });
+    }
+  }
+  return kept;
 }
 
 /**

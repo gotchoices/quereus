@@ -82,6 +82,7 @@ import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { StagedTransactionMetadata } from './staged-transaction-metadata.js';
+import { LocalWriteTracker } from './local-write-tracker.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets, filedAtOrigin, filingGroupKey, type FiledChange } from './change-grouping.js';
 import { alterPrimaryKeyColumns } from './migration-ddl.js';
@@ -202,6 +203,20 @@ function cellChanged(oldRow: Row | undefined, i: number, value: SqlValue): boole
 	return !oldRow || !sqlValueIdentical(oldRow[i], value);
 }
 
+/** The cells a write changes, by {@link cellChanged}: what capture records and what an apply's local-write tracker marks. */
+function changedCellIndices(oldRow: Row | undefined, newRow: Row): number[] {
+	const changed: number[] = [];
+	for (let i = 0; i < newRow.length; i++) {
+		if (cellChanged(oldRow, i, newRow[i])) changed.push(i);
+	}
+	return changed;
+}
+
+/** The name capture files cell `i` of a table's rows under; `col_${i}` with no schema (a relay-only manager). */
+function columnNameAt(definition: TableSchema | undefined, i: number): string {
+	return definition?.columns?.[i]?.name ?? `col_${i}`;
+}
+
 /**
  * The name a table had before this transaction's own renames, which is the name whose
  * migrations storage holds, and whether the transaction created it under any name along
@@ -297,6 +312,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	// Settles when every adoption started so far has. A snapshot apply waits on it: see applySnapshot.
 	private adoptionsInFlight: Promise<void> = Promise.resolve();
+
+	// The trackers applies in flight registered (trackLocalWrites); every local commit marks
+	// its cells in each. Empty, and so free, whenever no apply is running.
+	private readonly localWriteTrackers = new Set<LocalWriteTracker>();
 
 	// Tables whose migrations are known to bring them into existence, so a repeat write
 	// reads no migrations (see announceUnrecordedTables). Keyed by the catalog's schema
@@ -781,7 +800,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// RE-ENTRANCY: in production this runs inside the firing `apply schema` statement,
 		// which holds the engine exec mutex (the module `notifyLensDeployment` hook is awaited
 		// mid-statement). The drain re-enters the engine via `applyToStore` →
-		// `db.ingestExternalRowChanges`, which acquires that same mutex — awaiting it inline
+		// `db.ingestExternalRowWrite`, which acquires that same mutex — awaiting it inline
 		// would deadlock (the statement can't release the mutex until this returns). So when
 		// the engine reports it is mid-statement, defer the drain to fire-and-forget: it queues
 		// on the mutex and runs the instant `apply schema` commits and releases it (callers
@@ -872,9 +891,50 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * engine's perspective; only inter-handler ordering changes.
 	 */
 	enqueueTransactionCommit(batch: TransactionCommitBatch): void {
+		try {
+			this.noteLocalWrites(batch);
+		} catch (error) {
+			// The capture below must still be chained, so this commit is recorded either way.
+			console.error('[Sync] Could not mark a local commit for the apply in flight, which may overwrite its cells:', error);
+		}
 		this.commitChain = this.commitChain
 			.then(() => this.handleTransactionCommit(batch))
 			.catch(error => console.error('[Sync] Commit chain link failed:', error));
+	}
+
+	/** See {@link SyncContext.trackLocalWrites}. */
+	trackLocalWrites(): LocalWriteTracker {
+		const tracker: LocalWriteTracker = new LocalWriteTracker(
+			(schema, table) => this.getPkKeying(schema, table),
+			() => this.localWriteTrackers.delete(tracker),
+		);
+		this.localWriteTrackers.add(tracker);
+		return tracker;
+	}
+
+	/**
+	 * Mark what one committed transaction's local data events change in every tracker an
+	 * apply in flight registered (`local-write-tracker.ts`). Runs synchronously inside the
+	 * engine commit, under the exec mutex, so a commit's marks are in place before the next
+	 * statement — or an apply's data write, which takes the same mutex — can run. An update
+	 * marks the cells capture would record as changed; an insert or a delete replaces the
+	 * row. A relocating key change arrives as a delete plus an insert (the engine's
+	 * data-event contract), so it replaces both keys.
+	 */
+	private noteLocalWrites(batch: TransactionCommitBatch): void {
+		if (this.localWriteTrackers.size === 0) return;
+		for (const event of batch.dataEvents) {
+			const { schemaName, tableName, key, oldRow, newRow } = event;
+			// A table outside the basis has no pk identity; no apply can write it either.
+			if (event.remote || !key || !this.isTableInBasis(schemaName, tableName)) continue;
+			if (event.type === 'update' && newRow) {
+				const definition = this.getTableSchema?.(schemaName, tableName);
+				const columns = changedCellIndices(oldRow, newRow).map(i => columnNameAt(definition, i));
+				for (const tracker of this.localWriteTrackers) tracker.noteCells(schemaName, tableName, key, columns);
+			} else {
+				for (const tracker of this.localWriteTrackers) tracker.noteRowReplaced(schemaName, tableName, key);
+			}
+		}
 	}
 
 	/**
@@ -1415,15 +1475,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// schema oracle at all). An oracle-wired manager can no longer reach here for
 		// a table the oracle does not know — filterCapturableDataEvents skipped it.
 		const schema = this.getTableSchema?.(schemaName, tableName);
-		const columnNames = schema?.columns?.map(c => c.name);
-		const columnAt = (i: number): string => columnNames?.[i] ?? `col_${i}`;
+		const columnAt = (i: number): string => columnNameAt(schema, i);
 		const keyColumns = new Set(schema?.primaryKeyDefinition?.map(key => key.index));
 
 		const priors = new Map<number, ColumnVersionData | undefined>();
-		for (let i = 0; i < newRow.length; i++) {
-			if (cellChanged(oldRow, i, newRow[i])) {
-				priors.set(i, await this.priorCellVersion(schemaName, tableName, pk, columnAt(i), staged));
-			}
+		for (const i of changedCellIndices(oldRow, newRow)) {
+			priors.set(i, await this.priorCellVersion(schemaName, tableName, pk, columnAt(i), staged));
 		}
 
 		const cellsToRecord = oldRow && await this.isFirstEditOfUnrecordedRow(schemaName, tableName, pk, priors, staged)
@@ -1497,13 +1554,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * re-files a row's cells into the transaction's batch, so committed storage shows
 	 * nothing under the new key while the overlay holds them.
 	 *
-	 * NOTE: a remote apply writes rows before filing their records, so a local update landing
-	 * in that window stamps the whole row, and the apply's metadata then overwrites those
-	 * cells but leaves their change-log entries, one per column where the edited cell
-	 * alone did this before. Each then points at a record filed elsewhere, which
-	 * `resolveLogEntry` reads as stale, so the local edit is served to nobody. If a push
-	 * ever lands inside the window and shows up as clobbered concurrent edits, have capture
-	 * wait or skip while an apply is in flight.
+	 * A local update landing while a remote apply is in flight stamps the whole row here
+	 * too. The apply's filing then drops the cells the update changed (they are newer) and
+	 * files its other cells over the stamped records, re-reading each so the stamped
+	 * record's change-log entry goes with it (`local-write-tracker.ts`).
 	 *
 	 * NOTE: a streaming snapshot's header clears this metadata, so a row edited during the
 	 * transfer answers yes here too. A row the snapshot carries is overwritten by its table's

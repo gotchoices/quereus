@@ -265,6 +265,16 @@ export interface DatabaseInternal {
 	): Promise<IngestExternalChangesResult>;
 
 	/**
+	 * {@link ingestExternalRowChanges} with the caller's storage write run inside the same
+	 * exec-mutex hold: `write` resolves with the changes it applied, and no statement can
+	 * commit between what it reads, what it writes, and the pipeline that reports it.
+	 */
+	ingestExternalRowWrite(
+		write: () => Promise<readonly ExternalRowChange[]>,
+		options?: IngestExternalChangesOptions,
+	): Promise<IngestExternalChangesResult>;
+
+	/**
 	 * The canonical collation resolver for this database — the only supported way for
 	 * an extension package to turn a collation name into a comparison function that
 	 * honors `db.registerCollation`. Stable identity across calls; reads the live

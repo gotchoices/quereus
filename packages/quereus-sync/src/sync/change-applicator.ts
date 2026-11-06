@@ -24,6 +24,7 @@ import type {
 	ColumnChange,
 	RowDeletion,
 	ApplyResult,
+	ApplyToStoreOptions,
 	DataChangeToApply,
 	SchemaChangeToApply,
 	SchemaMigration,
@@ -33,6 +34,7 @@ import type {
 import { isBaselineVersion, migrationObjectKind, orderMigrations, sameVersionLocalDDL, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError, deleteRowVersionsAndLogEntries, persistHLCStateBatch } from './sync-context.js';
+import type { LocalWriteTracker } from './local-write-tracker.js';
 import { admitGroup } from './admission.js';
 
 /**
@@ -43,10 +45,6 @@ export interface ResolvedChange {
 	outcome: 'applied' | 'skipped' | 'conflict';
 	change: Change;
 	dataChange?: DataChangeToApply;
-	/** For column changes: the old version to clean up in the change log. */
-	oldColumnVersion?: ColumnVersion;
-	/** For delete changes: the prior tombstone whose stale delete entry to clean up in the change log. */
-	oldTombstone?: Tombstone;
 	/**
 	 * For a row's winning in-batch delete under `allowResurrection`: columns of this
 	 * row whose same-batch write beat the delete, so the post-commit cleanup keeps
@@ -56,9 +54,9 @@ export interface ResolvedChange {
 	/**
 	 * For a column change that BEAT a same-batch delete under `allowResurrection`:
 	 * the delete erased this cell's local lineage before the write landed, so the
-	 * write records no before-image. {@link oldColumnVersion} still travels with it
-	 * — its stale `cl:` entry must be dropped, and the delete's cleanup now skips
-	 * this column. Filled by {@link reconcileInBatchDeletes}.
+	 * write records no before-image. The filing still replaces the cell's stored
+	 * record — its stale `cl:` entry must be dropped, and the delete's cleanup now
+	 * skips this column. Filled by {@link reconcileInBatchDeletes}.
 	 */
 	priorErasedByInBatchDelete?: boolean;
 	/**
@@ -104,6 +102,11 @@ export interface FilingOptions {
 	readonly watermarkHLC?: HLC;
 	/** The batch's out-of-basis changes to hold, positioned in the same write and tick as its data. */
 	readonly hold?: HoldOptions;
+	/**
+	 * The apply's local-write tracker: every column or delete fact it reports as superseded
+	 * is left unfiled, as the data write left it unwritten. The filing closes it.
+	 */
+	readonly localWrites?: LocalWriteTracker;
 }
 
 /** Diverted changes to hold under `quarantine` or `store-and-forward`. */
@@ -280,22 +283,6 @@ export async function applyChanges(
 	ctx: SyncContext,
 	changes: ChangeSet[],
 ): Promise<ApplyResult> {
-	let applied = 0;
-	let skipped = 0;
-	let conflicts = 0;
-
-	const schemaChangesToApply: SchemaChangeToApply[] = [];
-	const appliedChanges: Array<{ change: Change; siteId: SiteId }> = [];
-	const resolvedDataChanges: ResolvedChange[] = [];
-	// Every data-change resolution in batch order, with its relaying changeset's
-	// siteId. Counters and apply lists are built from these AFTER the in-batch
-	// delete reconciliation below, not inside the resolve loop.
-	const dataResolutions: Array<{ resolved: ResolvedChange; siteId: SiteId }> = [];
-	const pendingSchemaMigrations: PendingSchemaMigration[] = [];
-	// Out-of-basis straggler changes diverted out of the resolve/apply/metadata
-	// path, grouped per table for disposition + telemetry.
-	const unknownByTable = new Map<string, UnknownTableGroup>();
-
 	// Pre-commit drift validation: reject a batch whose maximum fact HLC is beyond the
 	// drift bound BEFORE any resolution, data write, or CRDT metadata commit — so a peer
 	// with a badly-wrong clock cannot land far-future LWW winners that then beat every
@@ -316,6 +303,44 @@ export async function applyChanges(
 			throw error;
 		}
 	}
+
+	// From here on a local commit is newer than every fact in the batch: the tracker
+	// marks what it changes, and merging the batch's clock now — before Phase 1, and
+	// before any capture this apply waits for below has ticked — makes its capture tick
+	// above the batch (docs/sync-transactions.md § Local writes during an apply). Both
+	// happen synchronously, so no commit falls between them. The merge is in memory only
+	// until the filing write persists it; a crash before that loses only the advance.
+	const localWrites = ctx.trackLocalWrites();
+	try {
+		if (watermarkHLC) ctx.hlcManager.receive(watermarkHLC);    // monotonic merge, idempotent
+		return await applyTrackedBatch(ctx, changes, watermarkHLC, localWrites);
+	} finally {
+		localWrites.close();
+	}
+}
+
+/** {@link applyChanges} once the batch has passed the drift check and its clock is merged. */
+async function applyTrackedBatch(
+	ctx: SyncContext,
+	changes: ChangeSet[],
+	watermarkHLC: HLC | undefined,
+	localWrites: LocalWriteTracker,
+): Promise<ApplyResult> {
+	let applied = 0;
+	let skipped = 0;
+	let conflicts = 0;
+
+	const schemaChangesToApply: SchemaChangeToApply[] = [];
+	const appliedChanges: Array<{ change: Change; siteId: SiteId }> = [];
+	const resolvedDataChanges: ResolvedChange[] = [];
+	// Every data-change resolution in batch order, with its relaying changeset's
+	// siteId. Counters and apply lists are built from these AFTER the in-batch
+	// delete reconciliation below, not inside the resolve loop.
+	const dataResolutions: Array<{ resolved: ResolvedChange; siteId: SiteId }> = [];
+	const pendingSchemaMigrations: PendingSchemaMigration[] = [];
+	// Out-of-basis straggler changes diverted out of the resolve/apply/metadata
+	// path, grouped per table for disposition + telemetry.
+	const unknownByTable = new Map<string, UnknownTableGroup>();
 
 	// NOTE: orders this apply AFTER every local commit already enqueued. Local capture
 	// runs on the async commit chain behind the engine commit, so a local `rename to`
@@ -390,9 +415,8 @@ export async function applyChanges(
 		(schema, table) => ctx.isTableInBasis(schema, table),
 	);
 
-	// PHASE 1b: Resolve all data changes (no writes yet). The clock watermark is merged
-	// once after a successful admission (see admitGroup below), not per changeset —
-	// resolution reads stored versions via compareHLC, never the live clock.
+	// PHASE 1b: Resolve all data changes (no writes yet). Resolution reads stored
+	// versions via compareHLC, never the live clock.
 	for (const changeSet of changes) {
 		for (const change of changeSet.changes) {
 			// Self-origin echo skip BEFORE unknown-table detection, so a self-change
@@ -497,10 +521,13 @@ export async function applyChanges(
 	// with no metadata committed on any data-apply failure. The batch is admitted
 	// once (not per ChangeSet): the single per-peer lastSyncHLC watermark cannot
 	// express a partial commit, so selective commit is intentionally not done.
+	// What a local commit during the apply superseded is dropped by both the data write
+	// and the filing; once the filing has closed the tracker, `landed` is what is left.
+	let landed = appliedChanges;
 	await admitGroup(ctx, {
 		dataChanges: dataChangesToApply,
 		schemaChanges: schemaChangesToApply,
-		applyOptions: { remote: true },
+		applyOptions: { remote: true, supersededLocally: supersedesFor(localWrites) },
 		commitMetadata: async (executed) => {
 			// Table-identity transitions for the DDL Phase 2 actually RAN — a drop retires
 			// the name's generation, a rename moves it, a create ensures one — committed
@@ -527,31 +554,36 @@ export async function applyChanges(
 			// Every table whose primary key Phase 2 actually REDEFINED has its existing
 			// records re-filed under the new key now — before this batch's own records are
 			// filed below, so those overwrite re-filed ones, never the reverse.
-			await rekeyAfterReplicatedKeyChange(ctx, executed, retiredKeys, resolvedDataChanges);
+			await rekeyAfterReplicatedKeyChange(ctx, executed, retiredKeys);
 
 			// One write, at one clock tick: the batch's migrations, data and held
-			// changes, and the clock merged with the batch's greatest HLC. Merging once
-			// is equivalent to receiving each changeset's HLC (receive is a monotonic
-			// max-merge); on a mid-batch abort the clock does not advance and the batch
-			// re-resolves next sync. Undefined only for an empty batch, which merges
-			// nothing. The holds land before this apply returns, so the sender's
+			// changes, and the clock (merged with the batch's greatest HLC when the apply
+			// began; merged again here, a no-op, and persisted with the positions taken
+			// from it). Merging once is equivalent to receiving each changeset's HLC
+			// (receive is a monotonic max-merge). Undefined only for an empty batch, which
+			// merges nothing. The holds land before this apply returns, so the sender's
 			// watermark cannot pass a straggler's change that a crash left unheld (the
 			// batch re-resolves and re-holds idempotently, HLC-keyed).
 			await commitChangeMetadata(ctx, resolvedDataChanges, {
 				migrations: pendingSchemaMigrations,
 				watermarkHLC,
 				hold: holdOptions(disposition, unknownByTable, receivedAt),
+				localWrites,
 			});
+			landed = withoutLocalWins(appliedChanges, localWrites);
 
 			// Dynamic basis-retirement signal: a remote write to a non-directly-mapped
 			// tracked table bumps its `lastDirectlyMappedWriteAt`, deferring eviction
 			// (docs/migration.md § 2 Converge). Advisory — never aborts the apply.
-			await bumpLastDirectlyMappedWrites(ctx, appliedChanges);
+			await bumpLastDirectlyMappedWrites(ctx, landed);
 		},
 	});
+	// A change a local write superseded lost to it, as a conflict the local side won.
+	applied -= appliedChanges.length - landed.length;
+	conflicts += appliedChanges.length - landed.length;
 
 	// Emit remote change events (grouped by the relaying changeset's siteId).
-	emitRemoteChanges(ctx, appliedChanges);
+	emitRemoteChanges(ctx, landed);
 
 	// Reactive low-latency drain (sync-drain-reappear-inbound-ddl): every APPLIED
 	// migration that makes a NAME exist — a `create_table`, or a `rename_table` moving a
@@ -648,27 +680,23 @@ function captureRetiredKeyColumns(
 /**
  * Phase 3 step for the `alter primary key` migrations Phase 2 actually RAN: re-file
  * each such table's bookkeeping (`rekey-on-pk-change.ts`) in its own batch — one pass
- * per executed statement, in order, each from the key the previous one installed —
- * then re-read the prior version / tombstone of every applied change on those tables.
+ * per executed statement, in order, each from the key the previous one installed.
  *
  * Phase 1 resolved the batch's changes under the PRE-change keying while their pks —
  * recorded by the sender after its own key change — are under the new one, so it found
- * no prior for any of them. The pass has just made those priors addressable; without
- * re-reading them `commitChangeMetadata` would leave each prior's `cl:` entry behind,
- * pointing at a record no longer filed where the entry is (the LOAD-BEARING INVARIANT of
- * `collectChangesSince`). The last-writer decision itself is not revisited — the data
- * is already written — which is the concurrent-DDL-versus-data race docs/sync.md
- * § Tombstones leaves open.
+ * no prior for any of them. The pass makes those priors addressable, and the filing
+ * reads each fact's prior where it is then ({@link recordsReplacedBy}), so each prior's
+ * `cl:` entry goes with it (the LOAD-BEARING INVARIANT of `collectChangesSince`). The
+ * last-writer decision itself is not revisited — the data is already written — which is
+ * the concurrent-DDL-versus-data race docs/sync.md § Tombstones leaves open.
  */
 async function rekeyAfterReplicatedKeyChange(
 	ctx: SyncContext,
 	executed: readonly SchemaChangeToApply[],
 	retiredKeys: ReadonlyMap<string, readonly string[]>,
-	resolved: ResolvedChange[],
 ): Promise<void> {
 	// Per table, the key its records are filed under as the passes proceed.
 	const filedUnder = new Map(retiredKeys);
-	const rekeyedTables = new Set<string>();
 	// NOTE: only an apply's final metadata write is serialized on a manager (the commit
 	// chain), so another push can apply between a pass's scan and its write. A duplicate
 	// push of the same key change is safe: the relay
@@ -687,19 +715,7 @@ async function rekeyAfterReplicatedKeyChange(
 		if (!counts) continue;
 		await batch.write();
 		filedUnder.set(key, newKeyColumns);
-		rekeyedTables.add(key);
 		reportRekeyOutcome(ctx, change.schema, change.table, counts);
-	}
-	if (rekeyedTables.size === 0) return;
-
-	for (const entry of resolved) {
-		if (entry.outcome !== 'applied' || !rekeyedTables.has(tableKey(entry.change.schema, entry.change.table))) continue;
-		const { change } = entry;
-		if (change.type === 'delete') {
-			entry.oldTombstone = await ctx.tombstones.getTombstone(change.schema, change.table, change.pk);
-		} else {
-			entry.oldColumnVersion = await ctx.columnVersions.getColumnVersion(change.schema, change.table, change.pk, change.column);
-		}
 	}
 }
 
@@ -830,9 +846,10 @@ function emitRemoteChanges(
 	}
 }
 
-// NOTE: this file is ~1490 lines (`wc -l`), second-largest in the package. The drain
+// NOTE: this file is ~1800 lines (`wc -l`), second-largest in the package. The drain
 // block below (`drainHeldChanges` → `drainReappearedTables`) shares only `resolveChange`,
-// `reconcileInBatchDeletes`, `commitChangeMetadata`, and `admitGroup` with the wire-apply
+// `reconcileInBatchDeletes`, `commitChangeMetadata`, `admitGroup`, and the local-write
+// helpers (`supersedesFor`, `withoutLocalWins`) with the wire-apply
 // half above, so it is the natural seam if the file keeps growing.
 
 /**
@@ -901,8 +918,25 @@ async function drainTableGroup(
 	// also the no-oracle case) stays held; skip the whole group, drain nothing.
 	const columns = ctx.getTableColumnNames(group.schema, group.table);
 	if (columns === undefined) return 0;
-	const columnSet = new Set(columns);
 
+	// A local commit during the drain is newer than every held change — their HLCs were
+	// merged into the clock when they were first received — so it wins its cells exactly
+	// as it does during `applyChanges`.
+	const localWrites = ctx.trackLocalWrites();
+	try {
+		return await drainTrackedTableGroup(ctx, group, new Set(columns), localWrites);
+	} finally {
+		localWrites.close();
+	}
+}
+
+/** {@link drainTableGroup} once the table is known to be back and local writes are tracked. */
+async function drainTrackedTableGroup(
+	ctx: SyncContext,
+	group: { schema: string; table: string; changes: Change[] },
+	columnSet: ReadonlySet<string>,
+	localWrites: LocalWriteTracker,
+): Promise<number> {
 	// Same ordering need as `applyChanges`: a drain reads and files identity-keyed
 	// metadata, so a local rename still on the commit chain must land first.
 	await ctx.whenCommitsSettled();
@@ -958,9 +992,9 @@ async function drainTableGroup(
 	await admitGroup(ctx, {
 		dataChanges: dataChangesToApply,
 		schemaChanges: [],
-		applyOptions: { remote: true },
+		applyOptions: { remote: true, supersededLocally: supersedesFor(localWrites) },
 		commitMetadata: async () => {
-			await commitChangeMetadata(ctx, resolvedDataChanges);
+			await commitChangeMetadata(ctx, resolvedDataChanges, { localWrites });
 			// Clear every held entry CONSIDERED this drain (applied, LWW-lost, blocked,
 			// or drift-dropped) in the SAME unit, so the hold clears atomically with the
 			// apply. Once a held change has resolved against the present table, holding
@@ -975,15 +1009,20 @@ async function drainTableGroup(
 		},
 	});
 
+	// A held change a local write superseded was neither written nor filed (the filing
+	// closed the tracker, so this is the answer it acted on).
+	const landed = withoutLocalWins(appliedEntries, localWrites);
+	const lost = appliedEntries.length - landed.length;
+
 	// Revival events AFTER the unit commits (so a listener reading back sees the
 	// applied data): remote-change per origin, then one drained event for the table.
-	emitRemoteChanges(ctx, appliedEntries);
+	emitRemoteChanges(ctx, landed);
 	ctx.syncEvents.emitHeldChangesDrained({
 		schema: group.schema,
 		table: group.table,
 		drained: group.changes.length,
-		applied,
-		skipped,
+		applied: applied - lost,
+		skipped: skipped + lost,
 	});
 
 	return group.changes.length;
@@ -1056,7 +1095,6 @@ export async function resolveChange(
 		return {
 			outcome: 'applied',
 			change,
-			oldTombstone: existingTombstone ?? undefined,
 			dataChange: {
 				type: 'delete',
 				schema: change.schema,
@@ -1140,7 +1178,6 @@ export async function resolveChange(
 		const resolved: ResolvedChange = {
 			outcome: 'applied',
 			change,
-			oldColumnVersion: localVersion ?? undefined,
 			dataChange: {
 				type: 'update',
 				schema: change.schema,
@@ -1322,6 +1359,9 @@ function tablesWithRecordsElsewhere(batchSchemaChanges: readonly SchemaChangeToA
  * {@link reconcileInBatchDeletes}: every column change still `'applied'` here is one
  * that must be written, and a winning delete's {@link ResolvedChange.keepColumns}
  * names the columns its cleanup must leave alone.
+ *
+ * With `filing.localWrites`, a column or delete fact a local commit during the apply
+ * superseded is not filed ({@link fileAtNextTick}), and the data write did not write it.
  */
 export async function commitChangeMetadata(
 	ctx: SyncContext,
@@ -1336,27 +1376,44 @@ export async function commitChangeMetadata(
 	];
 	if (facts.length === 0 && !filing.watermarkHLC) return;
 
-	await ctx.onCommitChain(() => fileAtNextTick(ctx, facts, filing.watermarkHLC));
+	const filed = await ctx.onCommitChain(() => fileAtNextTick(ctx, facts, filing.watermarkHLC, filing.localWrites));
 
-	// Column-version cleanup for deletes requires async iteration — once per winning
-	// delete (losers were never written, so there is nothing of theirs to clean). The
-	// row's change-log column entries go in the same batch as its versions: an inbound
-	// delete must leave no more index garbage behind than a local one, and this is the
-	// path a relay runs almost exclusively. `keepColumns` spares the cell records this
-	// same batch wrote past the delete (allowResurrection winners) — the scan reads
-	// committed storage, which by now INCLUDES them (the metadata batch above is
-	// already written, so no staged overlay is needed here; each cleanup commits in
-	// its own batch). These batches only delete, so they take no position and need no
-	// place on the commit chain.
-	for (const fact of winners) {
+	// Column-version cleanup for deletes requires async iteration — once per FILED
+	// delete (in-batch losers were never written, and one a local write superseded was
+	// not filed, so there is nothing of theirs to clean). The row's change-log column
+	// entries go in the same batch as its versions: an inbound delete must leave no more
+	// index garbage behind than a local one, and this is the path a relay runs almost
+	// exclusively. `keepColumns` spares the cell records this same batch wrote past the
+	// delete (allowResurrection winners) — the scan reads committed storage, which by now
+	// INCLUDES them (the metadata batch above is already written, so no staged overlay is
+	// needed here; each cleanup commits in its own batch). These batches only delete, so
+	// they take no position and need no place on the commit chain.
+	for (const fact of filed) {
 		if (fact.kind !== 'delete') continue;
-		const { change, resolved } = fact;
+		const { change } = fact;
 		const cleanupBatch = ctx.kv.batch();
 		await deleteRowVersionsAndLogEntries(ctx, cleanupBatch, change.schema, change.table, change.pk, {
-			keepColumns: resolved.keepColumns,
+			keepColumns: columnsKeptPastDelete(fact, filing.localWrites),
 		});
 		await cleanupBatch.write();
 	}
+}
+
+/**
+ * The columns a filed delete's cleanup spares: those this batch wrote past it
+ * ({@link ResolvedChange.keepColumns}), minus any a local write superseded. Neither the
+ * data write nor the filing wrote such a column's resurrecting value, so the row was
+ * rebuilt without it, and its cell record goes with the delete as it would have had the
+ * local edit landed before the apply began.
+ */
+function columnsKeptPastDelete(
+	fact: Extract<FactToFile, { kind: 'delete' }>,
+	localWrites: LocalWriteTracker | undefined,
+): ReadonlySet<string> | undefined {
+	const { keepColumns } = fact.resolved;
+	if (!keepColumns || !localWrites) return keepColumns;
+	const { schema, table, pk } = fact.change;
+	return new Set([...keepColumns].filter(column => !localWrites.supersedes(schema, table, pk, column)));
 }
 
 /** One thing {@link fileAtNextTick} writes at a position of its own; `hlc` is its origin timestamp. */
@@ -1435,19 +1492,98 @@ function collapseInBatchRepeats(ctx: SyncContext, resolvedChanges: readonly Reso
  * (`change-grouping.ts`). A re-held change keeps the position it was first held at
  * ({@link positionsOfExistingHolds}) and so sits outside this tick's run; it was filed
  * in an earlier one.
+ *
+ * `localWrites` is read, and closed, synchronously as the entry starts: a column or
+ * delete fact it reports as superseded is left out, as the data write left it out
+ * (`ApplyToStoreOptions.supersededLocally`). A local commit landing after that point is
+ * captured after this entry, so its records overwrite the filed ones (its capture finds
+ * and removes their change-log entries), and its row write came after the data write: both
+ * end up local. Each fact that is filed replaces the record stored NOW
+ * ({@link recordsReplacedBy}), not the one Phase 1 read.
+ *
+ * Returns the facts it filed.
  */
-async function fileAtNextTick(ctx: SyncContext, facts: readonly FactToFile[], watermarkHLC: HLC | undefined): Promise<void> {
+async function fileAtNextTick(
+	ctx: SyncContext,
+	facts: readonly FactToFile[],
+	watermarkHLC: HLC | undefined,
+	localWrites: LocalWriteTracker | undefined,
+): Promise<FactToFile[]> {
+	localWrites?.close();
+	const toFile = localWrites ? facts.filter(fact => !lostToLocalWrite(localWrites, fact)) : [...facts];
 	if (watermarkHLC) ctx.hlcManager.receive(watermarkHLC);    // monotonic merge, idempotent
-	const kept = await positionsOfExistingHolds(ctx, facts);
+	const kept = await positionsOfExistingHolds(ctx, toFile);
+	const replaced = await recordsReplacedBy(ctx, toFile);
 
 	const batch = ctx.kv.batch();
-	if (facts.length > 0) {
+	if (toFile.length > 0) {
 		const nextPosition = positionsFrom(ctx.hlcManager.tick());
-		const inOriginOrder = [...facts].sort((a, b) => compareHLC(a.hlc, b.hlc));
-		for (const fact of inOriginOrder) fileFact(ctx, batch, fact, kept.get(fact) ?? nextPosition());
+		const inOriginOrder = [...toFile].sort((a, b) => compareHLC(a.hlc, b.hlc));
+		for (const fact of inOriginOrder) fileFact(ctx, batch, fact, kept.get(fact) ?? nextPosition(), replaced);
 	}
 	persistHLCStateBatch(ctx, batch);
 	await batch.write();
+	return toFile;
+}
+
+/** Whether a local write made this fact lose (only column and delete facts can). */
+function lostToLocalWrite(localWrites: LocalWriteTracker, fact: FactToFile): boolean {
+	return (fact.kind === 'column' || fact.kind === 'delete') && supersededChange(localWrites, fact.change);
+}
+
+/** {@link LocalWriteTracker.supersedes} for one change: a column change by its cell, a delete by its row. */
+function supersededChange(localWrites: LocalWriteTracker, change: Change): boolean {
+	return localWrites.supersedes(change.schema, change.table, change.pk, change.type === 'column' ? change.column : undefined);
+}
+
+/** The data write's `supersededLocally` answer, from the apply's tracker. */
+function supersedesFor(localWrites: LocalWriteTracker): NonNullable<ApplyToStoreOptions['supersededLocally']> {
+	return (schema, table, pk, column) => localWrites.supersedes(schema, table, pk, column);
+}
+
+/**
+ * The applied changes a local write did not supersede. Read once the filing has closed
+ * the tracker, this is what the data write and the filing actually landed.
+ */
+function withoutLocalWins<T extends { change: Change }>(entries: T[], localWrites: LocalWriteTracker): T[] {
+	return entries.filter(({ change }) => !supersededChange(localWrites, change));
+}
+
+/** The record each column and delete fact replaces, read by {@link recordsReplacedBy}. */
+interface ReplacedRecords {
+	readonly versions: ReadonlyMap<FactToFile, ColumnVersion>;
+	readonly tombstones: ReadonlyMap<FactToFile, Tombstone>;
+}
+
+/**
+ * The stored cell version or tombstone each column or delete fact replaces, read inside
+ * the filing's commit-chain entry rather than taken from Phase 1. The filing removes that
+ * record's change-log entry and chains the before-image from it, so it must be the record
+ * actually there: since Phase 1 a local commit's capture may have rewritten it (capture
+ * records EVERY column on the first edit of a row sync has no records for, so a cell the
+ * batch files can carry a local record Phase 1 never saw), and a replicated `alter
+ * primary key` pass may have re-filed it under the key the batch's pks use
+ * ({@link rekeyAfterReplicatedKeyChange}). Captures run on the same chain, so nothing
+ * rewrites a record between this read and the write.
+ *
+ * NOTE: one read per filed fact on top of Phase 1's; if large wire batches ever show up in
+ * profiles, re-read only the rows a local commit or a re-key touched since Phase 1.
+ */
+async function recordsReplacedBy(ctx: SyncContext, facts: readonly FactToFile[]): Promise<ReplacedRecords> {
+	const versions = new Map<FactToFile, ColumnVersion>();
+	const tombstones = new Map<FactToFile, Tombstone>();
+	await Promise.all(facts.map(async fact => {
+		if (fact.kind === 'column') {
+			const { schema, table, pk, column } = fact.change;
+			const version = await ctx.columnVersions.getColumnVersion(schema, table, pk, column);
+			if (version) versions.set(fact, version);
+		} else if (fact.kind === 'delete') {
+			const { schema, table, pk } = fact.change;
+			const tombstone = await ctx.tombstones.getTombstone(schema, table, pk);
+			if (tombstone) tombstones.set(fact, tombstone);
+		}
+	}));
+	return { versions, tombstones };
 }
 
 /**
@@ -1472,17 +1608,17 @@ async function positionsOfExistingHolds(ctx: SyncContext, facts: readonly FactTo
 	return kept;
 }
 
-function fileFact(ctx: SyncContext, batch: WriteBatch, fact: FactToFile, position: HLC): void {
+function fileFact(ctx: SyncContext, batch: WriteBatch, fact: FactToFile, position: HLC, replaced: ReplacedRecords): void {
 	switch (fact.kind) {
 		case 'migration':
 			commitMigrationMetadata(ctx, batch, fact.pending, position);
 			break;
 		case 'delete':
-			commitDeleteMetadata(ctx, batch, fact.change, position, fact.resolved.oldTombstone);
+			commitDeleteMetadata(ctx, batch, fact.change, position, replaced.tombstones.get(fact));
 			break;
 		case 'column':
 			commitColumnMetadata(
-				ctx, batch, fact.change, position, fact.resolved.oldColumnVersion, fact.resolved.priorErasedByInBatchDelete,
+				ctx, batch, fact.change, position, replaced.versions.get(fact), fact.resolved.priorErasedByInBatchDelete,
 			);
 			break;
 		case 'held':

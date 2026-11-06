@@ -1,6 +1,6 @@
 /**
  * External row-change ingestion — the batch driver behind
- * `Database.ingestExternalRowChanges`.
+ * `Database.ingestExternalRowChanges` and `Database.ingestExternalRowWrite`.
  *
  * A write applied directly to module storage (sync-inbound replication, a
  * host's direct row store) bypasses the DML executor and therefore the
@@ -127,19 +127,55 @@ export async function ingestExternalRowChangeBatch(
 	changes: readonly ExternalRowChange[],
 	options?: IngestExternalChangesOptions,
 ): Promise<IngestExternalChangesResult> {
-	// Empty batch: a true no-op — no transaction begin, no savepoint.
+	// Empty batch: a true no-op — no transaction begin, no savepoint, no mutex.
 	if (changes.length === 0) return { assertionViolations: [] };
+	return withExecMutex(db, () => ingestHoldingMutex(db, changes, options));
+}
 
+/**
+ * Run the caller's storage `write`, then ingest the changes it returns, in ONE exec-mutex
+ * hold (`Database.ingestExternalRowWrite`). No statement can commit between whatever
+ * `write` reads and what it writes, nor between the write and the pipeline that reports
+ * it. `write` runs before any transaction is begun, exactly as a write made before
+ * {@link ingestExternalRowChangeBatch} would; it must not re-enter the engine's mutex.
+ */
+export async function ingestExternalRowWriteBatch(
+	db: Database,
+	write: () => Promise<readonly ExternalRowChange[]>,
+	options?: IngestExternalChangesOptions,
+): Promise<IngestExternalChangesResult> {
+	return withExecMutex(db, async () => {
+		const changes = await write();
+		if (changes.length === 0) return { assertionViolations: [] };
+		return ingestHoldingMutex(db, changes, options);
+	});
+}
+
+/**
+ * Serialize against concurrent statements for the whole batch: FK-action cascades
+ * re-enter the DML pipeline via _execWithinTransaction (the already-holding-the-mutex
+ * variant), and the batch's savepoint scope must not interleave with another statement's.
+ */
+async function withExecMutex<T>(db: Database, work: () => Promise<T>): Promise<T> {
+	const releaseMutex = await db._acquireExecMutex();
+	try {
+		return await work();
+	} finally {
+		await releaseMutex();
+	}
+}
+
+/** The ingestion pipeline proper, for a non-empty batch; the caller holds the exec mutex. */
+async function ingestHoldingMutex(
+	db: Database,
+	changes: readonly ExternalRowChange[],
+	options: IngestExternalChangesOptions | undefined,
+): Promise<IngestExternalChangesResult> {
 	const captureChanges = options?.captureChanges ?? true;
 	const maintainMaterializedViews = options?.maintainMaterializedViews ?? true;
 	const applyForeignKeyActions = options?.applyForeignKeyActions ?? false;
 	const assertionFailureMode = options?.assertionFailureMode ?? 'throw';
 
-	// Serialize against concurrent statements for the whole batch: FK-action
-	// cascades re-enter the DML pipeline via _execWithinTransaction (the
-	// already-holding-the-mutex variant), and the batch's savepoint scope must
-	// not interleave with another statement's.
-	const releaseMutex = await db._acquireExecMutex();
 	// Trust-the-origin apply path: skip parent-side FK RESTRICT enforcement for the whole
 	// batch (the origin already enforced it at its own commit; re-enforcing here would wedge
 	// the sync stream). Set BEFORE the change loop so every nested cascade DML and
@@ -280,6 +316,5 @@ export async function ingestExternalRowChangeBatch(
 		// non-RESTRICT mid-batch throw (a cascade DML tripping CHECK / NOT NULL / a
 		// connection error), so a subsequent normal statement re-enforces RESTRICT.
 		if (applyForeignKeyActions) db._setFkRestrictSuppressed(priorSuppress);
-		await releaseMutex();
 	}
 }

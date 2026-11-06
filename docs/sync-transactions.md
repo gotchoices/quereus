@@ -192,6 +192,53 @@ a key redefinition is not a new arrival. A snapshot carries each record's positi
 receiver files it there too, so a replica rebuilt from a snapshot has the sender's order
 and a watermark taken on the sender stays meaningful on it.
 
+### Local writes during an apply
+
+An apply decides each incoming cell against the cell's stored record, writes the rows, and
+files the records, in that order. Local DML is not ordered against those steps: the engine
+commits a local statement whenever it gets the exec mutex, and that commit's capture runs
+later, on the commit chain. A local commit landing between the apply's decision and its
+filing was made after this replica received the batch, so by last-writer-wins it is the
+newer write. **It wins every cell it changed**, and the row and the cell records must both
+say so. Four pieces make that hold:
+
+1. **The batch's clock is merged first.** `applyChanges` merges the batch's greatest HLC into
+   the clock right after the drift check, before it waits for pending captures and before it
+   reads any record. A local commit the apply does not see is captured after that wait, so
+   its capture ticks above every fact in the batch, and the edit also wins on the sender once
+   it is pushed back. The merge stays in memory until the filing write persists it with the
+   positions taken from it; a crash in between loses only the in-memory advance.
+2. **Local writes are tracked.** In the same synchronous step the apply registers a tracker
+   (`local-write-tracker.ts`). The manager fills it inside each local engine commit
+   (`enqueueTransactionCommit`, which runs under the exec mutex): an update marks the cells
+   whose values changed, by the comparison capture uses; an insert or a delete marks the row
+   as replaced. A relocating key change arrives as a delete plus an insert.
+3. **The data write skips marked cells, atomically.** The store adapter runs its row writes
+   inside the ingestion seam's exec-mutex hold (`Database.ingestExternalRowWrite`) and drops
+   every incoming value the tracker marks (`ApplyToStoreOptions.supersededLocally`) before it
+   builds a row's write. No local statement can commit while the mutex is held, and every
+   commit that landed earlier is already in the tracker.
+4. **The filing drops the same facts and re-reads the rest.** At the start of its
+   commit-chain entry the filing closes the tracker and leaves out every fact it marks. Each
+   fact it does file replaces the record stored at that moment, not the one the apply first
+   read: capture records every column on the first edit of a row sync has no records for, so
+   a cell the batch files can carry a local record the apply never saw, and that record's
+   change-log entry has to go with it.
+
+| A local commit lands… | Row | Records |
+|---|---|---|
+| before the apply reads the cell | local | local: the apply sees the record and the incoming change loses |
+| between that read and the data write | local: the data write skips the cell | local: the filing drops the fact |
+| between the data write and the filing | local: it wrote last | local: the filing drops the fact |
+| after the filing closed the tracker | local: it wrote last | local: its capture overwrites the filed record |
+
+A dropped fact counts as a conflict in `ApplyResult` and is left out of `onRemoteChange`. An
+incoming **delete** still beats local cell edits: a delete is compared only with tombstones,
+and its cleanup removes the row's cell records. A local **insert or delete** of a row beats
+everything the batch carries for that row. The held-change drain (`drainHeldChanges`) uses
+the same tracker, since held changes' clocks were merged when they first arrived; snapshot
+applies do not. The cases this leaves open are recorded at the tracker.
+
 ### Read side: one ChangeSet per transaction
 
 `getChangesSince(peerSiteId, sinceHLC?)` returns **one `ChangeSet` per source
@@ -380,7 +427,9 @@ Applying remote changes writes to two separate stores: **CRDT metadata** (column
 
 In the **mixed case** — one batch carrying *both* a per-change `errors` failure and a reported global-assertion violation tripped by a successfully-applied change B — `applyDataToStore` emits `onAssertionViolation` **before** the abort throws. B's violating row already committed in report mode (the abort blocks the metadata commit, not the storage write), so the violation is a fact about committed data. On retry B contributes nothing to the seam batch, so the assertion over B's table is not re-evaluated (assertions fire only when their referenced tables changed) and does not double-fire; deferring the emit past the abort would lose it permanently.
 
-**Unified admission core** (`admission.ts`) centralizes both failure shapes and the ordering in one seam, so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a group-atomic unit — data, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The wire path merges its clock watermark inside `commitMetadata` instead, in the same write as the filing positions it takes from the merged clock (§ Filing position). The streaming snapshot (`snapshot-stream`) keeps its checkpoint-based model but reuses `applyDataToStore` per flush, so a flush throw emits the same `status: 'error'` event.
+**Unified admission core** (`admission.ts`) centralizes both failure shapes and the ordering in one seam, so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a group-atomic unit — data, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The wire path merges its clock watermark in memory when the apply begins (§ Local writes during an apply) and persists it inside `commitMetadata` instead, in the same write as the filing positions it takes from the merged clock (§ Filing position). The streaming snapshot (`snapshot-stream`) keeps its checkpoint-based model but reuses `applyDataToStore` per flush, so a flush throw emits the same `status: 'error'` event.
+
+**Local writes landing during the apply** win the cells they changed, and the data write and the metadata write honour that one decision, so a row and its records never disagree about it ([§ Local writes during an apply](#local-writes-during-an-apply)).
 
 With no metadata committed the caller does not advance its per-peer `lastSyncHLC` watermark, so the **whole batch re-resolves and re-applies on the next sync**, idempotently — value-identical upserts are suppressed by the adapter, so only the previously-failed change is genuinely retried. (A change that *always* fails blocks its batch forever: an accepted "poison batch" property; detection/recovery is the host's.) Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done — a batch spans multiple HLCs but re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore **one** all-or-nothing `admitGroup` unit, not one per `ChangeSet`.
 
@@ -389,7 +438,8 @@ engine's constraint machinery. The production adapter (`createStoreAdapter`, the
 `applyToStore` implementation) writes inbound data straight to module storage via
 `StoreTable.applyExternalRowChanges` — bypassing the DML executor, so there is **no**
 per-row CHECK / NOT NULL / UNIQUE / **child-side FK-existence** check at write time —
-then makes a single end-of-invocation seam call, `db.ingestExternalRowChanges`, driving
+inside a single seam call, `db.ingestExternalRowWrite`, whose exec-mutex hold covers the
+row writes and then drives
 the post-write pipeline: capture for `Database.watch`, commit-time **global assertions**,
 materialized-view maintenance, and *opt-in* parent-side FK actions. The seam re-validates
 nothing: the origin enforced every declared constraint at its own commit, and merging

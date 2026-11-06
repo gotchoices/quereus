@@ -69,7 +69,7 @@ import {
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
 import { InternalStatementCache } from './internal-statement-cache.js';
-import { ingestExternalRowChangeBatch } from './database-external-changes.js';
+import { ingestExternalRowChangeBatch, ingestExternalRowWriteBatch } from './database-external-changes.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
@@ -3286,6 +3286,29 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	): Promise<IngestExternalChangesResult> {
 		this.checkOpen();
 		return ingestExternalRowChangeBatch(this, changes, options);
+	}
+
+	/**
+	 * {@link ingestExternalRowChanges} for a caller that has not written yet: runs
+	 * `write` — the caller's direct storage write, resolving with the changes it made —
+	 * and then the ingestion pipeline over them, all in ONE exec-mutex hold. No statement
+	 * can commit between whatever `write` reads and what it writes, nor between the write
+	 * and the pipeline that reports it, so a caller that decides per row what to write
+	 * (from the stored row, or from what local statements have changed) decides against
+	 * state that cannot move under it.
+	 *
+	 * `write` runs before any transaction is begun, as a write made before calling
+	 * {@link ingestExternalRowChanges} would, and must not re-enter the engine (no
+	 * `exec`/`eval`/seam call: the mutex is held). Resolving with no changes ingests
+	 * nothing. Every other part of the contract is {@link ingestExternalRowChanges}'s;
+	 * see `docs/mv-ingestion.md`.
+	 */
+	public async ingestExternalRowWrite(
+		write: () => Promise<readonly ExternalRowChange[]>,
+		options?: IngestExternalChangesOptions,
+	): Promise<IngestExternalChangesResult> {
+		this.checkOpen();
+		return ingestExternalRowWriteBatch(this, write, options);
 	}
 
 	/** @internal Compile + register an MV for row-time write-through maintenance.

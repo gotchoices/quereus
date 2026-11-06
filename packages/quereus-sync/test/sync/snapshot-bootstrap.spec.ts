@@ -56,7 +56,7 @@ const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): Col
 	({ column, hlc, value, pk });
 
 
-/** Counters for the three engine entry points the bootstrap path drives. */
+/** Counters for the engine entry points the bootstrap path drives (either seam entry point counts as a seam call). */
 interface Spies {
 	seamCalls: number;
 	refreshCalls: number;
@@ -71,6 +71,11 @@ function installSpies(db: Database): Spies {
 	db.ingestExternalRowChanges = (changes, options) => {
 		spies.seamCalls++;
 		return origIngest(changes, options);
+	};
+	const origIngestWrite = db.ingestExternalRowWrite.bind(db);
+	db.ingestExternalRowWrite = (write, options) => {
+		spies.seamCalls++;
+		return origIngestWrite(write, options);
 	};
 
 	const origRefresh = db.refreshAllMaterializedViews.bind(db);

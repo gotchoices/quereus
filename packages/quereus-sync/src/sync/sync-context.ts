@@ -21,6 +21,7 @@ import type { TableIdentityStore } from '../metadata/table-identity.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
 import type { StagedRowState } from './staged-transaction-metadata.js';
+import type { LocalWriteTracker } from './local-write-tracker.js';
 import { SYNC_KEY_PREFIX, type PkKeying } from '../metadata/keys.js';
 
 /**
@@ -97,6 +98,14 @@ export interface SyncContext {
 	 * reads its header from this, so "everything up to the header" is exact.
 	 */
 	nextFilingTick(): Promise<HLC>;
+
+	/**
+	 * Start recording the cells and rows local commits change, from this call until the
+	 * returned tracker is closed (`local-write-tracker.ts`). Filled synchronously inside
+	 * each local engine commit, so a commit that has landed is in it. An apply registers
+	 * one before merging its batch's clock and closes it when filing reads it.
+	 */
+	trackLocalWrites(): LocalWriteTracker;
 
 	/**
 	 * Resolves once every remote apply queued so far has finished, failed ones

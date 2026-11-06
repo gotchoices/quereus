@@ -924,7 +924,7 @@ describe('SyncManager', () => {
 
       // Verify applyToStore was called with correct data
       expect(appliedChanges.data).to.have.lengthOf(1);
-      expect(appliedChanges.options).to.deep.equal({ remote: true });
+      expect(appliedChanges.options).to.include({ remote: true });
 
       const dataChange = appliedChanges.data[0] as { type: string; table: string; pk: unknown[]; columns: Record<string, unknown> };
       expect(dataChange.type).to.equal('update');

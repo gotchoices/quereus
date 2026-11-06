@@ -20,7 +20,7 @@ This document is the **overview**: what a materialized view is, how to declare o
 | --- | --- | --- |
 | [Materialized-View Maintenance](mv-maintenance.md) | Strategy selection, the four bounded-delta arms, the full-rebuild floor, MV-over-MV cascade, the per-statement contract. | An engine developer changing how a view is kept fresh. |
 | [Derived-Row Constraints and Covering Structures](mv-constraints.md) | Declared CHECK / FK / secondary UNIQUE on a maintained table, parent-side referential enforcement, the coverage prover, enforcement through a covering view. | An engine developer working on constraint enforcement. |
-| [External row-change ingestion](mv-ingestion.md) | `Database.ingestExternalRowChanges` — facets, trust boundary, visibility contract, DML replay versus the seam. | A sync or replication developer. |
+| [External row-change ingestion](mv-ingestion.md) | `Database.ingestExternalRowChanges` and `ingestExternalRowWrite` — facets, trust boundary, visibility contract, DML replay versus the seam. | A sync or replication developer. |
 | [Schema-change staleness](mv-schema-change.md) | Staleness marking, recompile-in-place, rename propagation, `ALTER TABLE` on the maintained table itself. | An engine developer touching DDL. |
 | [Backing-host capability](mv-backing-host.md) | The `BackingHost` contract, the store host, cross-module atomicity and the adopt-without-refill fast path. | A **module author** implementing the capability. |
 
