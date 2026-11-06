@@ -103,7 +103,8 @@ pattern as `cacheStates` / `executionMemo`, so a re-run re-drains with current
 data. The impure (DML-bearing) `IN` path builds and probes the same set in the
 same map, differing only in building it on the first call unconditionally — a
 NULL first condition does not skip the drain, so the inner DML still fires once
-([Runtime § Impure subquery emitters](runtime.md#impure-subquery-emitters-full-drain--run-once)). The gate (uncorrelated + functional) matches the retired rule: correlated
+([Runtime § Impure subquery emitters](runtime.md#impure-subquery-emitters-full-drain--run-once)).
+The gate (uncorrelated + functional) matches the retired rule: correlated
 sources must re-evaluate per outer row, and non-deterministic sources keep their
 per-row semantics — both route to the streaming (early-exit) path instead.
 

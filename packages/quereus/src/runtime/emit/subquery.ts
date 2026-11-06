@@ -292,6 +292,10 @@ async function membershipSetFor(
 	collation: CollationFunction,
 	memberKey: (value: SqlValue) => SqlValue,
 ): Promise<InMembershipSet> {
+	// NOTE: the slot is written only after the drain completes, so two overlapping
+	// evaluations of one site would both drain — for impure `IN` that fires the DML
+	// twice. Nothing evaluates one site concurrently today; if that changes, store
+	// the in-flight Promise in the slot (as `cteMaterializations` does).
 	const existing = rctx.inSetProbes?.get(slot);
 	if (existing) return existing;
 	const built = await drainMembershipSet(input, collation, memberKey);
