@@ -138,10 +138,10 @@ export class Statement {
 	/**
 	 * @internal Tables this statement reads from the given rows instead of from their module (see
 	 * `PlanningContext.rowSourceOverrides`). Set right after `db.prepare(...)`, under the same
-	 * deferred-compile reasoning as {@link _schemaPathOverride}, by exactly one site: the
-	 * existing-row CHECK scan run over each state a rollback could restore
-	 * (`scanChecksOverRows`, `schema/constraint-builder.ts`), so that pass re-runs the
-	 * very SQL the effective pass ran.
+	 * deferred-compile reasoning as {@link _schemaPathOverride}, by the existing-row scans run
+	 * over each state a rollback could restore (`scanChecksOverRows` and `scanForOrphans`,
+	 * `schema/constraint-builder.ts`), so each such pass re-runs the very SQL the effective
+	 * pass ran.
 	 */
 	_rowSourceOverrides?: RowSourceOverrides;
 	/**

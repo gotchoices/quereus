@@ -99,9 +99,9 @@ cannot hand down the effective rows and forget the rollback states.
     it was judged against do not, so the module then runs the *same* check, on its own, over each
     state a rollback could restore: its own committed rows (the whole-transaction rollback state,
     which only it holds) and each of `rows.savepoints`. A violation confined to such a state
-    refuses with `BUSY` and the message `rolledBackRowsWouldViolate` builds — "rows this
-    transaction has deleted or overwritten would violate it if the transaction rolled back. Commit
-    the pending writes first, then retry." `judgeRestorableStates` runs a probe over each state and
+    refuses with `BUSY` and the message `rolledBackRowsWouldViolate` builds — "rolling back this
+    transaction would leave rows that break it. Commit the pending writes first, then retry."
+    `judgeRestorableStates` runs a probe over each state and
     rewraps its `CONSTRAINT` / `MISMATCH` as that `BUSY`, so the wording lives in one place; run it
     *after* the effective pass so a visible violation keeps its own status. (A primary-key re-key
     refuses with the same status when its map-shaped tree physically cannot hold a committed pair
@@ -133,9 +133,12 @@ consumer is a set-shaped check.
 Some row-validating DDL is judged by the engine, not the module: the existing-row CHECK scan of
 `ALTER TABLE … ADD CONSTRAINT … CHECK` and of an inline CHECK on `ALTER TABLE … ADD COLUMN`
 (`validateRowInvariantChecksOverExistingRows`, `schema/constraint-builder.ts`), which runs
-`select 1 from <t> where not (<check>) limit 1` through the ordinary read path. That path sees only
-the effective rows, so a module whose DDL survives a rollback reports the other states through an
-optional module-level hook:
+`select 1 from <t> where not (<check>) limit 1` through the ordinary read path, and the orphan scan
+of `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` and of an inline `references` on `ADD COLUMN`
+(`validateAddedForeignKeyOverExistingRows`, called from the module's own `addConstraint` arm), which
+runs `select 1 from <child> where <fk columns not null> and not exists (select 1 from <parent> where
+<match>) limit 1`. That path sees only the effective rows, so a module whose DDL survives a rollback
+reports the other states through an optional module-level hook:
 
 ```ts
 interface RestorableRowStates {
@@ -159,21 +162,41 @@ lifted from the table's declaration over them. The optimizer lifting a declared 
 CHECK into a fact about every stored row is why this matters: accepted, a restored violator
 would vanish from every query that filters for it.
 
+A foreign key reads two tables, and a rollback moves both to the same point, so its scan pairs
+them by rollback point instead of walking each table's states on its own. The points are the
+whole-transaction rollback and each open savepoint depth; at each, the child's rows *and* the
+parent's rows are replaced by the state that point restores, both overrides in one statement. A
+table that reports no states (no open work, or no hook) keeps its current rows at every point; a
+self-referencing key has one table, so both reads take its one state; an absent parent needs no
+override, since every fully non-NULL child row is then an orphan anyway. Judging a child state
+against the parent's *current* rows would be wrong both ways: a parent row the transaction
+inserted would hide a committed orphan that a rollback brings back (missed violation), and a
+parent deleted together with its child rows would refuse a rollback that restores both (false
+refusal). A point whose two sides are both current is the effective scan and is skipped; with
+neither table holding open work no second scan runs.
+
 The contract:
 
 *   Return `undefined` when the issuing connection has no open work on the table — every state
     then equals the effective rows, and the common case pays no second scan.
-*   Read-only: no drain, no flush, no other mutation. `ADD CONSTRAINT` calls the hook *before*
-    `alterTable`; `ADD COLUMN` calls it *after* `alterTable(addColumn)`, so each state already
-    carries the new column as the module wrote it into that state. Rows are in the table's
-    current column layout.
+*   Read-only: no drain, no flush, no other mutation. `ADD CONSTRAINT … CHECK` calls the hook
+    *before* `alterTable`; `ADD COLUMN` calls it *after* `alterTable(addColumn)`, so each state
+    already carries the new column as the module wrote it into that state; a foreign key's scan
+    calls it from *inside* the module's `alterTable(addConstraint)` — for the child and for the
+    parent, each through the module the catalog routes that table through (the wrapper, under the
+    isolation layer) — so the hook must not take a latch the module's own schema change holds.
+    Rows are in the table's current column layout. A constraint being put back during a failed
+    `apply schema`'s unwind (`SchemaChangeInfo.restoring`) is not judged, so the hook is not
+    called for it.
 *   Index `savepoints` by the database's savepoint depth so two tables' states can be paired by
     rollback point (a foreign key pairs a child's state with its parent's). A released savepoint
     has no entry.
 *   A state the module holds but cannot report must refuse, not pass: the isolation layer, over
     an overlay module without `savepointRowSources`, throws `rolledBackRowsWouldViolate(ddl, …)`
     under open savepoints. `ddl` is the statement as the user wrote it (`add constraint pos
-    check`, `add check`, `add column w`).
+    check`, `add check`, `add column w`, `add constraint fk foreign key`, `add foreign key` — the
+    last two also for an inline `references` on `ADD COLUMN`, since the module arm cannot tell the
+    two statements apart).
 *   A module whose DDL rolls back with its data needs no hook; one declaring
     `permitsGrandfatheredCheckViolators` is not judged at all.
 

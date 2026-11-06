@@ -12,7 +12,7 @@ import { MemoryVirtualTableConnection } from '../connection.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError, formatKeyValue } from '../../../schema/constraint-builder.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateAddedForeignKeyOverExistingRows, maintainedTableUniqueViolationError, formatKeyValue } from '../../../schema/constraint-builder.js';
 import { indexEnforcesUnique, uniqueColumnsChanged as sharedUniqueColumnsChanged, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
 import { generateIndexDDL, generateDropIndexDDL } from '../../../schema/ddl-generator.js';
 import { rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
@@ -32,7 +32,7 @@ import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 import type { EffectiveRowSource, IssuerRowSources } from '../../module.js';
-import { distinctRestorableRows, judgeRestorableStates, type RestorableRows, type RestorableRowStates } from '../../rollback-states.js';
+import { describeAddForeignKey, distinctRestorableRows, judgeRestorableStates, type RestorableRows, type RestorableRowStates } from '../../rollback-states.js';
 import { convertRowAtIndex, mapRows, mapRowsAsync, type RowMapper } from './row-convert.js';
 import { buildAlterColumnPlan, describeAlterColumn, planColumnAttributeChange, type AlterColumnChange, type AlterColumnPlan, type EffectiveRows, type RestorableState } from './alter-column.js';
 
@@ -2800,9 +2800,12 @@ export class MemoryTableManager {
 	 * `VirtualTableModule.restorableRowStates` for this table: the committed rows and each open
 	 * savepoint's rows of the DDL connection, or undefined when it holds no open work here.
 	 *
-	 * Called BEFORE `ensureSchemaChangeSafety` on the `add constraint` path and must not drain, so
-	 * the committed rows are the committed head, not the base (which the drain has not yet brought
-	 * up to date). Each stream is a SYNC walk, for the reason given on {@link effectiveDdlRows}.
+	 * Called BEFORE `ensureSchemaChangeSafety` on the `add constraint … check` path and must not
+	 * drain, so the committed rows are the committed head, not the base (which the drain has not
+	 * yet brought up to date). The foreign key arm calls it after the drain, inside the
+	 * schema-change latch, where head and base coincide — and on a PARENT table, whose manager
+	 * holds no latch and has not drained. Each stream is a SYNC walk, for the reason given on
+	 * {@link effectiveDdlRows}.
 	 */
 	public restorableRowStates(): RestorableRowStates | undefined {
 		const connection = this.ddlConnection();
@@ -3293,7 +3296,8 @@ export class MemoryTableManager {
 
 	/**
 	 * FOREIGN KEY arm of {@link addConstraint}. Validates existing child rows
-	 * against the new FK (pragma-gated; throws CONSTRAINT on an orphan), then
+	 * against the new FK (pragma-gated; CONSTRAINT on a visible orphan, BUSY on one
+	 * a rollback would leave — `validateAddedForeignKeyOverExistingRows`), then
 	 * appends it to the cached schema. No physical structure — FK enforcement is
 	 * engine-side (synthesized EXISTS checks at plan time). `restoring` skips the
 	 * validation: see `SchemaChangeInfo`.
@@ -3314,7 +3318,7 @@ export class MemoryTableManager {
 		// Validate BEFORE swapping the cached schema — a throw leaves the table
 		// unmodified. The scan only reads (no schema-change latch), so holding our
 		// own latch here is safe; ensureSchemaChangeSafety already drained to base.
-		if (!restoring) await validateForeignKeyOverExistingRows(this.db, newSchema, fk);
+		if (!restoring) await validateAddedForeignKeyOverExistingRows(this.db, newSchema, fk, describeAddForeignKey(constraint.name));
 
 		this.baseLayer.updateSchema(newSchema);
 		this.tableSchema = newSchema;

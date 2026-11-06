@@ -28,8 +28,8 @@ import { resolveComparisonCollation } from '../planner/analysis/comparison-colla
 import { containsOldRowImageRef, isRowInvariantCheck } from '../planner/analysis/check-extraction.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename-rewriter.js';
-import { rowSourceOverrideKey } from '../planner/planning-context.js';
-import { distinctRestorableRows, judgeRestorableStates, type RestorableRows } from '../vtab/rollback-states.js';
+import { rowSourceOverrideKey, type RowSourceOverrides } from '../planner/planning-context.js';
+import { distinctRestorableRows, judgeRestorableStates, type RestorableRows, type RestorableRowStates } from '../vtab/rollback-states.js';
 
 const log = createLogger('schema:constraint-builder');
 
@@ -635,8 +635,13 @@ export async function validateRowInvariantChecksOverExistingRows(
 }
 
 /**
- * Validates every existing CHILD row against a newly-added FOREIGN KEY,
- * throwing `StatusCode.CONSTRAINT` if any row references a non-existent parent.
+ * Validates every existing CHILD row against a FOREIGN KEY, throwing
+ * `StatusCode.CONSTRAINT` if any row references a non-existent parent — over the
+ * rows the issuing transaction can see only. The maintained-table derivation's entry
+ * point: the rows it judges are a derived image it just built, not rows a rollback
+ * restores (its CHECK scan, `validateChecksOverExistingRows`, judges no rollback state
+ * either). An ALTER adding a foreign key calls
+ * {@link validateAddedForeignKeyOverExistingRows} instead.
  *
  * Engine-level and backend-agnostic: it reads committed/base data through
  * `db.prepare` + scan (which does not take any module schema-change latch, so it
@@ -664,7 +669,56 @@ export async function validateForeignKeyOverExistingRows(
 	onViolation?: () => QuereusError,
 ): Promise<void> {
 	if (!db.options.getBooleanOption('foreign_keys')) return;
+	const { sql } = foreignKeyOrphanScan(db, childSchema, fk);
+	await scanForOrphans(db, childSchema, fk, sql, onViolation);
+}
 
+/**
+ * {@link validateForeignKeyOverExistingRows} for a foreign key an ALTER is adding
+ * (`add constraint … foreign key`, and `add column … references`, which reaches the
+ * same module arm), run over every state a rollback could return the two tables to as
+ * well. Called by the module's `addConstraint` arm, which skips it while restoring a
+ * dropped constraint during an unwind (`SchemaChangeInfo` `restoring`).
+ *
+ * DDL survives a rollback on the bundled backends while the rows it was judged against
+ * do not, so a child row a rollback restores, or a parent row it removes, would leave an
+ * orphan under the surviving constraint. A rollback moves both tables to the same point,
+ * so each state of the child is judged against the parent as it would stand at that same
+ * point ({@link foreignKeyRollbackPoints}) — never against the parent's current rows,
+ * which would both miss an orphan (a parent the transaction inserted rescues a committed
+ * child row) and refuse a consistent rollback (a parent deleted with its child rows).
+ *
+ * An orphan the transaction can see keeps `CONSTRAINT` (that scan runs first); one
+ * confined to a rollback point refuses as `BUSY` (`judgeRestorableStates`), with `ddl`
+ * naming the statement (`describeAddForeignKey`). When neither table has open work no
+ * second scan runs.
+ */
+export async function validateAddedForeignKeyOverExistingRows(
+	db: Database,
+	childSchema: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+	ddl: string,
+): Promise<void> {
+	if (!db.options.getBooleanOption('foreign_keys')) return;
+	const { sql, parentTable } = foreignKeyOrphanScan(db, childSchema, fk);
+	await scanForOrphans(db, childSchema, fk, sql);
+	await judgeRestorableStates(
+		await foreignKeyRollbackPoints(db, childSchema, parentTable, ddl),
+		overrides => scanForOrphans(db, childSchema, fk, sql, undefined, overrides),
+		ddl,
+		childSchema.name,
+	);
+}
+
+/**
+ * The `select 1 … limit 1` that finds a fully-non-NULL child row of `fk` with no parent, and
+ * the parent table it reads (undefined when absent: every such row is then an orphan).
+ */
+function foreignKeyOrphanScan(
+	db: Database,
+	childSchema: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+): { readonly sql: string; readonly parentTable: TableSchema | undefined } {
 	const childRef = qualifyRelation(childSchema.schemaName, childSchema.name);
 	const childAlias = '_c';
 	// MATCH SIMPLE: only rows where every FK column is non-NULL can violate.
@@ -674,35 +728,48 @@ export async function validateForeignKeyOverExistingRows(
 
 	const parentSchemaName = fk.referencedSchema ?? childSchema.schemaName;
 	const parentTable = db.schemaManager.findTable(fk.referencedTable, parentSchemaName);
-
-	let sql: string;
 	if (!parentTable) {
-		// Parent absent: any fully-non-NULL child row references a non-existent parent.
-		sql = `select 1 from ${childRef} as ${childAlias} where ${notNullChain} limit 1`;
-	} else {
-		// Shared with the plan-time / runtime enforcement sites so one malformed FK
-		// reports one message wherever it is met.
-		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childSchema);
-		const parentRef = qualifyRelation(parentTable.schemaName, parentTable.name);
-		const parentAlias = '_p';
-		// Aliases keep the correlation unambiguous even for a self-referencing FK
-		// (child table === parent table).
-		const matchChain = fk.columns
-			.map((childIdx, i) =>
-				`${parentAlias}.${quoteIdentifier(parentTable.columns[parentColIndices[i]].name)} = ${childAlias}.${quoteIdentifier(childSchema.columns[childIdx].name)}`)
-			.join(' and ');
-		// `not exists` correlated subquery: a fully-non-NULL child row with no matching
-		// parent is an orphan. (The decorrelator may turn this into an anti-join; that is
-		// fine — the ADD COLUMN path deliberately validates against a live schema that does
-		// NOT yet declare the new FK, so `ruleAntiJoinFkEmpty` has no FK to fold against.)
-		sql = `select 1 from ${childRef} as ${childAlias} `
-			+ `where ${notNullChain} `
-			+ `and not exists (select 1 from ${parentRef} as ${parentAlias} where ${matchChain}) limit 1`;
+		return { sql: `select 1 from ${childRef} as ${childAlias} where ${notNullChain} limit 1`, parentTable };
 	}
 
-	log('FK existing-row validation for %s.%s: %s', childSchema.schemaName, childSchema.name, sql);
+	// Shared with the plan-time / runtime enforcement sites so one malformed FK
+	// reports one message wherever it is met.
+	const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childSchema);
+	const parentRef = qualifyRelation(parentTable.schemaName, parentTable.name);
+	const parentAlias = '_p';
+	// Aliases keep the correlation unambiguous even for a self-referencing FK
+	// (child table === parent table).
+	const matchChain = fk.columns
+		.map((childIdx, i) =>
+			`${parentAlias}.${quoteIdentifier(parentTable.columns[parentColIndices[i]].name)} = ${childAlias}.${quoteIdentifier(childSchema.columns[childIdx].name)}`)
+		.join(' and ');
+	// `not exists` correlated subquery: a fully-non-NULL child row with no matching
+	// parent is an orphan. (The decorrelator may turn this into an anti-join; that is
+	// fine — the ADD COLUMN path deliberately validates against a live schema that does
+	// NOT yet declare the new FK, so `ruleAntiJoinFkEmpty` has no FK to fold against.)
+	const sql = `select 1 from ${childRef} as ${childAlias} `
+		+ `where ${notNullChain} `
+		+ `and not exists (select 1 from ${parentRef} as ${parentAlias} where ${matchChain}) limit 1`;
+	return { sql, parentTable };
+}
 
+/**
+ * Runs `sql` ({@link foreignKeyOrphanScan}) and throws on the first orphan it finds — with
+ * `overrides`, reading those tables from the given rows instead of their modules
+ * (`Statement._rowSourceOverrides`), so a rollback point is judged by the very SQL the
+ * effective pass ran.
+ */
+async function scanForOrphans(
+	db: Database,
+	childSchema: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+	sql: string,
+	onViolation?: () => QuereusError,
+	overrides?: RowSourceOverrides,
+): Promise<void> {
+	log('FK existing-row validation for %s.%s: %s', childSchema.schemaName, childSchema.name, sql);
 	const stmt = db.prepare(sql);
+	if (overrides) stmt._rowSourceOverrides = overrides;
 	try {
 		for await (const _row of stmt._iterateRowsRaw()) {
 			if (onViolation) throw onViolation();
@@ -715,6 +782,60 @@ export async function validateForeignKeyOverExistingRows(
 	} finally {
 		await stmt.finalize();
 	}
+}
+
+/**
+ * The row-source overrides for each rollback point — the whole-transaction rollback, then each
+ * open savepoint by depth — at which a foreign key's child or parent would hold rows other than
+ * its current ones, each pairing the child's rows at that point with the parent's rows at the
+ * same point. A table that reports no states (no open work, or a module without the hook) keeps
+ * its current rows at every point and gets no override. A self-referencing FK has one table and
+ * one override, which both reads of the scan take; an absent parent needs none. Points that pair
+ * the same two streams are judged once; there are none when neither table has open work.
+ */
+async function foreignKeyRollbackPoints(
+	db: Database,
+	childSchema: TableSchema,
+	parentTable: TableSchema | undefined,
+	ddl: string,
+): Promise<RowSourceOverrides[]> {
+	const childKey = rowSourceOverrideKey(childSchema.schemaName, childSchema.name);
+	const parentKey = parentTable && rowSourceOverrideKey(parentTable.schemaName, parentTable.name);
+	const child = await restorableStatesOf(db, childSchema, ddl);
+	const parent = parentTable && parentKey !== childKey ? await restorableStatesOf(db, parentTable, ddl) : undefined;
+	if (!child && !parent) return [];
+
+	const depth = Math.max(child?.savepoints.length ?? 0, parent?.savepoints.length ?? 0);
+	const pairs: [RestorableRows | undefined, RestorableRows | undefined][] = [[child?.transaction, parent?.transaction]];
+	for (let d = 0; d < depth; d++) pairs.push([rowsAtSavepoint(child, d), rowsAtSavepoint(parent, d)]);
+
+	const distinct = pairs.filter(([c, p], i) => pairs.findIndex(([c2, p2]) => c2 === c && p2 === p) === i);
+	return distinct.map(([childRows, parentRows]) => {
+		const overrides = new Map<string, RestorableRows>();
+		if (childRows) overrides.set(childKey, childRows);
+		if (parentRows && parentKey) overrides.set(parentKey, parentRows);
+		return overrides;
+	});
+}
+
+/**
+ * What `rollback to` the savepoint at `depth` restores `states`' table to. An entry the module
+ * did not report restores the committed rows (`VirtualTable.savepointRowSources` reads a
+ * missing trailing entry the same way).
+ */
+function rowsAtSavepoint(states: RestorableRowStates | undefined, depth: number): RestorableRows | undefined {
+	return states && (states.savepoints[depth] ?? states.transaction);
+}
+
+/**
+ * `table`'s restorable states, from the module the catalog routes it through — the wrapper (the
+ * isolation layer) rather than the module beneath it, since the wrapper stages the transaction's
+ * rows. The FK arm runs inside a module's `alterTable` holding that module's own copy of the
+ * child schema, hence the catalog lookup; the hook is read-only, so calling it from there is safe.
+ */
+async function restorableStatesOf(db: Database, table: TableSchema, ddl: string): Promise<RestorableRowStates | undefined> {
+	const catalogTable = db.schemaManager.findTable(table.name, table.schemaName) ?? table;
+	return requireVtabModule(catalogTable).restorableRowStates?.(db, table.schemaName, table.name, ddl);
 }
 
 /**

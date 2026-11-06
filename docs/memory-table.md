@@ -258,9 +258,9 @@ whole-transaction rollback restores) and the layer each **open** savepoint would
 `rollback to` restores — `MemoryTableConnection.savepointRestoreLayersByDepth`, which walks the
 savepoint *stack* rather than the layer chain, because a released savepoint cannot be rolled back
 to and its snapshot is not a restorable state even though it stays in the chain). A violation
-confined to a restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rows this
-transaction has deleted or overwritten would violate it if the transaction rolled back. Commit the
-pending writes first, then retry.` (`rolledBackRowsWouldViolate` in `vtab/rollback-states.ts`,
+confined to a restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rolling
+back this transaction would leave rows that break it. Commit the pending writes first, then retry.`
+(`rolledBackRowsWouldViolate` in `vtab/rollback-states.ts`,
 reached from every site through `judgeRestorableStates`) — the same retryable posture as rule 3,
 because the data the transaction can see is valid, and `commit` followed by the same statement
 lands it. A deleted row that breaks no rule does not block. Validation runs before anything is
@@ -288,6 +288,13 @@ reports its states through `MemoryTableModule.restorableRowStates` (the committe
 open savepoint's layer, by depth — read before the drain for `ADD CONSTRAINT`, after the backfill
 for `ADD COLUMN`, so the restored rows already carry the column's DEFAULT), and the engine re-runs
 the CHECK scan over each (docs/module-authoring-transactions.md § When the engine judges the rows).
+`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` (and an inline `references` on `ADD COLUMN`, which
+reaches the same arm) is judged by the engine too: `addForeignKeyConstraint` hands the new key to
+`validateAddedForeignKeyOverExistingRows` after the drain, which reads this manager's states for the
+child and the parent table's states from that table's own module, and re-runs the orphan scan once
+per rollback point with the child's and the parent's rows *at that same point*. A committed orphan
+the transaction deleted, or a parent row it inserted that is all that keeps a committed child row
+from being an orphan, refuses with `BUSY`; a parent deleted together with its child rows does not.
 
 Every `ALTER COLUMN` that can make two previously-distinct rows collide is validated the same
 way, once per uniqueness-enforcing index covering the altered column (`indexEnforcesUnique` —

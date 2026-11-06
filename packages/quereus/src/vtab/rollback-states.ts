@@ -51,8 +51,8 @@ export function distinctRestorableRows(states: RestorableRowStates): RestorableR
  */
 export function rolledBackRowsWouldViolate(ddl: string, tableName: string, cause?: Error): QuereusError {
 	return new QuereusError(
-		`Cannot ${ddl} on table ${tableName}: rows this transaction has deleted or overwritten would violate it `
-		+ `if the transaction rolled back. Commit the pending writes first, then retry.`,
+		`Cannot ${ddl} on table ${tableName}: rolling back this transaction would leave rows that break it. `
+		+ `Commit the pending writes first, then retry.`,
 		StatusCode.BUSY,
 		cause,
 	);
@@ -80,6 +80,11 @@ export function describeAlterColumn(change: AlterColumnAttributes): string {
 /** The `add constraint … check` statement as the user wrote it, for {@link rolledBackRowsWouldViolate}. */
 export function describeAddCheck(constraintName: string | undefined): string {
 	return constraintName ? `add constraint ${constraintName} check` : 'add check';
+}
+
+/** The `add constraint … foreign key` statement as the user wrote it, for {@link rolledBackRowsWouldViolate}. */
+export function describeAddForeignKey(constraintName: string | undefined): string {
+	return constraintName ? `add constraint ${constraintName} foreign key` : 'add foreign key';
 }
 
 /**

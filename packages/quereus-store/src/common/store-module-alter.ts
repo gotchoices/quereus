@@ -31,6 +31,7 @@ import {
 	buildUniqueConstraintSchema,
 	collectTableConstraintNames,
 	columnDefToSchema,
+	describeAddForeignKey,
 	foldDefaultToType,
 	objectRefKey,
 	rekeySchemaPrimaryKey,
@@ -39,7 +40,7 @@ import {
 	renameColumnInIndexPredicates,
 	resolveNamedConstraintClass,
 	shiftSchemaIndicesForDrop,
-	validateForeignKeyOverExistingRows,
+	validateAddedForeignKeyOverExistingRows,
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
@@ -606,8 +607,9 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				...oldSchema,
 				foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
 			};
-			// Pragma-gated existing-row validation; throws before persistence on an orphan.
-			if (!change.restoring) await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
+			// Pragma-gated existing-row validation, over every state a rollback could leave
+			// as well; throws before persistence on an orphan.
+			if (!change.restoring) await validateAddedForeignKeyOverExistingRows(db, updatedSchema, fk, describeAddForeignKey(constraint.name));
 		} else if (constraint.type === 'check') {
 			// Schema-only HERE: a CHECK has no physical structure, and the existing-row
 			// scan is the engine's, run pre-dispatch for every module

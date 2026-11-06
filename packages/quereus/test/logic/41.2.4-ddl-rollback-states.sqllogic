@@ -383,3 +383,178 @@ select * from rm;
 → [{"id":1,"v":1}]
 
 drop table rm;
+
+-- ===================================
+-- FOREIGN KEY. A rollback moves child and parent to the same point, so each state of the
+-- child is judged against the parent as it would stand at that same point.
+-- ===================================
+
+pragma foreign_keys = true;
+-- run
+
+-- ===================================
+-- N. a committed orphan the transaction deleted would come back under the new foreign key.
+-- ===================================
+
+create table np (id integer primary key);
+create table nc (id integer primary key, pid integer null);
+insert into np values (1);
+insert into nc values (1, 99), (2, 1);
+-- run
+
+begin;
+-- run
+delete from nc where id = 1;
+-- run
+alter table nc add constraint fk_n foreign key (pid) references np (id);
+-- error: commit the pending writes first
+
+rollback;
+-- run
+-- the orphan is back and no constraint claims otherwise
+select id, pid from nc where not exists (select 1 from np where np.id = nc.pid) order by id;
+→ [{"id":1,"pid":99}]
+
+delete from nc where id = 1;
+-- run
+alter table nc add constraint fk_n foreign key (pid) references np (id);
+-- run
+insert into nc values (3, 77);
+-- error: CHECK constraint failed: fk_n
+
+drop table nc;
+drop table np;
+
+-- ===================================
+-- O. a parent the transaction inserted rescues a committed orphan; the child has no open work.
+-- ===================================
+
+create table op (id integer primary key);
+create table oc (id integer primary key, pid integer null);
+insert into oc values (1, 5);
+-- run
+
+begin;
+-- run
+insert into op values (5);
+-- run
+alter table oc add foreign key (pid) references op (id);
+-- error: commit the pending writes first
+
+commit;
+-- run
+alter table oc add foreign key (pid) references op (id);
+-- run
+insert into oc values (2, 6);
+-- error: CHECK constraint failed: _fk_oc_pid
+
+drop table oc;
+drop table op;
+
+-- ===================================
+-- P. (legal) a parent deleted together with its child rows: the rollback restores both.
+-- ===================================
+
+create table pp (id integer primary key);
+create table pc (id integer primary key, pid integer null);
+insert into pp values (1), (2);
+insert into pc values (1, 1), (2, 2);
+-- run
+
+begin;
+-- run
+delete from pc where pid = 1;
+-- run
+delete from pp where id = 1;
+-- run
+alter table pc add constraint fk_p foreign key (pid) references pp (id);
+-- run
+rollback;
+-- run
+
+select id, pid from pc order by id;
+→ [{"id":1,"pid":1},{"id":2,"pid":2}]
+insert into pc values (3, 9);
+-- error: CHECK constraint failed: fk_p
+
+drop table pc;
+drop table pp;
+
+-- ===================================
+-- Q. only an open savepoint holds the orphan: the child row was staged before it, the parent after.
+-- ===================================
+
+create table qp (id integer primary key);
+create table qc (id integer primary key, pid integer null);
+-- run
+
+begin;
+-- run
+insert into qc values (1, 7);
+-- run
+savepoint s;
+-- run
+insert into qp values (7);
+-- run
+alter table qc add foreign key (pid) references qp (id);
+-- error: commit the pending writes first
+
+rollback to savepoint s;
+-- run
+select id, pid from qc where not exists (select 1 from qp where qp.id = qc.pid);
+→ [{"id":1,"pid":7}]
+
+rollback;
+-- run
+drop table qc;
+drop table qp;
+
+-- ===================================
+-- R. (legal) self-referencing: a row deleted with the row that references it. The one table is
+--    both sides, so each state is judged against itself.
+-- ===================================
+
+create table rs (id integer primary key, up integer null);
+insert into rs values (1, null), (2, 1), (3, null);
+-- run
+
+begin;
+-- run
+delete from rs where id in (1, 2);
+-- run
+alter table rs add constraint fk_up foreign key (up) references rs (id);
+-- run
+rollback;
+-- run
+
+select id, up from rs order by id;
+→ [{"id":1,"up":null},{"id":2,"up":1},{"id":3,"up":null}]
+insert into rs values (4, 9);
+-- error: CHECK constraint failed: fk_up
+
+drop table rs;
+
+-- ===================================
+-- S. an orphan the transaction can see keeps CONSTRAINT, though the transaction has open work.
+-- ===================================
+
+create table sp (id integer primary key);
+create table sc (id integer primary key, pid integer null);
+insert into sp values (1);
+insert into sc values (1, 99);
+-- run
+
+begin;
+-- run
+insert into sc values (2, 1);
+-- run
+alter table sc add foreign key (pid) references sp (id);
+-- error: FOREIGN KEY constraint failed
+
+rollback;
+-- run
+drop table sc;
+drop table sp;
+
+pragma foreign_keys = false;
+-- run

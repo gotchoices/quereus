@@ -588,12 +588,16 @@ export interface VirtualTableModule<
 	 * transaction could still perform, or undefined when that connection has no open work on the
 	 * table (every state then equals the rows it can see now, so there is nothing extra to judge).
 	 *
-	 * Read by the row-validating DDL the ENGINE judges rather than the module — the existing-row
-	 * CHECK scan of `add constraint … check` and `add column … check` — which re-runs its scan
-	 * over each state and refuses with `BUSY` when one would violate the new rule
-	 * (`rolledBackRowsWouldViolate`; docs/module-authoring-transactions.md § DDL inside an open
-	 * transaction). Rows are in the table's current column layout: called after the module's own
-	 * `alterTable` for `add column`, before it for `add constraint`.
+	 * Read by the row-validating DDL the ENGINE judges rather than the module: the existing-row
+	 * CHECK scan of `add constraint … check` and `add column … check`, and the orphan scan of
+	 * `add constraint … foreign key` and `add column … references`, which pairs the child's and
+	 * the parent's states by rollback point. Each re-runs its scan over each state and refuses
+	 * with `BUSY` when one would violate the new rule (`rolledBackRowsWouldViolate`;
+	 * docs/module-authoring-transactions.md § DDL inside an open transaction). Rows are in the
+	 * table's current column layout: called after the module's own `alterTable` for `add column`,
+	 * before it for `add constraint … check`, and from inside the module's own
+	 * `alterTable(addConstraint)` for a foreign key, for the child and the parent table alike — so
+	 * it must take no latch a schema change holds.
 	 *
 	 * Read-only: must not drain, flush or otherwise mutate. `ddl` names the statement as the user
 	 * wrote it, for the one refusal a module raises itself — a state it holds but cannot report

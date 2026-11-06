@@ -1218,8 +1218,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 	/**
 	 * `VirtualTableModule.restorableRowStates`, for the engine-judged row-validating DDL (the
-	 * existing-row CHECK scan). With nothing staged by the issuing connection the underlying holds
-	 * whatever open work there is, so it answers (behind this layer, nothing: writes reach it only
+	 * existing-row CHECK scan, and the foreign key orphan scan for both the child and the parent
+	 * table, called from inside the underlying's `alterTable`). With nothing staged by the issuing
+	 * connection the underlying holds whatever open work there is, so it answers (behind this layer, nothing: writes reach it only
 	 * at commit). Otherwise the whole-transaction rollback restores the underlying's own rows —
 	 * this layer stages every pending write, so they are the committed rows — and each open
 	 * savepoint restores the same merge over the overlay as it stood then

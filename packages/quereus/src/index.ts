@@ -60,7 +60,7 @@ export {
 	planCodeFromKind,
 } from './vtab/idx-str.js';
 export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, IssuerRowSources, ModuleRowCount, SchemaChangeInfo, TagChangeInfo, TagChangeTarget, TagEdit, VtabConcurrencyMode } from './vtab/module.js';
-export { describeAddCheck, describeAlterColumn, distinctRestorableRows, judgeRestorableStates, rolledBackRowsWouldViolate, type AlterColumnAttributes, type RestorableRows, type RestorableRowStates } from './vtab/rollback-states.js';
+export { describeAddCheck, describeAddForeignKey, describeAlterColumn, distinctRestorableRows, judgeRestorableStates, rolledBackRowsWouldViolate, type AlterColumnAttributes, type RestorableRows, type RestorableRowStates } from './vtab/rollback-states.js';
 export { COST_PRESETS, resolveModuleCostProfile } from './vtab/cost-profile.js';
 export type { ModuleCostProfile, ResolvedModuleCostProfile } from './vtab/cost-profile.js';
 export { getModuleConcurrencyMode, getModuleReadCommittedSnapshot, acquireConnectionLock } from './vtab/concurrency.js';
@@ -222,7 +222,7 @@ export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewA
 // names on an ALTER path — a parallel implementation is exactly the drift the differential
 // tests exist to catch.
 export { buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, disambiguateAutoConstraintName, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
-export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateChecksOverExistingRows, validateRowInvariantChecksOverExistingRows, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
+export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateChecksOverExistingRows, validateRowInvariantChecksOverExistingRows, validateForeignKeyOverExistingRows, validateAddedForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators
 // built from it — the single source of truth shared by store/isolation re-validators
