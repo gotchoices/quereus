@@ -228,7 +228,7 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 
 	it('an update that MOVES the primary key re-keys its delete and its insert independently', async () => {
 		// A PK-moving update is never one `update` event: the contract splits it into a
-		// `delete` at the old key and an `insert` at the new one (usage.md § Subscribing to
+		// `delete` at the old key and an `insert` at the new one (usage-events.md § Subscribing to
 		// Data Changes). Each carries a single meaningful image, so the re-key re-projects each
 		// through its own — [1, 9] for the delete's oldRow, [2, 9] for the insert's newRow —
 		// and the two land at DIFFERENT keys, which a shared re-key could not do.
@@ -388,7 +388,7 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 
 	/**
 	 * Runs one ALTER statement and asserts it announced exactly one event carrying `ddl`
-	 * and the shape `docs/usage.md` § What each `ALTER TABLE` arm reports promises for that
+	 * and the shape `docs/usage-events.md` § What each `ALTER TABLE` arm reports promises for that
 	 * arm. Asserting only that an event carrying `ddl` happened is what let the store report
 	 * `alter`/`table` for every column arm unnoticed, so the shape is pinned here per arm.
 	 */
@@ -408,7 +408,7 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 
 		// Hand-typed expectations (not round-tripped through the stringifier), so a silent
 		// rendering change is visible here. The third argument is the shape from
-		// `docs/usage.md` § What each `ALTER TABLE` arm reports: column arms name their
+		// `docs/usage-events.md` § What each `ALTER TABLE` arm reports: column arms name their
 		// column, DROP COLUMN reports `drop`, whole-table arms report `alter`/`table`.
 		await assertSingleEvent(
 			'alter table orders add column sku text null',
@@ -599,7 +599,7 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 });
 
 /**
- * The promise `docs/usage.md` § What each `ALTER TABLE` arm reports makes is not per-backend:
+ * The promise `docs/usage-events.md` § What each `ALTER TABLE` arm reports makes is not per-backend:
  * every structural arm raises one event, "whether or not the storage backend ships an emitter
  * of its own ... so a subscriber sees the same facts either way". Pin that as a PROPERTY rather
  * than as two hand-tabulated expectation lists that can drift apart: run the identical

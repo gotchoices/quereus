@@ -1116,7 +1116,7 @@ auto-event path produces both for it.
   interleave other events between the pair.
 
 Both are what lets a listener retire a row's old identity without knowing which columns form
-the key — see [usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes).
+the key — see [Event System § Subscribing to Data Changes](usage-events.md#subscribing-to-data-changes).
 
 ## Write scope
 

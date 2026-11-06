@@ -796,7 +796,7 @@ export abstract class StoreTableBase extends VirtualTable {
 	 *
 	 * Ordering within a transaction is the coordinator's queue order, which is the order
 	 * these calls are made — the event contract's delete-before-insert promise for a
-	 * relocating key change rides on that (docs/usage.md § Subscribing to Data Changes).
+	 * relocating key change rides on that (docs/usage-events.md § Subscribing to Data Changes).
 	 */
 	protected emitOrQueueDataChange(inTransaction: boolean, event: DataChangeEvent): void {
 		if (inTransaction && this.coordinator) {

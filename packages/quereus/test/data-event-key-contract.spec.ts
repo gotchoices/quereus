@@ -1,6 +1,6 @@
 /**
  * The data-change event key contract, pinned across both in-engine producers
- * (docs/usage.md § Subscribing to Data Changes). Two clauses:
+ * (docs/usage-events.md § Subscribing to Data Changes). Two clauses:
  *
  *  1. `key` is the primary key projected out of the event's OWN row image — `newRow` for an
  *     insert and an update, `oldRow` for a delete. An update therefore keys by its POST-image.

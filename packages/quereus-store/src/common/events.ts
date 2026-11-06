@@ -11,7 +11,7 @@ import type { SqlValue, VTableDataChangeEvent, VTableEventEmitter, VTableSchemaC
  * are one wire shape, and the hand-maintained copy this replaced had drifted narrower than
  * the engine's (no `'column'` object type, no `columnName` / `oldColumnName`), which made
  * the documented per-arm ALTER TABLE shape unrepresentable here. Keep it an alias so the
- * store cannot drift from the contract in `docs/usage.md`
+ * store cannot drift from the contract in `docs/usage-events.md`
  * § What each `ALTER TABLE` arm reports again.
  */
 export type SchemaChangeEvent = VTableSchemaChangeEvent;
@@ -23,7 +23,7 @@ export type SchemaChangeEvent = VTableSchemaChangeEvent;
  * reason {@link SchemaChangeEvent} is an alias: a hand-maintained second copy of one wire
  * shape drifts, and the schema half of this file is what that drift already cost. The store
  * adds exactly one field of its own — `pk`, a legacy alias of `key` — and inherits the rest,
- * including the engine's key contract (`docs/usage.md` § Subscribing to Data Changes): `key`
+ * including the engine's key contract (`docs/usage-events.md` § Subscribing to Data Changes): `key`
  * is projected from the event's own row image, and an `update` never moves a row (a
  * relocating primary-key change is a `delete` at the old key then an `insert` at the new one).
  */

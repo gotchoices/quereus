@@ -459,7 +459,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	// Per-PK-column comparators for the data-event contract's relocation test: an UPDATE
 	// whose key values differ under the PRIMARY KEY's own comparator MOVES the row, and the
 	// contract delivers that as delete-at-old-key + insert-at-new-key rather than one `update`
-	// (docs/usage.md § Subscribing to Data Changes). Built through the shared UNIQUE-enforcement
+	// (docs/usage-events.md § Subscribing to Data Changes). Built through the shared UNIQUE-enforcement
 	// rule so the test is collation- and type-aware — never raw value equality, which would
 	// mis-classify a NOCASE case-only rewrite ('apple' → 'APPLE') as a move when the row never
 	// left its slot. Resolved once here (the resolver throws on an unregistered name and
@@ -1228,7 +1228,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	/**
 	 * Emit the auto data event(s) for one row-level UPDATE under the event contract's split
-	 * rule (docs/usage.md § Subscribing to Data Changes): a relocating key change is delivered
+	 * rule (docs/usage-events.md § Subscribing to Data Changes): a relocating key change is delivered
 	 * as a `delete` at the old key then an `insert` at the new key — so a listener retires the
 	 * old identity without having to know which columns form the key — and anything else is a
 	 * single `update` keyed by the POST-image, which is the row the table now holds.

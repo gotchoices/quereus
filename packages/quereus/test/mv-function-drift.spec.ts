@@ -21,7 +21,7 @@
  * is how the rows are re-derived under the new meaning.
  *
  * Detection is by object identity, so it holds WITHIN a session only — a reopen attaches
- * a fresh derivation with no prior capture. See `docs/materialized-views.md` § Function
+ * a fresh derivation with no prior capture. See `docs/mv-query-rewrite.md` § Function
  * identity.
  */
 

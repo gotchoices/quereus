@@ -629,7 +629,7 @@ export class StoreTable extends StoreTableConstraints {
 				// Queue or emit the event(s). An update that RELOCATED the row is delivered
 				// as a `delete` at the old key then an `insert` at the new one, never a single
 				// `update` — the event contract's split rule, which lets a listener retire the
-				// old identity without knowing which columns form the key (docs/usage.md
+				// old identity without knowing which columns form the key (docs/usage-events.md
 				// § Subscribing to Data Changes). `pkChanged` is exactly the relocation test the
 				// contract names: encoded data keys fold each PK column's collation, so a NOCASE
 				// case-only rewrite stays one in-place `update`, keyed — like every

@@ -2,7 +2,7 @@
  * A local UPDATE that MOVES a row's primary key must reach a synced peer as a move:
  * the old identity retired, the new one created — never both rows present.
  *
- * The engine's data-event contract is what makes this work (docs/usage.md § Subscribing to
+ * The engine's data-event contract is what makes this work (docs/usage-events.md § Subscribing to
  * Data Changes): a relocating key change is delivered as a `delete` at the old key followed by
  * an `insert` at the new key, never as one `update`. Sync is a plain consumer of that — it
  * writes a tombstone only for a `delete` event and column versions under `event.key` for

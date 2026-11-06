@@ -493,7 +493,7 @@ arity.
 out of the change's own image at commit (`newRow` for an insert or an update, `oldRow` for a
 delete) through the primary key of the schema current *at delivery* — `eventKeyFromImage` in
 `MemoryTableManager.commitTransaction`. That is the engine-wide event contract
-([usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes)) read as an
+([Event System § Subscribing to Data Changes](usage-events.md#subscribing-to-data-changes)) read as an
 implementation: keying at delivery rather than replaying each write's recorded key is what makes
 an in-place rewrite that changes a key column's *value* but not the row's identity (a `NOCASE`
 `'apple'` → `'APPLE'`, which `recordUpsert` files under the pre-image key) hand listeners the

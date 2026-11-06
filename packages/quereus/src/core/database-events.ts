@@ -23,7 +23,7 @@ const errorLog = log.extend('error');
  * Data change event emitted at the database level.
  * Extends VTableDataChangeEvent with module identification.
  *
- * See `docs/usage.md` § Subscribing to Data Changes for the key contract every producer
+ * See `docs/usage-events.md` § Subscribing to Data Changes for the key contract every producer
  * follows: `key` is projected from the event's own row image, and an `update` never moves a
  * row (a relocating primary-key change is a `delete` at the old key then an `insert` at the new
  * one, in that order — ordering guaranteed, adjacency not).
@@ -248,7 +248,7 @@ function keyMatchesImage(row: Row, indices: readonly number[], key: readonly Sql
  * re-project through the new key so the re-key preserves whichever row the producer
  * was addressing.
  *
- * This is just the producers' own key rule (docs/usage.md § Subscribing to Data Changes)
+ * This is just the producers' own key rule (docs/usage-events.md § Subscribing to Data Changes)
  * read backwards: `key` is projected from `newRow` for an insert or an update, from
  * `oldRow` for a delete. An update's two images can still differ in a key column — a
  * NOCASE 'apple' → 'APPLE' rewrite leaves the row in place, and the contract keys it by the

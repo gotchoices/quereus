@@ -690,7 +690,7 @@ export class MemoryTableManager {
 			if (changes.length > 0 && this.eventEmitter?.emitDataChange) {
 				// The contract's `key` is the primary key projected out of the event's OWN row
 				// image — `newRow` for an insert or an update, `oldRow` for a delete — under the
-				// schema current at DELIVERY (docs/usage.md § Subscribing to Data Changes).
+				// schema current at DELIVERY (docs/usage-events.md § Subscribing to Data Changes).
 				// Projecting here rather than replaying the key each write recorded is what
 				// makes an in-place rewrite that changes the key's VALUE but not the row's
 				// identity (a NOCASE 'apple' → 'APPLE', which `recordUpsert` files under the
@@ -1199,7 +1199,7 @@ export class MemoryTableManager {
 		if (ucResult) return ucResult;
 
 		// Journal order evict-delete, move-delete, move-insert is the data-change
-		// event contract (docs/usage.md § Subscribing to Data Changes).
+		// event contract (docs/usage-events.md § Subscribing to Data Changes).
 		if (existingRowAtNewKey !== null) {
 			targetLayer.recordDelete(newPrimaryKey, existingRowAtNewKey);
 		}

@@ -84,7 +84,7 @@ interface DatabaseDataChangeEvent {
   key?: SqlValue[];         // Primary key projected from this event's OWN row image (newRow for
                             // insert/update, oldRow for delete), under the key the table has at
                             // delivery. An update never moves a row — a relocating PK change is
-                            // delivered as delete-then-insert. See usage.md § Subscribing to Data Changes.
+                            // delivered as delete-then-insert. See usage-events.md § Subscribing to Data Changes.
   oldRow?: Row;             // Previous values (update/delete)
   newRow?: Row;             // New values (insert/update)
   changedColumns?: string[]; // Column names that changed (update only)
@@ -206,8 +206,8 @@ async update(args: UpdateArgs): Promise<Row | undefined> {
 
 A subscriber must see the same facts whichever backend holds the table, so the per-arm
 `type` / `objectType` / `columnName` / `oldColumnName` of an `ALTER TABLE` announcement is a
-contract, not a module's choice — see [usage.md § What each `ALTER TABLE` arm
-reports](usage.md#what-each-alter-table-arm-reports) for the table. Derive it from the
+contract, not a module's choice — see [usage-events.md § What each `ALTER TABLE` arm
+reports](usage-events.md#what-each-alter-table-arm-reports) for the table. Derive it from the
 `SchemaChangeInfo` you were handed with the exported `alterEventShape(change, before)` instead
 of writing the triple out per arm — `before` is the table's schema as it was when you were
 called, which is how an ALTER PRIMARY KEY announcement comes to name the key it retired
@@ -283,7 +283,7 @@ nothing, even from a native emitter](#a-failed-ddl-statement-announces-nothing-e
 - `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`
 - **every structural `ALTER TABLE` arm** — `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, all four `ALTER COLUMN` attribute forms, `ALTER PRIMARY KEY`, `ADD CONSTRAINT`, `DROP CONSTRAINT`, `RENAME CONSTRAINT`
 
-One event per statement, on its success path only, in the same shape a natively-emitting backend reports — see [usage.md § What each `ALTER TABLE` arm reports](usage.md#what-each-alter-table-arm-reports) for the per-arm table. The engine emits at the *end* of the arm (after its catalog swap), where a natively-emitting module emits from inside its own `alterTable`; the ordering difference is not observable, since each arm produces one event and delivery is batched to commit.
+One event per statement, on its success path only, in the same shape a natively-emitting backend reports — see [usage-events.md § What each `ALTER TABLE` arm reports](usage-events.md#what-each-alter-table-arm-reports) for the per-arm table. The engine emits at the *end* of the arm (after its catalog swap), where a natively-emitting module emits from inside its own `alterTable`; the ordering difference is not observable, since each arm produces one event and delivery is batched to commit.
 
 Two `ALTER TABLE` arm families are **excluded** on both paths, so no asymmetry is introduced:
 

@@ -411,7 +411,7 @@ export class MaterializedViewManager {
 	 *  - No prior capture — a first registration, and equally a fresh derivation record
 	 *    (create, catalog import on reopen). Object identity cannot cross a process
 	 *    boundary, so drift detection is inherently within-session; see
-	 *    `docs/materialized-views.md` § Function identity.
+	 *    `docs/mv-query-rewrite.md` § Function identity.
 	 */
 	private applyBodyFunctionDrift(
 		mv: MaintainedTableSchema,

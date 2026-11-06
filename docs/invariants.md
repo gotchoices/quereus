@@ -949,17 +949,15 @@ Reporting a change against a maintained table is out of contract; its contents a
 - guard: `packages/quereus/test/mv-structural-alter-restore.spec.ts` — `frozen ALTER releases the plan, emits backing invalidation, and reads stale until REFRESH`
 - doc: [Materialized Views § Schema-change staleness](materialized-views.md#schema-change-staleness)
 
-A source schema change that a body provably cannot observe recompiles the view in place;
-anything else marks it **stale** and detaches its row-time plan, so it serves its last
-snapshot and source writes stop propagating. Dropping a plain view the body reads (directly or
-through other views) stales it the same way. A re-registration that resolves a body function
-to a different registration than the one that produced the stored rows stales the view too
+A source schema change the body provably cannot observe recompiles the view in place; any
+other marks it **stale**: its row-time plan detaches, it serves its last snapshot, and source
+writes stop propagating. Dropping a plain view the body reads, directly or through other views,
+stales it too, as does a re-registration that resolves a body function to a different
+registration than the one that produced the stored rows
 ([body-function drift](mv-schema-change.md#body-function-drift)). `stale` is the only
-read-state flag. Staleness
-is how MV-001 stays honest under DDL: a view that can no longer be maintained refuses to
-pretend, and its next reference re-validates the body — erroring with a staleness diagnostic
-rather than serving rows against a broken definition. Only `REFRESH`, or drop-and-recreate,
-clears the flag.
+read-state flag. Staleness keeps MV-001 true under DDL: a stale view's next reference
+re-validates the body and errors with a staleness diagnostic rather than serving rows against a
+broken definition. Only `REFRESH`, or drop-and-recreate, clears the flag.
 
 ### MV-023 — A rename rewrites the stored body rather than stranding it
 

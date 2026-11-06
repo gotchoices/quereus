@@ -441,7 +441,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 		it('an update that MOVES the primary key re-keys its delete and its insert independently', async () => {
 			// A PK-moving update is never one `update` event: the contract splits it into a
-			// `delete` at the old key and an `insert` at the new one (usage.md § Subscribing to
+			// `delete` at the old key and an `insert` at the new one (usage-events.md § Subscribing to
 			// Data Changes). Each carries a single meaningful image, so the re-key re-projects
 			// each through its own — [1, 9] for the delete's oldRow, [2, 9] for the insert's
 			// newRow — and the two land at DIFFERENT keys, which a shared re-key could not do.

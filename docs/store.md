@@ -67,7 +67,7 @@ store.onDataChange((event: DataChangeEvent) => {
 });
 ```
 
-`key` follows the engine-wide contract in [usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes):
+`key` follows the engine-wide contract in [Event System § Subscribing to Data Changes](usage-events.md#subscribing-to-data-changes):
 it is the primary key projected out of the event's own row image (`newRow` for an insert or an
 update, `oldRow` for a delete), and an `update` never moves a row — a key change that relocates
 the row arrives as a `delete` at the old key followed by an `insert` at the new one. The store

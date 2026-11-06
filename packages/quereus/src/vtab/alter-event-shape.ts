@@ -22,7 +22,7 @@ export type AlterEventShapeBefore = Pick<TableSchema, 'columns' | 'primaryKeyDef
  * `alter`/`column` naming the touched column for the column arms (`drop`/`column` for
  * DROP COLUMN), `alter`/`table` for the whole-table ones. Matches what the engine's own
  * no-emitter path reports for the same statements (`runtime/emit/alter-table.ts`) and
- * what `docs/usage.md` § What each `ALTER TABLE` arm reports promises.
+ * what `docs/usage-events.md` § What each `ALTER TABLE` arm reports promises.
  *
  * The caller supplies the rest of the event (`schemaName`, `objectName`, `ddl`) and owns
  * the emit-iff-`change.ddl` gate. `RENAME TO` is not an arm of this union — it goes

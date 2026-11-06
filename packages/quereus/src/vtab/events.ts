@@ -25,7 +25,7 @@ export function tryGetEventEmitter(module: AnyVirtualTableModule): VTableEventEm
 /**
  * Data change event emitted when mutations are committed.
  *
- * Producers owe the key contract in `docs/usage.md` § Subscribing to Data Changes: `key` is
+ * Producers owe the key contract in `docs/usage-events.md` § Subscribing to Data Changes: `key` is
  * projected from the event's own row image, and an `update` never moves a row (a relocating
  * primary-key change is a `delete` at the old key then an `insert` at the new one).
  */

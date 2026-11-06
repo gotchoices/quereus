@@ -154,7 +154,7 @@ A row with a first write in the same batch, in either order, is accepted: a prim
 
 **A primary-key change tombstones the old identity.** Sync sees the engine's data events, and
 those split a key change that *moves* a row into a `delete` at the old key followed by an
-`insert` at the new one ([usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes)).
+`insert` at the new one ([Event System § Subscribing to Data Changes](usage-events.md#subscribing-to-data-changes)).
 So `update t set id = 2 where id = 1` records a tombstone at `pk [1]` and a full cell set — every
 column, not just `id` — at `pk [2]`. That is what stops the receiving peer from ending up holding
 both rows, and it means a table that re-keys rows routinely accrues tombstones at the same rate,
