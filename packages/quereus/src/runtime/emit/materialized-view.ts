@@ -233,6 +233,11 @@ interface RefreshedRecord {
 }
 
 /** Re-stale a refreshed MV whose refresh was undone, if it still exists. */
+// NOTE: over-stales in two cases, each costing one extra refresh and never a wrong read:
+// the backing invalidation `markMaterializedViewStale` emits also stales live consumers
+// whose rows the rollback restored, and a COMMIT that fails after this MV's connection
+// already committed still runs the action. If either shows up as refresh churn, re-stale
+// only when the refreshed connection actually rolled back.
 function markStaleIfPresent(db: Database, schemaName: string, name: string): void {
 	const current = db.schemaManager.getMaintainedTable(schemaName, name);
 	if (current) db.markMaterializedViewStale(current);

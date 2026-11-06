@@ -763,4 +763,24 @@ describe('Maintained-table refresh re-validation', () => {
 			expect(isStale('mt'), 'the failed insert rolled back only its own statement').to.equal(false);
 		});
 	});
+
+	it('a refresh that removes a row a child references under RESTRICT is rejected', async () => {
+		// The refresh's diff runs the parent-side referential actions, so the rebuild's
+		// delete of row 2 is refused and the refresh unwinds, leaving the table stale.
+		await db.exec(`
+			pragma foreign_keys = true;
+			create table src (id integer primary key, v text not null, g text not null default 'keep');
+			create table mt (id integer primary key, v text not null)
+				maintained as select id, v from src where g <> 'skip';
+			create table child (cid integer primary key, pid integer references mt(id) on delete restrict);
+			insert into src (id, v) values (1, 'a'), (2, 'b');
+			insert into child values (10, 2);
+		`);
+		await db.exec(`alter table src alter column g set collate nocase`); // stale
+		await db.exec(`delete from src where id = 2`);
+
+		await expectError('refresh materialized view mt', 'RESTRICT');
+		expect(await readAll('select id from mt order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		expect(isStale('mt')).to.equal(true);
+	});
 });
