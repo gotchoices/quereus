@@ -5,6 +5,8 @@ import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputVal
 import type { ScalarType } from '../common/datatype.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { Statement } from './statement.js';
+import { InterruptibleIteration } from './interruptible-iteration.js';
+import { combineAbortSignals, type CombinedAbortSignal } from '../util/abort-signal.js';
 import { SchemaManager } from '../schema/manager.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
@@ -99,25 +101,6 @@ export interface ExistingRowScanPlanning {
 	readonly rowSourceOverrides?: RowSourceOverrides;
 }
 
-/**
- * Live handle for one mutex-free committed read (see
- * {@link import('../common/types.js').StatementOptions.readConcurrency}).
- * Minted by {@link Database._beginConcurrentRead}; the read combines `signal`
- * with the caller's own signal and MUST call `end()` on every exit path
- * (completion, break, error, abort) — {@link Database.close} awaits `done`,
- * so a leaked scope hangs close.
- */
-export interface ConcurrentReadScope {
-	/** Fired by {@link Database.close} so an in-flight read unwinds (with an
-	 *  AbortError) at its next row boundary. */
-	readonly signal: AbortSignal;
-	/** Resolves once {@link end} has run — i.e. the read's teardown (scan
-	 *  connection disconnects included) is complete. */
-	readonly done: Promise<void>;
-	/** Marks the read finished. Idempotent. */
-	end(): void;
-}
-
 /** Options accepted by {@link Database.registerCollation}'s third argument. */
 export interface RegisterCollationOptions {
 	normalizer?: (s: string) => string;
@@ -210,11 +193,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	private watchHandlersOfHold: Promise<void>[] | null = null;
 	/**
-	 * Live mutex-free committed-read scopes → their abort controllers.
-	 * {@link close} aborts each and awaits its `done` before tearing down shared
-	 * state, so no read is left iterating a schema being cleared.
+	 * Serialized statement iterations that hold the execution mutex. {@link close} interrupts
+	 * each, so an iterator nobody pulls again cannot hold close up, and then waits for the
+	 * mutex they release once unwound.
 	 */
-	private readonly concurrentReads = new Map<ConcurrentReadScope, AbortController>();
+	private readonly serializedIterations = new Set<InterruptibleIteration<unknown>>();
+	/**
+	 * Mutex-free committed reads, from their first pull until they have unwound. They hold
+	 * no mutex for {@link close} to wait on, so it interrupts each and awaits that instead.
+	 */
+	private readonly committedReads = new Set<InterruptibleIteration<Row>>();
+	/** Aborted by {@link close}. Every statement's runtime signal includes it (see {@link _statementSignal}). */
+	private readonly closeController = new AbortController();
+	/** The first {@link close} call's promise, which later calls return. */
+	private closing: Promise<void> | undefined;
 	/** Database-level event emitter for unified reactivity */
 	private readonly eventEmitter = new DatabaseEventEmitter();
 	/** Transaction management */
@@ -725,25 +717,35 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * @internal
 	 */
 	async _acquireExecMutex(): Promise<() => Promise<void>> {
+		const releaseMutex = await this.takeExecMutex();
+		try {
+			// close() takes the mutex after everyone already queued for it, so a caller that
+			// was waiting gets it with the database closed and must not run.
+			this.checkOpen();
+			// Every serialized statement passes through here, so a host whose async
+			// generators cannot release this mutex on early exit is refused before it
+			// does any work. Checked after taking the slot so the one-time probe cannot
+			// reorder waiters; a sync no-op once verified.
+			const supportCheck = ensureAsyncGeneratorCleanupSupported();
+			if (supportCheck) await supportCheck;
+		} catch (e) {
+			await releaseMutex();
+			throw e;
+		}
+		return releaseMutex;
+	}
+
+	/**
+	 * Waits for the execution mutex and returns its release, with no closed check: the
+	 * part of {@link _acquireExecMutex} that {@link close} uses for its own teardown.
+	 */
+	private async takeExecMutex(): Promise<() => Promise<void>> {
 		const previousMutex = this.execMutex;
 		let releaseMutex: () => void;
 		this.execMutex = new Promise<void>(resolve => {
 			releaseMutex = resolve;
 		});
 		await previousMutex;
-		// Every serialized statement passes through here, so a host whose async
-		// generators cannot release this mutex on early exit is refused before it
-		// holds it. Checked after taking the slot so the one-time probe cannot
-		// reorder waiters; a sync no-op once verified.
-		const supportCheck = ensureAsyncGeneratorCleanupSupported();
-		if (supportCheck) {
-			try {
-				await supportCheck;
-			} catch (e) {
-				releaseMutex!();
-				throw e;
-			}
-		}
 		// Mark the mutex held from acquisition until the returned release runs, so a
 		// re-entrant caller can detect it (see _isExecuting). The wrapper decrements
 		// at most once even if release is invoked more than once.
@@ -760,7 +762,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			releaseMutex!();
 			// NOTE: a statement's abort signal does not end this wait, because the statement
 			// has already finished; if a host needs abort to bound a slow handler, race the
-			// wait against the signal in `_withMutex` and `_iterateSerialized`.
+			// wait against the signal in `_withMutex` and `serializedIteration`.
 			await Promise.all(watchHandlers);
 		};
 	}
@@ -862,26 +864,27 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * @internal Registers a mutex-free committed read. The returned scope's
-	 * `signal` fires when {@link close} runs; the read must call `end()` on every
-	 * exit path or `close()` waits forever on `done`.
+	 * @internal Records that a mutex-free committed read has started, so {@link close} stops
+	 * it and waits for its teardown. Refuses a closed database. The read calls
+	 * {@link _endCommittedRead} in its `finally`, once its scan connections are released.
 	 */
-	_beginConcurrentRead(): ConcurrentReadScope {
+	_beginCommittedRead(read: InterruptibleIteration<Row>): void {
 		this.checkOpen();
-		const controller = new AbortController();
-		let resolveDone!: () => void;
-		const done = new Promise<void>(resolve => {
-			resolveDone = resolve;
-		});
-		const scope: ConcurrentReadScope = {
-			signal: controller.signal,
-			done,
-			end: () => {
-				if (this.concurrentReads.delete(scope)) resolveDone();
-			},
-		};
-		this.concurrentReads.set(scope, controller);
-		return scope;
+		this.committedReads.add(read);
+	}
+
+	/** @internal See {@link _beginCommittedRead}. */
+	_endCommittedRead(read: InterruptibleIteration<Row>): void {
+		this.committedReads.delete(read);
+	}
+
+	/**
+	 * @internal The signal a statement's runtime context carries: the caller's, joined with
+	 * the one {@link close} aborts, so close() stops a running statement at its next row.
+	 * Dispose it when the statement ends.
+	 */
+	_statementSignal(callerSignal: AbortSignal | undefined): CombinedAbortSignal {
+		return combineAbortSignals(callerSignal, this.closeController.signal);
 	}
 
 	/**
@@ -903,14 +906,22 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * the first row until its implicit transaction has finished, commit included. A closed
 	 * database or an aborted signal is refused before the mutex is taken, and a generator
 	 * that is never started runs none of this, so neither case can touch a transaction.
+	 * {@link close} can stop the iteration while it holds the mutex (see
+	 * {@link InterruptibleIteration}).
 	 */
-	async *_iterateSerialized<T>(body: () => AsyncIterable<T>, signal?: AbortSignal): AsyncGenerator<T> {
+	_iterateSerialized<T>(body: () => AsyncIterable<T>, signal?: AbortSignal): AsyncIterableIterator<T> {
+		return new InterruptibleIteration<T>(iteration => this.serializedIteration(body, signal, iteration));
+	}
+
+	private async *serializedIteration<T>(body: () => AsyncIterable<T>, signal: AbortSignal | undefined, iteration: InterruptibleIteration<T>): AsyncGenerator<T> {
 		this.checkOpen();
 		throwIfAborted(signal);
 		const releaseMutex = await this._acquireExecMutex();
 		try {
+			this.serializedIterations.add(iteration);
 			yield* this._iterateFinalizing(body);
 		} finally {
+			this.serializedIterations.delete(iteration);
 			// NOTE: this release follows awaits in `finally` blocks, so it relies on
 			// spec-conformant return() handling; hosts that drop it are refused by
 			// ensureAsyncGeneratorCleanupSupported() before any statement runs.
@@ -926,7 +937,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * NOTE: a separate generator so the nested trace path can share it, which costs one
 	 * more `yield*` layer per row (one 300k-row series: 616 to 681 ns/row against the old
-	 * wrapper). If that shows up in scan profiles, inline it into `_iterateSerialized`.
+	 * wrapper). If that shows up in scan profiles, inline it into `serializedIteration`.
 	 */
 	async *_iterateFinalizing<T>(body: () => AsyncIterable<T>): AsyncGenerator<T> {
 		let failed = false;
@@ -1058,8 +1069,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Used as the innermost execution primitive.
 	 */
 	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[], signal?: AbortSignal): Promise<void> {
-		// `close()` takes no mutex, so a statement queued behind it, or the next step of a
-		// running `apply schema`, gets here after the database was torn down.
+		// The next step of a running `apply schema` or `exec` batch gets here after close()
+		// began: close() waits for the mutex holder to stop rather than stopping it outright.
 		this.checkOpen();
 		// Pre-flight cancellation: reject before building/optimizing the plan.
 		throwIfAborted(signal);
@@ -1084,6 +1095,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		const scanConnections = new Map<symbol, VirtualTable>();
 		const cardinalityObservations = this._beginCardinalityObservations();
+		const runtimeSignal = this._statementSignal(signal);
 		const runtimeCtx: RuntimeContext = {
 			db: this,
 			stmt: undefined,
@@ -1092,7 +1104,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			tableContexts: wrapTableContextsStrict(new Map()),
 			tracer: this.instructionTracer,
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
-			signal,
+			signal: runtimeSignal.signal,
 			scanConnections,
 			cardinalityObservations,
 		};
@@ -1105,10 +1117,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// way Statement._iterateWithSignal does.
 			if (isAsyncIterable<Row>(result)) {
 				for await (const _row of result) {
-					throwIfAborted(signal);
+					throwIfAborted(runtimeSignal.signal);
 				}
 			}
 		} finally {
+			runtimeSignal.dispose();
 			for (const vtab of scanConnections.values()) {
 				await disconnectVTable(runtimeCtx, vtab);
 			}
@@ -1603,28 +1616,49 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * Closes the database connection and releases resources.
+	 * Closes the database connection and releases resources, once the work running on it
+	 * has stopped. A running statement stops at its next row (an interrupted implicit
+	 * transaction rolls back) and an open row iterator then rejects with `Database is
+	 * closed`; work that finishes before reaching a row completes, commit included.
+	 * Teardown runs after all of it, holding the execution mutex. Later calls return the
+	 * first call's promise.
+	 *
+	 * Code that runs inside a statement (a module hook, a user-defined function) must call
+	 * `void db.close()`: awaiting it there would wait for itself. A watch handler may await
+	 * it, since a statement releases the mutex before it waits for its handlers.
 	 * @returns A promise resolving on completion.
 	 */
-	async close(): Promise<void> {
-		if (!this.isOpen) {
-			return;
-		}
+	close(): Promise<void> {
+		this.closing ??= this.closeAfterRunningWork();
+		return this.closing;
+	}
 
+	/**
+	 * Everything before the first `await` runs inside the {@link close} call itself, so a
+	 * statement that calls close() from within fails at its next check.
+	 */
+	private async closeAfterRunningWork(): Promise<void> {
 		log("Closing database...");
 		this.isOpen = false;
-
-		// Abort every live mutex-free committed read and wait for each to tear
-		// down (its scan connections disconnect in the read's own finally) before
-		// touching shared state. A read parked at a yield unwinds at the
-		// consumer's next pull/return — close() waits for that, so an abandoned,
-		// never-again-pulled iterator delays close (same discipline as any held
-		// iterator).
-		for (const controller of this.concurrentReads.values()) {
-			controller.abort();
+		this.closeController.abort(new MisuseError('Database is closed'));
+		// Arrays are copied first because unwinding removes an iteration from its set. A
+		// serialized iteration is not awaited: the mutex wait below covers its unwinding,
+		// and its own promise also waits for the watch handlers of its hold, one of which
+		// may be awaiting this close.
+		for (const iteration of Array.from(this.serializedIterations)) void iteration.interrupt();
+		await Promise.all(Array.from(this.committedReads, read => read.interrupt()));
+		// Queues behind every holder and waiter; a waiter sees the closed database once it
+		// gets the mutex and leaves at once (see _acquireExecMutex).
+		const releaseMutex = await this.takeExecMutex();
+		try {
+			await this.tearDown();
+		} finally {
+			await releaseMutex();
 		}
-		await Promise.all(Array.from(this.concurrentReads.keys()).map(scope => scope.done));
+		log("Database closed.");
+	}
 
+	private async tearDown(): Promise<void> {
 		// Disconnect all active connections first
 		await this.disconnectAllConnections();
 
@@ -1659,8 +1693,6 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Clean up event emitter
 		this.eventEmitter.removeAllListeners();
-
-		log("Database closed.");
 	}
 
 	/** @internal Called by Statement when it's finalized */
@@ -2388,7 +2420,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this._evalSerialized(sql, params, options?.signal);
 	}
 
-	private _evalSerialized(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+	private _evalSerialized(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncIterableIterator<Record<string, SqlValue>> {
 		return this._iterateSerialized(() => this._evalGenerator(sql, params, signal), signal);
 	}
 

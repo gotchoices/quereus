@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
-import { AbortError } from '../../src/common/errors.js';
+import { AbortError, MisuseError } from '../../src/common/errors.js';
 import { installCommitStall, settleMacrotasks, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
 import type { SqlValue } from '../../src/common/types.js';
 
@@ -261,23 +261,23 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 		expect(Number(after?.n)).to.equal(3); // writer's row + the traced insert
 	});
 
-	it('db.close() aborts a mid-iteration concurrent read and still resolves', async () => {
+	it('db.close() stops a concurrent read nobody pulls again, which then rejects its next pull', async () => {
 		await db.exec("insert into t values (2, 'b'), (3, 'c')");
 		const stmt = db.prepare('select id from t order by id');
 		const iter = stmt.iterateRows(undefined, { readConcurrency: 'committed' });
 		const first = await iter.next();
 		expect(first.done).to.equal(false);
 
-		const closeP = db.close(); // aborts the read's scope, then awaits its teardown
-		let aborted = false;
+		await db.close(); // resolves with the read still parked at its row
+
+		let err: unknown;
 		try {
-			// The abort lands at the next row boundary, on this pull.
-			while (!(await iter.next()).done) { /* drain until abort */ }
+			await iter.next();
 		} catch (e) {
-			aborted = e instanceof AbortError;
+			err = e;
 		}
-		expect(aborted).to.equal(true);
-		await closeP; // teardown completed — close did not hang
+		expect(err).to.be.instanceOf(MisuseError);
+		expect((err as Error).message).to.equal('Database is closed');
 	});
 
 	it('a caller AbortSignal still cancels at a row boundary on the concurrent path', async () => {

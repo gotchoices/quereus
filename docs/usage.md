@@ -257,7 +257,7 @@ Eligibility (all must hold): the query is read-only; no explicit `BEGIN` is open
 
 **One prepared statement, one execution at a time.** A `Statement` holds per-execution state (its bound arguments, its busy flag), so overlapping executions of the *same* prepared statement throw `Statement busy` — the execution mutex used to make that impossible to hit, and mutex-free reads expose it. Give each concurrent caller its own statement; `db.get` and `db.eval` prepare per call and are unaffected.
 
-Honored by the row-returning entry points: `db.get`, `db.eval`, and the prepared-statement `stmt.get`, `stmt.all`, `stmt.iterateRows`, `stmt.run`. `db.exec` ignores the option (it returns no rows, and its per-statement transaction loop is exactly what the mutex-free path must not touch). A caller `signal` combines with the option normally, and `db.close()` aborts any in-flight concurrent read at its next row boundary. See [SQL Transactions § Concurrent committed reads](sql-txn.md#86-concurrent-committed-reads) for the transaction-interaction details and [Committed-Snapshot Reads](module-committed-reads.md) for the module contract.
+Honored by the row-returning entry points: `db.get`, `db.eval`, and the prepared-statement `stmt.get`, `stmt.all`, `stmt.iterateRows`, `stmt.run`. `db.exec` ignores the option (it returns no rows, and its per-statement transaction loop is exactly what the mutex-free path must not touch). A caller `signal` combines with the option normally, and `db.close()` stops any in-flight concurrent read at its next row boundary (see [`db.close()`](#dbclose)). See [SQL Transactions § Concurrent committed reads](sql-txn.md#86-concurrent-committed-reads) for the transaction-interaction details and [Committed-Snapshot Reads](module-committed-reads.md) for the module contract.
 
 ### Transactions
 
@@ -851,7 +851,14 @@ console.log(path); // ['main', 'extensions', 'plugins']
 ### `db.close()`
 Closes the database connection and finalizes all open statements.
 
-`close()` does not wait for a statement already running. A statement queued behind it is refused: `exec` with `Database is closed`, and a prepared statement (including `db.get`) with `Statement finalized`. The next step of a running `apply schema` is refused too, which normally makes the apply reject and report the schema as not restored (see [Yielding during an apply](schema-declarative.md#yielding-during-an-apply) for the exceptions).
+`close()` stops the work running on the database, waits for it, and only then tears the database down, so once it resolves nothing is still reading or writing. Calling it again returns the same promise.
+
+- **A running statement** stops at its next row and rejects with `Database is closed`; its implicit transaction rolls back. Work that finishes before reaching a row completes normally, commit included: a commit already under way finishes before `close()` disconnects the connections.
+- **An open row iterator** (`db.eval`, `stmt.iterateRows`, `stmt.all`, committed reads included) is stopped even if nothing pulls it again, so an abandoned iterator does not hold `close()` up. Its statement rolls back, and its next `next()` or `return()` rejects with `Database is closed`, so a loop that breaks out after the close reports that its statement did not commit.
+- **Work queued behind it** (`exec`, `db.get`, a prepared statement, `beginTransaction`) is refused with `Database is closed`.
+- **`apply schema`**: its next step is refused, which normally makes the apply reject and report the schema as not restored (see [Yielding during an apply](schema-declarative.md#yielding-during-an-apply) for the exceptions).
+
+Code that runs inside a statement — a module hook, a user-defined function — must start the close without awaiting it: `void db.close()`. The statement then fails at its next check and the teardown follows once it has unwound. `await db.close()` from there waits for the statement that is waiting for it, and never resolves. A [watch handler](change-scope.md#handler-ordering) may await it: a statement releases the execution mutex before it waits for its handlers.
 
 ## Statement API Reference
 

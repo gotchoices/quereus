@@ -1,5 +1,39 @@
 import { expect } from 'chai';
-import { Database, MisuseError } from '../src/index.js';
+import { Database, MemoryTableModule, MisuseError, type VirtualTableConnection } from '../src/index.js';
+import { settleMacrotasks } from '../src/vtab/test-support/commit-stall.js';
+
+async function rejectionOf(work: Promise<unknown>): Promise<Error> {
+	try {
+		await work;
+	} catch (e) {
+		return e as Error;
+	}
+	throw new Error('expected a rejection');
+}
+
+/** A connection whose commit waits until `open()`, recording the order of commit and disconnect. */
+function gatedConnection(events: string[]) {
+	let open!: () => void;
+	const gate = new Promise<void>(resolve => { open = resolve; });
+	let entered!: () => void;
+	const commitEntered = new Promise<void>(resolve => { entered = resolve; });
+	const connection: VirtualTableConnection = {
+		connectionId: 'gated',
+		tableName: 'gated',
+		begin() { /* nothing to begin */ },
+		async commit() {
+			entered();
+			await gate;
+			events.push('commit returned');
+		},
+		rollback() { /* nothing to undo */ },
+		createSavepoint() { /* not asserted */ },
+		releaseSavepoint() { /* not asserted */ },
+		rollbackToSavepoint() { /* not asserted */ },
+		disconnect() { events.push('disconnect'); },
+	};
+	return { connection, commitEntered, open };
+}
 
 describe('Database Lifecycle', () => {
 	let db: Database;
@@ -77,6 +111,59 @@ describe('Database Lifecycle', () => {
 			expect(err).to.be.instanceOf(MisuseError);
 			expect((err as MisuseError).message).to.include('closed');
 		}
+	});
+
+	describe('while work is running', () => {
+		it('an iterator pulled once does not hold close() up, and rejects its next pull', async () => {
+			const it = db.eval('select * from t');
+			expect((await it.next()).done).to.equal(false);
+
+			await db.close();
+
+			const err = await rejectionOf(it.next());
+			expect(err).to.be.instanceOf(MisuseError);
+			expect(err.message).to.equal('Database is closed');
+		});
+
+		it('close() waits for a commit in progress before disconnecting and clearing the catalog', async () => {
+			const events: string[] = [];
+			const { connection, commitEntered, open } = gatedConnection(events);
+			await db.registerConnection(connection);
+			const write = db.exec("insert into t values (3, 'c')");
+			await commitEntered;
+
+			let closed = false;
+			const closing = db.close().then(() => { closed = true; });
+			await settleMacrotasks();
+			expect(closed, 'close() resolved during the commit').to.equal(false);
+
+			open();
+			await write;
+			await closing;
+			expect(events).to.deep.equal(['commit returned', 'disconnect']);
+			expect([...db.schemaManager.getSchema('main')!.getAllTables()]).to.deep.equal([]);
+		});
+
+		it('a module hook may start close() without awaiting it: the statement rejects and close() completes', async () => {
+			let closing: Promise<void> | undefined;
+			let armed = false;
+			class ClosingModule extends MemoryTableModule {
+				override connect(...args: Parameters<MemoryTableModule['connect']>) {
+					if (armed) closing ??= db.close();
+					return super.connect(...args);
+				}
+			}
+			db.registerModule('closing', new ClosingModule());
+			await db.exec('create table s (id integer primary key) using closing');
+			await db.exec('insert into s values (1), (2)');
+			armed = true;
+
+			const err = await rejectionOf(db.exec('select * from s'));
+
+			expect(err.message).to.equal('Database is closed');
+			expect(closing, 'the hook ran').to.not.equal(undefined);
+			await closing;
+		});
 	});
 
 	it('statement prepared before close() rejects operations', async () => {

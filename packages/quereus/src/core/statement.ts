@@ -24,8 +24,9 @@ import type { BuildTimeDependencyTracker, RowSourceOverrides, SchemaDependency }
 import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
-import { combineAbortSignals } from '../util/abort-signal.js';
+import type { CombinedAbortSignal } from '../util/abort-signal.js';
 import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
+import { InterruptibleIteration } from './interruptible-iteration.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { analyzeWriteScope, bindWriteParameters, type WriteScope } from '../planner/analysis/write-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
@@ -531,6 +532,7 @@ export class Statement {
 		// it after the try body assigns it.
 		const scanConnections = new Map<symbol, VirtualTable>();
 		let runtimeCtx: RuntimeContext | undefined;
+		let runtimeSignal: CombinedAbortSignal | undefined;
 		let cardinalityObservations: CardinalityObservations | undefined;
 		try {
 			// Drop the previous execution's counters up front, so every early exit
@@ -567,6 +569,10 @@ export class Statement {
 				this.workCounters = { collector, planShape: computePlanShape(blockPlanNode) };
 			}
 			cardinalityObservations = this.db._beginCardinalityObservations();
+			// The scan and DML row checks see close() too. The output boundary below keeps the
+			// caller's signal alone, so its no-signal fast path survives; close() interrupts an
+			// iteration at that boundary itself (see InterruptibleIteration).
+			runtimeSignal = this.db._statementSignal(signal);
 			runtimeCtx = {
 				db: this.db,
 				stmt: this,
@@ -575,7 +581,7 @@ export class Statement {
 				tableContexts: wrapTableContextsStrict(new Map()),
 				tracer,
 				enableMetrics,
-				signal,
+				signal: runtimeSignal.signal,
 				scanConnections,
 				readCommitted: runtimeOverrides?.readCommitted,
 				workCounters: collector,
@@ -613,6 +619,7 @@ export class Statement {
 			// teardown), so the cached instances stay live for the whole streaming
 			// window and are released here. `runtimeCtx` is undefined only on the
 			// no-statements early return, where the map is empty anyway.
+			runtimeSignal?.dispose();
 			if (runtimeCtx) {
 				for (const vtab of scanConnections.values()) {
 					await disconnectVTable(runtimeCtx, vtab);
@@ -699,24 +706,24 @@ export class Statement {
 	 * transaction. Every table scan connects with `_readCommitted: true` (see
 	 * `RuntimeContext.readCommitted`), serving the last committed state.
 	 *
-	 * The {@link ConcurrentReadScope} is acquired lazily at first pull (not at
-	 * routing time) so an iterator that is never consumed holds no scope —
-	 * `Database.close()` awaits every live scope's teardown. The scope's signal
-	 * (fired by `close()`) is combined with the caller's; `scope.end()` runs in
-	 * this generator's `finally`, i.e. on every exit path.
+	 * The read registers with the database at first pull (not at routing time), so an
+	 * iterator that is never consumed holds nothing; from then until its `finally`,
+	 * `Database.close()` can interrupt it and waits for it to unwind.
 	 */
-	async *_iterateConcurrent(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Row> {
+	_iterateConcurrent(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Row> {
+		return new InterruptibleIteration<Row>(iteration => this.concurrentIteration(params, options, iteration));
+	}
+
+	private async *concurrentIteration(params: SqlParameters | SqlValue[] | undefined, options: StatementOptions | undefined, iteration: InterruptibleIteration<Row>): AsyncGenerator<Row> {
 		throwIfAborted(options?.signal);
 		// This path skips Database._acquireExecMutex, so it refuses unsupported hosts itself.
 		const supportCheck = ensureAsyncGeneratorCleanupSupported();
 		if (supportCheck) await supportCheck;
-		const scope = this.db._beginConcurrentRead();
-		const combined = combineAbortSignals(options?.signal, scope.signal);
+		this.db._beginCommittedRead(iteration);
 		try {
-			yield* this._iterateRowsRawInternal(params, { signal: combined.signal, readCommitted: true });
+			yield* this._iterateRowsRawInternal(params, { signal: options?.signal, readCommitted: true });
 		} finally {
-			combined.dispose();
-			scope.end();
+			this.db._endCommittedRead(iteration);
 		}
 	}
 
@@ -738,11 +745,11 @@ export class Statement {
 		return this._iterateRowsSerialized(params, options?.signal);
 	}
 
-	private _iterateRowsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Row> {
+	private _iterateRowsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncIterableIterator<Row> {
 		return this.db._iterateSerialized(() => this._iterateRowsRaw(params, signal), signal);
 	}
 
-	private _iterateObjectsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+	private _iterateObjectsSerialized(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncIterableIterator<Record<string, SqlValue>> {
 		return this.db._iterateSerialized(() => this._iterateObjectsRaw(params, signal), signal);
 	}
 
