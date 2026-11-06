@@ -76,3 +76,18 @@ A second hazard, found by reading `scan-layer.ts` and not run because nothing re
 This is a two-backend change plus an engine-side contract clarification, and the store
 half needs a backwards key-range walk it does not currently have. It is very likely
 more than one implement ticket; whoever promotes it should expect to split by backend.
+
+## Downstream need (2026-11-06)
+
+Optimystic issue gotchoices/optimystic#52 measured it. Sereus Chat's message list reads `select … from App.Message order by Timestamp desc, Id desc limit 100`. On an Optimystic strand that read takes 21 / ~100 / ~450 ms at 100 / 1,000 / 5,000 messages, about the same as `count(*)`. That is with or without an index on `(Timestamp, Id)`, and roughly 2 s per read on a Galaxy S7. Most of that cost is on the Optimystic side, which uses a secondary index only for equality. Even so, the issue lists a DESC reverse walk in Quereus as its third ask.
+
+Re-measured on Quereus 5.0.0, memory table, 2,000 rows, `index MT on M (T)`, `index CT on C (Ts, Id)`:
+
+| query | plan | ms |
+|---|---|---|
+| `order by T asc limit 10` | LIMITOFFSET INDEXSCAN | 3.1 |
+| `order by T desc limit 10` | LIMITOFFSET SORT INDEXSCAN | 23.8 |
+| `order by Ts desc, Id desc limit 10` | LIMITOFFSET SORT INDEXSCAN | 21.1 |
+| `order by Id desc limit 10` (primary key) | LIMITOFFSET SORT INDEXSCAN | 18.1 |
+
+The primary key is not walked backwards either. The "newest N" shape is common in applications, and declaring a descending index is the only workaround. That suggests the severity should be higher than cosmetic.
