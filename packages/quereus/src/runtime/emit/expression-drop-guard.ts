@@ -91,6 +91,9 @@ export function assertNoExpressionDependsOn(
 	// own DROP CONSTRAINT / SET DEFAULT later in the plan. No step before then judges an existing
 	// table's CHECKs or DEFAULTs (an ADD COLUMN backfill judges only the new column's inline CHECKs).
 	// If a plan step ever starts evaluating them mid-plan, remove those readers before that step.
+	// NOTE: "this schema's tables" includes engine-managed ones (`quereus.engine_managed`), which the
+	// catalog and so the declaration never see; none carries a CHECK or DEFAULT reading a user object
+	// today. If one ever does, keep it in the probe here, as it is outside the declaration.
 	const outsideAppliedSchema = db._getSchemaReleasedObjects().has(key)
 		? (table: TableSchema) => table.schemaName.toLowerCase() !== schemaName.toLowerCase()
 		: undefined;
