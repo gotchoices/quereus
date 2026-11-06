@@ -11,9 +11,10 @@
  *
  * The load-bearing identity: a forwarded change keeps its ORIGINAL `hlc` + `siteId`
  * (the straggler's fact), which is what makes the relay loop-free and convergent
- * across hops with no per-table peer-membership oracle. Forwardable changes are
- * filtered `> sinceHLC` before relay (the change-log contract) so a forwarded-only
- * round never regresses the consumer's per-peer watermark.
+ * across hops with no per-table peer-membership oracle. On a pull, a forwardable
+ * change is placed where the relay held it and filtered `> sinceHLC` by that position
+ * (the change-log contract), so it reaches a reader that pulled before it arrived, and
+ * a re-held change keeps its first position so two relays quiesce.
  */
 
 import { expect } from 'chai';
@@ -163,7 +164,7 @@ describe('store-and-forward relay', () => {
       const first = await pull(R, H, createHLC(1000n, 1, S, 0));
       expect(tablesIn(first.sets)).to.include(RETIRED);
 
-      // Re-pull at the advanced watermark → C filtered (HLC ≤ watermark), no duplicate relay.
+      // Re-pull at the advanced watermark → C filtered (held at or below it), no duplicate relay.
       const second = await pull(R, H, first.since);
       expect(tablesIn(second.sets), 'C is not re-sent after the watermark advanced past it').to.not.include(RETIRED);
     });
@@ -238,26 +239,29 @@ describe('store-and-forward relay', () => {
     });
   });
 
-  describe('below-watermark straggler is not relayed (documented scalar-watermark limitation)', () => {
-    it('filters a forwarded change with HLC ≤ sinceHLC and does not regress the watermark', async () => {
-      const S = generateSiteId();
+  describe('late-arriving held change', () => {
+    it('relays a held change written before the reader\'s watermark but held after it, once', async () => {
       const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users'] });
-      const P = await makePeer({ disposition: 'quarantine', known: ['main.users', `main.${RETIRED}`] });
-      const C = col(S, 1000, RETIRED, 1, 'note', 'hi'); // causally old
-      await R.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+      const H = await makePeer({ disposition: 'quarantine', known: ['main.users', `main.${RETIRED}`] });
+      const B = generateSiteId(); // straggler, offline
+      const X = generateSiteId();
+      const now = Date.now();
 
-      // P pulls at a watermark ABOVE C → C is filtered (not a bug: the accepted
-      // scalar-watermark limitation). Returning it would regress P's watermark.
-      const highWatermark = createHLC(2000n, 1, S, 0);
-      const sets = await R.manager.getChangesSince(P.site, highWatermark);
-      expect(tablesIn(sets), 'a below-watermark forwarded change is not relayed').to.not.include(RETIRED);
-      // No ChangeSet returned at all → nothing to regress the watermark to.
-      expect(replyWatermark(sets), 'no change returned ⇒ watermark cannot regress').to.be.undefined;
+      await R.manager.applyChanges([changeSet(X, 'tx-x', [col(X, now, 'users', 1, 'a', 'x')])]);
+      const caughtUp = await pull(R, H, undefined); // H's watermark is now R's position for X's change
+
+      const late = col(B, now - 60_000, RETIRED, 1, 'note', 'offline'); // written before H's watermark
+      await R.manager.applyChanges([changeSet(B, 'tx-b', [late])]);  // arrives after it; R holds it
+
+      const next = await pull(R, H, caughtUp.since);
+      expect(tablesIn(next.sets), 'the late held change reaches the caught-up reader').to.include(RETIRED);
+      const again = await pull(R, H, next.since);
+      expect(tablesIn(again.sets), 'and is not re-sent').to.not.include(RETIRED);
     });
   });
 
   describe('ordering', () => {
-    it('places a forwarded change at its write time and applied changes where they were filed', async () => {
+    it('places a forwarded change where it was held, in arrival order with applied changes', async () => {
       const S = generateSiteId();
       const X = generateSiteId(); // origin of R's own change-log entries on a live table
       const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users', 'main.live'] });
@@ -272,15 +276,15 @@ describe('store-and-forward relay', () => {
       const sets = await R.manager.getChangesSince(generateSiteId());
       const seq = flatten(sets).map(c => ({ table: c.table, wall: Number(c.hlc.wallTime) }));
 
-      // A held change was never filed on R, so it sits at its own write time; an applied
-      // one sits at the tick R filed it at, which is later than any of these write times.
-      expect(seq, 'held change first, then applied changes in the order R filed them').to.deep.equal([
-        { table: RETIRED, wall: 1500 },
+      // Held and applied changes alike sit at the tick R took when they arrived, whatever
+      // their write times.
+      expect(seq, 'every change in the order it reached R').to.deep.equal([
         { table: 'live', wall: 2000 },
         { table: 'live', wall: 1000 },
+        { table: RETIRED, wall: 1500 },
       ]);
-      // The applied sets resume from where R filed them; the held one from its write time.
-      expect(sets.map(cs => cs.cursor === undefined), 'only the held set lacks a cursor').to.deep.equal([true, false, false]);
+      // So every set resumes from where R placed it, not from its write time.
+      expect(sets.map(cs => cs.cursor !== undefined), 'every set carries a cursor').to.deep.equal([true, true, true]);
     });
   });
 
@@ -327,7 +331,7 @@ describe('store-and-forward relay', () => {
   });
 
   describe('bound: merged change-log + forwardable truncation', () => {
-    it('truncates the union at batchSize on a transaction boundary, deferring the forwardable tail to a later round (re-collected, still > sinceHLC), with no gap or duplicate', async () => {
+    it('truncates the union at batchSize on a transaction boundary, deferring the forwardable tail to a later round (re-collected, still positioned > sinceHLC), with no gap or duplicate', async () => {
       const S = generateSiteId();        // straggler origin of the forwarded change
       const X = generateSiteId();        // origin of R's live-table change-log writes
       const consumer = generateSiteId(); // the peer pulling (neither S nor X, so nothing echo-excluded)
@@ -354,12 +358,12 @@ describe('store-and-forward relay', () => {
         since = replyWatermark(sets);
       }
 
-      // All three delivered exactly once: the held change at its write time, ahead of the
-      // applied ones, which follow in the order R filed them. The bound neither dropped a
-      // source's tail nor duplicated it, and each round's watermark led into the next.
+      // All three delivered exactly once, in the order they reached R, the held change
+      // between the two applied ones. The bound neither dropped a source's tail nor
+      // duplicated it, and each round's watermark led into the next.
       expect(seen, 'each change once, across rounds').to.deep.equal([
-        { table: RETIRED, wall: 1500 },
         { table: 'live', wall: 1000 },
+        { table: RETIRED, wall: 1500 },
         { table: 'live', wall: 2000 },
       ]);
 
@@ -475,9 +479,9 @@ describe('store-and-forward relay', () => {
       expect(tablesIn(toR3.sets), 'first R2→R3 pass carries C').to.include(RETIRED);
       expect(tablesIn(toH.sets), 'first R3→H pass carries C').to.include(RETIRED);
 
-      // Re-pull each hop at its advanced watermark: C (HLC == watermark) is filtered
-      // (`> sinceHLC` is false), so the scalar watermark stops re-send after ONE
-      // exchange at EVERY depth — RETIRED is excluded on the second pass everywhere.
+      // Re-pull each hop at its advanced watermark: C (held at the watermark) is filtered
+      // (`> sinceHLC` is false), so the watermark stops re-send after ONE exchange at
+      // EVERY depth — RETIRED is excluded on the second pass everywhere.
       const toR2again = await pull(R1, R2, toR2.since);
       const toR3again = await pull(R2, R3, toR3.since);
       const toHagain = await pull(R3, H, toH.since);

@@ -36,10 +36,10 @@
  *    `relay()` helper strips `schemaMigrations` from the relayed sets, so R never
  *    receives a `create table orders` it would (wrongly) admit, and H never gets a
  *    duplicate-create error.
- *  - Relay is FROM-ZERO (no `sinceHLC`), deliberately sidestepping the documented
- *    scalar-watermark limitation: `collectForwardableChanges` only applies the
+ *  - Relay is FROM-ZERO (no `sinceHLC`): `collectForwardableChanges` only applies the
  *    watermark filter when `sinceHLC` is defined, so from-zero relays every
- *    `origin ≠ peer` forwardable entry.
+ *    `origin ≠ peer` forwardable entry. The watermark path is covered by the
+ *    metadata suite.
  *
  * Per-column recording (the one place this departs from the metadata suite's model):
  * the real engine records one CRDT `ColumnChange` per column of a fresh insert — the

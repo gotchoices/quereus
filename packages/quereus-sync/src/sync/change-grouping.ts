@@ -32,8 +32,7 @@ export interface FiledChange {
 
 /**
  * Changes filed at their own origin timestamps: what a replica wrote itself, and
- * anything grouped on the origin axis alone (a push, or a held change being relayed,
- * which was never filed).
+ * anything grouped on the origin axis alone (a push).
  */
 export function filedAtOrigin(changes: readonly Change[]): FiledChange[] {
 	return changes.map(change => ({ change, position: change.hlc }));

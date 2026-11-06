@@ -11,6 +11,7 @@ import type { WriteBatch } from '@quereus/store';
 import { compareHLC, maxHLC, assertWithinDrift, type HLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import { positionsFrom } from '../metadata/filing-position.js';
+import { holdPosition } from '../metadata/quarantine.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
@@ -27,6 +28,7 @@ import type {
 	SchemaChangeToApply,
 	SchemaMigration,
 	SchemaObjectKind,
+	UnknownTableDisposition,
 } from './protocol.js';
 import { isBaselineVersion, migrationObjectKind, orderMigrations, sameVersionLocalDDL, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
@@ -100,6 +102,17 @@ export interface FilingOptions {
 	readonly migrations?: readonly PendingSchemaMigration[];
 	/** The batch's greatest HLC, merged into the clock before the tick is taken. */
 	readonly watermarkHLC?: HLC;
+	/** The batch's out-of-basis changes to hold, positioned in the same write and tick as its data. */
+	readonly hold?: HoldOptions;
+}
+
+/** Diverted changes to hold under `quarantine` or `store-and-forward`. */
+export interface HoldOptions {
+	readonly changes: readonly Change[];
+	/** Receive time (ms), the retention horizon's clock. */
+	readonly receivedAt: number;
+	/** Whether peers that still have the table are offered these (`store-and-forward`). */
+	readonly forwardable: boolean;
 }
 
 /** Stable `schema.table` map key for batch deltas and diversion groups. */
@@ -516,30 +529,19 @@ export async function applyChanges(
 			// filed below, so those overwrite re-filed ones, never the reverse.
 			await rekeyAfterReplicatedKeyChange(ctx, executed, retiredKeys, resolvedDataChanges);
 
-			// One write, at one clock tick: the batch's migrations and data, and the
-			// clock merged with the batch's greatest HLC. Merging once is equivalent to
-			// receiving each changeset's HLC (receive is a monotonic max-merge); on a
-			// mid-batch abort the clock does not advance and the batch re-resolves next
-			// sync. Undefined only for an empty batch, which merges nothing.
-			await commitChangeMetadata(ctx, resolvedDataChanges, { migrations: pendingSchemaMigrations, watermarkHLC });
-
-			// Hold diverted changes as part of the admission unit — durable BEFORE
-			// this apply returns, so the sender's watermark cannot pass a straggler's
-			// change that a crash left unheld (the batch re-resolves and re-holds
-			// idempotently, HLC-keyed). Both `quarantine` and `store-and-forward`
-			// hold identically; `store-and-forward` additionally marks each entry
-			// forwardable so the relay (sibling ticket) can re-offer it. `ignore`
-			// writes nothing.
-			if ((disposition === 'quarantine' || disposition === 'store-and-forward') && unknownByTable.size > 0) {
-				const forwardable = disposition === 'store-and-forward';
-				const qBatch = ctx.kv.batch();
-				for (const group of unknownByTable.values()) {
-					for (const change of group.changes) {
-						ctx.quarantine.put(qBatch, change, receivedAt, forwardable);
-					}
-				}
-				await qBatch.write();
-			}
+			// One write, at one clock tick: the batch's migrations, data and held
+			// changes, and the clock merged with the batch's greatest HLC. Merging once
+			// is equivalent to receiving each changeset's HLC (receive is a monotonic
+			// max-merge); on a mid-batch abort the clock does not advance and the batch
+			// re-resolves next sync. Undefined only for an empty batch, which merges
+			// nothing. The holds land before this apply returns, so the sender's
+			// watermark cannot pass a straggler's change that a crash left unheld (the
+			// batch re-resolves and re-holds idempotently, HLC-keyed).
+			await commitChangeMetadata(ctx, resolvedDataChanges, {
+				migrations: pendingSchemaMigrations,
+				watermarkHLC,
+				hold: holdOptions(disposition, unknownByTable, receivedAt),
+			});
 
 			// Dynamic basis-retirement signal: a remote write to a non-directly-mapped
 			// tracked table bumps its `lastDirectlyMappedWriteAt`, deferring eviction
@@ -601,6 +603,21 @@ export async function applyChanges(
 		transactions: changes.length,
 		...(unknownTableCount > 0 ? { unknownTable: unknownTableCount } : {}),
 	};
+}
+
+/**
+ * What the disposition holds of the batch's diverted changes. `quarantine` and
+ * `store-and-forward` hold identically, `store-and-forward` also marking each entry
+ * forwardable so the relay re-offers it; `ignore` holds nothing.
+ */
+function holdOptions(
+	disposition: UnknownTableDisposition,
+	unknownByTable: ReadonlyMap<string, UnknownTableGroup>,
+	receivedAt: number,
+): HoldOptions | undefined {
+	if (disposition === 'ignore' || unknownByTable.size === 0) return undefined;
+	const changes = [...unknownByTable.values()].flatMap(group => group.changes);
+	return { changes, receivedAt, forwardable: disposition === 'store-and-forward' };
 }
 
 /**
@@ -1278,8 +1295,8 @@ function tablesWithRecordsElsewhere(batchSchemaChanges: readonly SchemaChangeToA
 }
 
 /**
- * Commit CRDT metadata for resolved changes, and with it the batch's schema migrations
- * and merged clock ({@link FilingOptions}).
+ * Commit CRDT metadata for resolved changes, and with it the batch's schema migrations,
+ * held changes and merged clock ({@link FilingOptions}).
  *
  * Phase 3 of the 3-phase apply pattern: called AFTER data is written to store.
  *
@@ -1315,6 +1332,7 @@ export async function commitChangeMetadata(
 	const facts: FactToFile[] = [
 		...(filing.migrations ?? []).map((pending): FactToFile => ({ kind: 'migration', hlc: pending.migration.hlc, pending })),
 		...winners,
+		...heldFacts(filing.hold),
 	];
 	if (facts.length === 0 && !filing.watermarkHLC) return;
 
@@ -1345,7 +1363,23 @@ export async function commitChangeMetadata(
 type FactToFile =
 	| { readonly kind: 'migration'; readonly hlc: HLC; readonly pending: PendingSchemaMigration }
 	| { readonly kind: 'delete'; readonly hlc: HLC; readonly change: RowDeletion; readonly resolved: ResolvedChange }
-	| { readonly kind: 'column'; readonly hlc: HLC; readonly change: ColumnChange; readonly resolved: ResolvedChange };
+	| { readonly kind: 'column'; readonly hlc: HLC; readonly change: ColumnChange; readonly resolved: ResolvedChange }
+	| HeldFact;
+
+/** A diverted change held in the quarantine store, at a position like any fact filed in the change log. */
+interface HeldFact {
+	readonly kind: 'held';
+	readonly hlc: HLC;
+	readonly change: Change;
+	readonly receivedAt: number;
+	readonly forwardable: boolean;
+}
+
+function heldFacts(hold: HoldOptions | undefined): HeldFact[] {
+	if (!hold) return [];
+	const { receivedAt, forwardable } = hold;
+	return hold.changes.map(change => ({ kind: 'held', hlc: change.hlc, change, receivedAt, forwardable }));
+}
 
 /**
  * The applied changes to write, with in-batch repeats of one key collapsed to the
@@ -1377,7 +1411,9 @@ function collapseInBatchRepeats(ctx: SyncContext, resolvedChanges: readonly Reso
 
 /**
  * The filing step of an apply: merge the batch's clock, take one tick, and write every
- * fact at a position off that tick, with the clock, in ONE batch.
+ * fact at a position off that tick, with the clock, in ONE batch. Held changes are
+ * facts here too: they go to the quarantine store rather than the change log, but a
+ * `getChangesSince` reader filters and resumes by their positions just the same.
  *
  * Must run as one entry on the commit chain (`SyncContext.onCommitChain`), and so must
  * not wait on the chain itself. The chain is what makes commit order equal position
@@ -1395,19 +1431,44 @@ function collapseInBatchRepeats(ctx: SyncContext, resolvedChanges: readonly Reso
  * transaction's lowest `opSeq`s). A reader of the log therefore meets a migration
  * before the data written with it, and finds each transaction's facts of this tick in
  * one unbroken run of positions, which is what lets a reply be cut between transactions
- * (`change-grouping.ts`).
+ * (`change-grouping.ts`). A re-held change keeps the position it was first held at
+ * ({@link positionsOfExistingHolds}) and so sits outside this tick's run; it was filed
+ * in an earlier one.
  */
 async function fileAtNextTick(ctx: SyncContext, facts: readonly FactToFile[], watermarkHLC: HLC | undefined): Promise<void> {
 	if (watermarkHLC) ctx.hlcManager.receive(watermarkHLC);    // monotonic merge, idempotent
+	const kept = await positionsOfExistingHolds(ctx, facts);
 
 	const batch = ctx.kv.batch();
 	if (facts.length > 0) {
 		const nextPosition = positionsFrom(ctx.hlcManager.tick());
 		const inOriginOrder = [...facts].sort((a, b) => compareHLC(a.hlc, b.hlc));
-		for (const fact of inOriginOrder) fileFact(ctx, batch, fact, nextPosition());
+		for (const fact of inOriginOrder) fileFact(ctx, batch, fact, kept.get(fact) ?? nextPosition());
 	}
 	persistHLCStateBatch(ctx, batch);
 	await batch.write();
+}
+
+/**
+ * The position each held fact already has here, for those this replica already holds.
+ *
+ * A re-held change keeps its first position. Given a new one, two `store-and-forward`
+ * replicas that both lack the table would pass it back and forth for good: each re-hold
+ * would place it above the other's watermark here, so the other would pull it again.
+ * Read inside the commit-chain entry, so two concurrent applies of one change cannot
+ * both find it absent. A hold pruned by retention is gone, and takes a new position; so
+ * does a plain `quarantine` hold re-held as forwardable, which no reader has been
+ * offered yet.
+ */
+async function positionsOfExistingHolds(ctx: SyncContext, facts: readonly FactToFile[]): Promise<Map<FactToFile, HLC>> {
+	const kept = new Map<FactToFile, HLC>();
+	const held = facts.filter((fact): fact is HeldFact => fact.kind === 'held');
+	const existing = await ctx.quarantine.getMany(held.map(fact => fact.change));
+	held.forEach((fact, i) => {
+		const entry = existing[i];
+		if (entry && (entry.forwardable || !fact.forwardable)) kept.set(fact, holdPosition(entry));
+	});
+	return kept;
 }
 
 function fileFact(ctx: SyncContext, batch: WriteBatch, fact: FactToFile, position: HLC): void {
@@ -1422,6 +1483,9 @@ function fileFact(ctx: SyncContext, batch: WriteBatch, fact: FactToFile, positio
 			commitColumnMetadata(
 				ctx, batch, fact.change, position, fact.resolved.oldColumnVersion, fact.resolved.priorErasedByInBatchDelete,
 			);
+			break;
+		case 'held':
+			ctx.quarantine.put(batch, fact.change, fact.receivedAt, fact.forwardable, position);
 			break;
 	}
 }

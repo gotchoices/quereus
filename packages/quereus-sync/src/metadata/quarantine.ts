@@ -11,17 +11,20 @@
  *   - **idempotent** — keyed by the change's HLC (+ type/pk/column), so applying
  *     the same straggler batch twice yields exactly one entry per change.
  *   - **durable within the admission unit** — `put` stages into a caller-owned
- *     {@link WriteBatch} that lands before the apply's clock watermark advances,
- *     so a crash never strands a straggler's change with no re-delivery.
+ *     {@link WriteBatch}: the apply's filing batch, which also carries its clock and
+ *     metadata, so a crash never strands a straggler's change with no re-delivery.
+ *   - **positioned** — each entry records where this replica placed it in its own
+ *     arrival order, so a reader that pulled before the hold still receives it.
  *   - **bounded** — {@link pruneOlderThan} GCs entries past the retention horizon
  *     (mirroring tombstone TTL), so cost is zero with no stragglers and bounded
  *     by the horizon otherwise.
  */
 
 import type { KVStore, WriteBatch } from '@quereus/store';
-import { hlcToJson, hlcFromJson, type SerializedHLC } from '../clock/hlc.js';
+import { hlcToJson, hlcFromJson, type HLC, type SerializedHLC } from '../clock/hlc.js';
 import type { Change } from '../sync/protocol.js';
 import { encodeSqlValue, decodeSqlValue } from './column-version.js';
+import { encodePosition, decodePosition, filingPosition, positionField } from './filing-position.js';
 import { buildQuarantineKey, buildQuarantineScanBounds } from './keys.js';
 
 /**
@@ -38,6 +41,18 @@ export interface QuarantineEntry {
    * is held identically either way — the flag only governs re-offer eligibility.
    */
   readonly forwardable: boolean;
+  /**
+   * Where this replica placed the hold in its own arrival order
+   * (`metadata/filing-position.ts`): the position a `getChangesSince` reader filters
+   * and resumes by. Absent when it equals `change.hlc`, which is how an entry written
+   * before holds were positioned reads back.
+   */
+  readonly position?: HLC;
+}
+
+/** Where this replica placed a hold in its arrival order; its write time for an entry stored without one. */
+export function holdPosition(entry: QuarantineEntry): HLC {
+  return filingPosition({ hlc: entry.change.hlc, position: entry.position });
 }
 
 /**
@@ -60,6 +75,7 @@ interface SerializedQuarantineEntry {
   readonly pr?: unknown[];   // encodeSqlValue per element — delete row before-image, present iff priorRow exists
   readonly f?: 1;            // forwardable mark (store-and-forward) — emitted ONLY when true, so plain
                              // quarantine entries stay byte-identical to today and decode to false
+  readonly p?: string;       // encodePosition(position) — present iff the position differs from the change HLC
 }
 
 /**
@@ -87,9 +103,11 @@ export function serializeQuarantineEntry(entry: QuarantineEntry): Uint8Array {
   // Emit the forwardable mark only when set, so plain-quarantine entries stay
   // byte-identical to the pre-store-and-forward encoding (and decode to false).
   const fwd = entry.forwardable ? { f: 1 as const } : undefined;
+  const { position } = positionField(c.hlc, entry.position);
+  const pos = position !== undefined ? { p: encodePosition(position) } : undefined;
   const obj: SerializedQuarantineEntry = c.type === 'column'
-    ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior, ...fwd }
-    : { ...base, ...priorRow, ...fwd };
+    ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior, ...fwd, ...pos }
+    : { ...base, ...priorRow, ...fwd, ...pos };
   return new TextEncoder().encode(JSON.stringify(obj));
 }
 
@@ -100,6 +118,7 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
   const obj = JSON.parse(new TextDecoder().decode(buffer)) as SerializedQuarantineEntry;
   const hlc = hlcFromJson(obj.h);
   const pk = obj.pk.map(decodeSqlValue);
+  const position = obj.p !== undefined ? { position: decodePosition(obj.p) } : undefined;
   if (obj.t === 'column') {
     // Restore the before-image when present (spread only then — keeps prior-less
     // changes free of phantom undefined fields, matching the producer path).
@@ -110,6 +129,7 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
       change: { type: 'column', schema: obj.s, table: obj.tb, pk, column: obj.col!, value: decodeSqlValue(obj.v), hlc, ...prior },
       receivedAt: obj.r,
       forwardable: obj.f === 1,
+      ...position,
     };
   }
   // Restore the row before-image when present (spread only then, matching the
@@ -119,7 +139,15 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
     change: { type: 'delete', schema: obj.s, table: obj.tb, pk, hlc, ...priorRow },
     receivedAt: obj.r,
     forwardable: obj.f === 1,
+    ...position,
   };
+}
+
+/** The `qt:` key of a held change: its HLC + type + pk (+ column). */
+function quarantineKeyOf(change: Change): Uint8Array {
+  const entryType = change.type === 'column' ? 'column' : 'delete';
+  const column = change.type === 'column' ? change.column : undefined;
+  return buildQuarantineKey(change.schema, change.table, change.hlc, entryType, change.pk, column);
 }
 
 /**
@@ -133,27 +161,29 @@ export class QuarantineStore {
    * same change overwrites its own entry (idempotent re-apply). The HLC key does
    * NOT include `forwardable`, so re-delivering a change under a different
    * disposition overwrites its own entry with the new flag — last-writer-wins on
-   * the flag, which is correct: the latest disposition governs.
+   * the flag, which is correct: the latest disposition governs. The key does not
+   * include `position` either: a caller re-holding a change passes the position
+   * {@link getMany} returned, so the hold keeps its first place in arrival order.
    */
-  put(batch: WriteBatch, change: Change, receivedAt: number, forwardable: boolean): void {
-    const entryType = change.type === 'column' ? 'column' : 'delete';
-    const column = change.type === 'column' ? change.column : undefined;
-    const key = buildQuarantineKey(change.schema, change.table, change.hlc, entryType, change.pk, column);
-    batch.put(key, serializeQuarantineEntry({ change, receivedAt, forwardable }));
+  put(batch: WriteBatch, change: Change, receivedAt: number, forwardable: boolean, position?: HLC): void {
+    batch.put(quarantineKeyOf(change), serializeQuarantineEntry({ change, receivedAt, forwardable, position }));
+  }
+
+  /** The held entry {@link put} wrote for each change, in input order; `undefined` where it is not held. */
+  async getMany(changes: readonly Change[]): Promise<(QuarantineEntry | undefined)[]> {
+    if (changes.length === 0) return [];
+    const values = await this.kv.getMany(changes.map(quarantineKeyOf));
+    return values.map(value => value === undefined ? undefined : deserializeQuarantineEntry(value));
   }
 
   /**
-   * Stage deletion of a held entry by its change, rebuilding the `qt:` key from
-   * the change exactly as {@link put} does (HLC + type + pk (+ column)) — so it
-   * is symmetric with `put` and clears precisely the entry that change produced.
+   * Stage deletion of a held entry by its change, keyed exactly as {@link put}
+   * keys it, so it clears precisely the entry that change produced.
    * Used by the drain path (`change-applicator.drainHeldChanges`) to clear a held
    * entry atomically with the apply that replays it into the reappeared table.
    */
   delete(batch: WriteBatch, change: Change): void {
-    const entryType = change.type === 'column' ? 'column' : 'delete';
-    const column = change.type === 'column' ? change.column : undefined;
-    const key = buildQuarantineKey(change.schema, change.table, change.hlc, entryType, change.pk, column);
-    batch.delete(key);
+    batch.delete(quarantineKeyOf(change));
   }
 
   /**
@@ -173,10 +203,10 @@ export class QuarantineStore {
    * Yield held entries marked forwardable (the `store-and-forward` disposition).
    * A full `qt:` scan filtered to {@link QuarantineEntry.forwardable}, so it is
    * bounded by the retention horizon exactly like {@link list} — and zero-cost
-   * when no straggler was ever stored forwardable. The relay (sibling ticket
-   * `sync-store-and-forward-relay`) filters these further by HLC/origin before
-   * re-offering them; this method stays deliberately dumb so it is independently
-   * testable here.
+   * when no straggler was ever stored forwardable. The relay
+   * (`SyncManagerImpl.collectForwardableChanges`) filters these further by position
+   * or origin before re-offering them; this method stays deliberately dumb so it is
+   * independently testable here.
    */
   async listForwardable(): Promise<QuarantineEntry[]> {
     const bounds = buildQuarantineScanBounds();

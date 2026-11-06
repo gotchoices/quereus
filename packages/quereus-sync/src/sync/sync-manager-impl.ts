@@ -35,7 +35,7 @@ import { DeltaFloorStore } from '../metadata/delta-floor.js';
 import { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
 import { filingPosition } from '../metadata/filing-position.js';
-import { QuarantineStore } from '../metadata/quarantine.js';
+import { QuarantineStore, holdPosition, type QuarantineEntry } from '../metadata/quarantine.js';
 import {
 	BasisLifecycleStore,
 	classifyBasisLifecycle,
@@ -1557,8 +1557,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const migrations = await this.collectSchemaMigrations(
 			migration => notFromPeer(migration.hlc) && filedAfter(migration),
 		);
+		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC, holdPosition);
 
-		return this.buildChangeSetsForPeer(peerSiteId, sinceHLC, dataChanges, migrations);
+		return this.buildChangeSetsForPeer(dataChanges, forwardable, migrations);
 	}
 
 	/**
@@ -1599,10 +1600,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// takes a device that retired a table the server still has, under the non-default
 		// `store-and-forward` disposition. If it matters, record the source peer on the
 		// quarantine entry.
+		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC, entry => entry.change.hlc);
 		return this.buildChangeSetsForPeer(
-			peerSiteId,
-			sinceHLC,
 			filedAtOrigin(ownChanges.map(filed => filed.change)),
+			forwardable,
 			ownMigrations.map(({ position: _position, ...migration }) => migration),
 		);
 	}
@@ -1612,29 +1613,28 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * held changes to forward, then group by transaction and filing tick and bound the
 	 * result.
 	 */
-	private async buildChangeSetsForPeer(
-		peerSiteId: SiteId,
-		sinceHLC: HLC | undefined,
+	private buildChangeSetsForPeer(
 		dataChanges: FiledChange[],
+		forwardable: FiledChange[],
 		migrations: SchemaMigration[],
-	): Promise<ChangeSet[]> {
-		// Fold forwardable held changes (the `store-and-forward` relay's outbound
-		// half) into the SAME ChangeSet[] return — no new transport surface. Each
-		// keeps its ORIGINAL hlc + siteId. A held change was never filed here, so it has
-		// no position of its own and is placed at its origin timestamp: it forms a
-		// ChangeSet with the other held changes of its transaction, separate from any
-		// part of that transaction this replica applied (which sits at the tick it was
-		// filed at).
+	): ChangeSet[] {
+		// Fold forwardable held changes (the `store-and-forward` relay's outbound half)
+		// into the SAME ChangeSet[] return — no new transport surface. Each keeps its
+		// ORIGINAL hlc + siteId, and is placed on its caller's axis: on a pull where this
+		// replica held it, on a push at its write time. On a pull, a held change and the
+		// part of its transaction this replica applied in the same tick share one group,
+		// and so one ChangeSet; parts filed at different ticks are separate ChangeSets
+		// with the same transactionId, each with its own cursor.
 		//
 		// BOUND + ORDERING (verify, no extra code): collectChangesSince early-exits its
 		// change-log scan at a group cut C; collectForwardableChanges is FULLY scanned
-		// (all `> sinceHLC`). buildTransactionChangeSets re-bounds the UNION at batchSize
-		// at a group boundary M ≤ C. Everything placed ≤ M from BOTH sources is present
-		// (change-log up to C ⊇ ≤ M; forwardable fully scanned ⊇ ≤ M), so advancing the
-		// consumer's watermark to M skips nothing that was collected, and forwardable
-		// entries placed in (M, …] are re-collected next round (still `> sinceHLC`).
-		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC);
-		const changes = forwardable.length > 0 ? [...dataChanges, ...filedAtOrigin(forwardable)] : dataChanges;
+		// (all placed `> sinceHLC`). buildTransactionChangeSets re-bounds the UNION at
+		// batchSize at a group boundary M ≤ C. Everything placed ≤ M from BOTH sources is
+		// present (change-log up to C ⊇ ≤ M; forwardable fully scanned ⊇ ≤ M), so
+		// advancing the consumer's watermark to M skips nothing that was collected, and
+		// forwardable entries placed in (M, …] are re-collected next round (still placed
+		// `> sinceHLC`).
+		const changes = forwardable.length > 0 ? [...dataChanges, ...forwardable] : dataChanges;
 
 		return buildTransactionChangeSets(
 			changes,
@@ -1878,26 +1878,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Two filters, mirroring {@link collectChangesSince} / {@link collectAllChanges}:
 	 *  - **Echo exclusion** — drop a change whose origin (`change.hlc.siteId`) is the
 	 *    peer itself, so a straggler's fact is never echoed back to its own author.
-	 *  - **Watermark filter** — when `sinceHLC` is defined (delta path), keep only
-	 *    `compareHLC(change.hlc, sinceHLC) > 0`. A held change was never filed, so it
-	 *    has no position here and is placed in the reply at its origin timestamp. On a
-	 *    pull, `sinceHLC` is a filing position, which is at or above every origin
-	 *    timestamp this replica had seen when it was issued; comparing the two filters
-	 *    out more than a position would, and never lets a reply carry a change at or
-	 *    below the watermark the consumer already holds. That matters because the
-	 *    consumer moves its watermark to the reply's greatest resume position: a
-	 *    change at or below the old watermark could not move it, and the same reply
-	 *    would be served again on every request. When `sinceHLC` is undefined
-	 *    (from-zero / {@link collectAllChanges} path) there is no lower bound, so all
-	 *    (origin ≠ peer) are kept.
+	 *  - **Watermark filter** — when `sinceHLC` is defined (delta path), keep only the
+	 *    changes `placeOf` puts after it, each placed there in the result. A pull passes
+	 *    {@link holdPosition}, where this replica held the change, since its `sinceHLC`
+	 *    is a position: a change held after the reader's last pull reaches it however
+	 *    old its write. A push passes the change's write time, since its `sinceHLC` is
+	 *    the sent watermark. When `sinceHLC` is undefined (from-zero) there is no lower
+	 *    bound, so all (origin ≠ peer) are kept.
 	 *
-	 * Known gap: a held change written before the peer's watermark (`HLC ≤ sinceHLC`)
-	 * is NOT relayed via this delta path. This is a limit of held changes alone. A
-	 * change this replica APPLIED is filed at the position it arrived at and reaches
-	 * every peer however old it is; a held one has no arrival position to be read by,
-	 * so one that arrives after a reader's last pull, written before it, is skipped for
-	 * that reader. The limit was accepted while applied changes shared it; they no
-	 * longer do. Tracked as backlog/bug-sync-held-change-late-arrival-not-relayed.
+	 * A re-held change keeps the position it was first held at (`change-applicator.ts`,
+	 * `positionsOfExistingHolds`), so two relays that both lack the table quiesce after
+	 * one exchange instead of re-offering it to each other above each other's watermark.
 	 *
 	 * Snapshot carve-out: forwardable entries are DELTA-ONLY. The snapshot collectors
 	 * scan only `cv:`/`tb:`/`sm:` (never `qt:`), since a snapshot transfers the
@@ -1908,16 +1899,19 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * the forwardable set is bounded by the retention horizon and is EMPTY — so this
 	 * is zero-cost — in the no-straggler case.
 	 */
-	private async collectForwardableChanges(peerSiteId: SiteId, sinceHLC?: HLC): Promise<Change[]> {
+	private async collectForwardableChanges(
+		peerSiteId: SiteId,
+		sinceHLC: HLC | undefined,
+		placeOf: (entry: QuarantineEntry) => HLC,
+	): Promise<FiledChange[]> {
 		const held = await this.quarantine.listForwardable();
-		const changes: Change[] = [];
+		const changes: FiledChange[] = [];
 		for (const entry of held) {
-			const change = entry.change;
 			// Echo exclusion: the change's HLC siteId is the straggler origin.
-			if (siteIdEquals(change.hlc.siteId, peerSiteId)) continue;
-			// Watermark filter on the delta path (see contract above).
-			if (sinceHLC && compareHLC(change.hlc, sinceHLC) <= 0) continue;
-			changes.push(change);
+			if (siteIdEquals(entry.change.hlc.siteId, peerSiteId)) continue;
+			const position = placeOf(entry);
+			if (sinceHLC && compareHLC(position, sinceHLC) <= 0) continue;
+			changes.push({ change: entry.change, position });
 		}
 		// Relay-activity telemetry: a held entry is counted on EVERY read that re-offers it
 		// (repeatedly until GC), and the batch bound may defer some to
