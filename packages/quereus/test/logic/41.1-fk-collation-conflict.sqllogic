@@ -275,3 +275,102 @@ drop table fwd_child;
 drop table fwd_parent;
 
 pragma foreign_keys = false;
+
+-- =============================================================================
+-- 11. Parent-side enforcement compares under the FK's resolved collation. A
+--     declared NOCASE parent key vs a defaulted child column resolves NOCASE
+--     (§ 4), so the child-side check admits a case-variant child. Every
+--     parent-side probe and propagating action must find that child too, or a
+--     parent DELETE / re-key orphans it. A case-only re-key leaves the key
+--     NOCASE-equal — every child still matches — so it counts as unchanged:
+--     RESTRICT does not fire and the actions do not propagate.
+--     Ticket bug-fk-parent-delete-misses-case-variant-child-under-nocase.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+-- 11.1 RESTRICT, batched statement-end route (the only inbound FK is a RESTRICT).
+create table nb_p (name text collate nocase primary key, w integer);
+insert into nb_p values ('alice', 0);
+create table nb_c (id integer primary key, ref text references nb_p(name));
+insert into nb_c values (1, 'ALICE');
+delete from nb_p where name = 'alice';
+-- error: FOREIGN KEY constraint failed: DELETE on 'nb_p' violates RESTRICT from 'nb_c'
+update nb_p set name = 'bob' where name = 'alice';
+-- error: FOREIGN KEY constraint failed: UPDATE on 'nb_p' violates RESTRICT from 'nb_c'
+-- The upsert DO UPDATE arm's per-row runtime pre-check is its only parent-side
+-- enforcement on this route (no plan-time probe, no statement-end batch).
+insert into nb_p values ('alice', 1) on conflict (name) do update set name = 'bob';
+-- error: FOREIGN KEY constraint failed: UPDATE on 'nb_p' violates RESTRICT from 'nb_c'
+drop table nb_c;
+drop table nb_p;
+
+-- 11.2 Case-only re-key on the per-row route (a second inbound cascade FK turns
+--      batching off): the plan-time NOT EXISTS skips it like the runtime sites do
+--      (the batched route's case-only re-key is pinned in 41.9).
+create table nr_p (name text collate nocase primary key);
+insert into nr_p values ('alice');
+create table nr_c (id integer primary key, ref text references nr_p(name));
+create table nr_cc (id integer primary key, ref text references nr_p(name) on delete cascade on update cascade);
+insert into nr_c values (1, 'ALICE');
+update nr_p set name = 'Alice' where name = 'alice';
+select name from nr_p;
+→ [{"name":"Alice"}]
+drop table nr_cc;
+drop table nr_c;
+drop table nr_p;
+
+-- 11.3 ON DELETE CASCADE removes the case-variant child.
+create table ncd_p (name text collate nocase primary key);
+insert into ncd_p values ('alice'), ('carol');
+create table ncd_c (id integer primary key, ref text references ncd_p(name) on delete cascade);
+insert into ncd_c values (1, 'ALICE'), (2, 'carol');
+delete from ncd_p where name = 'alice';
+select id from ncd_c;
+→ [{"id":2}]
+drop table ncd_c;
+drop table ncd_p;
+
+-- 11.4 ON DELETE SET NULL nulls the case-variant child.
+create table nsn_p (name text collate nocase primary key);
+insert into nsn_p values ('alice');
+create table nsn_c (id integer primary key, ref text null references nsn_p(name) on delete set null);
+insert into nsn_c values (1, 'ALICE');
+delete from nsn_p where name = 'alice';
+select id, ref from nsn_c;
+→ [{"id":1,"ref":null}]
+drop table nsn_c;
+drop table nsn_p;
+
+-- 11.5 ON UPDATE CASCADE re-points the case-variant child; a later case-only
+--      re-key does not propagate (the child keeps its spelling and still matches).
+create table ncu_p (name text collate nocase primary key);
+insert into ncu_p values ('alice');
+create table ncu_c (id integer primary key, ref text references ncu_p(name) on update cascade);
+insert into ncu_c values (1, 'ALICE');
+update ncu_p set name = 'bob' where name = 'alice';
+select ref from ncu_c;
+→ [{"ref":"bob"}]
+update ncu_p set name = 'BOB' where name = 'bob';
+select ref from ncu_c;
+→ [{"ref":"bob"}]
+drop table ncu_c;
+drop table ncu_p;
+
+-- 11.6 Transitive pre-walk: the cascade child is found under NOCASE, so the
+--      RESTRICT grandchild below it rejects the parent DELETE before any write
+--      (the runtime message — the cascade's own nested plan-time check would
+--      report `CHECK constraint failed` instead).
+create table nt_p (name text collate nocase primary key);
+insert into nt_p values ('alice');
+create table nt_c (id integer primary key, ref text references nt_p(name) on delete cascade);
+create table nt_g (id integer primary key, cid integer references nt_c(id));
+insert into nt_c values (1, 'ALICE');
+insert into nt_g values (1, 1);
+delete from nt_p where name = 'alice';
+-- error: FOREIGN KEY constraint failed: DELETE on 'nt_c' violates RESTRICT from 'nt_g'
+drop table nt_g;
+drop table nt_c;
+drop table nt_p;
+
+pragma foreign_keys = false;

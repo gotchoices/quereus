@@ -7,7 +7,8 @@ import type { RowDescriptor } from '../planner/nodes/plan-node.js';
 import { RowOpFlag } from '../schema/table.js';
 import { ConflictResolution } from '../common/constants.js';
 import { expressionToString } from '../emit/ast-stringify.js';
-import { sqlValueIdentical, isTruthy } from '../util/comparison.js';
+import { isTruthy } from '../util/comparison.js';
+import { referencedKeyValueChanged } from './foreign-key-actions.js';
 
 /**
  * Row validation shared by every site that must enforce a table's CHECK / NOT NULL /
@@ -42,6 +43,8 @@ export interface ConstraintMetadataEntry {
 	kind: 'check' | 'fk-child' | 'fk-parent';
 	/** For 'fk-parent' UPDATE checks: parent-table column indices the FK references. */
 	referencedColumnIndices?: ReadonlyArray<number>;
+	/** Aligned with `referencedColumnIndices`: the FK's key equality per column. */
+	referencedKeyEqualities?: ReadonlyArray<string | undefined>;
 	/** Verbatim violation text carried from a synthesized {@link ConstraintCheck}
 	 *  (see {@link constraintViolationMessage}). */
 	violationMessage?: string;
@@ -158,6 +161,7 @@ export function buildConstraintMetadata(
 		contextDescriptor,
 		kind: check.kind ?? 'check',
 		referencedColumnIndices: check.referencedColumnIndices,
+		referencedKeyEqualities: check.referencedKeyEqualities,
 		violationMessage: check.violationMessage,
 		messageValued: check.messageValued,
 	}));
@@ -280,6 +284,28 @@ async function checkNotNullConstraints(
 	return { skip: false, replacedRow: mutableRow };
 }
 
+/**
+ * True when an UPDATE moves at least one of a parent-side FK check's referenced
+ * columns to a different key for that FK. Both halves of the flat row are in stored
+ * (declared) form — OLD from the scan, NEW converted by the DML emitter.
+ */
+function fkParentKeyChanged(
+	rctx: RuntimeContext,
+	metadata: ConstraintMetadataEntry,
+	referencedColumnIndices: ReadonlyArray<number>,
+	numCols: number,
+	flatRow: Row,
+): boolean {
+	const resolveCollation = rctx.db.getCollationResolver();
+	for (let i = 0; i < referencedColumnIndices.length; i++) {
+		const colIdx = referencedColumnIndices[i];
+		const oldVal = flatRow[colIdx] as SqlValue;           // OLD section: 0..n-1
+		const newVal = flatRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
+		if (referencedKeyValueChanged(oldVal, newVal, metadata.referencedKeyEqualities?.[i], resolveCollation)) return true;
+	}
+	return false;
+}
+
 async function checkCheckConstraints(
 	rctx: RuntimeContext,
 	scope: RowConstraintScope,
@@ -304,25 +330,15 @@ async function checkCheckConstraints(
 		if (metadata.kind === 'fk-parent' && rctx.db._isFkRestrictSuppressed()) continue;
 
 		// Parent-side FK UPDATE: skip the NOT EXISTS subquery when none of the
-		// referenced parent columns actually changed.
+		// referenced parent columns changed to a different key for the FK — the
+		// same test the runtime RESTRICT / cascade sites apply.
 		if (
 			scope.operation === RowOpFlag.UPDATE &&
 			metadata.kind === 'fk-parent' &&
-			metadata.referencedColumnIndices
+			metadata.referencedColumnIndices &&
+			!fkParentKeyChanged(rctx, metadata, metadata.referencedColumnIndices, tableSchema.columns.length, flatRow)
 		) {
-			// Both halves are in stored (declared) form: OLD comes from the scan, NEW
-			// was converted by the DML emitter — so plain identity is the right test.
-			const numCols = tableSchema.columns.length;
-			let anyChanged = false;
-			for (const colIdx of metadata.referencedColumnIndices) {
-				const oldVal = flatRow[colIdx] as SqlValue;           // OLD section: 0..n-1
-				const newVal = flatRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
-				if (!sqlValueIdentical(oldVal, newVal)) {
-					anyChanged = true;
-					break;
-				}
-			}
-			if (!anyChanged) continue;
+			continue;
 		}
 
 		// Resolve effective action up front; non-default actions (IGNORE/REPLACE/FAIL/ROLLBACK)

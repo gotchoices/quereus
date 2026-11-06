@@ -269,20 +269,23 @@ into per-execution, per-FK state (`createParentRestrictBatch` /
 `accumulateParentRestrictKeys`, `runtime/foreign-key-actions.ts`) — deduplicated on an
 injective serialization, skipping tuples containing NULL (MATCH SIMPLE) and UPDATE rows
 that change no referenced column. "Change" means the value the column will actually
-**store** differs, not that the UPDATE text differs: `anyReferencedColumnChanged` re-coerces
-a non-identical NEW value through the column's logical type (the same `validateAndParse`
-conversion `coerceRowToSchema` applies moments later) before comparing again, so rewriting a
+**store** differs, not that the UPDATE text differs: both rows arrive in stored form (the DML
+emitters convert NEW to the declared column types before the pre-checks run), so rewriting a
 key as an equivalent-but-differently-spelled value (`1` as the text `'1'`, a JSON object with
-reordered keys) is not a change. The comparison is deliberately BINARY, not the column's
-collation — a `nocase` column still stores `'A'` and `'a'` distinctly. The same helper backs
-the per-row pre-walk and the lens pre-check, so all four enforcement sites agree; see its doc
-comment for the failure-direction reasoning. The state is per execution (never on the emit
+reordered keys) is not a change. Value identity is widened only by the key's own collation —
+the one resolved over the child and parent column ([Constraints § 7.6 FOREIGN
+KEY](sql-constraints.md#76-foreign-key-constraint), *Collation*): under a NOCASE key a
+case-only re-key is not a change, since every child that matched the old key still matches.
+The same test (`referencedKeyValueChanged`) backs the per-row pre-walk, the cascade actions,
+the lens pre-check and the plan-time `NOT EXISTS` skip in `runtime/row-constraints.ts`, so
+every enforcement site agrees. The state is per execution (never on the emit
 closure), so a re-run prepared statement starts empty. `flushParentRestrictBatch` fires in
 `runWithStatementSavepoints` after the row loop, **before** the deferred-maintenance flush
 (fail fast — skip wasted MV work) and before the statement savepoint releases, probing
 each FK's child table in ~500-key chunks (`fkcol in (?, …)`, or OR-of-conjunctions for a
-composite FK — plain SQL `=`/`IN` against the child column, so collation semantics match
-the per-row `NOT EXISTS` by construction). A hit throws the same
+composite FK — plain SQL `=`/`IN` against the child column, plus an explicit `collate` when
+the key's collation differs from the child column's own, since a bound parameter carries
+none — so the probe compares exactly as the per-row `NOT EXISTS` does). A hit throws the same
 `FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from '<child>'`
 error and the statement savepoint unwinds every row — the same final state and error class
 as a per-row abort. The REPLACE-eviction path (`processEvictions`) always stays per-row.

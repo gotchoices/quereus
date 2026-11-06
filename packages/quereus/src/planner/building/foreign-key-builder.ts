@@ -9,6 +9,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
+import { foreignKeyColumnComparison } from '../analysis/comparison-collation.js';
 import { basisFksOverriddenByDivergentLensFk } from '../../schema/lens-fk-discovery.js';
 import * as AST from '../../parser/ast.js';
 import { createLogger } from '../../common/logger.js';
@@ -373,7 +374,8 @@ export function buildParentSideFKChecks(
 		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, tableSchema, childTable);
 
 		// For UPDATE, the runtime skips this check when none of `parentColIndices`
-		// changed (see runtime/row-constraints.ts).
+		// changed to a different key for the FK (see runtime/row-constraints.ts —
+		// a NOCASE-equal re-key is unchanged; `referencedKeyEqualities` below).
 
 		// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
 		const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);
@@ -443,6 +445,8 @@ export function buildParentSideFKChecks(
 				needsDeferred: !isRestrict, // RESTRICT must be immediate, not deferred
 				kind: 'fk-parent',
 				referencedColumnIndices: parentColIndices,
+				referencedKeyEqualities: parentColIndices.map((parentIdx, i) =>
+					foreignKeyColumnComparison(childTable.columns[fk.columns[i]], tableSchema.columns[parentIdx]).keyEquality),
 			});
 		} finally {
 			if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);

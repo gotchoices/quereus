@@ -1447,7 +1447,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// and skipped the per-row NOT EXISTS checks.
 		const batchableFks = getBatchableRestrictFks(
 			ctx.db, tableSchema, 'update', plan.onConflict, plan.lensRouted);
-		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
+		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(tableSchema, batchableFks) : undefined;
 
 		// Physical Halloween avoidance: unless the target module guarantees per-scan
 		// snapshot isolation, fully drain the source match set (closing the scan
@@ -1606,7 +1606,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// key is still in place, and the end-of-statement probe must not report the
 		// children that still reference it.
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
+			accumulateParentRestrictKeys(ctx.db, fkRestrictBatch, 'update', oldRow, newRow);
 		}
 
 		return withStoredNewSection(flatRow, storedRow, newRow, numCols);
@@ -1633,7 +1633,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// end-of-statement boundary when the gate admits the statement).
 		const batchableFks = getBatchableRestrictFks(
 			ctx.db, tableSchema, 'delete', plan.onConflict, plan.lensRouted);
-		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
+		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(tableSchema, batchableFks) : undefined;
 
 		// Physical Halloween avoidance — see the matching note in runUpdate. Unless
 		// the target module guarantees per-scan snapshot isolation, drain the source
@@ -1732,7 +1732,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		}
 
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
+			accumulateParentRestrictKeys(ctx.db, fkRestrictBatch, 'delete', oldRow);
 		}
 
 		return flatRow;

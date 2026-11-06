@@ -21,6 +21,10 @@ export interface ConstraintCheck {
   /** For 'fk-parent' UPDATE checks: parent-table column indices the FK references.
    *  When set, the runtime can skip the check when none of these indices changed. */
   referencedColumnIndices?: ReadonlyArray<number>;
+  /** For 'fk-parent' UPDATE checks, aligned with {@link referencedColumnIndices}: the
+   *  collation under which an old and a new value are the same key for the FK
+   *  (`undefined` ⇒ value identity) — see `ForeignKeyColumnComparison.keyEquality`. */
+  referencedKeyEqualities?: ReadonlyArray<string | undefined>;
   /**
    * Verbatim violation text for a SYNTHESIZED check whose expression would
    * otherwise be reported as-is and mean nothing to the user (nobody wrote it).

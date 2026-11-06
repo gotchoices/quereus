@@ -1,5 +1,6 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../schema/table.js';
+import type { ColumnSchema } from '../schema/column.js';
 import { resolveReferencedColumnsForEnforcement } from '../schema/table.js';
 import type { ForeignKeyAction } from '../parser/ast.js';
 import type { Row, SqlValue } from '../common/types.js';
@@ -18,8 +19,82 @@ import {
 	type LogicalParentFkRef,
 } from '../schema/lens-fk-discovery.js';
 import type { BatchableRestrictFk } from '../planner/building/foreign-key-builder.js';
+import { foreignKeyColumnComparison } from '../planner/analysis/comparison-collation.js';
+import type { CollationResolver } from '../types/logical-type.js';
 
 const log = createLogger('runtime:fk-actions');
+
+// ---------------------------------------------------------------------------
+// FK column matching.
+//
+// Every statement this module builds binds the parent's key as a parameter
+// (`<child col> = ?`), and a parameter carries no collation — so the bare form
+// compares under the CHILD column's collation alone. The FK's equality resolves
+// over BOTH columns (`foreignKeyColumnComparison`), which is what the child-side
+// check used to admit the child row: a declared NOCASE parent key vs a defaulted
+// child column admits child `'ALICE'` for parent `'alice'`. A bare probe would miss
+// that child and orphan it, so the operand spells the FK collation out whenever it
+// differs from the child's own. The common case (matching or defaulted collations)
+// keeps the bare column — byte-identical SQL, child index still usable.
+// ---------------------------------------------------------------------------
+
+/** How a runtime-built parent-side statement matches one FK column. */
+interface FkColumnMatch {
+	/** The child column as the left operand of `= ?` / `in (?, …)`, `collate` included when needed. */
+	readonly childOperand: string;
+	/** Collation two parent key values must be equal under to be the same key for this FK; `undefined` ⇒ value identity. */
+	readonly keyEquality: string | undefined;
+}
+
+// NOTE: under the store module a plain `text primary key` parent reconciles to NOCASE at
+// default rank, so an ordinary text FK there resolves NOCASE and these operands carry
+// `collate nocase` — a default (BINARY) index on the child column cannot serve the probe.
+// If parent-side DELETE/UPDATE on store shows up slow against large child tables, index the
+// child column under the FK's collation (or have the store reconcile child FK columns too).
+function fkColumnMatch(childCol: ColumnSchema, parentCol: ColumnSchema): FkColumnMatch {
+	const cmp = foreignKeyColumnComparison(childCol, parentCol);
+	const quoted = quoteIdentifier(childCol.name);
+	return {
+		childOperand: cmp.childNeedsCollate ? `${quoted} collate ${quoteIdentifier(cmp.collation.toLowerCase())}` : quoted,
+		keyEquality: cmp.keyEquality,
+	};
+}
+
+/** {@link fkColumnMatch} for each column of a physical FK, aligned with `fk.columns`. */
+function physicalFkColumnMatches(
+	childTable: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+	parentTable: TableSchema,
+	parentColIndices: readonly number[],
+): FkColumnMatch[] {
+	return fk.columns.map((childIdx, i) =>
+		fkColumnMatch(childTable.columns[childIdx], parentTable.columns[parentColIndices[i]]));
+}
+
+/**
+ * {@link fkColumnMatch} for each column of a logical (lens) FK: the logical child
+ * column against the logical parent column it references — the pair the lens
+ * child-side check compares. A column that does not resolve falls back to the bare
+ * logical name under value identity.
+ */
+function lensFkColumnMatches(ref: LogicalParentFkRef, parentSlot: LensSlot): FkColumnMatch[] {
+	const childTable = ref.childSlot.logicalTable;
+	const parentTable = parentSlot.logicalTable;
+	return ref.fk.columns.map((childIdx, i) => {
+		const childCol = childTable.columns[childIdx];
+		const parentIdx = parentTable.columnIndexMap.get(ref.parentLogicalColumns[i].toLowerCase());
+		const parentCol = parentIdx === undefined ? undefined : parentTable.columns[parentIdx];
+		if (!childCol || !parentCol) {
+			return { childOperand: quoteIdentifier(ref.childLogicalColumns[i]), keyEquality: undefined };
+		}
+		return fkColumnMatch(childCol, parentCol);
+	});
+}
+
+/** `<child col> = ? and …` over the FK columns, parameters in FK column order. */
+function fkMatchWhere(matches: readonly FkColumnMatch[]): string {
+	return matches.map(m => `${m.childOperand} = ?`).join(' and ');
+}
 
 // ---------------------------------------------------------------------------
 // Batched parent-side RESTRICT enforcement.
@@ -37,6 +112,8 @@ const log = createLogger('runtime:fk-actions');
 
 /** Per-FK accumulation state for one statement execution. */
 export interface ParentRestrictBatchEntry extends BatchableRestrictFk {
+	/** Per FK column: the probe operand and the UPDATE short-circuit's key equality. */
+	readonly matches: readonly FkColumnMatch[];
 	/** Deduplicated OLD referenced-key tuples, keyed by an injective serialization. */
 	readonly keys: Map<string, SqlValue[]>;
 }
@@ -51,14 +128,23 @@ const RESTRICT_BATCH_CHUNK = 500;
  * inbound RESTRICT FKs. Must be called once per execution (never cached on the
  * emit closure) so a re-run prepared statement starts empty.
  */
-export function createParentRestrictBatch(fks: readonly BatchableRestrictFk[]): ParentRestrictBatch {
-	return fks.map(fk => ({ ...fk, keys: new Map<string, SqlValue[]>() }));
+export function createParentRestrictBatch(
+	parentTable: TableSchema,
+	fks: readonly BatchableRestrictFk[],
+): ParentRestrictBatch {
+	return fks.map(fk => ({
+		...fk,
+		matches: physicalFkColumnMatches(fk.childTable, fk.fk, parentTable, fk.parentColIndices),
+		keys: new Map<string, SqlValue[]>(),
+	}));
 }
 
 /**
  * Injective serialization of a referenced-key tuple for dedup. Each segment is
  * type-tagged and (for variable-length payloads) length-prefixed, so two
  * distinct tuples can never collide — a collision would silently drop a probe.
+ * BINARY by design: two keys equal only under the FK collation (`'alice'` /
+ * `'ALICE'`) stay two entries, which costs one redundant probe, never a missed one.
  */
 function serializeKeyTuple(values: SqlValue[]): string {
 	let out = '';
@@ -73,20 +159,37 @@ function serializeKeyTuple(values: SqlValue[]): string {
 }
 
 /**
+ * True when one referenced parent column's OLD and NEW values are a different key
+ * for the FK — value identity, widened by the FK's key equality (see
+ * `ForeignKeyColumnComparison.keyEquality`) for two strings. Under a NOCASE FK a
+ * case-only re-key (`'alice'` → `'ALICE'`) is NOT a change: every child that matched
+ * the old key still matches the new one, so RESTRICT must not reject it and the
+ * propagating actions have nothing to propagate. Shared with the plan-time parent-side
+ * check's skip (`runtime/row-constraints.ts`) so the two routes agree.
+ *
+ * `resolveCollation` is consulted only when the values differ and a key equality is set.
+ */
+export function referencedKeyValueChanged(
+	oldVal: SqlValue,
+	newVal: SqlValue,
+	keyEquality: string | undefined,
+	resolveCollation: CollationResolver,
+): boolean {
+	if (sqlValueIdentical(oldVal, newVal)) return false;
+	if (keyEquality === undefined || typeof oldVal !== 'string' || typeof newVal !== 'string') return true;
+	return resolveCollation(keyEquality)(oldVal, newVal) !== 0;
+}
+
+/**
  * The shared UPDATE short-circuit behind every parent-side RESTRICT / cascade site:
- * true when at least one of `colIndices` would actually STORE a different value.
+ * true when at least one of `colIndices` (aligned with `matches`) changed to a
+ * different key for the FK ({@link referencedKeyValueChanged}).
  *
  * Both rows arrive in declared (stored) form: `oldRow` comes from the source scan,
  * and `newRow` was converted to declared column types by the DML emitters before
  * the executor's pre-vtab checks run (ticket `json-coerce-once-at-dml-source` —
- * this used to re-convert `newRow` per cell because it arrived raw). So the test
- * is plain value identity.
- *
- * Deliberately BINARY identity rather than the column's collation: a NOCASE parent
- * column still stores `'A'` and `'a'` as distinct values, and the child's own match
- * runs under the CHILD column's collation, which may well be BINARY. A spurious
- * "changed" costs one redundant RESTRICT probe; a spurious "unchanged" would SKIP
- * enforcement entirely — so identity is the safe direction.
+ * this used to re-convert `newRow` per cell because it arrived raw). So the base
+ * test is plain value identity.
  *
  * NOTE: every caller today supplies declared-form rows (the DML executor's converted
  * NEW row; materialized-view maintenance passes the changes `applyMaintenance`
@@ -97,12 +200,18 @@ function serializeKeyTuple(values: SqlValue[]): string {
  * here.
  */
 function anyReferencedColumnChanged(
+	db: Database,
 	colIndices: readonly number[],
+	matches: readonly FkColumnMatch[],
 	oldRow: Row,
 	newRow: Row,
 ): boolean {
-	for (const idx of colIndices) {
-		if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) return true;
+	const resolveCollation = db.getCollationResolver();
+	for (let i = 0; i < colIndices.length; i++) {
+		const idx = colIndices[i];
+		if (referencedKeyValueChanged(oldRow[idx] as SqlValue, newRow[idx] as SqlValue, matches[i].keyEquality, resolveCollation)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -114,6 +223,7 @@ function anyReferencedColumnChanged(
  * for UPDATE, the referenced-column-change short-circuit.
  */
 export function accumulateParentRestrictKeys(
+	db: Database,
 	batch: ParentRestrictBatch,
 	operation: 'delete' | 'update',
 	oldRow: Row,
@@ -122,7 +232,7 @@ export function accumulateParentRestrictKeys(
 	for (const entry of batch) {
 		// UPDATE: only rows that actually re-key a referenced column contribute.
 		if (operation === 'update' && newRow !== undefined) {
-			if (!anyReferencedColumnChanged(entry.parentColIndices, oldRow, newRow)) continue;
+			if (!anyReferencedColumnChanged(db, entry.parentColIndices, entry.matches, oldRow, newRow)) continue;
 		}
 
 		// MATCH SIMPLE: NULL parent values cannot be referenced.
@@ -145,8 +255,8 @@ export function accumulateParentRestrictKeys(
  * The probe selects the FK columns (not `select 1`) so the violating key stays
  * available for a future richer message; the message itself is unchanged and
  * matcher-compatible (`/constraint|foreign|fk/i`). Comparison rides plain SQL
- * `=` / `IN` against the child column — identical collation semantics to the
- * per-row `NOT EXISTS` by construction.
+ * `=` / `IN` against the child column under the FK's resolved collation
+ * ({@link FkColumnMatch}) — the same comparison as the per-row `NOT EXISTS`.
  */
 export async function flushParentRestrictBatch(
 	db: Database,
@@ -159,8 +269,8 @@ export async function flushParentRestrictBatch(
 
 	for (const entry of batch) {
 		if (entry.keys.size === 0) continue;
-		const { childTable, fk } = entry;
-		const childColQuoted = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+		const { childTable } = entry;
+		const childColQuoted = entry.fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
 		const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
 			? `${quoteIdentifier(childTable.schemaName)}.`
 			: '';
@@ -171,12 +281,12 @@ export async function flushParentRestrictBatch(
 			const chunk = tuples.slice(i, i + RESTRICT_BATCH_CHUNK);
 			let whereClause: string;
 			let params: SqlValue[];
-			if (childColQuoted.length === 1) {
-				whereClause = `${childColQuoted[0]} in (${chunk.map(() => '?').join(', ')})`;
+			if (entry.matches.length === 1) {
+				whereClause = `${entry.matches[0].childOperand} in (${chunk.map(() => '?').join(', ')})`;
 				params = chunk.map(t => t[0]);
 			} else {
 				whereClause = chunk
-					.map(() => `(${childColQuoted.map(c => `${c} = ?`).join(' and ')})`)
+					.map(() => `(${fkMatchWhere(entry.matches)})`)
 					.join(' or ');
 				params = chunk.flat();
 			}
@@ -270,6 +380,7 @@ export async function executeForeignKeyActions(
 			// A count mismatch means the cascade cannot be aimed at the child rows —
 			// raise rather than skip, which would leave orphans behind a CASCADE.
 			const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
+			const matches = physicalFkColumnMatches(childTable, fk, parentTable, parentColIndices);
 
 			// UPDATE: an ON UPDATE action propagates a change to the parent's REFERENCED
 			// columns, so an update that leaves them alone must not touch the child at
@@ -279,7 +390,7 @@ export async function executeForeignKeyActions(
 			// data-change event with an empty changed-column list). Same short-circuit
 			// the RESTRICT sites and the lens walker already apply.
 			if (operation === 'update' && newRow !== undefined) {
-				if (!anyReferencedColumnChanged(parentColIndices, oldRow, newRow)) continue;
+				if (!anyReferencedColumnChanged(db, parentColIndices, matches, oldRow, newRow)) continue;
 			}
 
 			// Get old parent values for the referenced columns
@@ -289,9 +400,8 @@ export async function executeForeignKeyActions(
 			if (oldParentValues.some(v => v === null || v === undefined)) continue;
 
 			await executeSingleFKAction(
-				db, childTable, fk, action, parentTable, parentColIndices,
+				db, childTable, fk, matches, action, parentColIndices,
 				oldParentValues, operation === 'update' ? newRow : undefined,
-				visited
 			);
 		}
 	} finally {
@@ -428,6 +538,7 @@ export async function assertTransitiveRestrictsForParentMutation(
 
 			// Raises on a column-count mismatch, as every other enforcement site does.
 			const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
+			const matches = physicalFkColumnMatches(childTable, fk, parentTable, parentColIndices);
 
 			// MATCH SIMPLE: NULL parent values cannot be referenced.
 			const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
@@ -436,13 +547,12 @@ export async function assertTransitiveRestrictsForParentMutation(
 			// UPDATE-only short-circuit: skip if no referenced parent column changed.
 			let newParentValues: SqlValue[] | undefined;
 			if (operation === 'update' && newRow !== undefined) {
-				if (!anyReferencedColumnChanged(parentColIndices, oldRow, newRow)) continue;
+				if (!anyReferencedColumnChanged(db, parentColIndices, matches, oldRow, newRow)) continue;
 				newParentValues = parentColIndices.map(idx => newRow[idx]) as SqlValue[];
 			}
 
 			// Scan child rows that match the OLD parent values.
-			const childColQuoted = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
-			const whereClause = childColQuoted.map(c => `${c} = ?`).join(' AND ');
+			const whereClause = fkMatchWhere(matches);
 			const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
 				? `${quoteIdentifier(childTable.schemaName)}.`
 				: '';
@@ -566,18 +676,18 @@ export async function assertNoRestrictedChildrenForParentMutation(
 		// A count mismatch means RESTRICT cannot be probed — raise rather than skip,
 		// which would silently let the parent write through.
 		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
+		const matches = physicalFkColumnMatches(childTable, fk, parentTable, parentColIndices);
 
 		// UPDATE: only enforce when at least one referenced parent column changed.
 		if (operation === 'update' && newRow !== undefined) {
-			if (!anyReferencedColumnChanged(parentColIndices, oldRow, newRow)) continue;
+			if (!anyReferencedColumnChanged(db, parentColIndices, matches, oldRow, newRow)) continue;
 		}
 
 		// MATCH SIMPLE: NULL parent values cannot be referenced.
 		const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
 		if (oldParentValues.some(v => v === null || v === undefined)) continue;
 
-		const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
-		const whereClause = childColNames.map(c => `${c} = ?`).join(' AND ');
+		const whereClause = fkMatchWhere(matches);
 		const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
 			? `${quoteIdentifier(childTable.schemaName)}.`
 			: '';
@@ -627,17 +737,14 @@ async function executeSingleFKAction(
 	db: Database,
 	childTable: TableSchema,
 	fk: ForeignKeyConstraintSchema,
+	matches: readonly FkColumnMatch[],
 	action: 'cascade' | 'setNull' | 'setDefault',
-	parentTable: TableSchema,
 	parentColIndices: number[],
 	oldParentValues: SqlValue[],
 	newRow: Row | undefined,
-	_visited: Set<string>,
 ): Promise<void> {
 	const childColNames = fk.columns.map(idx => childTable.columns[idx].name);
-	const whereClause = childColNames
-		.map(name => `"${name}" = ?`)
-		.join(' AND ');
+	const whereClause = fkMatchWhere(matches);
 	const qualifiedChildTable = `"${childTable.schemaName}"."${childTable.name}"`;
 
 	switch (action) {
@@ -658,10 +765,7 @@ async function executeSingleFKAction(
 				const setClauses = childColNames
 					.map(name => `"${name}" = ?`)
 					.join(', ');
-				const whereParamsClause = childColNames
-					.map(name => `"${name}" = ?`)
-					.join(' AND ');
-				const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereParamsClause}`;
+				const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 				const params = [...newParentValues, ...oldParentValues];
 				log('CASCADE UPDATE: %s with params %o', sql, params);
 				await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, params));
@@ -765,20 +869,23 @@ type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefaul
  * ({@link assertLensRestrictsForParentMutation}), factored out so the two paths cannot drift.
  *
  * Maps each logical parent referenced column → its basis column (via `parentMap`) → basis
- * index, and reads the values off `oldRow` / `newRow` by basis index. Returns `undefined`
- * (⇒ skip this ref) when:
+ * index, and reads the values off `oldRow` / `newRow` by basis index. Also returns the
+ * ref's {@link FkColumnMatch}es, which the UPDATE short-circuit and the caller's child
+ * statement both compare under. Returns `undefined` (⇒ skip this ref) when:
  *  - a referenced column has no plain basis projection (cannot read its basis value);
  *  - MATCH SIMPLE: any OLD referenced value is NULL (participates in no FK match); or
  *  - UPDATE: no referenced parent column actually changed ({@link anyReferencedColumnChanged}).
  */
 function resolveLensFkParentReferencedValues(
+	db: Database,
 	ref: LogicalParentFkRef,
+	parentSlot: LensSlot,
 	parentMap: Map<string, string>,
 	basisParentTable: TableSchema,
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow: Row | undefined,
-): { oldParentValues: SqlValue[]; newParentValues?: SqlValue[] } | undefined {
+): { oldParentValues: SqlValue[]; newParentValues?: SqlValue[]; matches: FkColumnMatch[] } | undefined {
 	// Logical referenced column → basis column → basis index. A column with no plain basis
 	// projection disqualifies the ref (cannot read its basis value).
 	const basisIndices: number[] = [];
@@ -796,13 +903,14 @@ function resolveLensFkParentReferencedValues(
 	if (oldParentValues.some(v => v === null || v === undefined)) return undefined;
 
 	// UPDATE short-circuit: skip when no referenced parent column actually changed.
+	const matches = lensFkColumnMatches(ref, parentSlot);
 	let newParentValues: SqlValue[] | undefined;
 	if (operation === 'update' && newRow !== undefined) {
-		if (!anyReferencedColumnChanged(basisIndices, oldRow, newRow)) return undefined;
+		if (!anyReferencedColumnChanged(db, basisIndices, matches, oldRow, newRow)) return undefined;
 		newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
 	}
 
-	return { oldParentValues, newParentValues };
+	return { oldParentValues, newParentValues, matches };
 }
 
 /**
@@ -856,10 +964,10 @@ async function executeLensFkActionsForParentSlot(
 		// Read the parent's referenced OLD (and NEW) values off the basis row, applying the
 		// shared MATCH SIMPLE + UPDATE referenced-column-change skip rules. `undefined` ⇒
 		// skip this ref (unmappable column, NULL referenced value, or no key change).
-		const values = resolveLensFkParentReferencedValues(ref, parentMap, basisParentTable, operation, oldRow, newRow);
+		const values = resolveLensFkParentReferencedValues(db, ref, parentSlot, parentMap, basisParentTable, operation, oldRow, newRow);
 		if (!values) continue;
 
-		await issueLensFkAction(db, ref, action, operation, values.oldParentValues, values.newParentValues);
+		await issueLensFkAction(db, ref, values.matches, action, operation, values.oldParentValues, values.newParentValues);
 	}
 }
 
@@ -875,6 +983,7 @@ async function executeLensFkActionsForParentSlot(
 async function issueLensFkAction(
 	db: Database,
 	ref: LogicalParentFkRef,
+	matches: readonly FkColumnMatch[],
 	action: LensFkAction,
 	operation: 'delete' | 'update',
 	oldParentValues: SqlValue[],
@@ -886,7 +995,7 @@ async function issueLensFkAction(
 		? `${quoteIdentifier(childTable.schemaName)}.`
 		: '';
 	const qualifiedChild = `${schemaPrefix}${quoteIdentifier(childTable.name)}`;
-	const whereClause = childLogicalColumns.map(c => `${quoteIdentifier(c)} = ?`).join(' and ');
+	const whereClause = fkMatchWhere(matches);
 
 	switch (action) {
 		case 'cascade': {
@@ -1022,10 +1131,10 @@ async function assertLensRestrictsForParentSlot(
 		// cascade walker (executeLensForeignKeyActions), not rejected.
 		if (action !== 'restrict') continue;
 
-		const values = resolveLensFkParentReferencedValues(ref, parentMap, basisParentTable, operation, oldRow, newRow);
+		const values = resolveLensFkParentReferencedValues(db, ref, parentSlot, parentMap, basisParentTable, operation, oldRow, newRow);
 		if (!values) continue;
 
-		await assertNoLensChildReferences(db, ref, parentSlot, operation, values.oldParentValues);
+		await assertNoLensChildReferences(db, ref, values.matches, parentSlot, operation, values.oldParentValues);
 	}
 }
 
@@ -1038,6 +1147,7 @@ async function assertLensRestrictsForParentSlot(
 async function assertNoLensChildReferences(
 	db: Database,
 	ref: LogicalParentFkRef,
+	matches: readonly FkColumnMatch[],
 	parentSlot: LensSlot,
 	operation: 'delete' | 'update',
 	oldParentValues: SqlValue[],
@@ -1047,7 +1157,7 @@ async function assertNoLensChildReferences(
 		? `${quoteIdentifier(childTable.schemaName)}.`
 		: '';
 	const qualifiedChild = `${schemaPrefix}${quoteIdentifier(childTable.name)}`;
-	const whereClause = ref.childLogicalColumns.map(c => `${quoteIdentifier(c)} = ?`).join(' and ');
+	const whereClause = fkMatchWhere(matches);
 	const sql = `select 1 from ${qualifiedChild} where ${whereClause} limit 1`;
 
 	log('LENS RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);

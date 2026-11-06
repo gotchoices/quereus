@@ -23,8 +23,7 @@ import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
-import { columnSchemaToScalarType } from '../planner/type-utils.js';
-import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
+import { resolveForeignKeyColumnCollation } from '../planner/analysis/comparison-collation.js';
 import { containsOldRowImageRef, isRowInvariantCheck } from '../planner/analysis/check-extraction.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { requalifyOwnRowRefsInSchemaExpression, type OwnRowContextVariables } from './rename-rewriter.js';
@@ -851,13 +850,13 @@ async function restorableStatesOf(db: Database, table: TableSchema, ddl: string)
  * here at declaration time (CREATE TABLE / ALTER ADD CONSTRAINT / ADD COLUMN /
  * declarative apply). Pure schema check (no row scan).
  *
- * Stays in lockstep with enforcement by construction: it maps each column to a
- * `ScalarType` through {@link columnSchemaToScalarType} (the same map the FK
- * builder's comparison uses — `collationExplicit` → provenance `'declared'`,
- * else `'default'`) and resolves the pair through the same
- * {@link resolveComparisonCollation} lattice. So it fires on exactly the
- * conflicts the first DML against the child would, only sooner — never a
- * re-derived textuality- or name-based rule.
+ * Stays in lockstep with enforcement by construction: it resolves the pair
+ * through {@link resolveForeignKeyColumnCollation} — the one rule the child-side
+ * check, the parent-side checks and the runtime parent-side probes / actions
+ * share (`collationExplicit` → provenance `'declared'`, else `'default'`, then the
+ * comparison lattice). So it fires on exactly the conflicts the first DML
+ * against the child would, only sooner — never a re-derived textuality- or
+ * name-based rule.
  *
  * Resolution rules (consequences of staying in lockstep, intended):
  *  - matching declared collations (nocase/nocase) resolve, no conflict;
@@ -908,10 +907,7 @@ export function validateForeignKeyCollations(
 	for (let i = 0; i < fk.columns.length; i++) {
 		const childCol = childSchema.columns[fk.columns[i]];
 		const parentCol = parent.columns[parentColIndices[i]];
-		const res = resolveComparisonCollation(
-			columnSchemaToScalarType(childCol),
-			columnSchemaToScalarType(parentCol),
-		);
+		const res = resolveForeignKeyColumnCollation(childCol, parentCol);
 		if (res.kind === 'conflict') {
 			throw new QuereusError(
 				`FOREIGN KEY '${fk.name ?? `_fk_${childSchema.name}`}' on '${childSchema.name}': `

@@ -36,7 +36,9 @@ import type { InNode } from '../nodes/subquery.js';
 import type * as AST from '../../parser/ast.js';
 import type { ScalarType, CollationSource } from '../../common/datatype.js';
 import type { LogicalType } from '../../types/logical-type.js';
+import type { ColumnSchema } from '../../schema/column.js';
 import { isCollationAware, normalizeCollationName } from '../../util/comparison.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { collectCollateNames, collectColumnNames, columnIndexFromExpr } from './predicate-shape.js';
 import { classifyBinaryOperator } from './binary-operator-class.js';
@@ -105,6 +107,56 @@ function resolveContributions(
  */
 export function resolveComparisonCollation(left: CollationCarrier, right: CollationCarrier): CollationResolution {
 	return resolveContributions(collationContribution(left), collationContribution(right));
+}
+
+/**
+ * The collation a FOREIGN KEY's equality compares one child/parent column pair under:
+ * the lattice over the two columns, exactly as the child-side `parent.k = NEW.ref`
+ * check resolves it. CREATE-time validation, the plan-time parent-side checks and the
+ * runtime parent-side probes / actions all resolve through this, so the child side and
+ * the parent side of one FK can never compare differently. Pure — a same-rank conflict
+ * is returned, not thrown.
+ */
+export function resolveForeignKeyColumnCollation(childCol: ColumnSchema, parentCol: ColumnSchema): CollationResolution {
+	return resolveComparisonCollation(columnSchemaToScalarType(childCol), columnSchemaToScalarType(parentCol));
+}
+
+/** How the parent-side enforcement of a FOREIGN KEY compares one child/parent column pair. */
+export interface ForeignKeyColumnComparison {
+	/** The FK equality's resolved collation (normalized). */
+	readonly collation: string;
+	/**
+	 * True when the child column compared against a collation-less operand (a bound
+	 * parameter) would NOT already resolve to {@link collation} — such a probe must
+	 * spell the collation out (`<child col> collate <name> = ?`).
+	 */
+	readonly childNeedsCollate: boolean;
+	/**
+	 * The collation under which an old and a new parent key value are the same key for
+	 * this FK — `undefined` means plain value identity. Only set when the FK resolves
+	 * non-BINARY and both columns' types apply a collation when comparing
+	 * ({@link isCollationAware}); a type that ignores collation (temporal, JSON) keeps
+	 * identity, the safe direction for the UPDATE short-circuit (a spurious "changed"
+	 * costs one redundant probe, a spurious "unchanged" would skip enforcement).
+	 */
+	readonly keyEquality: string | undefined;
+}
+
+/**
+ * {@link resolveForeignKeyColumnCollation}, unpacked for the parent-side enforcement
+ * sites. Throws on a same-rank conflict: CREATE rejects one, so a live FK reaching here
+ * with a conflict is a legacy persisted schema, and it must fail loudly (as the plan-time
+ * checks do) rather than silently compare under one side's collation.
+ */
+export function foreignKeyColumnComparison(childCol: ColumnSchema, parentCol: ColumnSchema): ForeignKeyColumnComparison {
+	const collation = resolvedOrThrow(resolveForeignKeyColumnCollation(childCol, parentCol));
+	const childAlone = collationContribution(columnSchemaToScalarType(childCol))?.name ?? 'BINARY';
+	const keyEquality = collation !== 'BINARY'
+		&& isCollationAware(childCol.logicalType)
+		&& isCollationAware(parentCol.logicalType)
+		? collation
+		: undefined;
+	return { collation, childNeedsCollate: collation !== childAlone, keyEquality };
 }
 
 /** Build the plan-time error for a same-rank explicit/declared conflict. */
