@@ -135,18 +135,19 @@ export class MemoryTableConnection {
 		// on first mutation; rolling back to a lazy marker restores the
 		// no-pending state with the saved readLayer.
 		//
-		// Eager-snapshot: promote the existing pending layer to immutable
-		// (markCommitted) and reuse it as the snapshot. Data-copying via a
-		// fresh layer doesn't survive "delete of inherited row" — the copy
-		// iterates the post-delete view (which already excludes the row),
-		// so a fresh layer would re-inherit the original entry from the
-		// parent BTree. Promoting the layer keeps the BTree's
-		// copy-on-write structure (with the cloned-and-spliced leaf)
-		// intact.
+		// Eager-snapshot: freeze the existing pending layer (TransactionLayer.freeze)
+		// and reuse it as the snapshot. Data-copying via a fresh layer doesn't
+		// survive "delete of inherited row" — the copy iterates the post-delete
+		// view (which already excludes the row), so a fresh layer would
+		// re-inherit the original entry from the parent BTree. Freezing the
+		// layer keeps the BTree's copy-on-write structure (with the
+		// cloned-and-spliced leaf) intact; the freeze also detaches its trees
+		// from their base, so one snapshot per statement does not grow the
+		// tree chain the next pending layer reads through.
 		let snapshot: TransactionLayer | null = null;
 		if (this.pendingTransactionLayer) {
 			snapshot = this.pendingTransactionLayer;
-			snapshot.markCommitted();
+			snapshot.freeze();
 		}
 		this.savepointStack.push({ snapshot, readLayer: savedReadLayer, readSnapshot: savedReadSnapshot });
 

@@ -257,6 +257,7 @@ export class TransactionLayer implements Layer {
 		this.tableSchemaAtCreation = newSchema;
 
 		// Additive + re-key: add an index the layer lacks, replace one the new schema rebuilt.
+		const rebuilt: MemoryIndex[] = [];
 		for (const indexSchema of newSchema.indexes ?? []) {
 			const held = this.secondaryIndexes.get(indexSchema.name);
 			const previous = oldSchema.indexes?.find(ix => ix.name === indexSchema.name);
@@ -274,7 +275,9 @@ export class TransactionLayer implements Layer {
 			);
 			this.reindexOwnWrites(memoryIndex);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
+			rebuilt.push(memoryIndex);
 		}
+		this.detachRebuiltTrees(rebuilt);
 
 		// Removal (`drop index` / `drop constraint`): drop every held index the new schema no
 		// longer declares (empty/undefined `newSchema.indexes` drops all). Enforcement stops the
@@ -546,6 +549,8 @@ export class TransactionLayer implements Layer {
 		for (const index of this.secondaryIndexes.values()) {
 			this.reindexOwnWrites(index);
 		}
+
+		this.detachRebuiltTrees([this.primaryModifications, ...this.secondaryIndexes.values()]);
 	}
 
 	/**
@@ -824,6 +829,39 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
+	 * Freezes a connection's pending layer: marks it committed and detaches its trees from their
+	 * base. Called where the layer stops taking writes and becomes the layer the next pending
+	 * layer is built over — an eager savepoint snapshot (`MemoryTableConnection.createSavepoint`)
+	 * or the new committed head (`MemoryTableManager.commitTransaction`).
+	 *
+	 * The detach is what keeps the tree chain one link deep. Every DML statement inside a
+	 * transaction, and every row of an `insert or fail`, takes a snapshot; every autocommit
+	 * statement commits a new head. Left linked, the chain would grow by one link per statement.
+	 *
+	 * Legal because this layer was the connection's pending head until now, so no tree derives
+	 * from it yet (a child is only ever built over a read layer or the committed head, which this
+	 * becomes next) and dropping its base moves no derived tree's `chainVersion()`. The guard
+	 * below can only fire if that stops being true.
+	 *
+	 * What the detach gives up: inheritree's `MutatedBaseError` check no longer covers this
+	 * layer, so an in-place write to a tree it shares nodes with (the previous committed head, the
+	 * base layer, an older snapshot) would corrupt it silently. The layer code already relies on
+	 * those trees never being written in place — see {@link clearBase}.
+	 */
+	freeze(): void {
+		this.markCommitted();
+		if (this.hasDerivedChildren()) {
+			warnLog('Frozen layer %d already has a derived child; leaving its trees linked to their base', this.layerId);
+			return;
+		}
+		// NOTE: the depth of the tree chain must stay bounded here, not merely small on average:
+		// inheritree 1.0.1 computes `chainVersion()` by recursing once per base link on every tree
+		// access, so a chain that grows per statement is quadratic and overflows the stack at
+		// roughly 15,600 links.
+		this.clearBase();
+	}
+
+	/**
 	 * Enable change tracking for event emission.
 	 * Should be called before mutations if there are listeners.
 	 */
@@ -997,20 +1035,43 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
-	 * Detaches this layer's BTrees from their base, making them self-contained.
-	 * This should be called when the layer becomes the new effective base.
+	 * Detaches this layer's BTrees from their base, making them self-contained. O(1) per tree:
+	 * each keeps the merged view in its own root and goes on sharing untouched nodes with its
+	 * former base.
 	 *
 	 * ONLY legal while {@link hasDerivedChildren} is false. Dropping the base pointer
 	 * removes the base's contribution from each tree's `chainVersion()`, so any tree
 	 * already derived from these ones fails its next `checkBase()` with
-	 * `MutatedBaseError`; and per inheritree's own contract the detached tree still
-	 * shares nodes by identity with its former base, so base-immutability outlives the
-	 * call. `MemoryTableManager.tryCollapseLayers` is the only caller and enforces it.
+	 * `MutatedBaseError`. And because a detached tree no longer copies on write, the layer
+	 * must be frozen from here on, and so must every tree it shares nodes with — which holds
+	 * because committed layers, savepoint snapshots, and the base layer are never written in
+	 * place (a DDL rebuild replaces their tree objects instead).
+	 *
+	 * Callers: `MemoryTableManager.promoteCommittedHead` (layer collapse) and {@link freeze};
+	 * each checks {@link hasDerivedChildren} first.
+	 * {@link detachRebuiltTrees} applies the same detach to individual freshly built trees.
 	 */
 	public clearBase(): void {
 		this.primaryModifications.clearBase();
 		for (const memoryIndex of this.secondaryIndexes.values()) {
 			memoryIndex.clearBase();
 		}
+	}
+
+	/**
+	 * Detaches trees a DDL rebuild has just built for this layer, when the layer is frozen — a
+	 * savepoint snapshot, or a committed layer still on the DDL connection's chain. Without this
+	 * an in-transaction ALTER, which rebuilds every open layer's trees over its parent's
+	 * (oldest-first), would relink the chain {@link freeze} kept one link deep.
+	 *
+	 * Legal even though {@link hasDerivedChildren} is true for every layer below the pending
+	 * one: that flag is per layer, but these trees were created inside the calling rebuild, so
+	 * no tree derives from them yet — the layer above derives from them only once it is rebuilt
+	 * itself. The pending (uncommitted) layer is left linked: it is still written to, and a
+	 * detached tree would write into the nodes it shares with its parent instead of copying them.
+	 */
+	private detachRebuiltTrees(trees: Iterable<BTree<BTreeKeyForPrimary, Row> | MemoryIndex>): void {
+		if (!this._isCommitted) return;
+		for (const tree of trees) tree.clearBase();
 	}
 }

@@ -24,7 +24,7 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **Backend Library:** Uses the `inheritree` library (fork of `digitree`) for efficient, sorted storage with copy-on-write inheritance
 *   **Inheritance Model:** Each `TransactionLayer` creates BTrees that inherit from their parent layer's BTrees, providing automatic data propagation without complex change tracking
 *   **Copy-on-Write:** Modifications in child layers only copy pages when necessary, sharing immutable pages with parent layers
-*   **Layer Promotion:** The `clearBase()` method makes a transaction layer independent of its base, supporting layer collapse — legal **only for a layer nothing has ever derived from**; see [Layer Management](#layer-management)
+*   **Layer Detachment:** The `clearBase()` method makes a transaction layer independent of its base. A layer is detached as soon as it is frozen (savepoint snapshot or new committed head), which keeps the tree chain one link deep — legal **only for a layer nothing has ever derived from**; see [Layer Management](#layer-management)
 
 ## **Key Features:**
 
@@ -185,12 +185,40 @@ await db.exec("alter table users rename column created_at to registration_date")
 
 ### **Layer Management:**
 *   **Connection Isolation:** Each connection maintains its own read layer and optional pending transaction layer
+*   **Detach on Freeze:** A pending layer's BTrees are detached from their base the moment it is frozen (below)
 *   **Automatic Promotion:** `MemoryTableManager.tryCollapseLayers` (run on `disconnect`) promotes the committed head when both conditions below hold
 *   **Lock-Free Reads:** Read operations don't require locks, using the connection's current layer view
 *   **Efficient Writes:** Write operations use inherited BTrees to minimize data copying
 
+**Freezing detaches.** A pending layer stops taking writes at two points: when an eager savepoint
+(`MemoryTableConnection.createSavepoint`) turns it into the connection's read snapshot, and when
+`commitTransaction` installs it (or its rebased copy) as the committed head. At both,
+`TransactionLayer.freeze` marks it committed and calls `clearBase()` on its BTrees. Without that,
+the tree chain grows by one link per statement — every DML statement inside a transaction opens a
+statement savepoint, `insert or fail` opens one per row, and every autocommit statement commits a
+new head, and each next pending layer builds its trees over the frozen one's. inheritree walks the
+chain recursively on every tree access (`BTree.chainVersion()`), so a growing chain costs
+quadratic time and overflows the stack at roughly 15,600 links. The detach is legal by
+construction: the layer was the connection's pending head, so no tree derives from it yet
+(condition 2 below holds trivially). The layer-level parent chain (`Layer.getParent()`) is left
+intact; commit, rebase, `isLayerInUse` and the DDL passes still walk it.
+
+In-transaction DDL keeps the chain shallow the same way. The oldest-first rebuilds
+(`adoptSchema`, `rekeyPrimaryKey`, `installRekeyedPrimaryKeyColumns`, `convertColumn`,
+`installReshapedColumns`) build each open layer's new trees over its parent's new ones; for a
+frozen layer, `TransactionLayer.detachRebuiltTrees` detaches the trees just built before the
+layer above is rebuilt over them. The layer's derived-child flag is set by then, but it describes
+the layer's old trees: the new ones were created inside the call, so nothing derives from them
+yet. The pending layer is never detached — a detached tree no longer copies on write, so its
+writes would land in the nodes it shares with its parent.
+
+What detaching gives up: inheritree's `MutatedBaseError` guard no longer covers a detached layer.
+That rests on a standing rule instead — committed layers, savepoint snapshots and the base layer
+are never written in place; every rebuild replaces their tree objects.
+
 Promotion means `clearBase()` on the head's BTrees: the head stops inheriting, and the chain
-below it becomes releasable. It is safe only when **both** hold:
+below it becomes releasable. Since commit freezes every head it installs, promotion today only
+re-detaches an already-detached head. It is safe only when **both** hold:
 
 1.  **No attached connection's read or pending chain reaches the head's parent** —
     `isLayerInUse` walks both chains to the chain root.
@@ -234,8 +262,8 @@ a full scan that applies the constraint's own predicate and collations — slowe
 
 ### **Memory Management:**
 *   **Copy-on-Write Pages:** Only modified pages are copied, sharing immutable pages across layers
-*   **Automatic Cleanup:** Unused layers are automatically garbage collected when no longer referenced
-*   **Base Clearing:** The `clearBase()` operation makes a layer independent, releasing its ancestors — subject to the two promotion conditions in [Layer Management](#layer-management)
+*   **Layer Retention:** Layers are garbage collected when no longer referenced — but every layer references its parent (`TransactionLayer.parentLayer`), so the committed head keeps every earlier layer reachable, one per write statement, for the table's lifetime. Measured: 40,000 autocommit updates of one row retain about 58 MB
+*   **Base Clearing:** The `clearBase()` operation makes a layer's BTrees independent of its base (so the tree chain stays shallow); it does not release the ancestor layer objects — see [Layer Management](#layer-management)
 
 ## DDL and transactions
 
@@ -722,7 +750,7 @@ with those writes). See `docs/store.md` and `docs/module-authoring-transactions.
 ## **Performance Characteristics:**
 
 *   **Read Performance:** O(log n) for indexed lookups, O(n) for full scans
-*   **Write Performance:** O(log n) for inserts/updates with copy-on-write overhead only for modified pages
+*   **Write Performance:** O(log n) for inserts/updates with copy-on-write overhead only for modified pages — except that a layer's first write under a secondary-index value it inherited copies every primary key filed under that value (`MemoryIndex.addEntry` / `removeEntry`), so many statements writing one shared indexed value cost time and retained memory quadratic in the statement count
 *   **Memory Usage:** Efficient sharing of immutable pages across transaction layers
 *   **Concurrency:** High read concurrency with minimal locking; writes are serialized per connection
 *   **Transaction Overhead:** Minimal overhead for read-only transactions; moderate overhead for write transactions due to layer management

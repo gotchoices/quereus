@@ -629,7 +629,9 @@ export class MemoryTableManager {
 			if (headIsAncestorOfPending) {
 				// Case A: the un-emitted in-transaction event span ends at the head.
 				changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
-				pendingLayer.markCommitted();
+				// `freeze`, not a bare `markCommitted`: the next pending layer builds over this
+				// head, so a linked one would grow the tree chain by one link per commit.
+				pendingLayer.freeze();
 				committedLayer = pendingLayer;
 			} else {
 				// Find the fork point: the deepest layer present in BOTH chains.
@@ -673,7 +675,7 @@ export class MemoryTableManager {
 					// but aborting would roll back every connection. Preserve the prior
 					// wholesale publish.
 					changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
-					pendingLayer.markCommitted();
+					pendingLayer.freeze();
 					committedLayer = pendingLayer;
 				}
 			}
@@ -823,7 +825,7 @@ export class MemoryTableManager {
 			}
 		}
 
-		rebased.markCommitted();
+		rebased.freeze();
 		return rebased;
 	}
 
@@ -867,6 +869,10 @@ export class MemoryTableManager {
 	/**
 	 * Detaches the committed head from its parent (`clearBase()`), so the chain below it
 	 * can be released. Returns whether it did.
+	 *
+	 * Every head `commitTransaction` installs is already detached by `TransactionLayer.freeze`,
+	 * which skips the detach only for a layer with a derived child — and this refuses that layer
+	 * too. So today the `clearBase()` below re-detaches trees that have no base left.
 	 *
 	 * Caller holds the collapse latch.
 	 */

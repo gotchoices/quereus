@@ -48,3 +48,5 @@ module level plus one through the isolation layer with staged updates and delete
 
 Whoever enables a reverse-walk plan for a secondary index (so the engine can drop a sort)
 must land this first, or that optimization silently corrupts transactional reads.
+
+Related: `bug-memory-index-copies-every-key-for-a-repeated-value` proposes storing one index entry per (index value, primary key) pair. That layout would make primary-key order within an index value come from the B-tree itself, in both scan directions, which would resolve this ticket as a side effect.
