@@ -282,8 +282,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// both issued and written.
 	private commitChain: Promise<void> = Promise.resolve();
 
-	// Settles when every apply started so far has. See whenAppliesSettled.
-	private appliesInFlight: Promise<void> = Promise.resolve();
+	// Remote applies run one at a time, in the order they were started (enqueueApply). An
+	// apply decides each cell against its stored record and files that decision last, so
+	// another apply filing in between would leave it overwriting a record it never compared
+	// against (docs/sync-transactions.md § Filing position). Settles when every apply queued
+	// so far has, failed ones included. See whenAppliesSettled.
+	// NOTE: never wait on this queue from inside an apply (applyChanges, drainHeldChanges,
+	// whenAppliesSettled): the wait would be on the apply's own entry. That is why an apply's
+	// own drains (drainReappearedTables) call the change applicator directly.
+	// NOTE: one manager applies one batch at a time; if a busy coordinator's apply latency
+	// ever shows up, serialize per table instead.
+	// NOTE: snapshot applies are not on this queue, so a delta apply can still overlap one.
+	private applyQueue: Promise<void> = Promise.resolve();
 
 	// Settles when every adoption started so far has. A snapshot apply waits on it: see applySnapshot.
 	private adoptionsInFlight: Promise<void> = Promise.resolve();
@@ -778,11 +788,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// observe the drained rows after the capture settle, exactly like the local-change
 		// capture). Outside a live statement (e.g. unit tests over a stub store that never
 		// touches the engine mutex), await inline so the drain completes before returning.
+		// Either way the drain waits its turn on the apply queue. The inline wait never runs
+		// inside an apply: an apply reaches this method only through replicated DDL, which
+		// runs as a statement and so takes the deferred branch.
 		if (reappeared.length > 0) {
 			if (db._isExecuting?.()) {
-				void this.trackApply(drainReappearedTables(this, reappeared));
+				void this.enqueueApply(() => drainReappearedTables(this, reappeared));
 			} else {
-				await this.trackApply(drainReappearedTables(this, reappeared));
+				await this.enqueueApply(() => drainReappearedTables(this, reappeared));
 			}
 		}
 	}
@@ -891,13 +904,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	/** See {@link SyncContext.whenAppliesSettled}. */
 	whenAppliesSettled(): Promise<void> {
-		return this.appliesInFlight;
+		return this.applyQueue;
 	}
 
-	/** The `then` drops the results: keeping them would link every past apply into one growing chain. */
-	private trackApply<T>(applying: Promise<T>): Promise<T> {
-		this.appliesInFlight = Promise.allSettled([this.appliesInFlight, applying]).then(() => undefined);
-		return applying;
+	/** Run `apply` once every apply queued before it has settled. A failure reaches the caller and leaves the queue usable. */
+	private enqueueApply<T>(apply: () => Promise<T>): Promise<T> {
+		const running = this.applyQueue.then(apply);
+		this.applyQueue = running.then(() => undefined, () => undefined);
+		return running;
 	}
 
 	/**
@@ -1954,11 +1968,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// ============================================================================
 
 	async applyChanges(changes: ChangeSet[]): Promise<ApplyResult> {
-		return this.trackApply(applyChangesImpl(this, changes));
+		return this.enqueueApply(() => applyChangesImpl(this, changes));
 	}
 
 	async drainHeldChanges(schema?: string, table?: string): Promise<number> {
-		return this.trackApply(drainHeldChangesImpl(this, schema, table));
+		return this.enqueueApply(() => drainHeldChangesImpl(this, schema, table));
 	}
 
 	async findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>> {
@@ -1978,8 +1992,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * apply writes rows before their records, so adoption would stamp a remote row as a
 	 * local one, and an apply files its metadata as an entry on the chain too, so
 	 * waiting for it from inside would deadlock. From the append on, a new apply queues
-	 * behind this entry, because `applyChanges` waits on the chain first thing. No `await`
-	 * may separate the wait below from the append.
+	 * behind this entry, because an apply waits on the chain first thing once it starts.
+	 * No `await` may separate the wait below from the append.
 	 *
 	 * The caller receives a failure; the chain itself carries on.
 	 */
@@ -1992,18 +2006,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Resolves at a moment when no apply is in flight, rechecking for any that started during the wait.
+	 * Resolves at a moment when no apply is in flight, rechecking for any queued during the wait.
 	 *
-	 * NOTE: an unbroken run of overlapping applies keeps this waiting. A client's broadcasts
+	 * NOTE: an apply queue that never empties keeps this waiting. A client's broadcasts
 	 * come in bursts, so it ends; if a busy server ever starves a first attach, stop admitting
 	 * new applies here instead of rechecking.
 	 */
 	private async appliesDrained(): Promise<void> {
 		let applies: Promise<void>;
 		do {
-			applies = this.appliesInFlight;
+			applies = this.applyQueue;
 			await applies;
-		} while (applies !== this.appliesInFlight);
+		} while (applies !== this.applyQueue);
 	}
 
 	async canDeltaSync(sinceHLC: HLC): Promise<boolean> {

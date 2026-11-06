@@ -162,12 +162,21 @@ differs from its HLC, and a change-log entry stores the HLC as its value under t
 condition, so a fact written here, and every record written before positions existed,
 reads as "filed at its HLC".
 
-**Commit order equals position order.** An apply's data writes are not serialized, but its
-final step is: merging the batch's clock, taking the tick, giving each fact a position and
-writing them all (`commitChangeMetadata` → `fileAtNextTick`) runs as one entry on the same
-chain local capture records on. Without that, an apply could take a tick, be overtaken by
-a later apply that commits first, and then commit below a position some peer had already
-read past. The clock is persisted in that same write: persisted afterwards, a crash
+**Applies run one at a time.** A manager queues every remote apply (`applyChanges`,
+`drainHeldChanges`, and the drain a lens deployment starts) and starts each only once the
+one before it has settled, failed or not. An apply decides each cell against the cell's
+stored record, writes the rows, and files its records last. If a second apply could run
+all three steps in between, the first would file over a record it never compared against
+and leave the second's change-log entry behind, pointing at a record filed elsewhere. An
+apply's own follow-up drains (`drainReappearedTables`) run inside it, off the queue: waiting
+on the queue from inside an apply waits on that apply. Snapshot applies are not queued.
+
+**Commit order equals position order.** An apply's final step, merging the batch's clock,
+taking the tick, giving each fact a position and writing them all (`commitChangeMetadata` →
+`fileAtNextTick`), runs as one entry on the same chain local capture records on. Local
+capture takes its tick inside its own entry, so without that a local commit could take a
+later tick and write first, and the apply would then commit below a position some peer had
+already read past. The clock is persisted in that same write: persisted afterwards, a crash
 between the two would restart the clock below positions already on disk. A batch's schema
 migrations, and the changes it holds for tables this replica lacks (`qt:` entries,
 [sync-unknown-tables.md § Store-and-forward relay](sync-unknown-tables.md#store-and-forward-relay)),

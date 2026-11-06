@@ -99,9 +99,10 @@ export interface SyncContext {
 	nextFilingTick(): Promise<HLC>;
 
 	/**
-	 * Resolves once every remote apply started so far has finished, failed ones
-	 * included. An apply writes rows before their metadata, so until then a row it
-	 * wrote can have no records. Never await this from inside an apply.
+	 * Resolves once every remote apply queued so far has finished, failed ones
+	 * included (applies run one at a time). An apply writes rows before their metadata,
+	 * so until then a row it wrote can have no records. Never await this from inside an
+	 * apply: it would wait on that apply.
 	 */
 	whenAppliesSettled(): Promise<void>;
 

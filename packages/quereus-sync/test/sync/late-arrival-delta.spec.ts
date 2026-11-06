@@ -6,16 +6,9 @@
  */
 
 import { expect } from 'chai';
-import { InMemoryKVStore } from '@quereus/store';
 import { closePeer, collect, COLUMNS_PER_FRESH_INSERT, makePeer, settle, toStream, type Peer } from './_peer-harness.js';
-import { createHLC, maxHLC } from '../../src/clock/hlc.js';
-import { generateSiteId, type SiteId } from '../../src/clock/site.js';
-import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl } from '../../src/sync/events.js';
-import {
-	DEFAULT_SYNC_CONFIG, replyWatermark,
-	type ApplyToStoreCallback, type ChangeSet, type SnapshotChunk, type SyncConfig,
-} from '../../src/sync/protocol.js';
+import { maxHLC } from '../../src/clock/hlc.js';
+import { replyWatermark, type ChangeSet, type SnapshotChunk, type SyncConfig } from '../../src/sync/protocol.js';
 import { deserializeSnapshotChunk, serializeSnapshotChunk } from '../../src/sync/wire.js';
 
 const ORDERS_DDL = 'create table orders (id integer primary key, note text) using store';
@@ -210,57 +203,5 @@ describe('a change that reaches the server after a device read past its write ti
 		await bootstrap(s, b);
 
 		expect(await b.manager.getChangesToPush(server, await b.manager.getPeerSentState(server))).to.deep.equal([]);
-	});
-});
-
-describe('applies that overlap on one replica', () => {
-	const SLOW_ROW = 1;
-	const FAST_ROW = 2;
-
-	function insertOf(writer: SiteId, wallTime: bigint, row: number): ChangeSet {
-		const hlc = createHLC(wallTime, 0, writer);
-		return {
-			siteId: writer,
-			transactionId: `row-${row}`,
-			hlc,
-			changes: [{ type: 'column', schema: 'main', table: 'users', pk: [row], column: 'name', value: 'x', hlc }],
-			schemaMigrations: [],
-		};
-	}
-
-	const rowsIn = (sets: ChangeSet[]): unknown[] => sets.flatMap(cs => cs.changes.map(change => change.pk[0]));
-
-	it('are filed in the order they commit, so a reader between two commits still receives the later one', async () => {
-		let releaseSlowStore!: () => void;
-		const slowStoreReleased = new Promise<void>(resolve => { releaseSlowStore = resolve; });
-		let slowStoreEntered!: () => void;
-		const slowStoreReached = new Promise<void>(resolve => { slowStoreEntered = resolve; });
-		const applyToStore: ApplyToStoreCallback = async (data, schema) => {
-			if (data.some(change => change.pk[0] === SLOW_ROW)) {
-				slowStoreEntered();
-				await slowStoreReleased;
-			}
-			return { dataChangesApplied: data.length, schemaChangesApplied: schema.length, errors: [] };
-		};
-		const server = await SyncManagerImpl.create(
-			new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(), applyToStore,
-		);
-		const writer = generateSiteId();
-		const reader = generateSiteId();
-		const now = BigInt(Date.now());
-
-		// The apply that starts first, and carries the OLDER write, is the one that commits last.
-		const slowApply = server.applyChanges([insertOf(writer, now - 1000n, SLOW_ROW)]);
-		await slowStoreReached;
-		await server.applyChanges([insertOf(writer, now, FAST_ROW)]);
-
-		const betweenCommits = await server.getChangesSince(reader);
-		expect(rowsIn(betweenCommits)).to.deep.equal([FAST_ROW]);
-
-		releaseSlowStore();
-		await slowApply;
-
-		const afterBoth = await server.getChangesSince(reader, replyWatermark(betweenCommits));
-		expect(rowsIn(afterBoth)).to.deep.equal([SLOW_ROW]);
 	});
 });

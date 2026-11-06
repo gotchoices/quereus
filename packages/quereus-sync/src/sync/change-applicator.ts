@@ -1417,10 +1417,11 @@ function collapseInBatchRepeats(ctx: SyncContext, resolvedChanges: readonly Reso
  *
  * Must run as one entry on the commit chain (`SyncContext.onCommitChain`), and so must
  * not wait on the chain itself. The chain is what makes commit order equal position
- * order: without it an apply could take its tick, be overtaken by a later one that
- * commits first, and then commit its own facts below a position some peer has already
- * read past, which that peer would then never ask for. Only this step is on the chain.
- * The apply's data writes run earlier and are not serialized.
+ * order: without it an apply could take its tick, be overtaken by a local commit's
+ * capture that ticks later and commits first, and then commit its own facts below a
+ * position some peer has already read past, which that peer would then never ask for.
+ * Only this step is on the chain. Applies themselves run one at a time (the manager's
+ * apply queue), so no other apply files between this one's decisions and this step.
  *
  * The clock is persisted in the same batch as the positions taken from it: were it
  * written afterwards, a crash between the two would restart the clock below positions
