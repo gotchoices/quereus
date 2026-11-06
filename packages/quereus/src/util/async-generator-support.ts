@@ -17,7 +17,14 @@
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 
-/** True when `finally` code after an `await` ran on an early `return()`. */
+/**
+ * True when `finally` code after an `await` ran on an early `return()`.
+ *
+ * NOTE: probes `return()` only. `Database.close()` also relies on `throw()` reaching the
+ * innermost generator through `yield*` and on its `finally` running after an await (see
+ * `core/interruptible-iteration.ts`); if a host shows close() hanging or skipping a
+ * rollback, extend this probe to cover `throw()`.
+ */
 export async function probeAsyncGeneratorCleanup(): Promise<boolean> {
 	let completed = false;
 	async function* probe(): AsyncGenerator<void> {

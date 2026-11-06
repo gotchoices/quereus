@@ -34,9 +34,12 @@ export class InterruptibleIteration<T> implements AsyncIterableIterator<T> {
 	}
 
 	async return(value?: T | PromiseLike<T>): Promise<IteratorResult<T>> {
+		// Stopping early normally commits; a statement interrupted before this call rolled
+		// back instead. An interrupt that lands during this call queues behind it, so the
+		// commit it waits for is real and is reported as such.
+		const rolledBack = this.interrupted;
 		const result = await this.generator.return(value);
-		// Stopping early normally commits; an interrupted statement rolled back instead.
-		if (this.interrupted) throw closedError();
+		if (rolledBack) throw closedError();
 		return result;
 	}
 

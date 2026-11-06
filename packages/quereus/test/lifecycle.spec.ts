@@ -144,6 +144,22 @@ describe('Database Lifecycle', () => {
 			expect([...db.schemaManager.getSchema('main')!.getAllTables()]).to.deep.equal([]);
 		});
 
+		it('an iterator whose return() is committing when close() lands reports the commit', async () => {
+			const events: string[] = [];
+			const { connection, commitEntered, open } = gatedConnection(events);
+			await db.registerConnection(connection);
+			const it = db.eval("insert into t values (3, 'c') returning id");
+			expect((await it.next()).done).to.equal(false);
+			const stopping = it.return!(undefined);
+			await commitEntered;
+
+			const closing = db.close();
+			open();
+			expect(await stopping).to.deep.equal({ done: true, value: undefined });
+			await closing;
+			expect(events).to.deep.equal(['commit returned', 'disconnect']);
+		});
+
 		it('a module hook may start close() without awaiting it: the statement rejects and close() completes', async () => {
 			let closing: Promise<void> | undefined;
 			let armed = false;

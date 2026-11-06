@@ -918,7 +918,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		throwIfAborted(signal);
 		const releaseMutex = await this._acquireExecMutex();
 		try {
+			// Registered and checked in one synchronous step: a close() that ran after the
+			// acquire's own check missed this iteration, so it must stop here instead.
 			this.serializedIterations.add(iteration);
+			this.checkOpen();
 			yield* this._iterateFinalizing(body);
 		} finally {
 			this.serializedIterations.delete(iteration);
