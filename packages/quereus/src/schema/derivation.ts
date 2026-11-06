@@ -50,12 +50,22 @@ export interface TableDerivation {
 	 * never serialized.
 	 */
 	coarsenedKey?: CoarsenedKeyInfo;
-	/** Qualified (lowercased `schema.table`) names of the source tables the body reads. */
+	/**
+	 * Qualified (lowercased `schema.table`) names of the base tables the body reads —
+	 * including those reached through a plain view, whose body the planner inlines.
+	 */
 	sourceTables: ReadonlyArray<string>;
 	/**
+	 * Qualified (lowercased `schema.view`) names of the plain views the body reads,
+	 * directly or through other views. An inlined view leaves no node in the plan, so
+	 * `sourceTables` cannot name it; dropping one of these marks the table stale.
+	 * Re-derived wherever `sourceTables` is, never serialized.
+	 */
+	sourceViews: ReadonlyArray<string>;
+	/**
 	 * Staleness flag set by the schema-change subscription when a source table is
-	 * modified/removed in a way that may break the body. Runtime state, never
-	 * serialized.
+	 * modified/removed in a way that may break the body, or a view the body reads is
+	 * dropped. Runtime state, never serialized.
 	 */
 	stale?: boolean;
 	/**

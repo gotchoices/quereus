@@ -579,6 +579,7 @@ function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 				bodyHash: '',
 				logicalKey: [],
 				sourceTables: [],
+				sourceViews: [],
 			},
 		};
 	}
@@ -610,6 +611,7 @@ function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 				bodyHash: '',
 				logicalKey: [],
 				sourceTables: [],
+				sourceViews: [],
 			},
 		};
 	}

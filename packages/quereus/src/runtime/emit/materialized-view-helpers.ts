@@ -4,6 +4,7 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
 import { astToString, expressionToString, viewDefinitionToCanonicalString } from '../../emit/ast-stringify.js';
 import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node.js';
+import type { BuildTimeDependencyTracker } from '../../planner/planning-context.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../../planner/nodes/reference.js';
 import { Parser } from '../../parser/parser.js';
 import { keysOf } from '../../planner/util/fd-utils.js';
@@ -101,6 +102,8 @@ export interface BackingShape {
 	ordering?: ReadonlyArray<{ index: number; desc: boolean }>;
 	/** Qualified (lowercased `schema.table`) source tables the body reads. */
 	sourceTables: string[];
+	/** Qualified (lowercased `schema.view`) plain views the body reads, transitively. */
+	sourceViews: string[];
 	/** Present when `primaryKey` is a **collation-coarsened lineage key** — the body
 	 *  has no provable key and the backing identity was derived from source-key
 	 *  lineage with at least one collation-weakened column (the parallel-migration
@@ -162,7 +165,7 @@ function deriveBackingShapeUnguarded(
 ): BackingShape {
 	// Home-schema path: the body's unqualified source names resolve next to the
 	// MV, independent of the session's schema path at re-plan time.
-	const plan = db.getPlan(bodySql, db._homeSchemaPath(schemaName));
+	const { plan, schemaDependencies } = db._getPlanWithDependencies(bodySql, db._homeSchemaPath(schemaName));
 	const root = plan.getRelations()[0];
 	if (!root) {
 		throw new QuereusError('materialized view body produced no relation', StatusCode.INTERNAL);
@@ -241,6 +244,7 @@ function deriveBackingShapeUnguarded(
 		primaryKey,
 		ordering: ordering && ordering.length > 0 ? ordering : undefined,
 		sourceTables: collectSourceTables(plan),
+		sourceViews: collectSourceViews(schemaDependencies),
 		coarsenedKey,
 		allProvedKeys: keys.length > 0 ? keys.map(k => Array.from(k)) : undefined,
 	};
@@ -277,6 +281,15 @@ function collectSourceTables(plan: PlanNode): string[] {
 	};
 	walk(plan);
 	return [...out];
+}
+
+/** Qualified (lowercased) names of every plain view the build inlined. Nested view
+ *  bodies plan under a context that shares the reader's tracker, so the set is
+ *  transitive. */
+function collectSourceViews(deps: BuildTimeDependencyTracker): string[] {
+	return deps.getDependencies()
+		.filter(dep => dep.type === 'view_read')
+		.map(dep => `${dep.schemaName}.${dep.objectName}`.toLowerCase());
 }
 
 /**
@@ -605,6 +618,7 @@ function buildTableDerivation(def: MaterializeViewDefinition, shape: BackingShap
 		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst)),
 		ordering: shape.ordering,
 		sourceTables: shape.sourceTables,
+		sourceViews: shape.sourceViews,
 		stale: false,
 	};
 }
@@ -2259,11 +2273,12 @@ function expandGeneratedDependencyClosure(cols: Set<number>, deps: ReadonlyMap<n
  *     mid-statement, while a co-source's rename has landed but this MV's body
  *     rewrite has not — the rename propagation's own MV loop restores it later).
  *     A DROP COLUMN the body references directly throws here too.
- *  2. `sameSourceTables`: the re-planned source set must equal the recorded one.
- *     An FK drop can un-eliminate a previously FK/PK-eliminated join (growing
- *     the set); a constraint change can let `ruleFilterContradiction` fold a
- *     source out of the plan entirely (shrinking it). Either way the record is
- *     out of sync with the body's plan — leave it to REFRESH, which re-derives.
+ *  2. `describeSourceDrift`: the re-planned source tables and source views must
+ *     equal the recorded ones. An FK drop can un-eliminate a previously
+ *     FK/PK-eliminated join (growing the set); a constraint change can let
+ *     `ruleFilterContradiction` fold a source out of the plan entirely (shrinking
+ *     it). Either way the record is out of sync with the body's plan — leave it to
+ *     REFRESH, which re-derives.
  *  3. `backingColumnsStructurallyMatch` + `isBackingPkASuperkeyInShape`: the column
  *     structural attributes (type / not-null / collation) must match positionally,
  *     AND the live backing's physical PK column set must be a superkey of the
@@ -2319,9 +2334,10 @@ export function tryRecompileMaterializedViewLive(
 		const backing = isMaintainedTable(live) ? live : mv;
 		const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns,
 			{ moduleName: mv.vtabModuleName, moduleArgs: mv.vtabArgs, against: backing });
-		if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
-			log('Marking materialized view %s.%s stale instead of recompiling: re-planned source tables (%s) disagree with the recorded set (%s) — REFRESH re-derives',
-				mv.schemaName, mv.name, shape.sourceTables.join(', '), d.sourceTables.join(', '));
+		const sourceDrift = describeSourceDrift(d, shape);
+		if (sourceDrift) {
+			log('Marking materialized view %s.%s stale instead of recompiling: %s — REFRESH re-derives',
+				mv.schemaName, mv.name, sourceDrift);
 			return false;
 		}
 		const mismatch = describeBackingShapeMismatch(backing, shape);
@@ -2849,7 +2865,7 @@ async function reshapeBackingInPlace(
 	mv.derivation.logicalKey = shape.primaryKey;
 	mv.derivation.coarsenedKey = shape.coarsenedKey;
 	mv.derivation.ordering = shape.ordering;
-	mv.derivation.sourceTables = shape.sourceTables;
+	adoptShapeSources(mv.derivation, shape);
 	let live: MaintainedTableSchema = graftReshapedRecord(current, mv);
 	schema.addTable(live);
 
@@ -3333,9 +3349,10 @@ export async function restoreUnaffectedMaterializedViews(
 			// re-key leaves the OLD derivation (un-re-keyed `sourceTables`) holding the
 			// rewritten body. Registering that would compute `sourceScope` (and key the
 			// read-side rewrite) off the wrong bases — leave it stale instead.
-			if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
-				log('Leaving materialized view %s.%s stale after rename: recorded sourceTables disagree with the re-planned body — REFRESH recovers',
-					mv.schemaName, mv.name);
+			const sourceDrift = describeSourceDrift(d, shape);
+			if (sourceDrift) {
+				log('Leaving materialized view %s.%s stale after rename: %s — REFRESH recovers',
+					mv.schemaName, mv.name, sourceDrift);
 				continue;
 			}
 			const backing = schema.getTable(mv.name);
@@ -3359,9 +3376,29 @@ export async function restoreUnaffectedMaterializedViews(
 	}
 }
 
-/** Set-equality over qualified (already-lowercased) source-table lists. Order is
- *  irrelevant — both sides come from `collectSourceTables`' Set walk. */
-function sameSourceTables(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
+/** Why the derivation's recorded source sets disagree with a re-planned `shape`, or
+ *  null when both agree. A disagreement means the record no longer describes the
+ *  body's plan, so only a REFRESH (which re-derives the record) may revive it. */
+function describeSourceDrift(d: TableDerivation, shape: BackingShape): string | null {
+	if (!sameNameSet(d.sourceTables, shape.sourceTables)) {
+		return `re-planned source tables (${shape.sourceTables.join(', ')}) disagree with the recorded set (${d.sourceTables.join(', ')})`;
+	}
+	if (!sameNameSet(d.sourceViews, shape.sourceViews)) {
+		return `re-planned source views (${shape.sourceViews.join(', ')}) disagree with the recorded set (${d.sourceViews.join(', ')})`;
+	}
+	return null;
+}
+
+/** Records `shape`'s source sets on the derivation — the two travel together, since
+ *  the schema-change listener stales a table off either one. */
+export function adoptShapeSources(d: TableDerivation, shape: BackingShape): void {
+	d.sourceTables = shape.sourceTables;
+	d.sourceViews = shape.sourceViews;
+}
+
+/** Set-equality over qualified (already-lowercased) name lists. Order is irrelevant —
+ *  both sides come from a Set-deduplicated collection. */
+function sameNameSet(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
 	if (a.length !== b.length) return false;
 	const set = new Set(a);
 	return b.every(s => set.has(s));

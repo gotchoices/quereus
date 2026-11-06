@@ -2531,6 +2531,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * schema instead of the caller's path. See {@link _homeSchemaPath}.
 	 */
 	getPlan(sqlOrAst: string | AST.AstNode, schemaPath?: string[]): PlanNode {
+		return this._getPlanWithDependencies(sqlOrAst, schemaPath).plan;
+	}
+
+	/**
+	 * @internal {@link getPlan}, also returning the build's schema dependencies — what a
+	 * caller needs to learn which objects the build resolved but the optimized tree no
+	 * longer names (an inlined view body records a `view_read` there and leaves no node).
+	 */
+	_getPlanWithDependencies(sqlOrAst: string | AST.AstNode, schemaPath?: string[]): { plan: PlanNode; schemaDependencies: BuildTimeDependencyTracker } {
 		this.checkOpen();
 
 		let ast: AST.AstNode;
@@ -2550,11 +2559,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			ast = sqlOrAst;
 		}
 
-		const { plan } = this._buildPlan([ast as AST.Statement], undefined, schemaPath);
+		const { plan, schemaDependencies } = this._buildPlan([ast as AST.Statement], undefined, schemaPath);
 
-		if (plan.statements.length === 0) return plan; // No-op for this AST
+		if (plan.statements.length === 0) return { plan, schemaDependencies }; // No-op for this AST
 
-		return this.optimizer.optimize(plan, this) as BlockNode;
+		return { plan: this.optimizer.optimize(plan, this) as BlockNode, schemaDependencies };
 	}
 
 	/**

@@ -1,0 +1,38 @@
+-- 53.5-materialized-view-over-view-redefine.sqllogic — a materialized view whose body
+-- reads a plain view goes stale when that view is dropped. The planner inlines the view's
+-- body into the maintenance plan, so without this the plan kept computing the dropped
+-- view's definition, even after a new view of the same name was created with a different
+-- body. Stale serves the last snapshot until REFRESH re-derives it from the current view.
+
+create table T (Id integer primary key, N integer);
+insert into T values (1, 10);
+create view V1 as select sum(N) as S from T;
+create materialized view M as select S from V1;
+
+drop view V1;
+create view V1 as select sum(N) + 1 as S from T;
+
+-- stale: the snapshot from the old body, and writes no longer propagate
+select S from M;
+→ [{"S":10}]
+
+insert into T values (2, 1);
+select S from M;
+→ [{"S":10}]
+
+-- REFRESH re-derives the rows from the new body and resumes maintenance under it
+refresh materialized view M;
+select S from M;
+→ [{"S":12}]
+
+insert into T values (3, 1);
+select S from M;
+→ [{"S":13}]
+
+-- dropped with nothing recreated: the body no longer plans
+drop view V1;
+select S from M;
+-- error: is stale
+
+drop materialized view M;
+drop table T;

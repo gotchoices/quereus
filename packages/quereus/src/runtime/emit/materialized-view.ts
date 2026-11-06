@@ -24,6 +24,7 @@ import {
 	backingShapeMatches,
 	revalidateBody,
 	unlinkCoveredUniqueConstraints,
+	adoptShapeSources,
 } from './materialized-view-helpers.js';
 
 /**
@@ -215,6 +216,9 @@ export async function refreshMaintainedTable(db: Database, mv: MaintainedTableSc
 	let live: MaintainedTableSchema = mv;
 	if (backingShapeMatches(mv, shape)) {
 		// FAST PATH: shape unchanged — data-only swap, table identity + caches preserved.
+		// The sources may still have moved (a view the body reads was dropped and
+		// recreated over other tables), and registration below keys off the record.
+		adoptShapeSources(d, shape);
 		await rebuildBacking(db, mv);
 	} else {
 		// RESHAPE: the shape shifted — reconcile the live table to the re-planned

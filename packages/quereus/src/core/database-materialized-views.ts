@@ -165,30 +165,12 @@ export class MaterializedViewManager {
 					// reading it remain correct (a plan reading the *source* invalidates via its own
 					// direct statement dependency on the source table). Any failure (shape mismatch,
 					// content not provably stable, ineligible re-plan, body-function drift) falls
-					// through to the stale path below, verbatim — which is why that path is written
-					// to be idempotent: drift already applied the stale transition inside
-					// registration, so the fall-through re-asserts rather than initiates it.
+					// through to the stale transition below — idempotent, because drift already
+					// applied it inside registration, so the fall-through re-asserts rather than
+					// initiates it.
 					if (modified !== undefined && !mv.derivation.stale
 						&& tryRecompileMaterializedViewLive(this.ctx as unknown as Database, mv, modified.oldObject, modified.newObject)) continue;
-					if (!mv.derivation.stale) {
-						mv.derivation.stale = true;
-						log('Marked materialized view %s.%s stale due to %s on %s', mv.schemaName, mv.name, event.type, changed);
-					}
-					// A source schema change invalidates the compiled row-time plan;
-					// detach it. The MV reads "stale" until refreshed or recreated,
-					// which re-registers it.
-					this.releaseRowTime(mvKey(mv.schemaName, mv.name));
-					// Invalidate any cached prepared-statement plan reading this MV's
-					// backing table so it recompiles and re-hits the build-time `stale`
-					// guard (see emitBackingInvalidation). This is load-bearing for a plan
-					// compiled while the MV was NOT stale: its only schema dependency is the
-					// backing table, which the source event never names. (A plan compiled
-					// while already stale instead carries a direct dependency on the source —
-					// the while-stale build-time re-validation resolves and records it — so
-					// the emit is defensive redundancy there, not a correctness requirement.)
-					// Emitting per qualifying event (rather than only on the false→true
-					// transition) also re-propagates the cascade down an MV-over-MV chain.
-					this.emitBackingInvalidation(mv);
+					this.markMaterializedViewStale(mv, `${event.type} on ${changed}`);
 				}
 				// Rebuild any derived-row validator that depends on the changed table as a
 				// CONSTRAINT-ONLY dependency (FK parent / subquery-CHECK target — never a
@@ -210,6 +192,19 @@ export class MaterializedViewManager {
 				// directly. The table is already in the catalog when this fires.
 				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
 				this.rebuildConstraintValidatorsFor(changed, /*matchOwnName*/ false);
+			} else if (event.type === 'view_removed') {
+				// A plain view the body reads (directly or through other views) was dropped.
+				// The planner inlined its body into the row-time plan, so that plan keeps
+				// computing the old definition. No recompile is attempted: a later view of
+				// the same name may carry a different body, and the backing rows came from
+				// this one — only REFRESH re-derives them. No `view_added` / `view_modified`
+				// arm: a view cannot be redefined in place, so a redefinition always passes
+				// through this drop, and `view_modified` fires only for tag changes and the
+				// rename propagation's semantics-preserving rewrite.
+				const removed = `${event.schemaName}.${event.objectName}`.toLowerCase();
+				for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
+					if (mv.derivation.sourceViews.includes(removed)) this.markMaterializedViewStale(mv, `${event.type} on ${removed}`);
+				}
 			} else if (event.type === 'materialized_view_removed') {
 				this.releaseRowTime(mvKey(event.schemaName, event.objectName));
 			}
@@ -441,19 +436,33 @@ export class MaterializedViewManager {
 	}
 
 	/**
-	 * Force-mark an MV stale: set the flag, detach its row-time plan, and invalidate
-	 * cached prepared-statement plans reading its backing so the next reference
-	 * re-hits the build-time stale guard. Mirrors the schema-change listener's stale
-	 * transition exactly; exposed for the ALTER … RENAME propagation failure path
-	 * (a dependent MV whose in-place body rewrite / backing rename / re-registration
-	 * failed mid-way must not keep serving its backing as if live).
+	 * Mark an MV stale: set the flag, detach its row-time plan, and invalidate cached
+	 * prepared-statement plans reading its backing so the next reference re-hits the
+	 * build-time stale guard. The schema-change listener's stale transition (a source
+	 * change the MV cannot survive live); also exposed for the ALTER … RENAME
+	 * propagation failure path (a dependent MV whose in-place body rewrite / backing
+	 * rename / re-registration failed mid-way must not keep serving its backing as if
+	 * live). `reason` only feeds the log.
+	 *
+	 * Idempotent — over an already-stale MV it re-releases (nothing) and re-emits the
+	 * invalidation — because the keep-live recompile's decline paths fall through to it
+	 * after some of them already applied the transition.
 	 */
-	markMaterializedViewStale(mv: MaintainedTableSchema): void {
+	markMaterializedViewStale(mv: MaintainedTableSchema, reason = 'forced'): void {
 		if (!mv.derivation.stale) {
 			mv.derivation.stale = true;
-			log('Marked materialized view %s.%s stale (forced)', mv.schemaName, mv.name);
+			log('Marked materialized view %s.%s stale (%s)', mv.schemaName, mv.name, reason);
 		}
+		// The compiled row-time plan is now wrong; detach it. The MV reads "stale" until
+		// refreshed or recreated, which re-registers it.
 		this.releaseRowTime(mvKey(mv.schemaName, mv.name));
+		// Load-bearing for a plan compiled while the MV was NOT stale: its only schema
+		// dependency is the backing table, which the source event never names. (A plan
+		// compiled while already stale instead carries a direct dependency on the source —
+		// the while-stale build-time re-validation resolves and records it — so the emit
+		// is defensive redundancy there.) Emitting on every call, not only on the
+		// false→true transition, also re-propagates the cascade down an MV-over-MV chain.
+		// See emitBackingInvalidation.
 		this.emitBackingInvalidation(mv);
 	}
 

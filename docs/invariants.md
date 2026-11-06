@@ -951,7 +951,8 @@ Reporting a change against a maintained table is out of contract; its contents a
 
 A source schema change that a body provably cannot observe recompiles the view in place;
 anything else marks it **stale** and detaches its row-time plan, so it serves its last
-snapshot and source writes stop propagating. A re-registration that resolves a body function
+snapshot and source writes stop propagating. Dropping a plain view the body reads (directly or
+through other views) stales it the same way. A re-registration that resolves a body function
 to a different registration than the one that produced the stored rows stales the view too
 ([body-function drift](mv-schema-change.md#body-function-drift)). `stale` is the only
 read-state flag. Staleness
