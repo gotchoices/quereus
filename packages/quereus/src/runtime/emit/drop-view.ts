@@ -65,7 +65,8 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 				);
 			}
 
-			// Fire view_removed so a store-backed catalog can forget this view. Fired
+			// Fire view_removed so a store-backed catalog can forget this view and the
+			// materialized-view manager can stale every MV whose body inlined it. Fired
 			// here (not from Schema.removeView) to mirror create-view's emitter-scoped
 			// view_added. Not reached on the IF EXISTS no-op above.
 			if (removed && existingView) {
