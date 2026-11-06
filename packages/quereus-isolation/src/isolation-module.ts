@@ -1238,7 +1238,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			throw new QuereusError(`Isolation layer: underlying table '${schemaName}.${tableName}' cannot be scanned for its committed rows`, StatusCode.INTERNAL);
 		}
 		const { savepointsByDepth } = this.overlayRowSources(db, state.underlyingTable, overlayState, ddl, tableName);
-		return { transaction, savepoints: savepointsByDepth.map(frame => frame ?? transaction) };
+		// `savepointRowSources` may stop short of the open depth (a missing entry restores the
+		// committed rows); `RestorableRowStates.savepoints` owes one entry per depth.
+		const depth = (db as DatabaseInternal).getActiveSavepointDepth();
+		const savepoints = Array.from({ length: depth }, (_, i) => savepointsByDepth[i] ?? transaction);
+		return { transaction, savepoints };
 	}
 
 	/**

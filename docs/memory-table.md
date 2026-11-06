@@ -257,8 +257,8 @@ the same check then runs, on its own, over each *restorable state*: the base (wh
 whole-transaction rollback restores) and the layer each **open** savepoint would reinstate (what
 `rollback to` restores — `MemoryTableConnection.savepointRestoreLayersByDepth`, which walks the
 savepoint *stack* rather than the layer chain, because a released savepoint cannot be rolled back
-to and its snapshot is not a restorable state even though it stays in the chain). A violation confined to a
-restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rows this
+to and its snapshot is not a restorable state even though it stays in the chain). A violation
+confined to a restorable state refuses the statement with `BUSY`: `Cannot <statement> on table t: rows this
 transaction has deleted or overwritten would violate it if the transaction rolled back. Commit the
 pending writes first, then retry.` (`rolledBackRowsWouldViolate` in `vtab/rollback-states.ts`,
 reached from every site through `judgeRestorableStates`) — the same retryable posture as rule 3,

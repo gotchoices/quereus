@@ -140,7 +140,7 @@ export class Statement {
 	 * `PlanningContext.rowSourceOverrides`). Set right after `db.prepare(...)`, under the same
 	 * deferred-compile reasoning as {@link _schemaPathOverride}, by exactly one site: the
 	 * existing-row CHECK scan run over each state a rollback could restore
-	 * (`validateChecksOverExistingRows`, `schema/constraint-builder.ts`), so that pass re-runs the
+	 * (`scanChecksOverRows`, `schema/constraint-builder.ts`), so that pass re-runs the
 	 * very SQL the effective pass ran.
 	 */
 	_rowSourceOverrides?: RowSourceOverrides;

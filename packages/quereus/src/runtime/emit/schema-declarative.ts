@@ -852,7 +852,12 @@ async function revalidateChecksOverRecreatedObjects(db: Database, schemaName: st
 	return undefined;
 }
 
-/** The error for a CHECK that fails over a recreated object: it names the CHECK and what it reads, since its own body may not mention that object. */
+/**
+ * The error for a CHECK that fails over a recreated object: it names the CHECK and what it reads, since its own body may not mention that object.
+ *
+ * NOTE: flattens to ERROR like every apply-schema failure (see the NOTE in `executeMigrationStep`), so a retryable `BUSY` from a
+ * rollback state (`rolledBackRowsWouldViolate`) survives only on `cause` and in the message; propagate the inner code if a caller ever keys on it.
+ */
 function recreatedObjectBrokeCheck(reaching: CheckReachingObjects, schemaName: string, cause: unknown): QuereusError {
 	const objects = reaching.reached.map(({ key, path }) => `'${key}'${describeReachPath(path)}`).join(', ');
 	const on = describeDependentTable(reaching.table, schemaName);

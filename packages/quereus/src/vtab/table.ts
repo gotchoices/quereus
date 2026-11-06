@@ -272,10 +272,11 @@ export abstract class VirtualTable {
 	 * For each open savepoint, indexed by its depth (the index passed to {@link savepoint}): the
 	 * rows this table would show its connection after `rollback to` that savepoint, or undefined
 	 * when that rollback restores the table's committed rows (the connection had staged nothing
-	 * here yet); a depth past the end of the list restores them too. Entries may share one stream. A wrapper module that stages a connection's writes
-	 * in a table of another module (the isolation layer's overlay) reads this off the staging
-	 * table to build {@link IssuerRowSources.savepoints} for a row-validating DDL on the wrapped
-	 * module, and the per-depth states its `restorableRowStates` reports.
+	 * here yet); a depth past the end of the list restores them too. Entries may share one stream.
+	 * A wrapper module that stages a connection's writes in a table of another module (the
+	 * isolation layer's overlay) reads this off the staging table to build
+	 * {@link IssuerRowSources.savepoints} for a row-validating DDL on the wrapped module, and the
+	 * per-depth states its `restorableRowStates` reports.
 	 *
 	 * Optional; a module without it cannot serve as a staging overlay for row-validating DDL under
 	 * open savepoints — the isolation layer refuses such a DDL with `BUSY` rather than leave a
