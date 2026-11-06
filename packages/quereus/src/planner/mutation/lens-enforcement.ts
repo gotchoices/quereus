@@ -1128,6 +1128,12 @@ function buildNullSafeEquality(col: string): AST.Expression {
  * rejected, while a NULL→NULL no-op still short-circuits true. DELETE never gets this
  * guard — there NEW is all-NULL, so on a NULL OLD key `OLD ≡ NEW` would now be true and
  * wrongly short-circuit; op-specific synthesis keeps DELETE on the plain `NOT EXISTS`.
+ *
+ * NOTE: `OLD.p = NEW.p` compares under the parent basis column's collation, while the runtime
+ * sites (`referencedKeyValueChanged`) use the FK's collation resolved over child + parent. They
+ * agree unless the NOCASE is declared on the logical child column alone; then this guard counts a
+ * case-only parent rename as a key change and rejects it where the physical route accepts it
+ * (over-rejection, never an orphan). If that case matters, add an explicit `collate` per column here.
  */
 function buildParentSideUpdateGuard(parentBasisColumns: readonly string[], notExists: AST.Expression): AST.Expression {
 	const equalities: AST.Expression[] = parentBasisColumns.map(buildNullSafeEquality);

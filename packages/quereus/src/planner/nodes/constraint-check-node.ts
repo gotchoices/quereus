@@ -10,6 +10,15 @@ import type { RowConstraintSchema } from '../../schema/table.js';
 import type { ConflictResolution } from '../../common/constants.js';
 import type { Expression } from '../../parser/ast.js';
 
+/** One parent-table column a parent-side FK check references. */
+export interface ReferencedKeyColumn {
+  /** Parent-table column index. */
+  readonly index: number;
+  /** Collation under which an old and a new value are the same key for the FK
+   *  (`undefined` ⇒ value identity) — see `ForeignKeyColumnComparison.keyEquality`. */
+  readonly keyEquality: string | undefined;
+}
+
 export interface ConstraintCheck {
   constraint: RowConstraintSchema;  // The constraint metadata
   expression: ScalarPlanNode;       // Pre-built expression node
@@ -18,13 +27,9 @@ export interface ConstraintCheck {
   needsDeferred: boolean;            // Whether this constraint must be deferred (subquery, committed ref, etc.)
   /** Constraint class for conflict-resolution dispatch at runtime. */
   kind?: 'check' | 'fk-child' | 'fk-parent';
-  /** For 'fk-parent' UPDATE checks: parent-table column indices the FK references.
-   *  When set, the runtime can skip the check when none of these indices changed. */
-  referencedColumnIndices?: ReadonlyArray<number>;
-  /** For 'fk-parent' UPDATE checks, aligned with {@link referencedColumnIndices}: the
-   *  collation under which an old and a new value are the same key for the FK
-   *  (`undefined` ⇒ value identity) — see `ForeignKeyColumnComparison.keyEquality`. */
-  referencedKeyEqualities?: ReadonlyArray<string | undefined>;
+  /** For 'fk-parent' UPDATE checks: the parent-table columns the FK references. When
+   *  set, the runtime skips the check when none of them changed to a different key. */
+  referencedKeyColumns?: ReadonlyArray<ReferencedKeyColumn>;
   /**
    * Verbatim violation text for a SYNTHESIZED check whose expression would
    * otherwise be reported as-is and mean nothing to the user (nobody wrote it).

@@ -1,4 +1,4 @@
-import type { ConstraintCheck } from '../planner/nodes/constraint-check-node.js';
+import type { ConstraintCheck, ReferencedKeyColumn } from '../planner/nodes/constraint-check-node.js';
 import type { RuntimeContext } from './types.js';
 import type { Row, SqlValue, OutputValue } from '../common/types.js';
 import { ConstraintError, constraintErrorForAction } from '../common/errors.js';
@@ -41,10 +41,8 @@ export interface ConstraintMetadataEntry {
 	baseTable: string;
 	contextDescriptor?: RowDescriptor; // Mutation context row descriptor
 	kind: 'check' | 'fk-child' | 'fk-parent';
-	/** For 'fk-parent' UPDATE checks: parent-table column indices the FK references. */
-	referencedColumnIndices?: ReadonlyArray<number>;
-	/** Aligned with `referencedColumnIndices`: the FK's key equality per column. */
-	referencedKeyEqualities?: ReadonlyArray<string | undefined>;
+	/** For 'fk-parent' UPDATE checks: the parent-table columns the FK references. */
+	referencedKeyColumns?: ReadonlyArray<ReferencedKeyColumn>;
 	/** Verbatim violation text carried from a synthesized {@link ConstraintCheck}
 	 *  (see {@link constraintViolationMessage}). */
 	violationMessage?: string;
@@ -160,8 +158,7 @@ export function buildConstraintMetadata(
 		baseTable: `${tableSchema.schemaName}.${tableSchema.name}`,
 		contextDescriptor,
 		kind: check.kind ?? 'check',
-		referencedColumnIndices: check.referencedColumnIndices,
-		referencedKeyEqualities: check.referencedKeyEqualities,
+		referencedKeyColumns: check.referencedKeyColumns,
 		violationMessage: check.violationMessage,
 		messageValued: check.messageValued,
 	}));
@@ -291,19 +288,17 @@ async function checkNotNullConstraints(
  */
 function fkParentKeyChanged(
 	rctx: RuntimeContext,
-	metadata: ConstraintMetadataEntry,
-	referencedColumnIndices: ReadonlyArray<number>,
+	referencedKeyColumns: ReadonlyArray<ReferencedKeyColumn>,
 	numCols: number,
 	flatRow: Row,
 ): boolean {
 	const resolveCollation = rctx.db.getCollationResolver();
-	for (let i = 0; i < referencedColumnIndices.length; i++) {
-		const colIdx = referencedColumnIndices[i];
-		const oldVal = flatRow[colIdx] as SqlValue;           // OLD section: 0..n-1
-		const newVal = flatRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
-		if (referencedKeyValueChanged(oldVal, newVal, metadata.referencedKeyEqualities?.[i], resolveCollation)) return true;
-	}
-	return false;
+	return referencedKeyColumns.some(({ index, keyEquality }) => referencedKeyValueChanged(
+		flatRow[index] as SqlValue,           // OLD section: 0..n-1
+		flatRow[numCols + index] as SqlValue, // NEW section: n..2n-1
+		keyEquality,
+		resolveCollation,
+	));
 }
 
 async function checkCheckConstraints(
@@ -335,8 +330,8 @@ async function checkCheckConstraints(
 		if (
 			scope.operation === RowOpFlag.UPDATE &&
 			metadata.kind === 'fk-parent' &&
-			metadata.referencedColumnIndices &&
-			!fkParentKeyChanged(rctx, metadata, metadata.referencedColumnIndices, tableSchema.columns.length, flatRow)
+			metadata.referencedKeyColumns &&
+			!fkParentKeyChanged(rctx, metadata.referencedKeyColumns, tableSchema.columns.length, flatRow)
 		) {
 			continue;
 		}

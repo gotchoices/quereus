@@ -375,7 +375,7 @@ export function buildParentSideFKChecks(
 
 		// For UPDATE, the runtime skips this check when none of `parentColIndices`
 		// changed to a different key for the FK (see runtime/row-constraints.ts —
-		// a NOCASE-equal re-key is unchanged; `referencedKeyEqualities` below).
+		// a NOCASE-equal re-key is unchanged; `referencedKeyColumns` below).
 
 		// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
 		const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);
@@ -444,9 +444,10 @@ export function buildParentSideFKChecks(
 				initiallyDeferred: !isRestrict,
 				needsDeferred: !isRestrict, // RESTRICT must be immediate, not deferred
 				kind: 'fk-parent',
-				referencedColumnIndices: parentColIndices,
-				referencedKeyEqualities: parentColIndices.map((parentIdx, i) =>
-					foreignKeyColumnComparison(childTable.columns[fk.columns[i]], tableSchema.columns[parentIdx]).keyEquality),
+				referencedKeyColumns: parentColIndices.map((index, i) => ({
+					index,
+					keyEquality: foreignKeyColumnComparison(childTable.columns[fk.columns[i]], tableSchema.columns[index]).keyEquality,
+				})),
 			});
 		} finally {
 			if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);
