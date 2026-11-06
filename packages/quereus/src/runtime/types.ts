@@ -70,8 +70,10 @@ export type RuntimeContext = {
 	planStack?: PlanNode[];
 	/**
 	 * Per-execution memo for instructions that must fire exactly once per statement
-	 * execution — the impure (DML-bearing) scalar/`IN`/`EXISTS` subquery emitters
-	 * store their drained result here, keyed by a unique symbol minted at emit time.
+	 * execution — the impure (DML-bearing) scalar/`EXISTS` subquery emitters store
+	 * their drained answer here, keyed by a unique symbol minted at emit time. (The
+	 * impure `IN` emitter's answer depends on each probe value, so it memoizes its
+	 * drained membership set in {@link inSetProbes} instead.)
 	 * Because a fresh RuntimeContext is built for each execution while the instruction
 	 * tree is cached and reused, tying the memo to the context (not the emit-time
 	 * closure) makes it reset between prepared-statement runs — so a re-executed
@@ -128,19 +130,19 @@ export type RuntimeContext = {
 	 */
 	cteMaterializations?: Map<TableDescriptor, Promise<Row[]>>;
 	/**
-	 * Per-execution materialized lookup sets for uncorrelated, functional
-	 * `x IN (subquery)` probes ({@link import('./emit/subquery.js').emitIn}), keyed
-	 * by a stable symbol minted in the emitter closure. The subquery source is
-	 * drained exactly once per statement execution into a `BTree` keyed under the
-	 * membership collation, then probed per outer row — O(K + N·log K) with zero
-	 * statistics, replacing the retired row-cache-plus-linear-scan mechanism. A
-	 * fresh RuntimeContext per execution resets the map between prepared-statement
-	 * runs, so a re-executed statement re-drains and observes current data.
-	 * `hasNull` records whether the inner produced any NULL — needed for
-	 * three-valued membership (a miss yields NULL when the inner had a NULL, else
-	 * false). Mirrors {@link executionMemo} / {@link cacheStates}.
+	 * Per-execution materialized lookup sets for `x IN (subquery)` probes
+	 * ({@link import('./emit/subquery.js').emitIn}), keyed by a stable symbol minted
+	 * in the emitter closure. Two `emitIn` paths use it: the uncorrelated, functional
+	 * set probe, and the impure (DML-bearing) path, whose run-once contract is this
+	 * slot — the inner DML is drained exactly once per statement execution and every
+	 * later evaluation probes the stored set. The subquery source is drained into a
+	 * `BTree` keyed under the membership collation, then probed per outer row —
+	 * O(K + N·log K) with zero statistics. A fresh RuntimeContext per execution
+	 * resets the map between prepared-statement runs, so a re-executed statement
+	 * re-drains (and re-fires its DML) and observes current data. Mirrors
+	 * {@link executionMemo} / {@link cacheStates}.
 	 */
-	inSetProbes?: Map<symbol, { tree: BTree<SqlValue, SqlValue>; hasNull: boolean }>;
+	inSetProbes?: Map<symbol, InMembershipSet>;
 	/**
 	 * Per-execution work-counter collector; present only when `enableMetrics` is on
 	 * AND the execution site built one (`Statement._iterateRowsRawInternal`). The
@@ -162,6 +164,14 @@ export type RuntimeContext = {
 	 */
 	cardinalityObservations?: CardinalityObservations;
 };
+
+/** The drained right-hand side of one `x IN (subquery)` site; see {@link RuntimeContext.inSetProbes}. */
+export interface InMembershipSet {
+	/** Member keys (after the site's member key transform), ordered under the membership collation. */
+	readonly tree: BTree<SqlValue, SqlValue>;
+	/** Whether the inner produced a NULL member, or one that converted to NULL — a miss is then NULL, not false. */
+	readonly hasNull: boolean;
+}
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;
 

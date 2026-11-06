@@ -1,12 +1,12 @@
 import type { InNode, ExistsNode, ScalarSubqueryNode } from '../../planner/nodes/subquery.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { InMembershipSet, Instruction, InstructionRun, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { SqlValue, Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { compareSqlValuesFast, hasSemanticOrdering, semanticKeyTransform } from '../../util/comparison.js';
+import { compareSqlValuesFast, hasSemanticOrdering, semanticKeyTransform, type CollationFunction } from '../../util/comparison.js';
 import { createValueSet } from '../../util/value-set.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
@@ -18,7 +18,9 @@ import { comparandConverter, lenientCast } from '../../types/cast-semantics.js';
 import { isComparandSource } from '../../types/comparison-coercion.js';
 
 /**
- * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
+ * Once-per-execution answer memo for impure (DML-bearing) scalar and `EXISTS`
+ * subquery inners, whose answer does not depend on the outer row (impure `IN`
+ * memoizes its membership set instead — see {@link membershipSetFor}). The cell
  * lives on the {@link RuntimeContext} — rebuilt for every statement execution —
  * keyed by a symbol minted per emit site. This is what makes the "run-once per
  * execution" contract hold when the instruction tree is cached and reused across
@@ -250,6 +252,61 @@ function inMembershipKeys(plan: InNode): InMembershipKeys {
 	return transform ? { probe: transform, member: transform, note: ' semantic' } : IDENTITY_KEYS;
 }
 
+/** Applies a membership key transform; NULL stays NULL (UNKNOWN) without reaching the transform. */
+function membershipKey(value: SqlValue, transform: (value: SqlValue) => SqlValue): SqlValue {
+	return value === null ? null : transform(value);
+}
+
+/**
+ * Drains an `IN` subquery's rows into a membership set keyed under the membership
+ * collation. Consumes every row (no early exit), which the impure path's
+ * full-drain contract depends on.
+ */
+async function drainMembershipSet(
+	input: AsyncIterable<Row>,
+	collation: CollationFunction,
+	memberKey: (value: SqlValue) => SqlValue,
+): Promise<InMembershipSet> {
+	const tree = createValueSet<SqlValue>((a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation));
+	let hasNull = false;
+	for await (const row of input) {
+		if (row.length === 0) continue;
+		// A member that coerces to NULL is not a member — it makes the miss case
+		// UNKNOWN, exactly as a literal inner NULL does.
+		const rowKey = membershipKey(row[0], memberKey);
+		if (rowKey === null) {
+			hasNull = true;
+		} else {
+			// Duplicate keys are a no-op insert — the set only tracks membership.
+			tree.insert(rowKey);
+		}
+	}
+	return { tree, hasNull };
+}
+
+/** The `slot`'s membership set for this execution, draining `input` into it on first use. */
+async function membershipSetFor(
+	rctx: RuntimeContext,
+	slot: symbol,
+	input: AsyncIterable<Row>,
+	collation: CollationFunction,
+	memberKey: (value: SqlValue) => SqlValue,
+): Promise<InMembershipSet> {
+	const existing = rctx.inSetProbes?.get(slot);
+	if (existing) return existing;
+	const built = await drainMembershipSet(input, collation, memberKey);
+	(rctx.inSetProbes ??= new Map()).set(slot, built);
+	return built;
+}
+
+/** Three-valued membership: hit → true; miss → NULL if the inner had a NULL, else false. */
+function probeMembership(members: InMembershipSet, conditionKey: SqlValue): SqlValue {
+	if (members.tree.find(conditionKey).on) {
+		return true;
+	}
+	return members.hasNull ? null : false;
+}
+
 export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 	// ONE collation for the whole membership test (condition vs every RHS
 	// value), resolved through the shared provenance lattice — the BTree build
@@ -266,47 +323,21 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 		const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.source);
 
 		if (isImpure) {
-			// Impure inner: fully drain (no short-circuit on match) so every
-			// write fires, and memoize (once per execution, on the RuntimeContext)
-			// so re-evaluation does not re-drive the DML.
-			const memoKey = Symbol('IN(impure)');
+			// Impure inner: drain it fully (every write fires) exactly once per
+			// execution into a membership set, then probe that set per call. The set,
+			// not the answer, is what is memoized — the answer depends on each call's
+			// condition, so replaying the first call's answer would be wrong for every
+			// other outer row.
+			const setSlot = Symbol('IN(impure)');
 
 			async function runImpure(rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
-				const memoized = readExecutionMemo(rctx, memoKey);
-				if (memoized) return memoized.value;
-
-				let matched = false;
-				let hasNull = false;
-				// Keyed FIRST, then null-checked: a coercion can yield NULL (a blob is a JSON
-				// value under no reading, blank text against a TIMESTAMP stores NULL), which
-				// is UNKNOWN, not false.
-				const conditionKey = condition === null ? null : probeKey(condition);
-				const shouldCompare = conditionKey !== null;
-
-				for await (const row of input) {
-					if (row.length > 0) {
-						const rowValue = row[0];
-						const rowKey = rowValue === null ? null : memberKey(rowValue);
-						if (rowKey === null) {
-							hasNull = true;
-						} else if (shouldCompare && !matched && compareSqlValuesFast(conditionKey, rowKey, collation) === 0) {
-							matched = true;
-						}
-					}
-					// Continue iterating to drive every write past the first match.
-				}
-
-				let result: SqlValue;
-				if (!shouldCompare) {
-					result = null;
-				} else if (matched) {
-					result = true;
-				} else {
-					result = hasNull ? null : false;
-				}
-
-				writeExecutionMemo(rctx, memoKey, result);
-				return result;
+				// Build BEFORE the NULL short-circuit (unlike runSetProbe): the write must
+				// fire on the first evaluation even when that evaluation's probe is NULL.
+				const members = await membershipSetFor(rctx, setSlot, input, collation, memberKey);
+				// A coercion can yield NULL (a blob is a JSON value under no reading, blank
+				// text against a TIMESTAMP stores NULL), which is UNKNOWN, not false.
+				const conditionKey = membershipKey(condition, probeKey);
+				return conditionKey === null ? null : probeMembership(members, conditionKey);
 			}
 
 			const sourceInstruction = emitPlanNode(plan.source, ctx);
@@ -336,7 +367,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			// closure persists across prepared-statement runs but holds only the
 			// symbol — never the tree — so the set resets between executions and a
 			// re-run re-drains the source with current data. Same rule as the
-			// impure-IN memo and emitCache.
+			// impure-IN set and emitCache.
 			const probeSlot = Symbol('IN(set-probe)');
 
 			// NOTE: the set holds deduplicated scalar values — strictly less memory
@@ -347,46 +378,12 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				// Condition NULL → NULL, and do NOT force the build (short-circuit).
 				// A condition that COERCES to NULL under the object arm is UNKNOWN too,
 				// and must not force the build either — so key before the build, not after.
-				if (condition === null) {
-					return null;
-				}
-				const conditionKey = probeKey(condition);
+				const conditionKey = membershipKey(condition, probeKey);
 				if (conditionKey === null) {
 					return null;
 				}
-
-				let probe = rctx.inSetProbes?.get(probeSlot);
-				if (!probe) {
-					// First evaluation that needs the set: drain the source once into a
-					// BTree keyed under the membership collation, tracking inner NULLs.
-					const tree = createValueSet<SqlValue>(
-						(a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation)
-					);
-					let hasNull = false;
-					for await (const row of input) {
-						if (row.length > 0) {
-							const rowValue = row[0];
-							// A member that coerces to NULL is not a member — it makes the
-							// miss case UNKNOWN, exactly as a literal inner NULL does.
-							const rowKey = rowValue === null ? null : memberKey(rowValue);
-							if (rowKey === null) {
-								hasNull = true;
-							} else {
-								// Duplicate keys are a no-op insert — the set only tracks membership.
-								tree.insert(rowKey);
-							}
-						}
-					}
-					probe = { tree, hasNull };
-					(rctx.inSetProbes ??= new Map()).set(probeSlot, probe);
-				}
-
-				// Three-valued membership, identical to the streaming and value-list paths:
-				// hit → true; miss → NULL if the inner had a NULL, else false.
-				if (probe.tree.find(conditionKey).on) {
-					return true;
-				}
-				return probe.hasNull ? null : false;
+				const members = await membershipSetFor(rctx, probeSlot, input, collation, memberKey);
+				return probeMembership(members, conditionKey);
 			}
 
 			const sourceInstruction = emitPlanNode(plan.source, ctx);
@@ -402,13 +399,8 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 		// Correlated or non-deterministic source: streaming + early exit on match,
 		// re-evaluated per outer row.
 		async function runSubqueryStreaming(_rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
-			// If condition is NULL, result is NULL
-			if (condition === null) {
-				return null;
-			}
-
-			const conditionKey = probeKey(condition);
-			// A condition that coerces to NULL is UNKNOWN, like a NULL condition.
+			// A NULL condition — or one that coerces to NULL — is UNKNOWN.
+			const conditionKey = membershipKey(condition, probeKey);
 			if (conditionKey === null) {
 				return null;
 			}
@@ -416,8 +408,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			let hasNull = false;
 			for await (const row of input) {
 				if (row.length > 0) {
-					const rowValue = row[0];
-					const rowKey = rowValue === null ? null : memberKey(rowValue);
+					const rowKey = membershipKey(row[0], memberKey);
 					if (rowKey === null) {
 						hasNull = true;
 						continue;
@@ -456,7 +447,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 			function innerConstantRun(_rctx: RuntimeContext, condition: SqlValue): SqlValue {
 				// If condition is NULL — or coerces to NULL — the result is NULL
-				const conditionKey = condition === null ? null : probeKey(condition);
+				const conditionKey = membershipKey(condition, probeKey);
 				if (conditionKey === null) {
 					return null;
 				}
@@ -481,7 +472,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					const resolved = await Promise.all(values);
 
 					for (const value of resolved) {
-						const valueKey = value === null ? null : memberKey(value as SqlValue);
+						const valueKey = membershipKey(value as SqlValue, memberKey);
 						if (valueKey === null) {
 							hasNull = true;
 							continue;
@@ -493,7 +484,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				});
 			} else {
 				for (const value of values) {
-					const valueKey = value === null ? null : memberKey(value as SqlValue);
+					const valueKey = membershipKey(value as SqlValue, memberKey);
 					if (valueKey === null) {
 						hasNull = true;
 						continue;
@@ -514,7 +505,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			// Some values are expressions - build tree at runtime
 			function runDynamicValues(_rctx: RuntimeContext, condition: SqlValue, ...values: SqlValue[]): SqlValue {
 				// If condition is NULL — or coerces to NULL — the result is NULL
-				const conditionKey = condition === null ? null : probeKey(condition);
+				const conditionKey = membershipKey(condition, probeKey);
 				if (conditionKey === null) {
 					return null;
 				}
@@ -522,7 +513,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				// Linear scan is optimal since we're only doing one lookup per execution
 				let hasNull = false;
 				for (const value of values) {
-					const valueKey = value === null ? null : memberKey(value);
+					const valueKey = membershipKey(value, memberKey);
 					if (valueKey === null) {
 						hasNull = true;
 						continue;

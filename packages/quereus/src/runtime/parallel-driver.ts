@@ -64,7 +64,7 @@ export class ParallelDriver {
 	 *   `rctx.signal`.) (`mutationOrdinal` is a per-row INSERT/envelope
 	 *   scalar set+restored synchronously by the sequential insert path, never mutated
 	 *   inside a parallel fork, so each child snapshots the parent value.)
-	 *   (`executionMemo` is the once-per-execution memo for impure subqueries; shared
+	 *   (`executionMemo` is the once-per-execution memo for impure scalar/`EXISTS` subqueries; shared
 	 *   by reference so the run-once contract spans branches, matching the pre-cache
 	 *   single-closure memo. NOTE: it is lazily created on first impure-subquery run,
 	 *   so if a future parallelized query drives an impure subquery inside a fork, the
@@ -90,11 +90,13 @@ export class ParallelDriver {
 	 *   parallelized query driving CTE references inside forks must eagerly create
 	 *   the map on the parent before fork(). Dormant today: ParallelDriver has no
 	 *   query consumers.)
-	 *   (`inSetProbes` is the once-per-execution uncorrelated-`IN`-subquery lookup-set
-	 *   map; shared by reference so a set materialized in one branch is visible to a
-	 *   sibling branch re-driving the same IN site within the same execution. Same
-	 *   lazy-creation caveat as `executionMemo`. Dormant today: ParallelDriver has no
-	 *   query consumers.)
+	 *   (`inSetProbes` is the once-per-execution `IN`-subquery lookup-set map, used by
+	 *   the uncorrelated set probe and by impure (DML-bearing) `IN`; shared by reference
+	 *   so a set materialized in one branch is visible to a sibling branch re-driving
+	 *   the same IN site within the same execution. Same lazy-creation caveat as
+	 *   `executionMemo`, with the same consequence for impure `IN`: a map lazily made
+	 *   per branch would fire its inner DML once per branch. Dormant today:
+	 *   ParallelDriver has no query consumers.)
 	 *   (`workCounters` is the per-execution work-counter collector; shared by
 	 *   reference — a write-only sink like `tracer` — so counts incremented inside a
 	 *   forked branch roll up into the parent's snapshot with no merge step. It is a

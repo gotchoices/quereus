@@ -7,7 +7,8 @@
 --     (no short-circuit on first row, on match, or on EXISTS=true).
 --   - run-once: when an outer expression is re-evaluated (correlated
 --     subquery / per-row scan), the inner DML executes exactly once per
---     statement execution. The memoized result is replayed thereafter.
+--     statement execution. The memoized result is replayed thereafter (for
+--     IN, the drained membership set, probed per evaluation).
 
 -- ===================================
 -- 1. EXISTS over a DML inner: fully drains (no short-circuit on first row)
@@ -30,6 +31,47 @@ select 1 in (insert into log_i values (1), (2), (3) returning v) as found;
 select count(*) as c from log_i;
 → [{"c":3}]
 drop table log_i;
+
+-- Run-once memoizes the drained set, not the first row's answer: each outer
+-- row probes the one DML run with its own value.
+create table in_n (id integer primary key, i integer null);
+insert into in_n values (1, 10), (2, 20);
+create table in_w (k integer primary key, v integer null);
+select id from in_n where i in (insert into in_w values (1, 10) returning v);
+→ [{"id":1}]
+select count(*) as c from in_w;
+→ [{"c":1}]
+drop table in_w;
+
+-- First outer row misses, second hits.
+create table in_t (id integer primary key, s text null);
+insert into in_t values (1, 'a'), (2, 'b');
+create table in_w2 (k integer primary key, v text null);
+select id from in_t where s in (insert into in_w2 values (1, 'b') returning v);
+→ [{"id":2}]
+select count(*) as c from in_w2;
+→ [{"c":1}]
+drop table in_t;
+drop table in_w2;
+
+-- Three-valued per row: a hit is true, a miss against a set holding NULL is NULL.
+create table in_w3 (k integer primary key, v integer null);
+select id, i in (insert into in_w3 values (1, 10), (2, null) returning v) as m from in_n order by id;
+→ [{"id":1,"m":true},{"id":2,"m":null}]
+drop table in_w3;
+drop table in_n;
+
+-- A NULL first probe still fires the write (the set is built before the NULL
+-- short-circuit); the later row probes that one run.
+create table in_np (id integer primary key, i integer null);
+insert into in_np values (1, null), (2, 10);
+create table in_w4 (k integer primary key, v integer null);
+select id, i in (insert into in_w4 values (1, 10) returning v) as m from in_np order by id;
+→ [{"id":1,"m":null},{"id":2,"m":true}]
+select count(*) as c from in_w4;
+→ [{"c":1}]
+drop table in_np;
+drop table in_w4;
 
 -- ===================================
 -- 3. Scalar subquery over a DML inner: drains every row, scalar = first

@@ -37,11 +37,11 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `signal` | `shared-frozen` | Cooperative cancellation signal; shared so every branch honors the same abort, and never mutated by the runtime. |
 | `contextTracker` | `shared-sink` | Diagnostics sink. |
 | `planStack` | `shared-sink` | Tracing-only stack. |
-| `executionMemo` | `shared-cooperative` | Once-per-execution impure-subquery memo; shared so the run-once contract spans branches. |
+| `executionMemo` | `shared-cooperative` | Once-per-execution impure scalar/`EXISTS` subquery memo; shared so the run-once contract spans branches. |
 | `scanConnections` | `shared-cooperative` | Once-per-execution inner-scan connection cache; shared so statement teardown disconnects every branch's instances exactly once. |
 | `cacheStates` | `shared-cooperative` | Once-per-execution `CacheNode` row-cache map; shared so a cache materialized in one branch is visible to a sibling branch re-driving the same cache site. |
 | `cteMaterializations` | `shared-cooperative` | Once-per-execution shared CTE buffer map; shared so a CTE materialized in one branch replays in a sibling branch instead of re-driving the source. |
-| `inSetProbes` | `shared-cooperative` | Once-per-execution uncorrelated `IN`-subquery lookup-set map; shared so a set materialized in one branch is visible to a sibling re-driving the same `IN` site. |
+| `inSetProbes` | `shared-cooperative` | Once-per-execution `IN`-subquery lookup-set map (uncorrelated set probe and impure `IN`); shared so a set materialized in one branch is visible to a sibling re-driving the same `IN` site, which for impure `IN` keeps its DML run-once across branches. |
 | `workCounters` | `shared-sink` | Per-execution work-counter collector ([Runtime Work Counters](runtime-work-counters.md)); shared by reference so a forked branch's counts roll up with no merge step. |
 | `cardinalityObservations` | `shared-sink` | Per-execution cardinality-feedback sink ([Progressive Optimizer § 3.1](progressive-optimizer.md#31-what-is-observed)); shared by reference so a full scan completed in a forked branch reports into the parent's sink, published once at execution end. |
 

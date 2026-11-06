@@ -1016,13 +1016,21 @@ an impure-path implementation that applies two contracts:
   inners — acceptable because it only affects DML-bearing inners, where
   correctness trumps the optimization.
 - **Run-once per statement execution.** A correlated outer expression or a
-  per-row scan would re-invoke the scalar subquery's `run` once per outer row. The
-  emitter memoizes the materialized result and the scalar/`EXISTS`/`IN` answer on
-  first call and replays it afterwards without re-driving the iterator. The memo
-  lives on the per-execution `RuntimeContext` (`ctx.executionMemo`, keyed by a
-  symbol minted at emit time), not the emit-time closure — so a `Statement` reusing
-  its instruction tree across executions still resets the memo between runs,
-  re-driving the inner DML once per run.
+  per-row scan would re-invoke the subquery's `run` once per outer row. On the
+  first call the emitter drains the inner and memoizes what later calls need,
+  replaying it afterwards without re-driving the iterator. Scalar and `EXISTS`
+  memoize their answer, which does not depend on the outer row
+  (`ctx.executionMemo`). `IN` memoizes the drained **membership set** — the same
+  structure the [set probe](runtime-caching.md#in-subquery-set-probe) builds, in
+  `ctx.inSetProbes` — and probes it with each call's own condition, since its
+  answer differs per probe value. `IN` builds the set on the first call even
+  when that call's condition is NULL (the set probe skips the build for a NULL
+  condition), so the write fires regardless of the first probe. Both memos live
+  on the per-execution `RuntimeContext`, keyed by a symbol minted at emit time,
+  not the emit-time closure — so a `Statement` reusing its instruction tree
+  across executions still resets the memo between runs, re-driving the inner
+  DML once per run. A correlated impure inner still runs once, with the first
+  outer row's values; later rows probe that run's result.
 
 `emitLimitOffset` applies the full-drain half of this rule (never the run-once
 half — a `LIMIT` is not re-evaluated per outer row) with the same

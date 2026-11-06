@@ -74,10 +74,11 @@ const EXPECTED_FORK_POLICY = {
 	// re-driving the source. Mutation across branches is the emitCTE contract's
 	// responsibility.
 	cteMaterializations: 'shared-cooperative',
-	// Once-per-execution uncorrelated IN-subquery lookup-set map: shared by reference
-	// so a set materialized in one branch is visible to a sibling branch re-driving
-	// the same IN site within the same execution. Mutation across branches is the
-	// emitIn set-probe contract's responsibility.
+	// Once-per-execution IN-subquery lookup-set map (uncorrelated set probe and impure
+	// IN): shared by reference so a set materialized in one branch is visible to a
+	// sibling branch re-driving the same IN site within the same execution — for
+	// impure IN, that is what keeps its DML run-once across branches. Mutation across
+	// branches is the emitIn contract's responsibility.
 	inSetProbes: 'shared-cooperative',
 	// Per-execution work-counter collector: shared write-only instrumentation (like
 	// tracer/planStack) so counts from a forked branch roll up into the parent's
