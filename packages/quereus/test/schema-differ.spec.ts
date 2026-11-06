@@ -132,6 +132,7 @@ function makeEmptySchemaDiff(): SchemaDiff {
 		renames: [],
 		lensToAttach: [],
 		lensToDetach: [],
+		releasedDrops: [],
 	};
 }
 

@@ -92,7 +92,7 @@ function makeEmptySchemaDiff(): SchemaDiff {
 		tablesToCreate: [], tablesToDrop: [], tablesToAlter: [], maintainedModuleMigrations: [],
 		viewsToCreate: [], viewsToDrop: [], indexesToCreate: [], indexesToDrop: [],
 		assertionsToCreate: [], assertionsToDrop: [], viewTagsChanges: [], indexTagsChanges: [],
-		renames: [], lensToAttach: [], lensToDetach: [],
+		renames: [], lensToAttach: [], lensToDetach: [], releasedDrops: [],
 	};
 }
 
@@ -706,6 +706,7 @@ function broadDiff(): SchemaDiff {
 		indexTagsChanges: [{ name: 'idx_fresh', tags: {} }],
 		lensToAttach: [],
 		lensToDetach: [],
+		releasedDrops: [],
 	};
 }
 

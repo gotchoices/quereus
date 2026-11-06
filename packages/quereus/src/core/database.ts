@@ -2944,7 +2944,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  expression guard (`assertNoExpressionDependsOn`), because the object comes straight back;
 	 *  the CHECKs that reach it are then checked against the existing rows after the plan's last
 	 *  step. Unlike {@link _setSchemaUnwinding} this judges nothing less, it only moves the
-	 *  judgement to where the new object exists. Set only with the statement mutex held, so no
+	 *  judgement to where the new object exists. An object removed for good is held by
+	 *  {@link _setSchemaReleasedObjects} instead. Set only with the statement mutex held, so no
 	 *  other statement observes it. Returns the prior value so the caller restores it in a
 	 *  `finally`. Docs: `docs/schema-declarative.md` § Redefining what a rule reads. */
 	public _setSchemaRecreatedObjects(keys: ReadonlySet<string>): ReadonlySet<string> {
@@ -2957,6 +2958,30 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  {@link _setSchemaRecreatedObjects}. Empty outside a migration. */
 	public _getSchemaRecreatedObjects(): ReadonlySet<string> {
 		return this._schemaRecreatedObjects;
+	}
+
+	/** @internal Apply-schema released objects — see {@link _setSchemaReleasedObjects}. */
+	private _schemaReleasedObjects: ReadonlySet<string> = new Set();
+
+	/** @internal Holds the `objectRefKey`s of the objects the running `apply schema` plan drops for
+	 *  good while no rule of the declared schema reaches them (`SchemaDiff.releasedDrops`). A forward
+	 *  `DROP` of one of them passes the expression guard (`assertNoExpressionDependsOn`) for a rule on
+	 *  a table in the applied schema, because the plan drops or rewrites every such rule later; a rule
+	 *  on another schema's table still refuses it. The object does not exist after the plan, so unlike
+	 *  {@link _setSchemaRecreatedObjects} no rows are judged for it; the apply instead fails if any
+	 *  rule still reaches it then. Same holding contract as that holder: set only with the statement
+	 *  mutex held, prior value restored in a `finally`. Docs: `docs/schema-declarative.md` § Redefining
+	 *  what a rule reads. */
+	public _setSchemaReleasedObjects(keys: ReadonlySet<string>): ReadonlySet<string> {
+		const prior = this._schemaReleasedObjects;
+		this._schemaReleasedObjects = keys;
+		return prior;
+	}
+
+	/** @internal What the running `apply schema` plan removes with its rules — see
+	 *  {@link _setSchemaReleasedObjects}. Empty outside a migration. */
+	public _getSchemaReleasedObjects(): ReadonlySet<string> {
+		return this._schemaReleasedObjects;
 	}
 
 	/** @internal Migrating-apply flag — see {@link _setSchemaMigrating}. */

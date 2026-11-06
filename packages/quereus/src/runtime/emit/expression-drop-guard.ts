@@ -5,6 +5,7 @@ import { findTableExpressionDependent, describeDependentTable, type ExpressionDe
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import { objectRefKey } from '../../schema/rename-rewriter.js';
 import type { DroppableObjectKind } from './assertion-drop-guard.js';
+import type { TableSchema } from '../../schema/table.js';
 
 /**
  * Refuses to drop a table / view / materialized view that another table's stored
@@ -67,8 +68,15 @@ import type { DroppableObjectKind } from './assertion-drop-guard.js';
  * same name (`Database._setSchemaRecreatedObjects`): the reference is only broken until the
  * create runs, and no statement in a plan writes rows before then. The refusal this guard exists
  * for is not lost, because `runStepsWithUndoJournal` checks every CHECK reaching that object once
- * the plan's steps have run. A declaration that removes the object and keeps the rule is still
- * refused here, since a removed object is not in that set.
+ * the plan's steps have run.
+ *
+ * And passes a forward `apply schema` drop of an object the plan removes for good while no rule of
+ * the declared schema reaches it (`Database._setSchemaReleasedObjects`), as far as rules on tables
+ * in the applied schema go: the plan converges on the declaration, so it drops or rewrites each of
+ * them in a later step, and `runStepsWithUndoJournal` fails the apply if any still reaches the
+ * object after the last one. A rule on another schema's table is outside the declaration and still
+ * refuses. A declaration that removes the object and keeps a rule reading it releases nothing, so it
+ * is still refused here.
  */
 export function assertNoExpressionDependsOn(
 	db: Database,
@@ -77,8 +85,16 @@ export function assertNoExpressionDependsOn(
 	objectKind: DroppableObjectKind,
 ): void {
 	if (db._isSchemaUnwinding()) return;
-	if (db._getSchemaRecreatedObjects().has(objectRefKey(schemaName, objectName))) return;
-	const dependent = findTableExpressionDependent(db, schemaName, objectName);
+	const key = objectRefKey(schemaName, objectName);
+	if (db._getSchemaRecreatedObjects().has(key)) return;
+	// NOTE: a released object's readers on this schema's tables name a missing object until their
+	// own DROP CONSTRAINT / SET DEFAULT later in the plan. No step before then judges an existing
+	// table's CHECKs or DEFAULTs (an ADD COLUMN backfill judges only the new column's inline CHECKs).
+	// If a plan step ever starts evaluating them mid-plan, remove those readers before that step.
+	const outsideAppliedSchema = db._getSchemaReleasedObjects().has(key)
+		? (table: TableSchema) => table.schemaName.toLowerCase() !== schemaName.toLowerCase()
+		: undefined;
+	const dependent = findTableExpressionDependent(db, schemaName, objectName, outsideAppliedSchema);
 	if (!dependent) return;
 	// The catalog's spelling of the schema rather than the caller's: DROP emitters pass the
 	// name as the user typed it, so `drop table MAIN.t` would otherwise report a schema

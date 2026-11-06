@@ -6,8 +6,9 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
 import { renderCatalogForComparison, renderCatalogForRestoreCheck } from '../../schema/catalog-rendering.js';
-import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, objectsRecreatedByDiff, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
-import { describeDependentTable, findChecksReachingObjects, type CheckReachingObjects } from '../../schema/expression-dependents.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, objectsRecreatedByDiff, objectsReleasedByDiff, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
+import { describeDependentTable, findChecksReachingObjects, findTableExpressionDependent, type CheckReachingObjects } from '../../schema/expression-dependents.js';
+import { objectRefKey } from '../../schema/rename-rewriter.js';
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import { computeShortSchemaHash } from '../../schema/schema-hasher.js';
 import { deployLogicalSchema } from '../../schema/lens-compiler.js';
@@ -382,12 +383,14 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 				const priorRefused = rctx.db._setPrimaryKeyRebuildRefused(refuseRebuild);
 				const priorMigrating = rctx.db._setSchemaMigrating(true);
 				const priorRecreated = rctx.db._setSchemaRecreatedObjects(objectsRecreatedByDiff(diff, schemaName));
+				const priorReleased = rctx.db._setSchemaReleasedObjects(objectsReleasedByDiff(diff, schemaName));
 				try {
 					await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements, {
 						preApplyFingerprint: renderCatalogForRestoreCheck(actualCatalog),
 						eventWatermark,
 					}, pace);
 				} finally {
+					rctx.db._setSchemaReleasedObjects(priorReleased);
 					rctx.db._setSchemaRecreatedObjects(priorRecreated);
 					rctx.db._setSchemaMigrating(priorMigrating);
 					rctx.db._setPrimaryKeyRebuildRefused(priorRefused);
@@ -793,8 +796,9 @@ async function unwindRefusedBatchEnd(
  * `irreversible` poisons the journal BEFORE it runs — the step may apply partially before it
  * throws, so its own failure must not read as restorable either — and journaling stops there.
  *
- * Once every step has run, the CHECKs over what the plan recreated are checked, and a failure
- * there takes the failed-step path: the plan is what broke them, whichever step that was.
+ * Once every step has run, the CHECKs over what the plan recreated are checked, and so is that
+ * no rule still reaches what it released. A failure there takes the failed-step path: the plan is
+ * what broke them, whichever step that was.
  */
 async function runStepsWithUndoJournal(
 	db: Database,
@@ -818,7 +822,7 @@ async function runStepsWithUndoJournal(
 		if (poisonedBy === undefined && step.undo !== undefined && step.undo.length > 0) journal.push(step.undo);
 		await pace();
 	}
-	const error = await revalidateChecksOverRecreatedObjects(db, schemaName, pace);
+	const error = await revalidateChecksOverRecreatedObjects(db, schemaName, pace) ?? ruleStillReachingReleasedObject(db, schemaName);
 	if (error) return failed(error);
 	return { clean: true, journal, poisonedBy };
 }
@@ -848,6 +852,26 @@ async function revalidateChecksOverRecreatedObjects(db: Database, schemaName: st
 			return recreatedObjectBrokeCheck(reaching, schemaName, e);
 		}
 		await pace();
+	}
+	return undefined;
+}
+
+/**
+ * The error for a CHECK, DEFAULT or generated expression that still reaches an object the plan
+ * released, once every step has run, or `undefined` when none does. The guard let the object's drop
+ * through because the declaration has no such rule, so one here is a rule the plan failed to drop or
+ * rewrite. Released objects all belong to `schemaName`.
+ */
+function ruleStillReachingReleasedObject(db: Database, schemaName: string): QuereusError | undefined {
+	const schemaPrefixLength = objectRefKey(schemaName, '').length;
+	for (const key of db._getSchemaReleasedObjects()) {
+		const dependent = findTableExpressionDependent(db, schemaName, key.slice(schemaPrefixLength));
+		if (!dependent) continue;
+		const on = describeDependentTable(dependent.table, schemaName);
+		return new QuereusError(
+			`apply schema '${schemaName}': ${dependent.describe} on table ${on} still reads removed '${key}'${describeReachPath(dependent.path)} after the migration`,
+			StatusCode.ERROR,
+		);
 	}
 	return undefined;
 }

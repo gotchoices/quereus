@@ -149,6 +149,14 @@ export interface SchemaDiff {
 	 * a basis-table drop.
 	 */
 	lensToDetach: string[];
+	/**
+	 * The {@link tablesToDrop} / {@link viewsToDrop} names (spelled as there) this plan removes for
+	 * good while no rule of the declared schema still reaches them, so every rule that reaches one
+	 * in the catalog is dropped or rewritten later in the plan. `apply schema` lets their drops past
+	 * the expression guard for rules on tables in this schema. Empty unless that holds for EVERY
+	 * such drop; see {@link dropsReleasedByDeclaration}. Not rendered by `diff schema`.
+	 */
+	releasedDrops: string[];
 }
 
 export interface ColumnAttributeChange {
@@ -449,6 +457,7 @@ export function computeSchemaDiff(
 		renames: [],
 		lensToAttach: [],
 		lensToDetach: [],
+		releasedDrops: [],
 	};
 
 	// Logical schema: the per-table diff is attach/detach-lens, never
@@ -983,7 +992,8 @@ export function computeSchemaDiff(
 	// Declared world is single-schema, so the single-schema resolver reproduces
 	// exactly what the forward walkers resolve for these bodies.
 	const resolveDeclaredRef = singleSchemaObjectRefResolver(targetSchemaName);
-	const reachesRecreatedObject = recreatedObjectReachProbe(diff, declaredViewBodies, declaredTables, actualViews, actualTables, targetSchemaName);
+	const declaredBodies = declaredReachBodies(declaredViewBodies, declaredTables);
+	const reachesRecreatedObject = recreatedObjectReachProbe(diff, declaredBodies, actualViews, actualTables, targetSchemaName);
 	const namesDroppedObject = (check: AST.Expression): boolean =>
 		reachesRecreatedObject(check) || droppedInThisDiff.some(dropped => tableReferencedInAst(
 			check, dropped, resolveDeclaredRef, objectRefKey(targetSchemaName, dropped)));
@@ -1015,6 +1025,7 @@ export function computeSchemaDiff(
 		}
 	}
 
+	diff.releasedDrops = dropsReleasedByDeclaration(diff, declaredTables, declaredBodies, actualTables, targetSchemaName);
 	return diff;
 }
 
@@ -2662,18 +2673,13 @@ function orderViewDropsDependentsFirst(viewsToDrop: readonly string[], actualVie
  */
 function recreatedObjectReachProbe(
 	diff: SchemaDiff,
-	declaredViewBodies: ViewBodies,
-	declaredTables: ReadonlyMap<string, AST.DeclaredTable>,
+	declaredBodies: ViewBodies,
 	actualViews: ReadonlyMap<string, CatalogView>,
 	actualTables: ReadonlyMap<string, CatalogTable>,
 	schemaName: string,
 ): (check: AST.Expression) => boolean {
 	const recreated = objectsRecreatedByDiff(diff, schemaName);
 	if (recreated.size === 0) return () => false;
-	const declaredBodies: ViewBodies = new Map([
-		...declaredViewBodies,
-		...[...declaredTables].flatMap(([name, { tableStmt }]) => tableStmt.maintained ? [[name, tableStmt.maintained.select] as const] : []),
-	]);
 	const catalogBodies: ViewBodies = new Map([
 		...[...actualViews].map(([name, view]) => [name, view.select] as const),
 		...[...actualTables].flatMap(([name, table]) => table.maintained ? [[name, table.maintained.select] as const] : []),
@@ -2683,6 +2689,79 @@ function recreatedObjectReachProbe(
 		return [declaredBodies, catalogBodies].some(bodies =>
 			[...withViewsReached(named, bodies, schemaName)].some(name => recreated.has(objectRefKey(schemaName, name))));
 	};
+}
+
+/** The declared views' bodies and the declared maintained tables', which the drop guards follow alike. */
+function declaredReachBodies(declaredViewBodies: ViewBodies, declaredTables: ReadonlyMap<string, AST.DeclaredTable>): ViewBodies {
+	return new Map([
+		...declaredViewBodies,
+		...[...declaredTables].flatMap(([name, { tableStmt }]) => tableStmt.maintained ? [[name, tableStmt.maintained.select] as const] : []),
+	]);
+}
+
+/**
+ * {@link SchemaDiff.releasedDrops}: every table and view the diff drops without recreating, when no
+ * rule the schema will hold after the plan reaches any of them. Those rules are the declared tables'
+ * CHECKs, DEFAULTs and generated expressions, plus the catalog's generated expressions on every table
+ * kept, because the differ never changes a generated expression. Their reach follows the declared
+ * view and maintained-table bodies.
+ *
+ * All or nothing: one such drop that a rule still reaches releases none. The plan then fails at that
+ * drop, and an earlier released `DROP TABLE` would already have destroyed its rows. Removing a table
+ * and the view over it while a CHECK keeps reading the view is the case this keeps refused before
+ * the rows go.
+ *
+ * Nothing is released either when a walk names an object in another schema, since the differ cannot
+ * follow that object's body back into this one.
+ *
+ * NOTE: a view removed together with the generated column that reads it stays refused, because the
+ * catalog's generated expressions are counted on every kept table, dropped columns included. If that
+ * case shows up, skip the columns the table's alter diff drops.
+ */
+function dropsReleasedByDeclaration(
+	diff: SchemaDiff,
+	declaredTables: ReadonlyMap<string, AST.DeclaredTable>,
+	declaredBodies: ViewBodies,
+	actualTables: ReadonlyMap<string, CatalogTable>,
+	schemaName: string,
+): string[] {
+	const recreated = objectsRecreatedByDiff(diff, schemaName);
+	const removed = [...diff.tablesToDrop, ...diff.viewsToDrop].filter(name => !recreated.has(objectRefKey(schemaName, name)));
+	if (removed.length === 0) return [];
+	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
+	const keptGenerated = [...actualTables].flatMap(([name, table]) => dropped.has(name) ? [] : table.columns.map(col => col.generatedExpr));
+	const rules = [...declaredRuleExpressions(declaredTables), ...keptGenerated].filter(expr => expr !== undefined);
+	const reached = objectsRulesReach(rules, declaredBodies, schemaName);
+	if (reached === undefined || removed.some(name => reached.has(name.toLowerCase()))) return [];
+	return removed;
+}
+
+/** The CHECK (table and column level), DEFAULT and generated expressions of the declared tables. */
+function declaredRuleExpressions(declaredTables: ReadonlyMap<string, AST.DeclaredTable>): Array<AST.Expression | undefined> {
+	return [...declaredTables.values()].flatMap(({ tableStmt }) => [
+		...tableStmt.columns.flatMap(col => col.constraints.flatMap(constraint => [constraint.expr, constraint.generated?.expr])),
+		...tableStmt.constraints.map(constraint => constraint.expr),
+	]);
+}
+
+/**
+ * The lowercased names in `schemaName` that `rules` read, directly or through `bodies`, tables
+ * included; `undefined` when a rule or a body followed names an object in another schema.
+ */
+function objectsRulesReach(rules: readonly AST.Expression[], bodies: ViewBodies, schemaName: string): Set<string> | undefined {
+	const reached = new Set<string>();
+	const addReads = (node: AST.AstNode, opts?: TableRenameOpts): boolean => {
+		const { inSchema, leavesSchema } = objectsNamedBySchema(node, schemaName, opts);
+		for (const name of inSchema) reached.add(name);
+		return !leavesSchema;
+	};
+	if (!rules.every(rule => addReads(rule, { rowImageContext: true }))) return undefined;
+	// A Set iterates what is added during the walk, and visits each name once.
+	for (const name of reached) {
+		const body = bodies.get(name);
+		if (body && !addReads(body)) return undefined;
+	}
+	return reached;
 }
 
 /** Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions name. */
@@ -2702,8 +2781,18 @@ function collectExpressionReads(expr: AST.Expression, schemaName: string, into: 
 
 /** The lowercased names of the tables and views in `schemaName` that `node` names; another schema's are skipped. */
 function objectsNamedIn(node: AST.AstNode, schemaName: string, opts?: TableRenameOpts): string[] {
-	const refs = collectTableRefsInAst(node, singleSchemaObjectRefResolver(schemaName), opts);
-	return [...refs].filter(([key, name]) => key === objectRefKey(schemaName, name)).map(([, name]) => name);
+	return objectsNamedBySchema(node, schemaName, opts).inSchema;
+}
+
+/** {@link objectsNamedIn}, plus whether `node` also names a table or view in another schema. */
+function objectsNamedBySchema(node: AST.AstNode, schemaName: string, opts?: TableRenameOpts): { inSchema: string[]; leavesSchema: boolean } {
+	const inSchema: string[] = [];
+	let leavesSchema = false;
+	for (const [key, name] of collectTableRefsInAst(node, singleSchemaObjectRefResolver(schemaName), opts)) {
+		if (key === objectRefKey(schemaName, name)) inSchema.push(name);
+		else leavesSchema = true;
+	}
+	return { inSchema, leavesSchema };
 }
 
 /**
@@ -3463,6 +3552,11 @@ export function objectsRecreatedByDiff(diff: SchemaDiff, schemaName: string): Se
 		}
 	}
 	return recreated;
+}
+
+/** The `objectRefKey`s of {@link SchemaDiff.releasedDrops}. */
+export function objectsReleasedByDiff(diff: SchemaDiff, schemaName: string): Set<string> {
+	return new Set(diff.releasedDrops.map(name => objectRefKey(schemaName, name)));
 }
 
 /** The keys of the tables a table create's foreign keys name, resolved as `extractForeignKeys` does. */

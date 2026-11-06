@@ -190,17 +190,21 @@ export function findColumnExpressionDependent(
  * The match is `namerOf` over the expression's whole reach, so a CHECK that reads a view
  * whose body reads the dropped object matches too, and `path` carries the shortest chain
  * for the error to quote — empty exactly when the expression names the object itself.
+ *
+ * `probesTable`, when given, limits the scan to the tables it accepts.
  */
 export function findTableExpressionDependent(
 	db: Database,
 	schemaName: string,
 	objectName: string,
+	probesTable?: (table: TableSchema) => boolean,
 ): ExpressionDependent | undefined {
 	const resolvers = snapshotObjectRefResolvers(db);
 	const targetKey = objectRefKey(schemaName, objectName);
 
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		if (objectRefKey(table.schemaName, table.name) === targetKey) continue;
+		if (probesTable && !probesTable(table)) continue;
 		const names: ExpressionProbe = expr => {
 			if (expr === undefined) return undefined;
 			const path = reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: true })

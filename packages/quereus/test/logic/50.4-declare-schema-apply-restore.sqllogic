@@ -1081,3 +1081,226 @@ drop materialized view m_moved;
 drop materialized view m_kept;
 drop view m_v;
 drop table a_t;
+
+-- ===================================
+-- 20. A view or table removed together with every rule that reads it: the guard on its drop lets
+-- it through, because the plan drops or rewrites each of those rules in a later step
+-- ===================================
+
+create table d_t (id integer primary key, n integer);
+insert into d_t values (1, 10);
+create table d_t2 (id integer primary key, n integer);
+insert into d_t2 values (1, 20);
+create view d_v1 as select sum(n) as s from d_t;
+create table d_p (id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v1)));
+insert into d_p values (1, 5);
+
+-- The view goes, and so does the CHECK: DROP VIEW, then DROP CONSTRAINT.
+declare schema main {
+	table d_t { id integer primary key, n integer }
+	table d_t2 { id integer primary key, n integer }
+	table d_p { id integer primary key, u integer }
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+select count(*) as n from schema() where name = 'd_v1';
+→ [{"n": 0}]
+
+insert into d_p values (2, 50);
+delete from d_p where id = 2;
+
+-- The CHECK is rewritten off the view.
+create view d_v1 as select sum(n) as s from d_t;
+alter table d_p add constraint d_pc check (u <= (select s from d_v1));
+
+declare schema main {
+	table d_t { id integer primary key, n integer }
+	table d_t2 { id integer primary key, n integer }
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= 5) }
+}
+
+-- run
+
+apply schema main;
+
+select count(*) as n from schema() where name = 'd_v1';
+→ [{"n": 0}]
+
+insert into d_p values (2, 6);
+-- error: CHECK constraint failed: d_pc
+
+-- The view is renamed by hint, which drops the old name, and the CHECK moves to the new one.
+create view d_v1 as select sum(n) as s from d_t;
+alter table d_p drop constraint d_pc;
+alter table d_p add constraint d_pc check (u <= (select s from d_v1));
+
+declare schema main {
+	table d_t { id integer primary key, n integer }
+	table d_t2 { id integer primary key, n integer }
+	view d_v9 as select sum(n) as s from d_t with tags ("quereus.previous_name" = 'd_v1')
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v9)) }
+}
+
+-- run
+
+apply schema main;
+
+select count(*) as n from schema() where name = 'd_v1';
+→ [{"n": 0}]
+
+insert into d_p values (2, 11);
+-- error: CHECK constraint failed: d_pc
+
+-- The table goes while the view the CHECK reads moves off it. Table drops run before view drops,
+-- so the old view still reaches d_t when it is dropped.
+declare schema main {
+	table d_t2 { id integer primary key, n integer }
+	view d_v9 as select sum(n) as s from d_t2
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v9)) }
+}
+
+-- run
+
+apply schema main;
+
+select count(*) as n from schema() where name = 'd_t';
+→ [{"n": 0}]
+
+select s from d_v9;
+→ [{"s": 20}]
+
+insert into d_p values (2, 21);
+-- error: CHECK constraint failed: d_pc
+
+-- A DEFAULT moves off a view that goes.
+create view d_v2 as select max(n) as m from d_t2;
+create table d_q (id integer primary key, w integer default ((select m from d_v2)));
+
+declare schema main {
+	table d_t2 { id integer primary key, n integer }
+	view d_v9 as select sum(n) as s from d_t2
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v9)) }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+
+select count(*) as n from schema() where name = 'd_v2';
+→ [{"n": 0}]
+
+insert into d_q (id) values (1);
+select w from d_q;
+→ [{"w": 5}]
+
+-- ===================================
+-- 21. A drop let through that way is undone when a later step fails. A removed object that some
+-- rule of the declared schema still reads keeps every drop refused, before any table loses rows
+-- ===================================
+
+-- d_v9 goes with d_pc, then the new d_qc fails over the existing row.
+declare schema main {
+	table d_t2 { id integer primary key, n integer }
+	table d_p { id integer primary key, u integer, constraint d_qc check (u > 100) }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+-- error: d_qc
+
+select s from d_v9;
+→ [{"s": 20}]
+
+insert into d_p values (2, 21);
+-- error: CHECK constraint failed: d_pc
+
+-- The table goes while the view it feeds, and the CHECK over that view, stay.
+declare schema main {
+	view d_v9 as select sum(n) as s from d_t2
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v9)) }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
+
+-- The table and the view both go while the CHECK stays. Nothing reads d_t2 after the plan, but
+-- the plan fails at the view's drop, and dropping d_t2 first would have lost its rows.
+declare schema main {
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from d_v9)) }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
+
+-- The CHECK moves to a view in another schema, whose body the differ cannot follow back to d_t2.
+create view temp.d_w as select sum(n) as s from main.d_t2;
+
+declare schema main {
+	table d_p { id integer primary key, u integer, constraint d_pc check (u <= (select s from temp.d_w)) }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
+
+select n from d_t2;
+→ [{"n": 20}]
+
+drop view temp.d_w;
+
+-- No plan step changes a generated expression, so the catalog's still reads d_v9 after the plan.
+create table d_g (id integer primary key, w integer generated always as ((select s from d_v9)));
+
+declare schema main {
+	table d_t2 { id integer primary key, n integer }
+	table d_p { id integer primary key, u integer }
+	table d_q { id integer primary key, w integer default 5 }
+	table d_g { id integer primary key, w integer generated always as (5) }
+}
+
+-- run
+
+apply schema main;
+-- error: cannot drop view 'main.d_v9'
+
+drop table d_g;
+
+-- A CHECK on another schema's table is outside the declaration, so it still refuses the drop.
+create table temp.d_x (id integer primary key, u integer, constraint d_xc check (u <= (select s from main.d_v9)));
+
+declare schema main {
+	table d_t2 { id integer primary key, n integer }
+	table d_p { id integer primary key, u integer }
+	table d_q { id integer primary key, w integer default 5 }
+}
+
+-- run
+
+apply schema main;
+-- error: it is referenced by CHECK constraint 'd_xc' on table 'temp.d_x'
+
+select s from d_v9;
+→ [{"s": 20}]
+
+drop table temp.d_x;
+drop table d_q;
+drop table d_p;
+drop view d_v9;
+drop table d_t2;
