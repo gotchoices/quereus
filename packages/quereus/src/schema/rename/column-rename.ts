@@ -901,9 +901,9 @@ function newSpellingReadsContextVariable(state: ColumnRewriteState, col: AST.Col
  * its bare name when unaliased), a CTE name in scope, and a
  * shadowing-but-not-exposing CTE source.
  *
- * Deliberately "any enclosing frame wins" rather than innermost-first: a frame
- * only sits above index 0 while the walk is *inside* the subquery that pushed
- * it, so every such frame really does enclose the reference. A top-level
+ * Deliberately "any enclosing frame wins" rather than innermost-first: a
+ * non-seed frame only sits on the stack while the walk is *inside* the subquery
+ * that pushed it, so every such frame really does enclose the reference. A top-level
  * `new.a` in `check (new.a > 0 and (select count(*) from "new") >= 0)` is
  * visited with only the seed on the stack and still matches.
  *

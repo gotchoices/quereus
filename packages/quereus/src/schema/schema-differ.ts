@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { collectTableRefsInAst, contextVariableNames, NO_CONTEXT_VARIABLES, renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
+import { checkReadsColumnBare, collectTableRefsInAst, contextVariableNames, NO_CONTEXT_VARIABLES, renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameOpts } from './rename-rewriter.js';
 import { orderDependenciesFirst, orderDependentsFirst } from './dependency-order.js';
 import { Parser } from '../parser/parser.js';
@@ -2015,7 +2015,16 @@ function reconciledDeclaredBody(
 					resolve: resolveRef, resolveAfter: resolveRef,
 				}, { rowImageContext: { contextVariables } });
 			}
+			const ownKey = objectRefKey(schemaName, tableName);
 			for (const r of colRenames) {
+				// The forward RENAME COLUMN leaves a bare read of a mutation-context variable
+				// alone, so no live body renames into a declared bare read of the column when
+				// its OLD name is a variable: there the bare old name reads the variable. The
+				// inverse would still spell it that way and falsely match the live body.
+				if (contextVariables.has(r.oldName.toLowerCase())
+					&& checkReadsColumnBare(clone.expr!, tableName, r.newName, resolveRef, ownKey, contextVariables, resolveDeclaredColumn)) {
+					return d.definition;
+				}
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
 				// The declared-side resolver keeps the seeded walk scope-aware — an
 				// unqualified ref inside a subquery whose own FROM source exposes the
@@ -2025,7 +2034,7 @@ function reconciledDeclaredBody(
 				// mode 'own' mirrors that branch too: this CHECK's `new.`/`old.` names
 				// the owning table's row image, so an owning-column inverse follows it.
 				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, tableName), { kind: 'own', contextVariables }, resolveDeclaredColumn);
+					resolveRef, ownKey, { kind: 'own', contextVariables }, resolveDeclaredColumn);
 			}
 			// Cross-table column renames: a subquery in this CHECK may reference
 			// ANOTHER table whose column was renamed in this same diff; the forward

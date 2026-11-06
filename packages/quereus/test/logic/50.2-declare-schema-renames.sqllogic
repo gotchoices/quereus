@@ -941,3 +941,33 @@ select * from v27;
 drop view v27;
 drop table u27;
 drop table t27_2;
+
+-- ===================================
+-- 28. Column rename where the old name is also a mutation context variable
+-- ===================================
+
+-- The live `who > 0` reads the variable `who`, not the column, so the column rename leaves it
+-- alone; a declared `w > 0` reads the renamed column, so the CHECK must change in the same apply.
+create table t28 (a integer primary key, who integer null, constraint k check (who > 0)) with context (who integer null);
+
+declare schema main {
+	table t28 {
+		a integer primary key,
+		w integer null with tags ("quereus.previous_name" = 'who'),
+		constraint k check (w > 0)
+	} with context (who integer null)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t28 RENAME COLUMN who TO w"}, {"ddl": "ALTER TABLE t28 DROP CONSTRAINT k"}, {"ddl": "ALTER TABLE t28 ADD constraint k check (w > 0)"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table t28;

@@ -3,6 +3,7 @@ architecture: docs/schema-declarative.md#migration-order
 files:
   - packages/quereus/src/schema/schema-differ.ts # generateMigrationPlan: DROP TABLE runs in the drops phase, DROP CONSTRAINT in stage 2 of pushTableAlters
   - packages/quereus/src/schema/manager.ts # assertNoReferencingChildrenForDrop ~1554, the refusal
+  - packages/quereus/src/runtime/emit/alter-table.ts # assertRenamedColumnNotReadAsContextVariable, the RENAME COLUMN arm's refusal
 repro: verified
 severity: edge-case
 likelihood: unusual
@@ -33,3 +34,15 @@ The declaration applies: once the plan has finished, no foreign key points at th
 A likely fix is ordering: run `DROP CONSTRAINT` for a foreign key whose parent this plan removes ahead of the table drops, as a user would by hand, which also keeps `diff schema` output runnable as written. Not tried. Whatever the fix, it must not let the parent drop through when a declared foreign key (a kept one or a newly added one) still names the removed table, because `DROP TABLE` destroys rows and cannot be undone.
 
 The failure message also says the failing step "cannot be undone … so any partial effect of it stands", although a refused drop changed nothing; that wording is shared with every refused irreversible step and is not specific to this case.
+
+## Arm: a column rename refused because of a CHECK the same plan drops (repro: verified)
+
+Same pattern, different step: the plan emits `RENAME COLUMN` (stage 1 of `pushTableAlters` in `packages/quereus/src/schema/schema-differ.ts`) before the `DROP CONSTRAINT` (stage 2) that would remove the CHECK blocking it. Found in review of `bug-column-rename-rewrites-check-read-of-context-variable`, which added the refusal (`assertRenamedColumnNotReadAsContextVariable` in `packages/quereus/src/runtime/emit/alter-table.ts`): renaming a column to the name of one of the table's mutation context variables is refused while a CHECK reads the column unqualified, because the CHECK would then read the variable.
+
+```sql
+create table T3 (a integer primary key, x integer null, constraint k check (x > 0)) with context (who integer null);
+declare schema main { table T3 { a integer primary key, who integer null with tags ("quereus.previous_name" = 'x'), constraint k check (new.who > 0) } with context (who integer null) }
+apply schema main;
+```
+
+Plan: `ALTER TABLE T3 RENAME COLUMN x TO who ; ALTER TABLE T3 DROP CONSTRAINT k ; ALTER TABLE T3 ADD constraint k check (new.who > 0)`. Result: `cannot rename column 'x' of table 'T3' to 'who': CHECK constraint 'k' reads 'x' unqualified …`, and nothing changes. The declared result is valid. Expected: the declaration applies in one go. Running the drop of `k` before the rename would do it; if constraint drops move ahead of renames in general, the undo renderer (`UndoRenderer.readdConstraint`, which replays renames over the re-added body) has to follow.
