@@ -792,6 +792,12 @@ async function scanForOrphans(
  * its current rows at every point and gets no override. A self-referencing FK has one table and
  * one override, which both reads of the scan take; an absent parent needs none. Points that pair
  * the same two streams are judged once; there are none when neither table has open work.
+ *
+ * NOTE: a parent whose module has no `restorableRowStates` hook is read as unchanged by every
+ * rollback, so a parent row its transaction inserted can rescue a committed orphan here and then
+ * roll back. Every bundled module has the hook; if a third-party module without one is ever a
+ * parent of a child whose DDL survives rollback, refuse `BUSY` for such a parent inside an
+ * explicit transaction, since nothing else reveals its open work.
  */
 async function foreignKeyRollbackPoints(
 	db: Database,

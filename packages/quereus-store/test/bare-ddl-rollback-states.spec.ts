@@ -1,6 +1,6 @@
 /**
  * The bare store module (no isolation wrapper) vs. rollback, for the DDL that stays inside the
- * open transaction: `create [unique] index`, `add constraint … unique` / `… check`, and a
+ * open transaction: `create [unique] index`, `add constraint … unique` / `… check` / `… foreign key`, and a
  * `set not null` that sees no NULL.
  *
  * DDL survives a rollback while the rows it judged do not, and here those rows live in the
@@ -221,6 +221,23 @@ describe('Bare store DDL vs. the states a rollback could restore', () => {
 			await db.exec(`delete from t where id = 2`);
 			await expectRefusedBusy(`alter table t add check (v > 0)`);
 			await db.exec(`rollback`);
+		});
+	});
+
+	describe('add constraint … foreign key', () => {
+		// The engine's orphan scan reads the PARENT's states too, from inside the child's
+		// `alterTable`, off the same module-wide op log.
+		it('refuses when only a parent row the transaction inserted keeps a committed child row valid', async () => {
+			await db.exec(`pragma foreign_keys = true`);
+			await db.exec(`create table p (id integer primary key) using store`);
+			await db.exec(`create table c (id integer primary key, pid integer null) using store`);
+			await db.exec(`insert into c values (1, 5)`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into p values (5)`);
+			await expectRefusedBusy(`alter table c add foreign key (pid) references p (id)`);
+			await db.exec(`commit`);
+			await db.exec(`alter table c add foreign key (pid) references p (id)`);
 		});
 	});
 

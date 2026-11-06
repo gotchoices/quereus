@@ -172,7 +172,7 @@ async function runAddConstraintViaModule(
 	// on revert — see `runAddColumn`; keeping the two builds in lock-step here keeps that
 	// one rule.) Only FK ADD CONSTRAINT has a collation pairing (UNIQUE has none), so gate
 	// on the type. The
-	// module-side `validateForeignKeyOverExistingRows` stays where it is — it needs a row
+	// module-side `validateAddedForeignKeyOverExistingRows` stays where it is — it needs a row
 	// scan, this is a pure schema check. (The `foreign_keys` pragma does NOT gate this:
 	// a conflicting-collation declaration is malformed regardless of enforcement.)
 	//
@@ -197,7 +197,7 @@ async function runAddConstraintViaModule(
 		//
 		// The memory backend reaches the identical throw slightly later, from the same
 		// helper, via `MemoryTableManager.addForeignKeyConstraint` →
-		// `validateForeignKeyOverExistingRows`; hoisting it here changes nothing for that
+		// `validateAddedForeignKeyOverExistingRows`; hoisting it here changes nothing for that
 		// backend and gives every other module the same diagnosis instead of whatever its
 		// own probe happens to say. `runAddColumn` re-drives inline column-level constraints
 		// through this arm, so `alter table t add column p integer references <parent>` with
@@ -205,7 +205,7 @@ async function runAddConstraintViaModule(
 		//
 		// Two gates, both load-bearing:
 		//   - `foreign_keys` pragma: off means off on BOTH sides (corpus case B4), and it is
-		//     how `validateForeignKeyOverExistingRows` already behaves, so gating keeps the
+		//     how `validateAddedForeignKeyOverExistingRows` already behaves, so gating keeps the
 		//     memory backend byte-identical. (Unlike the collation check above, which is a
 		//     conflict in the declaration itself and is rejected regardless of enforcement.)
 		//   - parent present: forward references are legal (docs/sql-ddl.md § Order

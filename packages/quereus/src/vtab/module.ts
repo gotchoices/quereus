@@ -605,7 +605,10 @@ export interface VirtualTableModule<
 	 * must refuse, not pass.
 	 *
 	 * Optional; a module without it is not judged (status quo), which is correct for a module
-	 * whose DDL rolls back with its data.
+	 * whose DDL rolls back with its data. As a foreign key's PARENT, though, a table is read as
+	 * unchanged by any rollback when its module lacks the hook — whatever the CHILD module's DDL
+	 * does, so a parent row that module rolls back can still leave an orphan under a foreign key
+	 * that survives (see `foreignKeyRollbackPoints`).
 	 */
 	restorableRowStates?(
 		db: Database,

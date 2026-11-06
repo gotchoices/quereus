@@ -1112,6 +1112,12 @@ async function validateDeclaredConstraintsOverContents(
 	// any insert-OR-update CHECK — deliberately wider than the ALTER paths' row-invariant
 	// gate (`validateRowInvariantChecksOverExistingRows`), which is why this caller
 	// filters itself and takes the raw scan.
+	//
+	// NOTE: these scans judge only the effective contents, never a state a rollback could
+	// restore (the ALTER paths' BUSY pass, docs/module-authoring-transactions.md § When the
+	// engine judges the rows). If an attach inside an open transaction is shown to survive a
+	// rollback that brings back the table's pre-attach rows (or removes parent rows the FK
+	// scan leaned on), judge those states here too.
 	const applicableChecks = mt.checkConstraints.filter(
 		c => (c.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0);
 	const fks = mt.foreignKeys ?? [];

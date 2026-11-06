@@ -242,7 +242,7 @@ accepted afterwards. Consequences of routing through the module:
   dispatched to — the literal-default CHECK scan above and `ADD CONSTRAINT … CHECK`
   share one helper, `validateChecksOverExistingRows`, so the module's CHECK arm is
   a schema append. The memory and store modules both call the
-  shared `validateForeignKeyOverExistingRows`, so the ADD COLUMN and ADD CONSTRAINT
+  shared `validateAddedForeignKeyOverExistingRows`, so the ADD COLUMN and ADD CONSTRAINT
   paths cannot drift. FK validation is MATCH SIMPLE (a fully-non-NULL backfilled
   value with no matching parent aborts; NULL satisfies) and pragma-gated (`pragma
   foreign_keys = false` skips the scan and defers enforcement to later writes). It is
