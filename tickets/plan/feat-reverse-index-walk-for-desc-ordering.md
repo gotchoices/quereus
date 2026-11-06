@@ -8,6 +8,7 @@ files:
   - packages/quereus-store/src/common/store-module-access-plan.ts   # buildIndexOrderingAdvertisement / chooseOrderingPlan — same direction equality (~line 1554)
   - packages/quereus-store/src/common/store-table-scan.ts           # would need a backwards key-range walk
   - docs/module-authoring.md                                        # the providesOrdering contract modules implement
+prereq: debt-memory-reverse-secondary-pk-order
 severity: cosmetic
 likelihood: normal-use
 tradeoffs: A user can get the same speed today by declaring a second index in the direction they need, so this buys convenience and index-count rather than a capability that is otherwise unreachable; and the change has to be made twice, once per backend, with the store half needing a backwards key-range walk it does not have.
