@@ -23,7 +23,7 @@ import { expressionToString } from '../../src/emit/ast-stringify.js';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { parseInsert, parse } from '../../src/parser/index.js';
 import { snapshotObjectRefResolvers } from '../../src/schema/object-ref-resolver.js';
-import { objectRefKey, renameColumnInAst, renameTableInAst, renameTableInCheckConstraints, renameTableInColumnExpressions, renameTableInIndexPredicates, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import { NO_CONTEXT_VARIABLES, objectRefKey, renameColumnInAst, renameTableInAst, renameTableInCheckConstraints, renameTableInColumnExpressions, renameTableInIndexPredicates, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
 import type { ResolveObjectRef, TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import type * as AST from '../../src/parser/ast.js';
 
@@ -479,7 +479,7 @@ describe('row-image context through the shared CHECK collection helper', () => {
 		const changed = renameTableInCheckConstraints([{ expr }], {
 			oldName: 'new', newName: 'n2', schemaName: 'main',
 			resolve, resolveAfter: resolve,
-		});
+		}, NO_CONTEXT_VARIABLES);
 		expect(changed).to.equal(false);
 		expect(expressionToString(expr).replace(/"/g, '')).to.contain('new.a');
 	});
@@ -716,10 +716,10 @@ describe('rename rewrite post-condition (conditional qualification at the walker
 			readonly kind: string;
 			readonly apply: (expr: AST.Expression) => boolean;
 		}> = [
-			{ kind: 'CHECK constraint', apply: expr => renameTableInCheckConstraints([{ expr }], freeTarget) },
+			{ kind: 'CHECK constraint', apply: expr => renameTableInCheckConstraints([{ expr }], freeTarget, NO_CONTEXT_VARIABLES) },
 			{ kind: 'partial-index predicate', apply: expr => renameTableInIndexPredicates([{ predicate: expr }], freeTarget) },
-			{ kind: 'column DEFAULT', apply: expr => renameTableInColumnExpressions([{ defaultValue: expr }], freeTarget) },
-			{ kind: 'generated column', apply: expr => renameTableInColumnExpressions([{ generatedExpr: expr }], freeTarget) },
+			{ kind: 'column DEFAULT', apply: expr => renameTableInColumnExpressions([{ defaultValue: expr }], freeTarget, NO_CONTEXT_VARIABLES) },
+			{ kind: 'generated column', apply: expr => renameTableInColumnExpressions([{ generatedExpr: expr }], freeTarget, NO_CONTEXT_VARIABLES) },
 		];
 
 		for (const { kind, apply } of reapplied) {
@@ -738,7 +738,7 @@ describe('rename rewrite post-condition (conditional qualification at the walker
 			// that resolves through to another schema is already unevaluable — the
 			// only shape the untouched arm could fire on here.
 			const expr = parseExpressionString('(select count(*) from k) >= 0') as AST.Expression;
-			expect(renameTableInCheckConstraints([{ expr }], captureTarget)).to.equal(false);
+			expect(renameTableInCheckConstraints([{ expr }], captureTarget, NO_CONTEXT_VARIABLES)).to.equal(false);
 			expect(checkText(expr)).to.contain('from k');
 			expect(checkText(expr)).to.not.contain('main.');
 		});

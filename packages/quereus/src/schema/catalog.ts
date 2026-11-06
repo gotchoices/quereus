@@ -50,6 +50,13 @@ export interface CatalogTable {
 	primaryKey: Array<{ columnName: string; desc: boolean }>;
 	/** Lowercased names of tables this table FK-references (within the same schema). */
 	referencedTables: string[];
+	/**
+	 * Lowercased names of the declared mutation-context variables (`with context (…)`),
+	 * absent when there are none. The migration planner's undo renderer replays renames
+	 * over this table's CHECKs and DEFAULTs, where a bare or `context.` read of one is
+	 * not a column reference (`docs/sql-ddl.md` §2.6.2).
+	 */
+	contextVariables?: ReadonlyArray<string>;
 	tags?: Readonly<Record<string, SqlValue>>;
 	/**
 	 * Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags and a
@@ -366,6 +373,9 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		columns,
 		primaryKey,
 		referencedTables,
+		...(tableSchema.mutationContext?.length
+			? { contextVariables: tableSchema.mutationContext.map(contextVar => contextVar.name.toLowerCase()) }
+			: {}),
 		tags: tableSchema.tags,
 		namedConstraints,
 		unnamedConstraints,

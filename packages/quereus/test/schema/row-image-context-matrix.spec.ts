@@ -31,6 +31,7 @@ import { expect } from 'chai';
 import { parseExpressionString, parse } from '../../src/parser/index.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 import {
+	NO_CONTEXT_VARIABLES,
 	objectRefKey,
 	renameColumnInAst,
 	renameColumnInCheckExpression,
@@ -85,19 +86,19 @@ const exprSites: readonly Site[] = [
 	{
 		// rewriteTableForColumnRename, owning-table CHECK branch.
 		name: 'own CHECK (seeded, own)',
-		rewrite: e => renameColumnInCheckExpression(e, 'new', 'v', 'w', resolve, NEW_KEY, 'own'),
+		rewrite: e => renameColumnInCheckExpression(e, 'new', 'v', 'w', resolve, NEW_KEY, { kind: 'own', contextVariables: NO_CONTEXT_VARIABLES }),
 		expected: ALL,
 	},
 	{
 		// rewriteTableForColumnRename, other-table CHECK branch.
 		name: "another table's CHECK (unseeded, foreign)",
-		rewrite: e => renameColumnInAst(e, 'new', 'v', 'w', resolve, NEW_KEY, 'foreign'),
+		rewrite: e => renameColumnInAst(e, 'new', 'v', 'w', resolve, NEW_KEY, { kind: 'foreign', contextVariables: NO_CONTEXT_VARIABLES }),
 		expected: WRITTEN_ROW_FOREIGN,
 	},
 	{
 		// Own DEFAULT and generated body share one collection helper ('own' hardcoded).
 		name: 'own DEFAULT (collection helper)',
-		rewrite: e => renameColumnInColumnExpressions([{ defaultValue: e }], 'new', 'v', 'w', resolve, NEW_KEY),
+		rewrite: e => renameColumnInColumnExpressions([{ defaultValue: e }], 'new', 'v', 'w', resolve, NEW_KEY, NO_CONTEXT_VARIABLES),
 		expected: ALL,
 	},
 	{
@@ -105,13 +106,13 @@ const exprSites: readonly Site[] = [
 		// body outright (`new.v isn't a column`), so this cell pins the helper's
 		// contract rather than a shape a user can author today.
 		name: 'own GENERATED body (collection helper)',
-		rewrite: e => renameColumnInColumnExpressions([{ generatedExpr: e }], 'new', 'v', 'w', resolve, NEW_KEY),
+		rewrite: e => renameColumnInColumnExpressions([{ generatedExpr: e }], 'new', 'v', 'w', resolve, NEW_KEY, NO_CONTEXT_VARIABLES),
 		expected: ALL,
 	},
 	{
 		// rewriteOtherTableColumnExpressions — DEFAULT and generated take the same call.
 		name: "another table's DEFAULT / GENERATED body (unseeded, foreign)",
-		rewrite: e => renameColumnInAst(e, 'new', 'v', 'w', resolve, NEW_KEY, 'foreign'),
+		rewrite: e => renameColumnInAst(e, 'new', 'v', 'w', resolve, NEW_KEY, { kind: 'foreign', contextVariables: NO_CONTEXT_VARIABLES }),
 		expected: WRITTEN_ROW_FOREIGN,
 	},
 	{

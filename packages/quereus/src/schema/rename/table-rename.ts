@@ -1,5 +1,15 @@
 import type * as AST from '../../parser/ast.js';
-import { eq, objectRefKey, objectRefKeySchema, rewriteEach, type ResolveObjectRef, type TableRenameTarget } from './shared.js';
+import {
+	CONTEXT_QUALIFIER,
+	NO_CONTEXT_VARIABLES,
+	eq,
+	objectRefKey,
+	objectRefKeySchema,
+	rewriteEach,
+	type ResolveObjectRef,
+	type TableRenameTarget,
+	type WrittenRowContext,
+} from './shared.js';
 
 /**
  * Scope-aware, in-place table-reference walker: propagates
@@ -38,16 +48,25 @@ export interface TableRenameOpts {
 	 * a table reference. (The column walker records the same asymmetry by
 	 * passing row-image mode `'none'` for predicates.)
 	 *
-	 * A boolean where the column walker's
+	 * Present-or-absent where the column walker's
 	 * {@link import('./shared.js').RowImageContext} is three-valued, and
 	 * COMPLETE at two: this walker never *matches* a row image, only
 	 * suppresses one, so the column walker's `'own'`/`'foreign'` split
-	 * collapses — `false` maps to `'none'`, `true` to `'foreign'`. Like the
-	 * column walker, the flag is overridden (to `true`) over `with inverse` /
-	 * `with defaults` subtrees regardless of the entry-point value, because
-	 * written-row context there is a property of the position, not the walk.
+	 * collapses — absent maps to `'none'`, present to a foreign context. Like
+	 * the column walker, the option is overridden (to present, with no
+	 * variables) over `with inverse` / `with defaults` subtrees regardless of
+	 * the entry-point value, because written-row context there is a property
+	 * of the position, not the walk.
+	 *
+	 * `contextVariables` is the declared mutation-context variables of the
+	 * table OWNING the walked expression (empty for a generated body). An
+	 * unbound `context.<name>` naming one reads the variable (`docs/sql-ddl.md`
+	 * §2.6.2), so it is not a reference to a table named `context`; and a
+	 * self-qualifier `<table>.<name>` naming one is schema-qualified when a
+	 * rename would spell it `context.<name>` — see
+	 * {@link TableRef.contextVariableCaptures}.
 	 */
-	rowImageContext?: boolean;
+	rowImageContext?: Pick<WrittenRowContext, 'contextVariables'>;
 	/**
 	 * The walked expression is SCHEMA-AUTHORED — a CHECK constraint, a column
 	 * DEFAULT / generated body, or a partial-index predicate — so it plans under
@@ -138,6 +157,16 @@ interface TableRef {
 	 * schema-qualified source or target is never a CTE.
 	 */
 	cteShadows?: (next: string) => boolean;
+	/**
+	 * Present only at a seedless column qualifier in written-row context (a CHECK's
+	 * self-qualifier `t.who`). Answers whether spelling the qualifier `next` would
+	 * make the reference read a mutation-context variable instead of the column:
+	 * `context.<name>` with no schema always reaches the owning table's variable
+	 * (`docs/sql-ddl.md` §2.6.2), so a rename of `t` to `context` must write
+	 * `<schema>.context.who`, the spelling that reaches the column. Like
+	 * `cteShadows`, a capture the catalog resolvers cannot see.
+	 */
+	contextVariableCaptures?: (next: string) => boolean;
 }
 
 /** Return `true` to stop the walk early (the read-only probe's short-circuit). */
@@ -181,6 +210,8 @@ interface TableScopeFrame {
 interface TableRefWalkState {
 	sink: TableRefSink;
 	rowImage: boolean;
+	/** The variables of {@link TableRenameOpts.rowImageContext} at the current position. */
+	contextVariables: ReadonlySet<string>;
 	stack: TableScopeFrame[];
 	/** Set once the sink asks to stop; every visit entry checks it. */
 	stop: boolean;
@@ -297,12 +328,16 @@ export function renameTableInAst(
 			ref.setName(newName);
 			changed = true;
 			if (collides) ref.aliasAs?.(oldName);
-			// Catalog post-condition — with one addition the catalog resolvers
+			// Catalog post-condition — with two additions the catalog resolvers
 			// cannot express: a CTE in scope at the source captures a bare
-			// name before the catalog is ever consulted, so a rewritten
-			// reference whose new name a CTE shadows must be schema-qualified
-			// even when the catalog answer alone would leave it bare.
-			if (ref.qualify && (resolveAfter(ref.schema, newName) !== newTargetKey || (ref.cteShadows?.(newName) ?? false))) {
+			// name before the catalog is ever consulted, and a bare `context.`
+			// qualifier is captured by a mutation-context variable of that
+			// name, so a rewritten reference either would capture must be
+			// schema-qualified even when the catalog answer alone would leave
+			// it bare.
+			if (ref.qualify && (resolveAfter(ref.schema, newName) !== newTargetKey
+				|| (ref.cteShadows?.(newName) ?? false)
+				|| (ref.contextVariableCaptures?.(newName) ?? false))) {
 				ref.qualify(schemaName);
 			}
 			return;
@@ -441,6 +476,11 @@ export function renameTableInIndexPredicates(
  * also runs with {@link TableRenameOpts.schemaAuthoredBody}, for the same
  * reasons the predicate arm above does.
  *
+ * `contextVariables` is the declared mutation-context variables of the table that
+ * OWNS `checks` ({@link import('./shared.js').contextVariableNames}) — not of the
+ * renamed table, unless it is the owner: a `context.<name>` reading one is not a
+ * reference to a table named `context`.
+ *
  * Same sharing and idempotence story as {@link renameTableInIndexPredicates}: the
  * `expr` is the very AST the catalog's `TableSchema` holds, so one rewrite covers
  * every holder and a second call with the same pair is a no-op.
@@ -448,9 +488,10 @@ export function renameTableInIndexPredicates(
 export function renameTableInCheckConstraints(
 	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
 	target: TableRenameTarget,
+	contextVariables: ReadonlySet<string>,
 ): boolean {
-	return rewriteEach(checks, cc => cc.expr,
-		expr => renameTableInAst(expr, target, { rowImageContext: true, schemaAuthoredBody: true }));
+	const opts: TableRenameOpts = { rowImageContext: { contextVariables }, schemaAuthoredBody: true };
+	return rewriteEach(checks, cc => cc.expr, expr => renameTableInAst(expr, target, opts));
 }
 
 /**
@@ -473,6 +514,10 @@ export function renameTableInCheckConstraints(
  * columns (a self-referencing default, `default ((select count(*) from t))`) and for
  * every other table's.
  *
+ * `contextVariables` is the owning table's declared mutation-context variables, as for
+ * {@link renameTableInCheckConstraints}. Only the DEFAULT walk takes them: a generated
+ * body's `context.<name>` is a self-qualifier, never a variable (`docs/sql-ddl.md` §2.6).
+ *
  * Same sharing and idempotence story as {@link renameTableInCheckConstraints}: the
  * `Expression` is the very AST the catalog's `TableSchema` holds, so one in-place
  * rewrite reaches every holder and a second call with the same pair finds nothing
@@ -487,12 +532,13 @@ export function renameTableInColumnExpressions(
 		readonly generatedExpr?: AST.Expression;
 	}> | undefined,
 	target: TableRenameTarget,
+	contextVariables: ReadonlySet<string>,
 ): boolean {
-	const rewrite = (expr: AST.Expression): boolean =>
-		renameTableInAst(expr, target, { rowImageContext: true, schemaAuthoredBody: true });
+	const rewriteUnder = (variables: ReadonlySet<string>) => (expr: AST.Expression): boolean =>
+		renameTableInAst(expr, target, { rowImageContext: { contextVariables: variables }, schemaAuthoredBody: true });
 	// Both walks always run — `||` on the results, not short-circuited between them.
-	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
-	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
+	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewriteUnder(contextVariables));
+	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewriteUnder(NO_CONTEXT_VARIABLES));
 	return defaultsChanged || generatedChanged;
 }
 
@@ -503,7 +549,8 @@ export function renameTableInColumnExpressions(
 function walkTableRefs(node: AST.AstNode, sink: TableRefSink, opts?: TableRenameOpts): void {
 	const state: TableRefWalkState = {
 		sink,
-		rowImage: opts?.rowImageContext ?? false,
+		rowImage: opts?.rowImageContext !== undefined,
+		contextVariables: opts?.rowImageContext?.contextVariables ?? NO_CONTEXT_VARIABLES,
 		stack: [],
 		stop: false,
 	};
@@ -778,15 +825,18 @@ function visitDmlTargetRowClauses(
  * `visitRowImageForeignSubtree`. Unconditional on purpose: these subtrees are
  * written-row context of their enclosing select wherever the walk entered, so a
  * reached view body self-suppresses even though the entry point (rightly)
- * passed no `rowImageContext` for it.
+ * passed no `rowImageContext` for it. The owning table's mutation context does not
+ * reach such a subtree, so it carries no variables (column-walker parity).
  */
 function visitRowImageSubtree(expr: AST.Expression, state: TableRefWalkState): void {
-	const ambient = state.rowImage;
+	const ambient = { rowImage: state.rowImage, contextVariables: state.contextVariables };
 	state.rowImage = true;
+	state.contextVariables = NO_CONTEXT_VARIABLES;
 	try {
 		visitTableRefs(expr, state);
 	} finally {
-		state.rowImage = ambient;
+		state.rowImage = ambient.rowImage;
+		state.contextVariables = ambient.contextVariables;
 	}
 }
 
@@ -1022,8 +1072,12 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 				// Nothing in scope binds the qualifier: a seedless expression context
 				// (a CHECK / index-predicate self-qualifier, or correlation the walk
 				// cannot see). Treat as a direct table reference — except the row
-				// image in a written-row context.
+				// image in a written-row context, and a `context.<name>` reading one
+				// of the owning table's mutation-context variables.
 				if (state.rowImage && (qualifierLower === 'new' || qualifierLower === 'old')) break;
+				const colNameLower = col.name.toLowerCase();
+				if (qualifierLower === CONTEXT_QUALIFIER && state.contextVariables.has(colNameLower)) break;
+				const contextVariables = state.contextVariables;
 				emit(state, {
 					schema: undefined,
 					name: col.table,
@@ -1036,6 +1090,7 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 					// the only way the post-condition can fail here — is one the
 					// planner already rejects. Harmless, arguably an improvement.
 					qualify: schemaName => { col.schema = schemaName; },
+					contextVariableCaptures: next => eq(next, CONTEXT_QUALIFIER) && contextVariables.has(colNameLower),
 				});
 			} else if (resolved.binding !== null) {
 				// Bound by an unaliased real table source: the qualifier IS that

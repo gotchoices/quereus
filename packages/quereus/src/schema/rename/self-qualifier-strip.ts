@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { eq, type ResolveColumnInSource } from './shared.js';
+import { CONTEXT_QUALIFIER, eq, type ResolveColumnInSource } from './shared.js';
 import { hasBarrierFrame, hasSealedFrame, type ScopeFrame } from '../expr-scope/frame.js';
 import { walkSchemaExpressionScope } from '../expr-scope/walk.js';
 
@@ -115,7 +115,7 @@ function stripColumnQualifier(
 	if (state.shadowedColumns?.has(colLower)) {
 		// `context.<name>` with no schema always reaches the variable, including on a table
 		// literally named `context`.
-		if (qualifier === 'context' && col.schema === undefined) return;
+		if (qualifier === CONTEXT_QUALIFIER && col.schema === undefined) return;
 		// Left qualified to fail as an unshadowed name does: such a body cannot correlate to
 		// the written row, since a materialized CTE keeps one buffer per execution.
 		if (hasBarrierFrame(stack)) return;
@@ -251,7 +251,7 @@ function requalifyOwnRowRef(
 	const rowImage = qualifier === 'new' && col.schema === undefined;
 	if (!selfQualified && !rowImage) return;
 	if (selfQualified && selfQualifiedNameIsVariable(col, qualifier, state.contextVariables)) {
-		col.table = 'context';
+		col.table = CONTEXT_QUALIFIER;
 		col.schema = undefined;
 		state.changed = true;
 		return;
@@ -270,5 +270,5 @@ function selfQualifiedNameIsVariable(
 ): boolean {
 	const nameLower = col.name.toLowerCase();
 	if (!contextVariables?.names.has(nameLower)) return false;
-	return !contextVariables.shadowedColumns.has(nameLower) || (qualifier === 'context' && col.schema === undefined);
+	return !contextVariables.shadowedColumns.has(nameLower) || (qualifier === CONTEXT_QUALIFIER && col.schema === undefined);
 }

@@ -5,8 +5,11 @@ import { expressionToString } from '../emit/ast-stringify.js';
 import {
 	columnReferencedInAst,
 	columnReferencedInCheckExpression,
+	contextVariableNames,
+	NO_CONTEXT_VARIABLES,
 	objectRefKey,
 	type ResolveColumnInSource,
+	type RowImageContext,
 } from './rename-rewriter.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
 import { snapshotObjectRefResolvers, type ObjectRefResolvers } from './object-ref-resolver.js';
@@ -73,7 +76,10 @@ import { collectColumnRepublication, type ColumnRepublication } from './column-r
  *
  * The root body is walked with `rowImageContext` and every body below it without — see
  * `reachableObjects`' `rootOpts`. Rooting a CHECK / DEFAULT without it would put a table
- * literally called `new` in the reach and false-refuse its own drop.
+ * literally called `new` in the reach and false-refuse its own drop. The root's context
+ * carries the declared mutation-context variables of the table owning the expression
+ * (none for a generated body), so a bare or `context.` read of a variable is neither a
+ * column reference nor a reference to a table named `context` (`docs/sql-ddl.md` §2.6.2).
  *
  * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs, and
  * now builds one closure PER STORED EXPRESSION rather than per table. The closure only
@@ -205,9 +211,9 @@ export function findTableExpressionDependent(
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		if (objectRefKey(table.schemaName, table.name) === targetKey) continue;
 		if (probesTable && !probesTable(table)) continue;
-		const names: ExpressionProbe = expr => {
+		const names: ExpressionProbe = (expr, contextVariables) => {
 			if (expr === undefined) return undefined;
-			const path = reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: true })
+			const path = reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: { contextVariables } })
 				.namerOf(targetKey)?.path;
 			return path === undefined ? undefined : { path };
 		};
@@ -238,8 +244,9 @@ export function findChecksReachingObjects(db: Database, keys: ReadonlySet<string
 	const found: CheckReachingObjects[] = [];
 	for (const schema of db.schemaManager._getAllSchemas()) {
 		for (const table of schema.getAllTables()) {
+			const rowImageContext = { contextVariables: contextVariableNames(table.mutationContext) };
 			for (const check of table.checkConstraints ?? []) {
-				const reach = reachableObjects(db, check.expr, table.schemaName, resolvers, { rowImageContext: true });
+				const reach = reachableObjects(db, check.expr, table.schemaName, resolvers, { rowImageContext });
 				const reached = [...keys].flatMap(key => {
 					const namer = reach.namerOf(key);
 					return namer ? [{ key, path: namer.path }] : [];
@@ -269,8 +276,11 @@ export function describeDependentTable(table: TableSchema, homeSchemaName: strin
  * `undefined` for no match. Path-returning rather than boolean because a caller has to
  * phrase an indirect refusal differently: a user told a CHECK blocks the drop will read
  * its body, find no mention of the dropped object, and be stuck without the chain.
+ *
+ * `contextVariables` is the declared mutation-context variables in scope in the
+ * expression: its owning table's for a CHECK or DEFAULT, none for a generated body.
  */
-type ExpressionProbe = (expr: AST.Expression | undefined) => ProbeMatch | undefined;
+type ExpressionProbe = (expr: AST.Expression | undefined, contextVariables: ReadonlySet<string>) => ProbeMatch | undefined;
 
 /** How a probe matched: the reach path, plus the broken-view arm's marker. */
 interface ProbeMatch {
@@ -340,9 +350,9 @@ function columnProbe(
 	columnName: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): ExpressionProbe {
-	return expr => {
+	return (expr, contextVariables) => {
 		if (!expr) return undefined;
-		const reach = reachableObjects(db, expr, homeSchemaName, resolvers, { rowImageContext: true });
+		const reach = reachableObjects(db, expr, homeSchemaName, resolvers, { rowImageContext: { contextVariables } });
 		for (const [targetIndex, target] of republication.targets.entries()) {
 			for (const reached of reach.bodies) {
 				// Seeded ONLY on the probed table's own ROOT body, probing the BASE target: a
@@ -359,8 +369,11 @@ function columnProbe(
 				// table's root body binds that table's image; a republication target at the
 				// root still binds the OWNING table's image, not the view being probed).
 				// Anything REACHED below the root is a view / MV body — a relation with no
-				// written row — so `'none'`.
-				const rowImage = reached.ownerKey === undefined ? (seeded ? 'own' : 'foreign') : 'none';
+				// written row — so `'none'`. The root's context carries its owning table's
+				// variables, which the probe was handed.
+				const rowImage: RowImageContext = reached.ownerKey === undefined
+					? { kind: seeded ? 'own' : 'foreign', contextVariables }
+					: 'none';
 				const hit = seeded
 					? columnReferencedInCheckExpression(reached.body, target.tableName, columnName,
 						reached.resolve, target.targetKey, rowImage, resolveColumnInSource)
@@ -379,9 +392,10 @@ function columnProbe(
 
 /** The first CHECK constraint of `table` the probe matches, described for an error. */
 function findInChecks(table: TableSchema, names: ExpressionProbe): ProbeHit | undefined {
+	const contextVariables = contextVariableNames(table.mutationContext);
 	for (const check of table.checkConstraints ?? []) {
 		// `!== undefined`, not truthiness: a match with an EMPTY path is a direct match.
-		const match = names(check.expr);
+		const match = names(check.expr, contextVariables);
 		if (match !== undefined) return { describe: describeCheck(check), ...match };
 	}
 	return undefined;
@@ -400,16 +414,18 @@ function findInColumnExpressions(
 	names: ExpressionProbe,
 ): ProbeHit | undefined {
 	const lowerSkip = ownTable ? skipColumnName?.toLowerCase() : undefined;
+	const contextVariables = contextVariableNames(table.mutationContext);
 	for (const col of table.columns) {
 		if (lowerSkip !== undefined && col.name.toLowerCase() === lowerSkip) continue;
 		// `!== undefined` for the same reason as in {@link findInChecks}: an empty-path
 		// match is a direct hit.
-		const defaultMatch = names(col.defaultValue ?? undefined);
+		const defaultMatch = names(col.defaultValue ?? undefined, contextVariables);
 		if (defaultMatch !== undefined) {
 			return { describe: `the DEFAULT of column '${col.name}'`, ...defaultMatch };
 		}
 		if (ownTable) continue;
-		const generatedMatch = names(col.generatedExpr);
+		// A generated body's bare name always means the column (`docs/sql-ddl.md` §2.6).
+		const generatedMatch = names(col.generatedExpr, NO_CONTEXT_VARIABLES);
 		if (generatedMatch !== undefined) {
 			return { describe: `the GENERATED expression of column '${col.name}'`, ...generatedMatch };
 		}
@@ -424,7 +440,7 @@ function findInColumnExpressions(
  * has on it: `DROP CONSTRAINT` resolves by name only, so an unnamed CHECK can only be
  * removed by rebuilding its table.
  */
-function describeCheck(check: RowConstraintSchema): string {
+export function describeCheck(check: RowConstraintSchema): string {
 	return check.name
 		? `CHECK constraint '${check.name}'`
 		: `the CHECK constraint (${expressionToString(check.expr)})`;

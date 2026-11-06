@@ -14,8 +14,8 @@
  * keep one import path.
  */
 
-export type { ResolveColumnInSource, ResolveObjectRef, RowImageContext, TableRenameTarget } from './rename/shared.js';
-export { objectRefKey, objectRefKeySchema, singleSchemaObjectRefResolver } from './rename/shared.js';
+export type { ResolveColumnInSource, ResolveObjectRef, RowImageContext, TableRenameTarget, WrittenRowContext } from './rename/shared.js';
+export { NO_CONTEXT_VARIABLES, contextVariableNames, objectRefKey, objectRefKeySchema, singleSchemaObjectRefResolver } from './rename/shared.js';
 export {
 	renameTableInAst,
 	tableReferencedInAst,
@@ -31,6 +31,7 @@ export {
 	renameColumnInCheckExpression,
 	columnReferencedInAst,
 	columnReferencedInCheckExpression,
+	checkReadsColumnBare,
 	renameColumnInIndexPredicates,
 	renameColumnInCheckConstraints,
 	renameColumnInColumnExpressions,

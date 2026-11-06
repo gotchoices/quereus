@@ -1,6 +1,16 @@
 import type * as AST from '../../parser/ast.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
-import { eq, objectRefKeySchema, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef, type RowImageContext } from './shared.js';
+import {
+	CONTEXT_QUALIFIER,
+	NO_CONTEXT_VARIABLES,
+	eq,
+	objectRefKeySchema,
+	rewriteEach,
+	type ResolveColumnInSource,
+	type ResolveObjectRef,
+	type RowImageContext,
+	type WrittenRowContext,
+} from './shared.js';
 
 /**
  * Scope-aware, in-place column-rename walkers: propagate `ALTER TABLE … RENAME
@@ -47,6 +57,13 @@ interface ScopeFrame {
 	 * recursive analysis).
 	 */
 	realSources: Array<{ key: string; schemaLower: string; nameLower: string }>;
+	/**
+	 * Set only on the implicit binding to the owning table that
+	 * {@link renameColumnInCheckExpression} pushes — not a FROM binding. A bare name
+	 * that reaches it may read a mutation-context variable instead of the column, and
+	 * it never rebinds a qualifier (see {@link isQualifierReboundAboveSeed}).
+	 */
+	isSeed?: true;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -142,6 +159,12 @@ export function renameColumnInAst(
  * CHECK may legitimately contain `(select max("new".a) from "new")`. The match
  * therefore requires that no FROM/WITH frame above the seed rebind the
  * qualifier — see `matchesRowImage`.
+ *
+ * The written-row context also carries the owning table's declared
+ * mutation-context variables (`docs/sql-ddl.md` §2.6.2). A bare name that reaches
+ * the seed and names one reads the variable, so it never matches; nor does an
+ * unbound `context.<name>` naming one — see {@link unqualifiedRefBinding} and
+ * {@link readsContextVariable}.
  */
 export function renameColumnInCheckExpression(
 	expr: AST.AstNode | undefined,
@@ -154,7 +177,48 @@ export function renameColumnInCheckExpression(
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!expr) return false;
-	const state: ColumnRewriteState = {
+	const state = seededState(tableName, oldColName, newColName, resolve, targetKey, rowImage, resolveColumnInSource);
+	visitSeeded(expr, state);
+	return state.changed;
+}
+
+/**
+ * Whether `expr`, a CHECK of `tableName`, reads column `columnName` through a BARE
+ * name bound by the owning row itself — the implicit seed — rather than by a
+ * subquery's own source, or through `new.` / `<table>.`, or as a mutation-context
+ * variable of that name. Read-only; walks a throwaway {@link spineCloneAst} copy.
+ *
+ * The RENAME COLUMN pre-flight asks it when the new name is a declared variable of
+ * the table: such a reference, renamed, would read the variable (`docs/sql-ddl.md`
+ * §2.6.2), so the rename is refused rather than rewritten.
+ */
+export function checkReadsColumnBare(
+	expr: AST.AstNode | undefined,
+	tableName: string,
+	columnName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
+	contextVariables: ReadonlySet<string>,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (!expr) return false;
+	const state = seededState(tableName, columnName, PROBE_COLUMN_NAME, resolve, targetKey,
+		{ kind: 'own', contextVariables }, resolveColumnInSource);
+	state.bareSeedHit = false;
+	visitSeeded(spineCloneAst(expr), state);
+	return state.bareSeedHit;
+}
+
+function seededState(
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
+	rowImage: RowImageContext,
+	resolveColumnInSource: ResolveColumnInSource | undefined,
+): ColumnRewriteState {
+	return {
 		tableName: tableName.toLowerCase(),
 		oldCol: oldColName.toLowerCase(),
 		newCol: newColName,
@@ -165,15 +229,19 @@ export function renameColumnInCheckExpression(
 		resolveColumnInSource,
 		rowImage,
 	};
+}
+
+/** Walk `expr` under the implicit seed binding to the owning table. */
+function visitSeeded(expr: AST.AstNode, state: ColumnRewriteState): void {
 	const frame = emptyFrame();
 	frame.qualifiers.set(state.tableName, state.targetKey);
+	frame.isSeed = true;
 	state.scopeStack.push(frame);
 	try {
 		visitColumnRename(expr, state);
 	} finally {
 		state.scopeStack.pop();
 	}
-	return state.changed;
 }
 
 /**
@@ -296,6 +364,10 @@ export function renameColumnInIndexPredicates(
  * walk has no implicit seed. That own-table contract is also why the row-image
  * mode is hardcoded `'own'` here: a CHECK evaluates against the row being
  * written, whose image IS the renamed table's.
+ *
+ * `contextVariables` is the renamed table's declared mutation-context variables
+ * ({@link import('./shared.js').contextVariableNames}): a CHECK's bare or
+ * `context.` read of one is not a column reference and is left alone.
  */
 export function renameColumnInCheckConstraints(
 	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
@@ -304,10 +376,12 @@ export function renameColumnInCheckConstraints(
 	newColName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	contextVariables: ReadonlySet<string>,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
+	const rowImage: WrittenRowContext = { kind: 'own', contextVariables };
 	return rewriteEach(checks, cc => cc.expr, expr => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, resolve, targetKey, 'own', resolveColumnInSource));
+		expr, tableName, oldColName, newColName, resolve, targetKey, rowImage, resolveColumnInSource));
 }
 
 /**
@@ -330,6 +404,11 @@ export function renameColumnInCheckConstraints(
  * Case folding (`NEW.A`) and the shadowing edge (a real table literally named `new`,
  * reached from a subquery inside the expression) therefore behave exactly as they do for
  * a CHECK, because the same walk decides all three.
+ *
+ * The two arms differ in one thing: the table's declared mutation-context variables
+ * (`contextVariables`) reach a DEFAULT's walk, so its bare read of a variable is left
+ * alone, but never a generated body's — there a bare name always means the column, and
+ * `context.<name>` is a self-qualifier (`docs/sql-ddl.md` §2.6).
  *
  * Only pass the renamed table's OWN columns. A default on a *different* table can reach
  * this table only through a subquery, so an unqualified ref there must bind inside that
@@ -355,13 +434,16 @@ export function renameColumnInColumnExpressions(
 	newColName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	contextVariables: ReadonlySet<string>,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
-	const rewrite = (expr: AST.Expression): boolean => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, resolve, targetKey, 'own', resolveColumnInSource);
+	const rewriteUnder = (rowImage: WrittenRowContext) => (expr: AST.Expression): boolean => renameColumnInCheckExpression(
+		expr, tableName, oldColName, newColName, resolve, targetKey, rowImage, resolveColumnInSource);
 	// Both walks always run — `||` on the results, not short-circuited between them.
-	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
-	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
+	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined,
+		rewriteUnder({ kind: 'own', contextVariables }));
+	const generatedChanged = rewriteEach(columns, c => c.generatedExpr,
+		rewriteUnder({ kind: 'own', contextVariables: NO_CONTEXT_VARIABLES }));
 	return defaultsChanged || generatedChanged;
 }
 
@@ -501,14 +583,30 @@ interface ColumnRewriteState {
 	resolveColumnInSource?: ResolveColumnInSource;
 	/**
 	 * What a bare, unbound `new.` / `old.` qualifier names at the CURRENT
-	 * position — the caller's mode for the walked expression, overridden to
-	 * `'foreign'` while the walk descends a `with inverse` / `with defaults`
-	 * subtree (whose `new.` refs belong to the enclosing select, never to any
-	 * rename target — see the select arm of {@link visitColumnRename}). Decides
-	 * only the unbound-bare case in {@link matchesRowImage}; an in-scope binding
-	 * or a schema qualifier always wins first.
+	 * position, and which mutation-context variables are in scope there — the
+	 * caller's context for the walked expression, overridden to a foreign one
+	 * with no variables while the walk descends a `with inverse` /
+	 * `with defaults` subtree (whose `new.` refs belong to the enclosing select,
+	 * never to any rename target — see the select arm of
+	 * {@link visitColumnRename}). Decides only the unbound-bare case in
+	 * {@link matchesRowImage}, a bare name reaching the seed, and an unbound
+	 * `context.` qualifier; an in-scope binding or a schema qualifier always
+	 * wins first.
 	 */
 	rowImage: RowImageContext;
+	/**
+	 * Set by {@link checkReadsColumnBare} only: becomes true when a bare ref to
+	 * `oldCol` binds at the seed frame.
+	 */
+	bareSeedHit?: boolean;
+}
+
+/** {@link RowImageContext} with the variables dropped: what an unbound `new.` / `old.` names. */
+type RowImageKind = 'none' | WrittenRowContext['kind'];
+
+/** The mutation-context variables in scope at the walk's current position. */
+function contextVariablesAt(state: ColumnRewriteState): ReadonlySet<string> {
+	return state.rowImage === 'none' ? NO_CONTEXT_VARIABLES : state.rowImage.contextVariables;
 }
 
 function emptyFrame(): ScopeFrame {
@@ -656,22 +754,31 @@ function isCteInScope(state: ColumnRewriteState, name: string): boolean {
  * Aliased and unaliased sources bind alike here, and the shadow scan over
  * `realSources` widens in step (it records both), so `from u b` still stops an
  * outer capture of a bare `x` that `u` exposes.
+ *
+ * Answers WHERE it binds — `'seed'` for the implicit binding to the owning
+ * table, `'from'` for a FROM frame above it — or `undefined` when it binds
+ * something else. A name that reaches the seed and is a mutation-context
+ * variable of the owning table reads the variable (`docs/sql-ddl.md` §2.6.2,
+ * the planner's `registerMutationContextSymbols` registering it before the
+ * column), so it binds nothing here; a subquery selecting from the table itself
+ * binds it first at its own frame, as the planner resolves it there.
  */
-function unqualifiedRefBindsTarget(state: ColumnRewriteState): boolean {
+function unqualifiedRefBinding(state: ColumnRewriteState): 'seed' | 'from' | undefined {
 	for (let i = state.scopeStack.length - 1; i >= 0; i--) {
 		const frame = state.scopeStack[i];
-		if (frame.ctesInScope.has(state.tableName)) return false;
+		if (frame.ctesInScope.has(state.tableName)) return undefined;
 		if (state.resolveColumnInSource && frame.realSources.length > 0) {
 			for (const src of frame.realSources) {
 				// The renamed table itself trivially exposes oldCol; defer to
 				// the binding check below so we don't double-capture.
 				if (src.key === state.targetKey) continue;
-				if (state.resolveColumnInSource(src.schemaLower, src.nameLower, state.oldCol)) return false;
+				if (state.resolveColumnInSource(src.schemaLower, src.nameLower, state.oldCol)) return undefined;
 			}
 		}
-		if (frameBindsTarget(frame, state.targetKey)) return true;
+		if (frame.isSeed && contextVariablesAt(state).has(state.oldCol)) return undefined;
+		if (frameBindsTarget(frame, state.targetKey)) return frame.isSeed ? 'seed' : 'from';
 	}
-	return false;
+	return undefined;
 }
 
 /** Whether any source bound in `frame` resolves to `targetKey`. */
@@ -739,12 +846,44 @@ function resolveQualifierBinding(
  *
  * `qualifierLower` is `col.table` already lowercased by the caller.
  */
-function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): RowImageContext {
+function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): RowImageKind {
 	if (state.rowImage === 'none') return 'none';
 	if (col.schema !== undefined) return 'none';
 	if (qualifierLower !== 'new' && qualifierLower !== 'old') return 'none';
 	if (isQualifierReboundAboveSeed(state, qualifierLower)) return 'none';
-	return state.rowImage;
+	return state.rowImage.kind;
+}
+
+/**
+ * Whether a qualified ref to `oldCol` is `context.<name>` reading a
+ * mutation-context variable of the owning table rather than a column:
+ * `docs/sql-ddl.md` §2.6.2 — with no schema it always reaches the variable,
+ * including on a table literally named `context` (bound here by the seed) and
+ * over another table so named (reached through {@link ResolveObjectRef}). The
+ * one exception mirrors {@link matchesRowImage}'s: a subquery that really
+ * selects from a table named `context` binds the qualifier at its own frame,
+ * as the planner resolves it there.
+ */
+function readsContextVariable(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): boolean {
+	return qualifierLower === CONTEXT_QUALIFIER
+		&& col.schema === undefined
+		&& contextVariablesAt(state).has(state.oldCol)
+		&& !isQualifierReboundAboveSeed(state, qualifierLower);
+}
+
+/**
+ * Whether a qualified ref the walk is renaming would, under the new name, read a
+ * mutation-context variable instead of the column: `context.<old>` on a table
+ * named `context`, renamed to a declared variable's name. The rewrite then spells
+ * it `<schema>.context.<new>`, which §2.6.2 says reaches the column. A subquery
+ * that rebinds `context` keeps the bare spelling: it binds the column there.
+ */
+function newSpellingReadsContextVariable(state: ColumnRewriteState, col: AST.ColumnExpr): boolean {
+	const qualifierLower = col.table?.toLowerCase();
+	return qualifierLower === CONTEXT_QUALIFIER
+		&& col.schema === undefined
+		&& contextVariablesAt(state).has(state.newCol.toLowerCase())
+		&& !isQualifierReboundAboveSeed(state, qualifierLower);
 }
 
 /**
@@ -754,9 +893,10 @@ function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifi
  * is legal — so this scan is what stops the row-image match from false-firing
  * inside `check ((select max("new".a) from "new") >= 0)`.
  *
- * The scan starts at index 1: frame 0 is the implicit seed
- * {@link renameColumnInCheckExpression} pushes for the owning table, which is
- * not a FROM binding and must not count as a rebind. All three ways a frame can
+ * The scan skips the implicit seed {@link renameColumnInCheckExpression} pushes
+ * for the owning table ({@link ScopeFrame.isSeed}), which is not a FROM binding
+ * and must not count as a rebind. An unseeded walk has no seed, so every frame
+ * on its stack is a real one and is scanned. All three ways a frame can
  * bind a qualifier are checked — a FROM source's own qualifier (its alias, or
  * its bare name when unaliased), a CTE name in scope, and a
  * shadowing-but-not-exposing CTE source.
@@ -774,8 +914,8 @@ function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifi
  * the two (the SQL standard has none), not a change to this scan.
  */
 function isQualifierReboundAboveSeed(state: ColumnRewriteState, qualifier: string): boolean {
-	for (let i = 1; i < state.scopeStack.length; i++) {
-		const frame = state.scopeStack[i];
+	for (const frame of state.scopeStack) {
+		if (frame.isSeed) continue;
 		if (frame.qualifiers.has(qualifier)) return true;
 		if (frame.ctesInScope.has(qualifier)) return true;
 		if (frame.ctesShadowingSource.has(qualifier)) return true;
@@ -790,11 +930,12 @@ function isQualifierReboundAboveSeed(state: ColumnRewriteState, qualifier: strin
  * ambient mode after. The override is unconditional (not `||`-combined with the
  * ambient mode): even inside a seeded `'own'` walk, a nested select's inverse
  * expression's `new.` refs name THAT select's outputs, not the seeded table's
- * row image.
+ * row image. Nor does the owning table's mutation context reach that subtree, so
+ * it carries no variables.
  */
 function visitRowImageForeignSubtree(expr: AST.Expression, state: ColumnRewriteState): void {
 	const ambient = state.rowImage;
-	state.rowImage = 'foreign';
+	state.rowImage = { kind: 'foreign', contextVariables: NO_CONTEXT_VARIABLES };
 	try {
 		visitColumnRename(expr, state);
 	} finally {
@@ -1126,6 +1267,10 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					// A schema-qualified qualifier (`main.t.k`) can never be an
 					// alias, a CTE, or the row image — resolve it directly.
 					hit = state.resolveRef(col.schema, col.table) === state.targetKey;
+				} else if (readsContextVariable(state, col, qualifierLower)) {
+					// `context.<name>`: the owning table's variable, not a column
+					// of whatever table is named `context`.
+					hit = false;
 				} else {
 					const binding = resolveQualifierBinding(state, qualifierLower);
 					if (binding !== undefined) {
@@ -1150,11 +1295,16 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					}
 				}
 				if (hit) {
+					if (newSpellingReadsContextVariable(state, col)) {
+						col.schema = objectRefKeySchema(state.targetKey, state.tableName);
+					}
 					col.name = state.newCol;
 					state.changed = true;
 				}
 			} else {
-				if (unqualifiedRefBindsTarget(state)) {
+				const binding = unqualifiedRefBinding(state);
+				if (binding === 'seed' && state.bareSeedHit !== undefined) state.bareSeedHit = true;
+				if (binding !== undefined) {
 					col.name = state.newCol;
 					state.changed = true;
 				}

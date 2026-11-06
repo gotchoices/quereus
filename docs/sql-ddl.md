@@ -546,6 +546,12 @@ The rule is per variable, and it is enforced where the variable is *read*:
 
 Because context variables shadow same-named columns, a table that declares a variable named like one of its columns resolves a *bare* reference in a DEFAULT or CHECK to the variable — including when the statement supplies no envelope, in which case an omitted NULL-marked variable reads NULL. The `new.<column>`, `old.<column>` and `<table>.<column>` forms always reach the column. On a write that stores a row, `<table>.<column>` means `new.<column>`; on a DELETE it means `old.<column>`. `context.<name>` always reaches the variable; on a table literally named `context`, `<schema>.context.<column>` reaches the column. A column DEFAULT reads a sibling only as `new.<column>` and does not accept `<table>.<column>`. A `<table>.<name>` whose name is a variable and not a column reads the variable, until a column takes that name by ADD COLUMN or RENAME COLUMN: the CHECK then reads the column, and stored rows are not re-validated against it. Rows stored before `<table>.<column>` took this meaning, when it read the variable, are not re-validated, so a table can hold rows that violate its CHECK as now read.
 
+`ALTER TABLE … RENAME COLUMN`, `ALTER TABLE … RENAME TO`, `ALTER TABLE … DROP COLUMN` and `DROP TABLE` read a CHECK or DEFAULT with these same rules, using the variables of the table that owns it:
+
+- A bare or `context.` read of a variable is never rewritten and never blocks a drop. Renaming or dropping a column of the same name leaves `check (who > 0)` reading the variable; on a table named `context`, renaming or dropping column `who` leaves its `check (context.who > 0)` alone; and another table's `check (context.x > 0)` that reads its own variable `x` does not stop a table named `context` from being renamed or dropped, nor its column `x` from being renamed.
+- Renaming a column to a declared variable's name is refused while one of the table's CHECKs reads the column bare, since the CHECK would then read the variable. Qualify the reference as `<table>.<column>` or `new.<column>` first; the rename then follows it.
+- A rename that would turn a self-qualified column reference into the spelling `context.<variable>` writes `<schema>.context.<column>` instead, which keeps reading the column. This happens when a table is renamed to `context` (`t.who` becomes `main.context.who`), and when a column of a table named `context` is renamed to a variable's name (`context.x` becomes `main.context.who`).
+
 **Examples:**
 
 **Multi-Tenant Data Isolation:**

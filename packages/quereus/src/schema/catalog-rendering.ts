@@ -105,7 +105,8 @@ function sortedRenderings<T>(items: readonly T[], render: (item: T) => string): 
 }
 
 function renderTable(t: CatalogTable): string {
-	const { name, ddl, columns, primaryKey, referencedTables, tags, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
+	// `contextVariables` omitted: the table's `ddl` already renders the `with context` clause.
+	const { name, ddl, columns, primaryKey, referencedTables, contextVariables: _contextVariables, tags, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
 	assertEveryFieldConsidered(rest);
 	return [
 		`table ${name}`,

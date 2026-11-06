@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { collectTableRefsInAst, renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
+import { collectTableRefsInAst, contextVariableNames, NO_CONTEXT_VARIABLES, renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameOpts } from './rename-rewriter.js';
 import { orderDependenciesFirst, orderDependentsFirst } from './dependency-order.js';
 import { Parser } from '../parser/parser.js';
@@ -1983,6 +1983,8 @@ function reconciledDeclaredBody(
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	/** Declared-side column-existence resolver for the seeded CHECK rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
+	/** The declared table's mutation-context variables (`contextVariableNames`): a CHECK's read of one is no column or table reference. */
+	contextVariables: ReadonlySet<string>,
 ): string {
 	const tc = d.bodyAst;
 	switch (tc.type) {
@@ -2011,7 +2013,7 @@ function reconciledDeclaredBody(
 				renameTableInAst(clone.expr!, {
 					oldName: r.newName, newName: r.oldName, schemaName,
 					resolve: resolveRef, resolveAfter: resolveRef,
-				}, { rowImageContext: true });
+				}, { rowImageContext: { contextVariables } });
 			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
@@ -2023,7 +2025,7 @@ function reconciledDeclaredBody(
 				// mode 'own' mirrors that branch too: this CHECK's `new.`/`old.` names
 				// the owning table's row image, so an owning-column inverse follows it.
 				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, tableName), 'own', resolveDeclaredColumn);
+					resolveRef, objectRefKey(schemaName, tableName), { kind: 'own', contextVariables }, resolveDeclaredColumn);
 			}
 			// Cross-table column renames: a subquery in this CHECK may reference
 			// ANOTHER table whose column was renamed in this same diff; the forward
@@ -2051,7 +2053,7 @@ function reconciledDeclaredBody(
 					// written-row context of the OWNING table, so a bare `new.`/`old.`
 					// here is not a reference to the cross-renamed table.
 					renameColumnInAst(clone.expr!, seedTableName, r.newName, r.oldName,
-						resolveRef, objectRefKey(schemaName, seedTableName), 'foreign');
+						resolveRef, objectRefKey(schemaName, seedTableName), { kind: 'foreign', contextVariables });
 				}
 			}
 			return constraintBodyToCanonicalString(clone);
@@ -2388,7 +2390,8 @@ function computeTableAlterDiff(
 		}
 	}
 
-	recordCrossTableReads(diff, addedColumnDefs, actualTable, tableRenames, schemaName);
+	const declaredContextVariables = contextVariableNames(declaredTable.tableStmt.contextDefinitions);
+	recordCrossTableReads(diff, addedColumnDefs, declaredContextVariables, actualTable, tableRenames, schemaName);
 
 	// Apply require-hint to columns within this table
 	if (policy === 'require-hint') {
@@ -2457,7 +2460,7 @@ function computeTableAlterDiff(
 		// reconciliation, so the drop+recreate (and its rename-suppression) is kept.
 		if (
 			d.definition !== matchedActual.definition &&
-			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn) !== matchedActual.definition
+			reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn, declaredContextVariables) !== matchedActual.definition
 		) {
 			constraintsToDrop.push(matchedActual.name); // drop old
 			constraintsToAdd.push(d.ddl);               // add new (declared name + tags)
@@ -2490,7 +2493,7 @@ function computeTableAlterDiff(
 	const unnamed = diffUnnamedConstraints(declaredConstraints.unnamed, actualTable, {
 		tableName: declaredTable.tableStmt.table.name,
 		schemaName,
-		reconcile: d => reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn),
+		reconcile: d => reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn, declaredContextVariables),
 		declaredNames: [...declaredNamedConstraints.keys()],
 		namedDrops: constraintsToDrop,
 		addedColumns: addedColumnDefs.map(c => c.name),
@@ -2589,20 +2592,22 @@ function computeTableAlterDiff(
 function recordCrossTableReads(
 	diff: TableAlterDiff,
 	addedColumns: readonly AST.ColumnDef[],
+	declaredContextVariables: ReadonlySet<string>,
 	actualTable: CatalogTable,
 	tableRenames: ReadonlyArray<RenameOp>,
 	schemaName: string,
 ): void {
 	const added = new Set<string>();
-	for (const col of addedColumns) collectColumnDefReads(col, schemaName, added);
+	for (const col of addedColumns) collectColumnDefReads(col, declaredContextVariables, schemaName, added);
 	if (added.size > 0) diff.addedColumnReads = [...added];
 
 	const droppedColumns = new Set(diff.columnsToDrop.map(c => c.toLowerCase()));
 	const dropped = new Set<string>();
+	const actualContextVariables = catalogContextVariables(actualTable);
 	for (const col of actualTable.columns) {
 		if (!droppedColumns.has(col.name.toLowerCase())) continue;
-		if (col.defaultValue) collectExpressionReads(col.defaultValue, schemaName, dropped);
-		if (col.generatedExpr) collectExpressionReads(col.generatedExpr, schemaName, dropped);
+		if (col.defaultValue) collectExpressionReads(col.defaultValue, actualContextVariables, schemaName, dropped);
+		if (col.generatedExpr) collectExpressionReads(col.generatedExpr, NO_CONTEXT_VARIABLES, schemaName, dropped);
 	}
 	if (dropped.size > 0) {
 		diff.droppedColumnReads = [...dropped].map(name =>
@@ -2729,33 +2734,48 @@ function dropsReleasedByDeclaration(
 	const removed = [...diff.tablesToDrop, ...diff.viewsToDrop].filter(name => !recreated.has(objectRefKey(schemaName, name)));
 	if (removed.length === 0) return [];
 	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
-	const keptGenerated = [...actualTables].flatMap(([name, table]) => dropped.has(name) ? [] : table.columns.map(col => col.generatedExpr));
-	const rules = [...declaredRuleExpressions(declaredTables), ...keptGenerated].filter(expr => expr !== undefined);
+	const keptGenerated = [...actualTables].flatMap(([name, table]) => dropped.has(name)
+		? []
+		: table.columns.map(col => ({ expr: col.generatedExpr, contextVariables: NO_CONTEXT_VARIABLES })));
+	const rules = [...declaredRuleExpressions(declaredTables), ...keptGenerated]
+		.filter((rule): rule is RuleExpression => rule.expr !== undefined);
 	const reached = objectsRulesReach(rules, declaredBodies, schemaName);
 	if (reached === undefined || removed.some(name => reached.has(name.toLowerCase()))) return [];
 	return removed;
 }
 
+/** A written-row expression with the mutation-context variables its owning table declares (none for a generated body). */
+interface RuleExpression {
+	expr: AST.Expression;
+	contextVariables: ReadonlySet<string>;
+}
+
 /** The CHECK (table and column level), DEFAULT and generated expressions of the declared tables. */
-function declaredRuleExpressions(declaredTables: ReadonlyMap<string, AST.DeclaredTable>): Array<AST.Expression | undefined> {
-	return [...declaredTables.values()].flatMap(({ tableStmt }) => [
-		...tableStmt.columns.flatMap(col => col.constraints.flatMap(constraint => [constraint.expr, constraint.generated?.expr])),
-		...tableStmt.constraints.map(constraint => constraint.expr),
-	]);
+function declaredRuleExpressions(declaredTables: ReadonlyMap<string, AST.DeclaredTable>): Array<{ expr: AST.Expression | undefined; contextVariables: ReadonlySet<string> }> {
+	return [...declaredTables.values()].flatMap(({ tableStmt }) => {
+		const contextVariables = contextVariableNames(tableStmt.contextDefinitions);
+		return [
+			...tableStmt.columns.flatMap(col => col.constraints.flatMap(constraint => [
+				{ expr: constraint.expr, contextVariables },
+				{ expr: constraint.generated?.expr, contextVariables: NO_CONTEXT_VARIABLES },
+			])),
+			...tableStmt.constraints.map(constraint => ({ expr: constraint.expr, contextVariables })),
+		];
+	});
 }
 
 /**
  * The lowercased names in `schemaName` that `rules` read, directly or through `bodies`, tables
  * included; `undefined` when a rule or a body followed names an object in another schema.
  */
-function objectsRulesReach(rules: readonly AST.Expression[], bodies: ViewBodies, schemaName: string): Set<string> | undefined {
+function objectsRulesReach(rules: readonly RuleExpression[], bodies: ViewBodies, schemaName: string): Set<string> | undefined {
 	const reached = new Set<string>();
 	const addReads = (node: AST.AstNode, opts?: TableRenameOpts): boolean => {
 		const { inSchema, leavesSchema } = objectsNamedBySchema(node, schemaName, opts);
 		for (const name of inSchema) reached.add(name);
 		return !leavesSchema;
 	};
-	if (!rules.every(rule => addReads(rule, { rowImageContext: true }))) return undefined;
+	if (!rules.every(rule => addReads(rule.expr, { rowImageContext: { contextVariables: rule.contextVariables } }))) return undefined;
 	// A Set iterates what is added during the walk, and visits each name once.
 	for (const name of reached) {
 		const body = bodies.get(name);
@@ -2764,19 +2784,30 @@ function objectsRulesReach(rules: readonly AST.Expression[], bodies: ViewBodies,
 	return reached;
 }
 
-/** Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions name. */
-function collectColumnDefReads(col: AST.ColumnDef, schemaName: string, into: Set<string>): void {
+/**
+ * Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions
+ * name. `contextVariables` is the owning table's declared variables, in scope in its CHECKs and DEFAULT.
+ */
+function collectColumnDefReads(col: AST.ColumnDef, contextVariables: ReadonlySet<string>, schemaName: string, into: Set<string>): void {
 	for (const constraint of col.constraints) {
 		const fk = constraint.foreignKey;
 		if (fk && (!fk.schema || fk.schema.toLowerCase() === schemaName.toLowerCase())) into.add(fk.table.toLowerCase());
-		if (constraint.expr) collectExpressionReads(constraint.expr, schemaName, into);
-		if (constraint.generated) collectExpressionReads(constraint.generated.expr, schemaName, into);
+		if (constraint.expr) collectExpressionReads(constraint.expr, contextVariables, schemaName, into);
+		if (constraint.generated) collectExpressionReads(constraint.generated.expr, NO_CONTEXT_VARIABLES, schemaName, into);
 	}
 }
 
-/** Adds the tables and views in `schemaName` that a written-row expression names. */
-function collectExpressionReads(expr: AST.Expression, schemaName: string, into: Set<string>): void {
-	for (const name of objectsNamedIn(expr, schemaName, { rowImageContext: true })) into.add(name);
+/**
+ * Adds the tables and views in `schemaName` that a written-row expression names, given the
+ * mutation-context variables in scope there: a `context.<name>` reading one names no table.
+ */
+function collectExpressionReads(expr: AST.Expression, contextVariables: ReadonlySet<string>, schemaName: string, into: Set<string>): void {
+	for (const name of objectsNamedIn(expr, schemaName, { rowImageContext: { contextVariables } })) into.add(name);
+}
+
+/** {@link CatalogTable.contextVariables} as the set the rename walkers take. */
+function catalogContextVariables(table: CatalogTable | undefined): ReadonlySet<string> {
+	return table?.contextVariables?.length ? new Set(table.contextVariables) : NO_CONTEXT_VARIABLES;
 }
 
 /** The lowercased names of the tables and views in `schemaName` that `node` names; another schema's are skipped. */
@@ -4168,7 +4199,7 @@ class UndoRenderer {
 		if (!actual) return undefined;
 		if (!actual.defaultValue) return null;
 		const expr = cloneExpr(actual.defaultValue);
-		this.replayRenames(expr, table, { rowImageContext: true, schemaAuthoredBody: true });
+		this.replayRenames(expr, table, { rowImageContext: { contextVariables: catalogContextVariables(this.tableNow(table)) }, schemaAuthoredBody: true });
 		return expressionToString(expr);
 	}
 
@@ -4183,7 +4214,10 @@ class UndoRenderer {
 		switch (tc.type) {
 			case 'check': {
 				const clone: AST.TableConstraint = { ...tc, expr: tc.expr ? cloneExpr(tc.expr) : undefined };
-				if (clone.expr) this.replayRenames(clone.expr, owner, { rowImageContext: true, schemaAuthoredBody: true });
+				if (clone.expr) {
+					this.replayRenames(clone.expr, owner,
+						{ rowImageContext: { contextVariables: catalogContextVariables(this.tableNow(owner)) }, schemaAuthoredBody: true });
+				}
 				return clone;
 			}
 			case 'unique': {
@@ -4230,9 +4264,11 @@ class UndoRenderer {
 	 * in `'foreign'` mode; a free body (a view, assertion or derivation body, an
 	 * index predicate) takes every rename through the plain walk in `'none'` mode.
 	 * `tableOpts` is the body kind's `renameTableInAst` options, exactly as the
-	 * matching `renameTableIn*` helper passes them.
+	 * matching `renameTableIn*` helper passes them; an owned body's carry the owning
+	 * table's mutation-context variables, which the column walks take too.
 	 */
 	private replayRenames(node: AST.AstNode, owner: string | undefined, tableOpts: TableRenameOpts): void {
+		const contextVariables = tableOpts.rowImageContext?.contextVariables ?? NO_CONTEXT_VARIABLES;
 		for (const r of this.tableRenames) {
 			renameTableInAst(node, {
 				oldName: r.oldName, newName: r.newName, schemaName: this.schemaName,
@@ -4243,9 +4279,10 @@ class UndoRenderer {
 			const targetKey = objectRefKey(this.schemaName, r.table);
 			const resolveColumn = this.columnResolverAfter(replayedSoFar);
 			if (owner !== undefined && sameName(r.table, owner)) {
-				renameColumnInCheckExpression(node, owner, r.oldName, r.newName, this.resolveRef, targetKey, 'own', resolveColumn);
+				renameColumnInCheckExpression(node, owner, r.oldName, r.newName, this.resolveRef, targetKey, { kind: 'own', contextVariables }, resolveColumn);
 			} else {
-				renameColumnInAst(node, r.table, r.oldName, r.newName, this.resolveRef, targetKey, owner !== undefined ? 'foreign' : 'none', resolveColumn);
+				renameColumnInAst(node, r.table, r.oldName, r.newName, this.resolveRef, targetKey,
+					owner !== undefined ? { kind: 'foreign', contextVariables } : 'none', resolveColumn);
 			}
 		});
 	}

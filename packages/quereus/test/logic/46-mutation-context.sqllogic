@@ -878,3 +878,78 @@ drop table "new";
 create table SqCte (a integer primary key, who integer null, check ((with c as (select SqCte.who as x from SqPeer) select max(x) from c) > 0)) with context (who integer null);
 insert into SqCte values (1, 5), (2, -5);
 -- error: SqCte.who isn't a column
+
+-- Test 30: RENAME COLUMN, RENAME TABLE, DROP COLUMN and DROP TABLE read a CHECK or DEFAULT the way a
+-- write does. A bare or `context.` read of a variable is never rewritten and never blocks a drop.
+create table RnPeer (k integer primary key);
+create table RnBare (a integer primary key, who integer null,
+	constraint k1 check (who > 0),
+	constraint k2 check ((select count(*) from RnPeer where RnPeer.k = who) = 0)) with context (who integer null);
+alter table RnBare rename column who to w;
+select name, expr from check_constraint_info('RnBare') order by name;
+→ [{"name":"k1","expr":"who > 0"},{"name":"k2","expr":"(select count(*) from RnPeer where RnPeer.k = who) = 0"}]
+insert into RnBare with context who = -5 values (1, 9);
+-- error: CHECK constraint failed
+insert into RnBare with context who = 5 values (2, -9);
+alter table RnBare rename column w to who;
+alter table RnBare drop column who;
+select a from RnBare;
+→ [{"a":2}]
+
+create table RnDefault (a integer primary key, who integer null, b integer null default (who)) with context (who integer null);
+alter table RnDefault rename column who to w;
+insert into RnDefault (a, w) with context who = 7 values (1, 1);
+select a, w, b from RnDefault;
+→ [{"a":1,"w":1,"b":7}]
+
+-- Renaming a column to a variable's name is refused while a CHECK reads it bare, since the CHECK
+-- would then read the variable; a qualified reference follows the rename.
+create table RnTo (a integer primary key, x integer null, constraint k check (x > 0)) with context (who integer null);
+alter table RnTo rename column x to who;
+-- error: reads 'x' unqualified
+alter table RnTo drop constraint k;
+alter table RnTo add constraint k check (new.x > 0);
+alter table RnTo rename column x to who;
+select expr from check_constraint_info('RnTo') where name = 'k';
+→ [{"expr":"new.who > 0"}]
+insert into RnTo with context who = 5 values (1, -1);
+-- error: CHECK constraint failed
+
+-- Another table's `context.x` reads its own variable, not the column of a table named `context`.
+drop table context;
+create table context (k integer primary key, x integer null);
+create table RnItems (a integer primary key, constraint k check (context.x > 0)) with context (x integer null);
+alter table context rename column x to y;
+alter table context rename to RnCtx;
+alter table RnCtx rename to context;
+drop table context;
+select expr from check_constraint_info('RnItems') where name = 'k';
+→ [{"expr":"context.x > 0"}]
+insert into RnItems with context x = 1 values (1);
+insert into RnItems with context x = -1 values (2);
+-- error: CHECK constraint failed
+
+-- On a table named `context`, its own `context.who` keeps reading the variable.
+create table context (a integer primary key, who integer null, constraint k check (context.who > 0)) with context (who integer null);
+alter table context rename column who to whom;
+alter table context rename column whom to who;
+alter table context drop column who;
+alter table context rename to RnCtxOwn;
+select expr from check_constraint_info('RnCtxOwn') where name = 'k';
+→ [{"expr":"context.who > 0"}]
+insert into RnCtxOwn with context who = -5 values (1);
+-- error: CHECK constraint failed
+
+-- A self-qualified column renamed into the spelling `context.<variable>` takes the schema, which
+-- keeps it reading the column: by RENAME TABLE to `context`, and by RENAME COLUMN on `context`.
+create table RnSelf (a integer primary key, who integer null, x integer null,
+	constraint k1 check (RnSelf.who > 0), constraint k2 check (RnSelf.x < 10)) with context (who integer null, w integer null);
+alter table RnSelf rename to context;
+alter table context rename column x to w;
+select name, expr from check_constraint_info('context') order by name;
+→ [{"name":"k1","expr":"main.context.who > 0"},{"name":"k2","expr":"main.context.w < 10"}]
+insert into context with context who = 5, w = 0 values (1, -1, 0);
+-- error: CHECK constraint failed
+insert into context with context who = 5, w = 0 values (1, 1, 20);
+-- error: CHECK constraint failed
+insert into context with context who = -5, w = 20 values (2, 1, 0);

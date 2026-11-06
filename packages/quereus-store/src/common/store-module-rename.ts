@@ -13,6 +13,7 @@ import type { Database, DatabaseInternal, TableSchema } from '@quereus/quereus';
 import {
 	QuereusError,
 	StatusCode,
+	contextVariableNames,
 	snapshotObjectRefResolvers,
 	tableRenameTargetsFor,
 	renameTableInCheckConstraints,
@@ -245,11 +246,12 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			// own target: un-renaming back to `oldName` lands on the base snapshot,
 			// which IS the pre-rename catalog.
 			const resolvers = snapshotObjectRefResolvers(db);
+			const contextVariables = contextVariableNames(currentSchema.mutationContext);
 			const rewriteTable = (from: string, to: string): void => {
 				const target = tableRenameTargetsFor(resolvers, schemaName, from, to)(schemaName);
 				renameTableInIndexPredicates(currentSchema.indexes, target);
-				renameTableInCheckConstraints(currentSchema.checkConstraints, target);
-				renameTableInColumnExpressions(currentSchema.columns, target);
+				renameTableInCheckConstraints(currentSchema.checkConstraints, target, contextVariables);
+				renameTableInColumnExpressions(currentSchema.columns, target, contextVariables);
 			};
 			try {
 				rewriteTable(oldName, newName);

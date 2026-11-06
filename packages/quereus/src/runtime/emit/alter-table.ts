@@ -15,7 +15,7 @@ import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildChe
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { quoteIdentifier, astToString } from '../../emit/ast-stringify.js';
-import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions, renameTableInCheckConstraints, renameTableInIndexPredicates, renameTableInColumnExpressions, objectRefKey } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions, renameTableInCheckConstraints, renameTableInIndexPredicates, renameTableInColumnExpressions, objectRefKey, checkReadsColumnBare, contextVariableNames, NO_CONTEXT_VARIABLES } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
@@ -27,6 +27,7 @@ import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen, rebuildNotOnlyEffectError } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
+import { describeCheck } from '../../schema/expression-dependents.js';
 import { assertNoColumnExpressionNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
 import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
@@ -386,6 +387,8 @@ async function runRenameColumn(
 	// (and same reasoning) as the table-rename arm above.
 	const objectResolvers = snapshotObjectRefResolvers(rctx.db);
 	const renamedTableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
+	assertRenamedColumnNotReadAsContextVariable(tableSchema, oldName, newName,
+		objectResolvers.forHomeSchema(tableSchema.schemaName), renamedTableKey, resolveColumnInSource);
 	assertRenameDependentsPersistable(rctx.db,
 		// Row-image mode 'none': the probed bodies are view / MV bodies — relations
 		// with no written row (their `with inverse` / `with defaults` subtrees
@@ -590,6 +593,41 @@ function assertRenamedColumnBackingNamesFree(
 			undefined,
 			postRenameColumns,
 			`rename column '${oldName}' to '${newName}' on table '${tableSchema.name}'`,
+		);
+	}
+}
+
+/**
+ * Refuses renaming a column to the name of one of the table's mutation-context variables
+ * while a CHECK of the table reads the column through a bare name bound by the written row.
+ * Renamed, that name would read the variable instead (`docs/sql-ddl.md` §2.6.2), so the
+ * CHECK would silently judge something else. Refused rather than rewritten to a qualified
+ * spelling: `<table>.<new>` is wrong on a table named `context`, and wrong again inside a
+ * subquery that aliases another source as `<table>`; the user can qualify the reference
+ * first, and then the rename follows it.
+ *
+ * Only own CHECKs can hold such a reference. A DEFAULT cannot read a sibling column bare,
+ * a generated body's bare name always means the column, and another table's expression
+ * reaches this one only through a subquery whose FROM binds the name first.
+ */
+function assertRenamedColumnNotReadAsContextVariable(
+	tableSchema: TableSchema,
+	oldName: string,
+	newName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
+	resolveColumnInSource: ResolveColumnInSource,
+): void {
+	const contextVariables = contextVariableNames(tableSchema.mutationContext);
+	if (!contextVariables.has(newName.toLowerCase())) return;
+	for (const check of tableSchema.checkConstraints) {
+		if (!checkReadsColumnBare(check.expr, tableSchema.name, oldName, resolve, targetKey, contextVariables, resolveColumnInSource)) continue;
+		throw new QuereusError(
+			`cannot rename column '${oldName}' of table '${tableSchema.name}' to '${newName}': ` +
+			`${describeCheck(check)} reads '${oldName}' unqualified, and '${newName}' is a mutation context variable ` +
+			`of the table, so the CHECK would read the variable instead; ` +
+			`qualify the reference as '${tableSchema.name}.${oldName}' or 'new.${oldName}' first`,
+			StatusCode.ERROR,
 		);
 	}
 }
@@ -2597,9 +2635,11 @@ function rewriteTableForTableRename(
 ): TableSchema {
 	const target = targetFor(table.schemaName);
 	const targetKey = objectRefKey(target.schemaName, target.oldName);
+	// The variables of THIS table, which owns the walked expressions — not the renamed one's.
+	const contextVariables = contextVariableNames(table.mutationContext);
 	let changed = false;
 
-	if (renameTableInCheckConstraints(table.checkConstraints, target)) changed = true;
+	if (renameTableInCheckConstraints(table.checkConstraints, target, contextVariables)) changed = true;
 
 	const newFks = (table.foreignKeys ?? []).map(fk => {
 		if (objectRefKey(fk.referencedSchema ?? table.schemaName, fk.referencedTable) !== targetKey) return fk;
@@ -2617,7 +2657,7 @@ function rewriteTableForTableRename(
 	// split: `renameTableInAst` resolves nothing against an implicit owning table, so one
 	// entry point covers the renamed table's own self-referencing default and every other
 	// table's alike.
-	if (renameTableInColumnExpressions(table.columns, target)) changed = true;
+	if (renameTableInColumnExpressions(table.columns, target, contextVariables)) changed = true;
 
 	if (!changed) return table;
 
@@ -2744,6 +2784,8 @@ function rewriteTableForColumnRename(
 	// Key comparison, so a same-named table in another schema never takes the
 	// seeded branch.
 	const isRenamedTable = objectRefKey(table.schemaName, table.name) === targetKey;
+	// The variables of THIS table, which owns the walked expressions — not the renamed one's.
+	const contextVariables = contextVariableNames(table.mutationContext);
 	let changed = false;
 
 	// Row-image modes: a CHECK is written-row context wherever it lives — 'own'
@@ -2752,8 +2794,8 @@ function rewriteTableForColumnRename(
 	// even for a table literally called `new`).
 	const newChecks = table.checkConstraints.map(cc => {
 		const rewrote = isRenamedTable
-			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, resolve, targetKey, 'own', resolveColumnInSource)
-			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, resolve, targetKey, 'foreign', resolveColumnInSource);
+			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, resolve, targetKey, { kind: 'own', contextVariables }, resolveColumnInSource)
+			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, resolve, targetKey, { kind: 'foreign', contextVariables }, resolveColumnInSource);
 		if (!rewrote) return cc;
 		changed = true;
 		return { ...cc };
@@ -2818,8 +2860,8 @@ function rewriteTableForColumnRename(
 	// built and handed back. Flipping `changed` is what re-registers the table and fires
 	// `table_modified`, which is all the copies above achieve either.
 	const columnsRewritten = isRenamedTable
-		? renameColumnInColumnExpressions(table.columns, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)
-		: rewriteOtherTableColumnExpressions(table.columns, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+		? renameColumnInColumnExpressions(table.columns, tableName, oldCol, newCol, resolve, targetKey, contextVariables, resolveColumnInSource)
+		: rewriteOtherTableColumnExpressions(table.columns, tableName, oldCol, newCol, resolve, targetKey, contextVariables, resolveColumnInSource);
 	if (columnsRewritten) changed = true;
 
 	if (!changed) return table;
@@ -2854,16 +2896,20 @@ function rewriteOtherTableColumnExpressions(
 	newCol: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	contextVariables: ReadonlySet<string>,
 	resolveColumnInSource: ResolveColumnInSource,
 ): boolean {
 	let changed = false;
+	// 'foreign': another table's DEFAULT / generated body is written-row context whose
+	// image is THAT table — a bare `new.`/`old.` there names nothing this rename cares
+	// about. Only the DEFAULT carries that table's mutation-context variables.
+	const rewrite = (expr: Expression | null | undefined, variables: ReadonlySet<string>): void => {
+		if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, resolve, targetKey,
+			{ kind: 'foreign', contextVariables: variables }, resolveColumnInSource)) changed = true;
+	};
 	for (const col of columns) {
-		for (const expr of [col.defaultValue, col.generatedExpr]) {
-			// 'foreign': another table's DEFAULT / generated body is written-row
-			// context whose image is THAT table — a bare `new.`/`old.` there names
-			// nothing this rename cares about.
-			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, resolve, targetKey, 'foreign', resolveColumnInSource)) changed = true;
-		}
+		rewrite(col.defaultValue, contextVariables);
+		rewrite(col.generatedExpr, NO_CONTEXT_VARIABLES);
 	}
 	return changed;
 }

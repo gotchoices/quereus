@@ -14,7 +14,7 @@
 import { expect } from 'chai';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { cloneExpr } from '../../src/planner/mutation/scope-transform.js';
-import { renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver, type TableRenameOpts, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
+import { renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver, NO_CONTEXT_VARIABLES, type TableRenameOpts, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
 // These are pure scope-rule tests over a single default schema, so the
@@ -175,14 +175,14 @@ const CASES: Case[] = [
 		title: 'row image: bare new.a in a written-row context is NOT a table reference',
 		sql: 'new.a > 0',
 		table: 'new',
-		opts: { rowImageContext: true },
+		opts: { rowImageContext: { contextVariables: NO_CONTEXT_VARIABLES } },
 		referenced: false,
 	},
 	{
 		title: 'row image: bare old.a in a written-row context is NOT a table reference',
 		sql: 'old.a > 0',
 		table: 'old',
-		opts: { rowImageContext: true },
+		opts: { rowImageContext: { contextVariables: NO_CONTEXT_VARIABLES } },
 		referenced: false,
 	},
 	{
@@ -196,7 +196,7 @@ const CASES: Case[] = [
 		title: 'row image survives while a real FROM of the same-named table still rewrites',
 		sql: 'new.a > 0 and (select count(*) from new) >= 0',
 		table: 'new',
-		opts: { rowImageContext: true },
+		opts: { rowImageContext: { contextVariables: NO_CONTEXT_VARIABLES } },
 		referenced: true,
 		contains: [NEW_NAME],
 		preserves: ['new.a'],
@@ -205,7 +205,7 @@ const CASES: Case[] = [
 		title: 'a `new` REBOUND by an inner FROM is that table, not the row image — rewrites',
 		sql: '(select max(new.a) from new) >= 0',
 		table: 'new',
-		opts: { rowImageContext: true },
+		opts: { rowImageContext: { contextVariables: NO_CONTEXT_VARIABLES } },
 		referenced: true,
 		contains: [`${NEW_NAME}.a`],
 	},
@@ -213,7 +213,7 @@ const CASES: Case[] = [
 		title: 'schema-qualified main.new.a is a real three-part reference even in row-image context',
 		sql: 'main.new.a > 0',
 		table: 'new',
-		opts: { rowImageContext: true },
+		opts: { rowImageContext: { contextVariables: NO_CONTEXT_VARIABLES } },
 		referenced: true,
 		contains: [`main.${NEW_NAME}.a`],
 	},

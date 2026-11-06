@@ -31,6 +31,7 @@ import {
 	buildUniqueConstraintSchema,
 	collectTableConstraintNames,
 	columnDefToSchema,
+	contextVariableNames,
 	describeAddForeignKey,
 	foldDefaultToType,
 	objectRefKey,
@@ -467,13 +468,16 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// the table itself, so forward and reverse passes share one target key.
 		const resolveRef = buildObjectRefResolver(db, schemaName);
 		const tableKey = objectRefKey(schemaName, tableName);
+		// A CHECK's or DEFAULT's bare or `context.` read of a declared variable is not a
+		// column reference, so the walks must know the table's variables.
+		const contextVariables = contextVariableNames(oldSchema.mutationContext);
 		const rewriteColumn = (from: string, to: string): void => {
 			renameColumnInIndexPredicates(
 				updatedIndexes, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
 			renameColumnInCheckConstraints(
-				oldSchema.checkConstraints, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
+				oldSchema.checkConstraints, tableName, from, to, resolveRef, tableKey, contextVariables, resolveColumnInSource);
 			renameColumnInColumnExpressions(
-				updatedColumns, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
+				updatedColumns, tableName, from, to, resolveRef, tableKey, contextVariables, resolveColumnInSource);
 		};
 		try {
 			rewriteColumn(change.oldName, change.newName);

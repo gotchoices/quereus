@@ -246,6 +246,7 @@ export {
 	renameColumnInIndexPredicates, renameTableInIndexPredicates,
 	renameColumnInCheckConstraints, renameTableInCheckConstraints,
 	renameColumnInColumnExpressions, renameTableInColumnExpressions,
+	contextVariableNames,
 	objectRefKey, singleSchemaObjectRefResolver,
 } from './schema/rename-rewriter.js';
 export type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from './schema/rename-rewriter.js';

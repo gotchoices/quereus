@@ -85,21 +85,66 @@ export interface TableRenameTarget {
 
 /**
  * What a bare, unbound `new.` / `old.` column qualifier names AT THIS POINT in a
- * rename walk. Three-valued because the domain is: the walk's own target's row
- * image, some OTHER relation's row image, or no written-row context at all.
- * `new` and `old` are not reserved words in this parser (`create table "new"` is
- * legal), so the mode is what disambiguates the two spellings — and it is a
- * property of the POSITION in the tree, not of the walk's entry point: a
- * `with inverse` expression forces `'foreign'` over its subtree regardless of
- * the ambient mode (see `visitColumnRename`'s select arm).
+ * rename walk, and which mutation-context variables the written row's statement
+ * carries. Three ways because the domain is: the walk's own target's row image,
+ * some OTHER relation's row image, or no written-row context at all. `new` and
+ * `old` are not reserved words in this parser (`create table "new"` is legal),
+ * so the mode is what disambiguates the two spellings — and it is a property of
+ * the POSITION in the tree, not of the walk's entry point: a `with inverse`
+ * expression forces a foreign context with no variables over its subtree
+ * regardless of the ambient mode (see `visitColumnRename`'s select arm).
+ *
+ * `'none'` carries no variables: a view body, an assertion or a partial-index
+ * predicate has no written row, so no statement supplies any.
  */
 export type RowImageContext =
 	/** No written-row context here — `new.x` is an ordinary table reference. */
 	| 'none'
-	/** Written-row context whose image IS the walk's target table — match it. */
-	| 'own'
-	/** Written-row context whose image belongs to another relation — ignore it. */
-	| 'foreign';
+	| WrittenRowContext;
+
+/**
+ * A written-row context: the walked expression is a CHECK, DEFAULT or generated
+ * body, evaluated against a row a statement writes. Bundled so no caller can say
+ * "written row" without also saying which variables that statement carries.
+ */
+export interface WrittenRowContext {
+	/**
+	 * `'own'`: the row image IS the walk's target table — match it. `'foreign'`: the
+	 * image belongs to another relation — ignore it.
+	 */
+	readonly kind: 'own' | 'foreign';
+	/**
+	 * Lowercase names of the mutation-context variables declared by the table that
+	 * OWNS the walked expression (not the renamed table, unless it is the owner).
+	 * `docs/sql-ddl.md` §2.6.2: a bare name that reaches the owning table, and a
+	 * `context.<name>` nothing in scope rebinds, read such a variable rather than a
+	 * column. Empty for a generated body, whose bare names always mean the column
+	 * and whose `context.<name>` is a self-qualifier — see
+	 * {@link contextVariableNames}.
+	 */
+	readonly contextVariables: ReadonlySet<string>;
+}
+
+/** No declared mutation-context variables. */
+export const NO_CONTEXT_VARIABLES: ReadonlySet<string> = new Set();
+
+/**
+ * The lowercase variable names {@link WrittenRowContext.contextVariables} takes,
+ * from a table's declared mutation context — `TableSchema.mutationContext` and the
+ * parser's `CreateTableStmt.contextDefinitions` both fit.
+ */
+export function contextVariableNames(declared: ReadonlyArray<{ readonly name: string }> | undefined): ReadonlySet<string> {
+	if (!declared || declared.length === 0) return NO_CONTEXT_VARIABLES;
+	return new Set(declared.map(contextVar => contextVar.name.toLowerCase()));
+}
+
+/**
+ * The `context` qualifier a mutation-context variable is spelled with
+ * (`context.<name>`), lowercase. `docs/sql-ddl.md` §2.6.2: with no schema it always
+ * reaches the variable, even on a table literally named `context`, where
+ * `<schema>.context.<column>` is the spelling that reaches the column.
+ */
+export const CONTEXT_QUALIFIER = 'context';
 
 /**
  * Returns whether the named source table has a column matching the renamed
