@@ -172,4 +172,40 @@ describe('applies on one replica', () => {
 		expect(await manager.columnVersions.getColumnVersion('main', 'orders', [1], 'qty')).to.equal(undefined);
 		expect(await manager.repairChangeLog()).to.equal(0);
 	});
+
+	it('an incoming delete beats a local cell edit made before the data write', async () => {
+		const { db, manager, hook } = receiver;
+		await manager.applyChanges([insertSet]);
+		hook.before = async () => { await db.exec('update orders set qty = 2 where id = 1'); };
+		await manager.applyChanges([deleteSet(BigInt(Date.now()) - 5_000n)]);
+		await settle();
+
+		expect(await collect(db, 'select * from orders where id = 1')).to.deep.equal([]);
+		expect(await manager.tombstones.getTombstone('main', 'orders', [1])).to.not.equal(undefined);
+		expect(await manager.columnVersions.getColumnVersion('main', 'orders', [1], 'qty')).to.equal(undefined);
+		expect(await manager.repairChangeLog()).to.equal(0);
+	});
+
+	it('a local insert after the data write applied an incoming delete keeps the row and its records', async () => {
+		const { db, manager, hook } = receiver;
+		await manager.applyChanges([insertSet]);
+		hook.after = async () => { await db.exec(`insert into orders values (1, 'mine', 3)`); };
+		await manager.applyChanges([deleteSet(BigInt(Date.now()) - 5_000n)]);
+		await settle();
+
+		const [stored] = await collect(db, 'select note, qty from orders where id = 1');
+		expect(stored).to.deep.include({ note: 'mine' });
+		expect(Number(stored.qty)).to.equal(3);
+		expect(await manager.tombstones.getTombstone('main', 'orders', [1])).to.equal(undefined);
+		const qtyRecord = await manager.columnVersions.getColumnVersion('main', 'orders', [1], 'qty');
+		expect(Number(qtyRecord?.value)).to.equal(3);
+		expect(await manager.repairChangeLog()).to.equal(0);
+	});
 });
+
+/** A delete of row 1 written at `wallTime`, by a writer that had seen the insert. */
+function deleteSet(wallTime: bigint): ChangeSet {
+	const hlc = createHLC(wallTime, 0, writer);
+	return { siteId: writer, transactionId: `tx-${wallTime}`, hlc, schemaMigrations: [],
+		changes: [{ type: 'delete', schema: 'main', table: 'orders', pk: [1], hlc }] };
+}

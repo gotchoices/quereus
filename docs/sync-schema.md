@@ -315,8 +315,17 @@ queued behind it in the same batch. So `applyToStore` splits each batch's schema
 into two phases (`partitionSchemaChanges` in `store-adapter.ts`):
 
 ```
-non-validating DDL  →  row writes  →  row-validating DDL  →  engine ingestion seam
+non-validating DDL  →  [ row writes  →  engine ingestion seam ]  →  row-validating DDL
 ```
+
+The bracketed pair runs in one exec-mutex hold (`Database.ingestExternalRowWrite`), so
+no local statement commits between the row writes and the seam that reports them
+([sync-transactions.md § Local writes during an apply](sync-transactions.md#local-writes-during-an-apply)).
+The row-validating DDL runs after that hold, since `db.exec` takes the same mutex. None
+of it changes a row's shape, so the seam reports the same rows either way; the one
+visible consequence is that a foreign key added by the batch's own `add constraint` is
+not yet in place when the seam's opt-in FK actions (`applyForeignKeyActions`) run over
+the batch's rows — the origin recorded those rows before it added the constraint.
 
 **Row-validating** — deliberately narrow: only alterations that *inspect* existing rows
 without changing how those rows are stored or addressed.

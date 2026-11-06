@@ -1,4 +1,4 @@
-description: A local edit made while an incoming sync change to the same row was being applied could leave the device's row and sync's records disagreeing, so the device served the wrong value and never sent its own edit. Now the local edit wins the cells it changed, and the row and the records always agree. Review the fix.
+description: A local edit made while an incoming sync change to the same row was being applied could leave the device's row and sync's records disagreeing, so the device served the wrong value and never sent its own edit. Now the local edit wins the cells it changed, and the row and the records always agree.
 prereq: sync-serialize-applies
 architecture: docs/sync-transactions.md#transactional-integrity-during-sync
 files:
@@ -12,6 +12,7 @@ files:
   - packages/quereus/src/core/database.ts # Database.ingestExternalRowWrite
   - packages/quereus/src/core/database-internal.ts # DatabaseInternal.ingestExternalRowWrite
   - packages/quereus-sync/test/sync/concurrent-apply.spec.ts # reproduction tests
+  - docs/sync-schema.md # apply-order diagram (updated in review)
   - docs/sync-transactions.md # new § Local writes during an apply; § Transactional Integrity pointer
   - docs/mv-ingestion.md # the new entry point
 repro: verified
@@ -68,3 +69,33 @@ Existing tests adjusted: `sync-manager.spec.ts` (apply options now `include({ re
 - **One extra KV read per filed fact** inside the filing entry (`NOTE:` at `recordsReplacedBy`).
 - **A host-supplied `applyToStore` that ignores `supersededLocally` is now worse than before in window A:** filing drops the fact while the row gets the incoming value. This is documented on the option.
 - Related, not addressed: `bug-sync-local-create-during-replicated-drop-loses-bookkeeping` (backlog) is the same kind of race for table identity.
+
+## Review findings
+
+Read the `ticket(implement): bug-sync-local-edit-during-apply-diverges` diff before the handoff. Ran `yarn workspace @quereus/sync typecheck` (clean) and `yarn workspace @quereus/sync test` (878 passing, up from 876 with the two tests below). Did not re-run the engine, coordinator or client suites: review changes touched only a sync test, a sync comment and a doc; the implementer's runs of those suites stand.
+
+**Checked, no defect found:**
+- Timing of the marks: `enqueueTransactionCommit` is called synchronously from the engine's commit flush (`database-events.ts` `emitTransactionCommit`), which runs inside the committing statement under the exec mutex, so every commit that lands before the data write's mutex hold is in the tracker when `supersededLocally` is asked.
+- The "relocating key change is a delete plus an insert" claim in `noteLocalWrites`: confirmed in `store-table.ts` (the `pkChanged` branch) and pinned by existing tests in `alter-events.spec.ts` / `alter-table-events.spec.ts`.
+- Trackers are registered inside the apply queue (`enqueueApply`), so only the running apply or drain holds one; the `Set` of trackers is never longer than one in practice.
+- Counting: `appliedChanges` holds only data changes (`Change = ColumnChange | RowDeletion`), so subtracting superseded entries from `applied` and adding them to `conflicts` is exact; the drain's `applied`/`skipped` adjustment likewise.
+- Error paths: tracker closed in `finally` in both `applyChanges` and `drainTableGroup`; the engine's `withExecMutex` releases on a throwing `write`; `noteLocalWrites` failures are logged, and the capture is still chained.
+- Filing re-read (`recordsReplacedBy`): walked the unrecorded-row case (a capture stamps every column with an HLC newer than the batch, then the filing files the incoming unchanged cells over those stamps). The values agree and the stamp's change-log entry goes with it, so nothing stale is pushed. The record's HLC moves backwards for those cells, but the value is the same, and the sender already holds that fact.
+- `allowResurrection` with a superseded resurrecting column (`columnsKeptPastDelete`): matches the outcome of a local edit made before the apply began.
+- Removal of `ResolvedChange.oldColumnVersion` / `oldTombstone` and of the re-key re-read loop: no remaining readers; `commitColumnMetadata`/`commitDeleteMetadata` parameters of the same names now receive the re-read record.
+- Type safety, `any`, resource cleanup, and the new engine entry point (`ingestExternalRowWrite` on `Database` and `DatabaseInternal`): no issues.
+
+**Found and fixed in this pass (minor):**
+- `docs/sync-schema.md` § Apply order still showed `row writes → row-validating DDL → engine ingestion seam`. Updated the diagram to the new order (row writes and seam in one mutex hold, then row-validating DDL), and documented why plus the one visible consequence (a foreign key added by the batch's own `add constraint` is not yet in place when opt-in FK actions run).
+- Two contracts in the spec (docs/sync-transactions.md § Local writes during an apply) had no test, so added them to `concurrent-apply.spec.ts`:
+  - an incoming delete beats a local cell edit made before the data write (row gone, tombstone filed, no cell record, no stale change-log entries);
+  - a local insert after the data write applied an incoming delete keeps the row and its records, with no tombstone. I confirmed this test depends on inserts marking the row as replaced: with inserts marked as cells only, it fails, because the tombstone is filed under a live row.
+
+**Tripwires parked:**
+- No `onConflictResolved` event for facts a local write superseded: `NOTE:` added at the counting site in `applyChanges` (`change-applicator.ts`).
+- The three limits the implementer recorded at the top of `local-write-tracker.ts` (explicit transaction open across the data write; capture stamping every column; `allowResurrection` delete cleanup after filing) and the extra read per filed fact (`recordsReplacedBy`): reviewed. They are genuinely conditional and already parked as `NOTE:`s, so I left them.
+
+**Not filed:**
+- Atomicity between the `supersededLocally` check and the row write inside the mutex hold is reasoned, not tested. No test hook can reach that window, and the mutex is the guarantee, so I did not add a test.
+- `change-applicator.ts` is 1803 lines (`wc -l`). Its existing `NOTE:` already names the drain block as the split point, and the implementer updated it, so no ticket.
+- Empty categories: no performance findings (the tracker costs nothing when no apply is running; the per-fact re-read is parked as above), and no tests cut (the implementer's table-driven block is the reproduction and each case is load-bearing, per their disable-and-rerun check).

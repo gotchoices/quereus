@@ -579,6 +579,9 @@ async function applyTrackedBatch(
 		},
 	});
 	// A change a local write superseded lost to it, as a conflict the local side won.
+	// NOTE: counted but not reported through `onConflictResolved`, which would need the
+	// winning local value and HLC read back here; if a host ever needs those events, read
+	// them inside the filing entry, where the tracker is closed and the records are stable.
 	applied -= appliedChanges.length - landed.length;
 	conflicts += appliedChanges.length - landed.length;
 
