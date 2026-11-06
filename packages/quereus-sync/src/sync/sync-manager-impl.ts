@@ -1600,6 +1600,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// takes a device that retired a table the server still has, under the non-default
 		// `store-and-forward` disposition. If it matters, record the source peer on the
 		// quarantine entry.
+		//
+		// NOTE: held changes are filtered here by write time against the sent watermark, so
+		// one held after this replica's last push, but written before it, is not pushed. A
+		// held change on a device came from the server it pulls from, which is the one it
+		// pushes to, so nothing is lost. If a replica ever relays held changes to a peer
+		// other than its source, filter by hold position against a per-peer pushed position.
 		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC, entry => entry.change.hlc);
 		return this.buildChangeSetsForPeer(
 			filedAtOrigin(ownChanges.map(filed => filed.change)),

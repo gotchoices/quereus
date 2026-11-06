@@ -169,7 +169,9 @@ chain local capture records on. Without that, an apply could take a tick, be ove
 a later apply that commits first, and then commit below a position some peer had already
 read past. The clock is persisted in that same write: persisted afterwards, a crash
 between the two would restart the clock below positions already on disk. A batch's schema
-migrations are filed in the same write and tick as its data.
+migrations, and the changes it holds for tables this replica lacks (`qt:` entries,
+[sync-unknown-tables.md § Store-and-forward relay](sync-unknown-tables.md#store-and-forward-relay)),
+are filed in the same write and tick as its data.
 
 Within a tick, facts are filed in HLC order. Facts of one transaction share a base HLC,
 so each transaction's facts of that tick occupy one unbroken run of positions, its
@@ -192,7 +194,8 @@ getChangesSince(peerSiteId, sinceHLC):
   facts      = sinceHLC ? changeLog.scan(filed after sinceHLC) : (all column-versions + tombstones)
                skipping any fact whose hlc.siteId == peerSiteId   // echo filter (whole tx)
   migrations = sm: scan, filed after sinceHLC, not from peerSiteId
-  group facts+migrations by (transaction identity (wallTime, counter, siteId), filing tick):
+  held       = forwardable qt: entries held after sinceHLC, not from peerSiteId (store-and-forward)
+  group facts+held+migrations by (transaction identity (wallTime, counter, siteId), filing tick):
     each group ⇒ one ChangeSet:
       changes:          group's facts in filing order (= opSeq order, intra-table write order)
       schemaMigrations: group's migrations in filing order (DDL below the tx's DML)
