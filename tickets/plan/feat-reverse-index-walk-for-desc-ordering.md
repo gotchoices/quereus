@@ -68,7 +68,7 @@ backwards secondary-index read emits rows *within* one indexed value in forward
 primary-key order, while the transaction-isolation layer's merge expects the whole
 composite ordering reversed. Nothing requests a backwards read today, so it is dormant
 — this ticket is what would wake it. It should land first, or as the first arm of this
-work.
+work. (Planning found the effect narrower than stated: the isolation secondary-index merge drops shadowed rows by a primary-key set, so the mismatch only misplaces staged rows within one indexed value, and the memory ordering claim never covers the primary-key tail. It is being fixed as contract conformance; see the implement ticket.)
 
 A second hazard, found by reading `scan-layer.ts` and not run because nothing requests a reverse walk today: the memory scan positions a prefix seek at the key `[prefix]`, which sorts just before every full key in that prefix group. That start is right for a forward walk only. Walking backwards from it lands in the previous group, the prefix check fails, and the scan ends with no rows. A reverse prefix walk has to start from the end of the group. This becomes reachable for `where k = ? order by r desc` over `(k, r)` once bug-memory-compound-index-unusable-on-leading-column makes equality on a leading column a prefix seek.
 
