@@ -59,7 +59,7 @@ Rules:
 - Seek keys are the listed filters' value expressions (`valueExpr` when dynamic, a literal otherwise), evaluated per execution like the existing arms.
 - `providesOrdering` is honoured with the leaf named by `indexName`.
 - The idxStr carries `indexName` and a plan code distinct from the existing ones, so the module can tell this arm apart.
-- Collation cover: run the range rule (decline to scan + residual on any mismatch) over the listed filters, resolving index collations through the module's `indexDescriptor` (see `bug-index-collation-lookup-ignores-module-descriptor`) and BINARY where it is silent.
+- Collation cover: run the range rule (decline to scan + residual on any mismatch) over the listed filters, resolving index collations through the module's `indexDescriptor` (see `collation-checks-resolve-the-chosen-index-like-the-rest-of-the-planner`, which absorbed `bug-index-collation-lookup-ignores-module-descriptor`) and BINARY where it is silent.
 - Index-nested-loop and key-set-seek synthesize their own constraints; they decline a plan carrying `moduleSeekFilters` unless the plan stage decides to support it.
 
 ## Isolation overlay
