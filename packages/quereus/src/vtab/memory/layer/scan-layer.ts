@@ -3,6 +3,7 @@ import type { Layer } from './interface.js';
 import { keyParts, leadingKeyPart, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
+import type { BTree } from 'inheritree';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
 import { planAppliesToKey, resolveScanComparators, type ResolvedScanComparators } from './plan-filter.js';
@@ -71,6 +72,77 @@ function seekStartKey(
 	const parts = [...(plan.equalityPrefix ?? []), ...(seekBound ? [seekBound.value] : [])];
 	if (parts.length === 0) return undefined;
 	return { value: !isComposite && parts.length === 1 ? parts[0] : parts };
+}
+
+/**
+ * The key a walk starts from: {@link seekStartKey}, except that a BACKWARDS walk seeking with a
+ * tuple shorter than the tree's keys starts from the last key of the group sharing that tuple.
+ *
+ * The short tuple sorts just before every key sharing it, so the seek lands at the START of that
+ * group. A forward walk then enters the group; a backwards walk would move away from it and skip
+ * every row in it (`where k = 1 order by r desc` over `(k, r)` would return nothing). A full-length
+ * key needs no help (an exact hit, or the crack `moveNearest` steps off correctly), and neither
+ * does an exclusive seek bound, which excludes the whole group anyway.
+ */
+function walkStartKey<TEntry>(
+	tree: BTree<BTreeKey, TEntry>,
+	plan: ScanPlan,
+	seekBound: ScanPlanRangeBound | undefined,
+	keyArity: number,
+	keyFromEntry: (entry: TEntry) => BTreeKey,
+	comparators: ResolvedScanComparators,
+): { value: BTreeKey } | undefined {
+	const startKey = seekStartKey(plan, seekBound, keyArity > 1);
+	if (!startKey || !plan.descending) return startKey;
+	const seekPartCount = (plan.equalityPrefix?.length ?? 0) + (seekBound ? 1 : 0);
+	if (seekPartCount >= keyArity || (seekBound && isExclusiveBound(seekBound))) return startKey;
+	return lastKeyOfSeekGroup(tree, startKey, plan, seekBound, keyFromEntry, comparators);
+}
+
+function isExclusiveBound(bound: ScanPlanRangeBound): boolean {
+	return bound.op === IndexConstraintOp.GT || bound.op === IndexConstraintOp.LT;
+}
+
+/**
+ * The last key at or after `startKey` whose leading columns equal the seek tuple, or `startKey`
+ * itself when no key does (the crack is then already the right start for a backwards walk).
+ * Equality runs under the walk's own per-column comparators, which mirror the tree's, so the
+ * group is contiguous and collation variants of one value count as one group.
+ *
+ * NOTE: costs one extra forward pass over the group's keys (for a secondary index, distinct index
+ * keys, not rows). If a large duplicate group at a range boundary ever shows up in a profile, give
+ * the key comparator a high sentinel and seek past the group directly.
+ */
+function lastKeyOfSeekGroup<TEntry>(
+	tree: BTree<BTreeKey, TEntry>,
+	startKey: { value: BTreeKey },
+	plan: ScanPlan,
+	seekBound: ScanPlanRangeBound | undefined,
+	keyFromEntry: (entry: TEntry) => BTreeKey,
+	comparators: ResolvedScanComparators,
+): { value: BTreeKey } {
+	const path = tree.find(startKey.value);
+	if (!path.on) tree.moveNext(path);
+	let last: BTreeKey | undefined;
+	for (; path.on; tree.moveNext(path)) {
+		const key = keyFromEntry(tree.at(path)!);
+		if (!keyInSeekGroup(key, plan, seekBound, comparators)) break;
+		last = key;
+	}
+	return last === undefined ? startKey : { value: last };
+}
+
+/** True when `key`'s leading columns equal the equality prefix and then the seek bound's value. */
+function keyInSeekGroup(
+	key: BTreeKey,
+	plan: ScanPlan,
+	seekBound: ScanPlanRangeBound | undefined,
+	comparators: ResolvedScanComparators,
+): boolean {
+	const parts = keyParts(key, comparators.keyIsTuple);
+	const prefix = plan.equalityPrefix ?? [];
+	if (prefix.some((value, i) => comparators.equalityPrefix[i](parts[i], value) !== 0)) return false;
+	return !seekBound || comparators.bound(parts[prefix.length], seekBound.value) === 0;
 }
 
 /**
@@ -231,12 +303,13 @@ function* scanLayerResolved(
 		// no `desc`, and a full-key prefix has no bound column, so the `?.` chain
 		// yields false for both, which is correct.
 		const isDescBoundColumn = schema.primaryKeyDefinition?.[boundPosition]?.desc === true;
-		// NOTE: `> 1`, whereas the key-shape flag `comparators.keyIsTuple` uses `!== 1`.
+		// NOTE: `walkStartKey` reads `keyArity > 1` as composite, whereas the key-shape flag
+		// `comparators.keyIsTuple` uses `!== 1`.
 		// They differ only for the zero-column singleton PK, which stores `[]`: neither
 		// branch below can reach it (an `equalityPrefix` needs a PK column, and there is
 		// no column for a bound to constrain), so the seek key is never built for it. If a
 		// zero-arity plan ever does reach here, switch this to `keyIsTuple`.
-		const isComposite = (schema.primaryKeyDefinition?.length ?? schema.columns.length) > 1;
+		const keyArity = schema.primaryKeyDefinition?.length ?? schema.columns.length;
 
 		// Seek-start selection must depend on the *physical* walk direction, not just
 		// the bound column's declared direction. The four {isAscending}×{isDescBoundColumn}
@@ -247,11 +320,10 @@ function* scanLayerResolved(
 		//   descending + DESC bound column → seek from lower, terminate at upper
 		// i.e. seek from the upper bound exactly when isAscending === isDescBoundColumn
 		// (and terminate at the complement). Absent the chosen bound we fall back to
-		// the tree end `safeIterate` picks for the direction, or to the start of the
-		// prefix's group.
+		// the tree end `safeIterate` picks for the direction, or to the prefix's group.
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-		const startKey = seekStartKey(plan, seekBound, isComposite);
+		const startKey = walkStartKey(tree, plan, seekBound, keyArity, primaryKeyExtractorFromRow, comparators);
 
 		for (const value of safeIterate(tree, isAscending, startKey, primaryKeyExtractorFromRow)) {
 			const row = value as Row;
@@ -313,10 +385,10 @@ function* scanLayerResolved(
 		// Seek-from end depends on the physical walk direction (see the primary
 		// branch for the full rationale): seek from the upper bound exactly when
 		// isAscending === isDescBoundColumn, terminate at the complement.
-		const isComposite = (indexDef?.columns.length ?? 1) > 1;
+		const keyArity = indexDef?.columns.length ?? 1;
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-		const startKey = seekStartKey(plan, seekBound, isComposite);
+		const startKey = walkStartKey(indexTree, plan, seekBound, keyArity, entry => entry.indexKey, comparators);
 
 		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {

@@ -73,6 +73,11 @@ select val from d_null order by val desc;
 select val from d_null where val is not null order by val desc;
 → [{"val":"z"},{"val":"m"},{"val":"a"}]
 
+-- Ascending over the DESC index: a backwards walk runs the column ascending, so it emits
+-- the NULLs first as the engine wants
+select val from d_null order by val;
+→ [{"val":null},{"val":null},{"val":"a"},{"val":"m"},{"val":"z"}]
+
 -- Explicit NULLs FIRST under DESC
 select val from d_null order by val desc nulls first;
 → [{"val":null},{"val":null},{"val":"z"},{"val":"m"},{"val":"a"}]
@@ -128,3 +133,104 @@ select name from d_text where name >= 'b' order by name desc;
 → [{"name":"date"},{"name":"cherry"},{"name":"banana"}]
 
 drop table d_text;
+
+-- =====================================================
+-- 6. Ascending index and primary key read backwards
+-- =====================================================
+-- A descending ORDER BY over an ascending index (or primary key) may be served by
+-- walking it backwards instead of sorting; a backend that cannot still sorts. Answers
+-- only -- the plan differs per backend.
+create table r_asc (id integer primary key, c integer, n integer null, k integer, r integer);
+create index ix_r_asc_c on r_asc(c);
+create index ix_r_asc_n on r_asc(n);
+create index ix_r_asc_kr on r_asc(k, r);
+insert into r_asc values (1, 10, 3, 1, 5);
+insert into r_asc values (2, 20, null, 1, 7);
+insert into r_asc values (3, 10, 1, 0, 9);
+insert into r_asc values (4, 30, 2, 1, 6);
+insert into r_asc values (5, 20, null, 2, 1);
+insert into r_asc values (6, 10, 4, 1, 8);
+
+-- Ties on an ascending index read descending. SQL leaves the order of rows sharing a
+-- value open and the backends differ (a backwards walk gives reverse primary-key order, a
+-- sort keeps scan order), so only the sorted column is projected.
+select c from r_asc order by c desc;
+→ [{"c":30},{"c":20},{"c":20},{"c":10},{"c":10},{"c":10}]
+
+-- Primary key read backwards
+select id from r_asc order by id desc limit 3;
+→ [{"id":6},{"id":5},{"id":4}]
+
+-- A nullable ascending column read descending: NULLs still come first, so a backwards
+-- walk (which emits them last) must not serve this
+select n from r_asc order by n desc;
+→ [{"n":null},{"n":null},{"n":4},{"n":3},{"n":2},{"n":1}]
+
+-- With the NULLs filtered out the backwards walk may serve it
+select n from r_asc where n is not null order by n desc;
+→ [{"n":4},{"n":3},{"n":2},{"n":1}]
+
+select n from r_asc where n > 1 order by n desc;
+→ [{"n":4},{"n":3},{"n":2}]
+
+-- Equality on the leading column of (k, r), trailing column read descending: the walk
+-- must start from the END of the k = 1 group
+select r from r_asc where k = 1 order by r desc;
+→ [{"r":8},{"r":7},{"r":6},{"r":5}]
+
+select r from r_asc where k = 1 and r <= 7 order by r desc;
+→ [{"r":7},{"r":6},{"r":5}]
+
+-- A partial flip of (k, r) is neither the index order nor its reverse
+select k, r from r_asc order by k desc, r asc;
+→ [{"k":2,"r":1},{"k":1,"r":5},{"k":1,"r":6},{"k":1,"r":7},{"k":1,"r":8},{"k":0,"r":9}]
+
+-- Composite primary key, range on its leading column, read backwards: every row AT the
+-- bound must come back, not just those below it
+create table r_pk (a integer, b integer, v text, primary key (a, b));
+insert into r_pk values (3, 1, 'p');
+insert into r_pk values (5, 1, 'q');
+insert into r_pk values (5, 2, 'r');
+insert into r_pk values (5, 3, 's');
+insert into r_pk values (7, 1, 't');
+
+select a, b from r_pk where a <= 5 order by a desc, b desc;
+→ [{"a":5,"b":3},{"a":5,"b":2},{"a":5,"b":1},{"a":3,"b":1}]
+
+select a, b from r_pk where a >= 5 order by a desc, b desc;
+→ [{"a":7,"b":1},{"a":5,"b":3},{"a":5,"b":2},{"a":5,"b":1}]
+
+select a, b from r_pk where a < 5 order by a desc, b desc;
+→ [{"a":3,"b":1}]
+
+select b from r_pk where a = 5 order by b desc;
+→ [{"b":3},{"b":2},{"b":1}]
+
+-- The same reads over rows staged in an open transaction
+begin;
+insert into r_pk values (5, 4, 'u');
+insert into r_pk values (4, 1, 'w');
+update r_pk set v = 'P' where a = 3 and b = 1;
+delete from r_pk where a = 5 and b = 2;
+insert into r_asc values (7, 25, 5, 1, 4);
+update r_asc set c = 40 where id = 1;
+delete from r_asc where id = 4;
+
+select a, b, v from r_pk where a <= 5 order by a desc, b desc;
+→ [{"a":5,"b":4,"v":"u"},{"a":5,"b":3,"v":"s"},{"a":5,"b":1,"v":"q"},{"a":4,"b":1,"v":"w"},{"a":3,"b":1,"v":"P"}]
+
+select c from r_asc order by c desc;
+→ [{"c":40},{"c":25},{"c":20},{"c":20},{"c":10},{"c":10}]
+
+select r from r_asc where k = 1 order by r desc;
+→ [{"r":8},{"r":7},{"r":5},{"r":4}]
+
+select id from r_asc order by id desc limit 2;
+→ [{"id":7},{"id":6}]
+commit;
+
+select a, b from r_pk order by a desc, b desc;
+→ [{"a":7,"b":1},{"a":5,"b":4},{"a":5,"b":3},{"a":5,"b":1},{"a":4,"b":1},{"a":3,"b":1}]
+
+drop table r_pk;
+drop table r_asc;

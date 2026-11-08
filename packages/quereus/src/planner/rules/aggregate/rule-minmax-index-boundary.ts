@@ -33,16 +33,16 @@
  * null and the plan is left byte-identical. No Sort, Filter or Limit is ever
  * introduced into a plan that cannot serve the ordering.
  *
- * Neither shipped backend walks an index backwards (both require the requested
- * direction to equal the index column's declared direction), so in practice:
+ * Which walks qualify is the backend's ordering claim. The memory backend serves an
+ * ordering by walking an index either way (a backwards walk when every ordered column
+ * is flipped), so there:
  *
- *   min(c) + ascending index on c (incl. the primary key) -> boundary read
- *   max(c) + descending index on c                        -> boundary read
- *   max(c) + only an ascending index on c                 -> unchanged, full scan
- *   either + no index                                     -> unchanged, full scan
+ *   min(c) or max(c) + an index leading on c (incl. the primary key) -> boundary read
+ *   either + no index                                                -> unchanged, full scan
  *
- * Making `max(c)` fast off an ascending index needs backwards index walks, tracked
- * separately as `feat-reverse-index-walk-for-desc-ordering`.
+ * The store backend only walks an index in its declared direction, so on it `max(c)`
+ * with only an ascending index (and `min(c)` with only a descending one) stays a full
+ * scan until `reverse-index-walk-store` lands.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -84,10 +84,11 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	// line reads the column reference's own type, while `nullSafeOrderingPrefixLength`
 	// (vtab/best-access-plan.ts) reads `tableSchema.columns[i].notNull`. They agree today
 	// because a bare table column's `columnType` is built from that same schema column,
-	// and the DESC direction fails safe either way (a missing filter makes the ordering
-	// claim be refused, so the rule declines). The ASC direction does NOT fail safe: an
-	// ordering claim over a nullable ASC column is granted unconditionally, so a type that
-	// under-reports nullability would skip this filter and `min(c)` would return NULL.
+	// and a walk that runs the column descending (a DESC column forwards, an ASC column
+	// backwards) fails safe either way (a missing filter makes the ordering claim be
+	// refused, so the rule declines). A walk that runs it ascending does NOT fail safe: that
+	// claim over a nullable column is granted unconditionally, so a type that under-reports
+	// nullability would skip this filter and the aggregate would return NULL.
 	// Revisit if a rewrite ever narrows a ColumnReferenceNode's nullability, or if a
 	// non-table relation becomes reachable through the absorb probe's chain walk.
 	const inner = colRef.getType().nullable
@@ -202,10 +203,11 @@ function sourceAcceptsTruncation(node: AggregateNode): boolean {
  * hand the aggregate a NULL and `max(d)` would return NULL whenever the column has
  * any NULL at all.
  *
- * It also unlocks the descending case: `nullSafeOrderingPrefixLength`
- * (vtab/best-access-plan.ts) refuses a DESC ordering claim over a column NULLs could
- * reach unless a NULL-excluding filter is present in the request, and `IS NOT NULL`
- * is one of its recognized ops.
+ * It also unlocks the descending walks: `nullSafeOrderingPrefixLength`
+ * (vtab/best-access-plan.ts) refuses a claim that walks a column descending (a DESC
+ * column forwards, an ASC one backwards) where NULLs could reach it unless a
+ * NULL-excluding filter is present in the request, and `IS NOT NULL` is one of its
+ * recognized ops.
  *
  * NOTE: when the module does NOT consume this as a seek bound, the ordered walk steps
  * over the whole NULL run before reaching the first real value — bounded by the NULL

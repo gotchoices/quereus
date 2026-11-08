@@ -2,6 +2,25 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { planRows } from '../plan/_helpers.js';
 
+/** Number of SORT operators in `sql`'s physical plan. */
+async function sortCountIn(db: Database, sql: string): Promise<number> {
+	const rows: Array<{ c: number }> = [];
+	for await (const r of db.eval("SELECT COUNT(*) AS c FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
+		rows.push(r as unknown as { c: number });
+	}
+	expect(rows).to.have.lengthOf(1);
+	return rows[0].c;
+}
+
+/** Every value of `name` produced by `sql`, in emission order. */
+async function columnIn(db: Database, sql: string, name: string): Promise<Array<number | null>> {
+	const values: Array<number | null> = [];
+	for await (const r of db.eval(sql)) {
+		values.push((r as Record<string, unknown>)[name] as number | null);
+	}
+	return values;
+}
+
 describe('DESC index — ordering and access path selection', () => {
 	let db: Database;
 
@@ -155,24 +174,8 @@ describe('DESC index — NULL placement gate', () => {
 		await db.close();
 	});
 
-	/** Number of SORT operators in `sql`'s physical plan. */
-	async function sortCount(sql: string): Promise<number> {
-		const rows: Array<{ c: number }> = [];
-		for await (const r of db.eval("SELECT COUNT(*) AS c FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
-			rows.push(r as unknown as { c: number });
-		}
-		expect(rows).to.have.lengthOf(1);
-		return rows[0].c;
-	}
-
-	/** Every value of `name` produced by `sql`, in emission order. */
-	async function column(sql: string, name: string): Promise<Array<number | null>> {
-		const values: Array<number | null> = [];
-		for await (const r of db.eval(sql)) {
-			values.push((r as Record<string, unknown>)[name] as number | null);
-		}
-		return values;
-	}
+	const sortCount = (sql: string) => sortCountIn(db, sql);
+	const column = (sql: string, name: string) => columnIn(db, sql, name);
 
 	it('a nullable DESC secondary index keeps its Sort and puts NULLs first', async () => {
 		await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NULL) USING memory");
@@ -247,6 +250,71 @@ describe('DESC index — NULL placement gate', () => {
 		const sql = "SELECT a FROM w ORDER BY a";
 		expect(await sortCount(sql), 'the trailing nullable DESC column is outside the claim').to.equal(0);
 		expect(await column(sql, 'a')).to.deep.equal([1, 2, 3, 4]);
+	});
+});
+
+/**
+ * A required ordering whose every matched column is the reverse of the index's declared
+ * direction is served by walking the index (or the primary key) backwards, with the
+ * NULL gate run on the walk's effective direction: an ASC column walked backwards emits
+ * its NULLs LAST, so a nullable one needs a NULL-excluding filter to claim.
+ */
+describe('memory module — backwards index walks', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('order by desc over an ascending index walks it backwards with no Sort', async () => {
+		await db.exec("create table t (id integer primary key, c integer)");
+		await db.exec("create index t_c on t(c)");
+		await db.exec("insert into t values (1, 10), (2, 30), (3, 10), (4, 40)");
+
+		const sql = "select id from t order by c desc";
+		expect(await sortCountIn(db, sql)).to.equal(0);
+		// Rows sharing `c = 10` come out in reverse primary-key order: the exact reverse of
+		// the forward read. SQL leaves tie order open, so this is pinned here, memory-only.
+		const forward = await columnIn(db, "select id from t order by c", 'id');
+		expect(forward).to.deep.equal([1, 3, 2, 4]);
+		expect(await columnIn(db, sql, 'id')).to.deep.equal([...forward].reverse());
+	});
+
+	it('order by id desc over an integer primary key walks it backwards with no Sort', async () => {
+		await db.exec("create table p (id integer primary key, v integer)");
+		await db.exec("insert into p values (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)");
+
+		const sql = "select id from p order by id desc limit 3";
+		expect(await sortCountIn(db, sql)).to.equal(0);
+		expect(await columnIn(db, sql, 'id')).to.deep.equal([5, 4, 3]);
+	});
+
+	it('a partial flip matches neither direction and keeps its Sort', async () => {
+		await db.exec("create table m (id integer primary key, a integer, b integer)");
+		await db.exec("create index m_ab on m(a, b)");
+		await db.exec("insert into m values (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 2)");
+
+		const sql = "select id from m order by a desc, b asc";
+		expect(await sortCountIn(db, sql)).to.equal(1);
+		expect(await columnIn(db, sql, 'id')).to.deep.equal([3, 4, 1, 2]);
+	});
+
+	it('a nullable ascending column needs a NULL-excluding filter to be walked backwards', async () => {
+		await db.exec("create table n (id integer primary key, c integer null)");
+		await db.exec("create index n_c on n(c)");
+		await db.exec("insert into n values (1, 2), (2, null), (3, 3), (4, 1)");
+
+		const unfiltered = "select c from n order by c desc";
+		expect(await sortCountIn(db, unfiltered), 'the backwards walk emits NULLs last').to.equal(1);
+		expect(await columnIn(db, unfiltered, 'c')).to.deep.equal([null, 3, 2, 1]);
+
+		const filtered = "select c from n where c > 0 order by c desc";
+		expect(await sortCountIn(db, filtered)).to.equal(0);
+		expect(await columnIn(db, filtered, 'c')).to.deep.equal([3, 2, 1]);
 	});
 });
 

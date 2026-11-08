@@ -44,6 +44,7 @@ export {
 	PRIMARY_PHYSICAL_INDEX_NAME,
 	isPrimaryIndexName,
 	primaryKeyDescriptor,
+	reversedIndexDescriptor,
 	resolveIndexDescriptor,
 	validateIndexDescriptor,
 } from './vtab/index-descriptor.js';
@@ -54,6 +55,8 @@ export {
 	encodeIdxStr,
 	decodeIdxStr,
 	idxStrSentinel,
+	idxStrWalksReverse,
+	REVERSE_PARAM,
 	retargetIdxStr,
 	makeIdxStrSpec,
 	planKindFromCode,

@@ -434,19 +434,20 @@ describe('key-set-seek plan shape', () => {
 			expect(await orderedColumn(sql, 'pk'), 'the two SMALLEST matching keys').to.deep.equal([2, 3]);
 		});
 
-		it('order by pk DESC over an ASCENDING pk keeps its Sort', async () => {
-			// The memory backend does not offer a reversed primary-key walk for this
-			// shape, so the ORDER BY is never absorbed and the leaf walks ascending:
-			// the rewrite fires and the Sort above must survive to flip the order.
-			// (A leaf that DID walk reversed is rejected by `seekPreservesTargetOrder`
-			// — its advertised direction disagrees with the key column's; that clause
-			// is pinned directly in the predicate's own describe block below.)
+		it('order by pk DESC over an ASCENDING pk: the reversed walk absorbs it and the seek branch sorts', async () => {
+			// The memory backend serves the ORDER BY by walking the primary key backwards,
+			// so the Sort is absorbed into the leaf. A multi-seek emits ascending, so
+			// `seekPreservesTargetOrder` rejects the reversed leaf (its advertised direction
+			// disagrees with the key column's) and the seek branch buffers and sorts back
+			// into the claimed order instead (`seekRestoresTargetOrder`).
 			await db.exec('insert into big (pk, v, w) values (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)');
 			await db.exec('insert into small values (2), (3), (4)');
 			const sql = 'select pk from big where pk in (select id from small) order by pk desc';
 			const plan = db.getPlan(sql);
-			expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
-			expect(collectNodes(plan, isSort), 'the Sort must survive the ascending claim').to.have.lengthOf(1);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes).to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the reversed walk serves the ORDER BY').to.have.lengthOf(0);
+			expect(seekPreservesTargetOrder(nodes[0].target, nodes[0].pushdown)).to.equal(false);
 			expect(await orderedColumn(sql, 'pk')).to.deep.equal([4, 3, 2]);
 		});
 

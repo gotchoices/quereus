@@ -171,17 +171,19 @@ const NULL_EXCLUDING_OPS: ReadonlySet<ConstraintOp> = new Set<ConstraintOp>([
 ]);
 
 /**
- * Truncate an ordered key's order-preserving prefix at the first DESC column whose walk
- * could misplace NULLs. Shared by every module that turns an index (or primary-key) walk
- * into an ordering claim.
+ * Truncate an ordered key's order-preserving prefix at the first column whose walk could
+ * misplace NULLs. Shared by every module that turns an index (or primary-key) walk into an
+ * ordering claim.
  *
  * The engine's ORDER BY places NULLs FIRST for BOTH directions — placement is absolute,
  * never direction-conditioned (`orderByNullResult`, util/comparison.ts). Both shipped
- * backends agree on an ASC column and DISAGREE on a DESC one: the store bit-inverts the
- * column's key bytes (NULL's low `0x00` tag ends up last) and the memory module negates
- * the ascending comparator (NULL is the lowest value, so negation sends it last). So a
- * DESC ordering claim is only sound when no NULL can appear in that column's emitted
- * rows:
+ * backends store NULL as a column's lowest value (the memory comparator ranks it lowest;
+ * the store's `0x00` tag byte is lowest, bit-inverted for a DESC column), so a walk emits
+ * a column's NULLs FIRST when it runs that column ascending — an ASC column walked
+ * forwards, or a DESC column walked backwards — and LAST when it runs it descending. The
+ * column's EFFECTIVE direction is therefore `col.desc !== reverse`, and an effectively
+ * descending ordering claim is only sound when no NULL can appear in that column's
+ * emitted rows:
  *
  *  - the column is declared NOT NULL — columns are NOT NULL by default in this engine, so
  *    this is the case that keeps the gate from firing on ordinary tables;
@@ -191,6 +193,10 @@ const NULL_EXCLUDING_OPS: ReadonlySet<ConstraintOp> = new Set<ConstraintOp>([
  *    this is what keeps `where n > 5 order by n desc` fast, and it holds whether or not
  *    the module marks the filter handled: an unhandled filter is retained by the engine
  *    as a residual `Filter`, which removes the NULL rows and preserves order either way.
+ *
+ * `reverse` is true when the claim is served by walking the key BACKWARDS (see
+ * `IndexDescriptor.reverse`). A backwards walk of a nullable ASC column is gated; a
+ * backwards walk of a nullable DESC column is safe.
  *
  * `keyColumns` is `ReadonlyArray<IndexColumnSchema>` rather than a whole `IndexSchema` so
  * that a table's `primaryKeyDefinition` can be passed directly — `PrimaryKeyColumnDefinition`
@@ -208,10 +214,11 @@ export function nullSafeOrderingPrefixLength(
 	keyColumns: ReadonlyArray<IndexColumnSchema>,
 	orderPreservingPrefix: number,
 	pinnedCols: ReadonlySet<number>,
+	reverse = false,
 ): number {
 	for (let i = 0; i < orderPreservingPrefix; i++) {
 		const col = keyColumns[i];
-		if (!col.desc) continue;
+		if (!!col.desc === reverse) continue; // walked ascending: NULLs come out first
 		if (tableInfo.columns[col.index]?.notNull) continue;
 		if (pinnedCols.has(col.index)) continue;
 		if (request.filters.some(f => f.columnIndex === col.index && NULL_EXCLUDING_OPS.has(f.op))) continue;

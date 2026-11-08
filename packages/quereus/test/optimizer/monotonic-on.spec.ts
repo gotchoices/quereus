@@ -40,9 +40,10 @@ describe('MonotonicOn characteristic propagation', () => {
 
 	it('Sort establishes strict monotonicOn when source is unique on the leading key', async () => {
 		await setupUnique();
-		// ORDER BY id DESC on a PK forces a Sort (the index is ascending), and the
-		// input PK uniqueKey covers id alone, so strict must be true.
-		const rows = await getPhysicalRows(db, "SELECT * FROM t ORDER BY id DESC");
+		// The LIMIT between the Sort and the table keeps the Sort from being absorbed into
+		// a (backwards) primary-key walk, and the input PK uniqueKey covers id alone, so
+		// strict must be true.
+		const rows = await getPhysicalRows(db, "SELECT * FROM (SELECT id, v FROM t LIMIT 100) s ORDER BY id DESC");
 		const sort = physicalOf(rows, r => r.op === 'SORT');
 		expect(sort, 'sort node present').to.not.equal(undefined);
 		expect(sort!.monotonicOn).to.be.an('array').with.lengthOf(1);

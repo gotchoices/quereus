@@ -57,10 +57,10 @@ export interface IndexDescriptor {
  * Which seek/scan strategy the planner chose over an {@link IndexDescriptor}.
  * One-to-one with the `plan=N` codes carried in `idxStr`.
  *
- * Scan DIRECTION is not part of the plan KIND. The in-memory vtab's runtime reads it
- * from `idxStr` (the `plan=1` / `plan=4` descending codes and the `ordCons=DESC`
- * parameter its scan-plan builder recognises), which no engine path emits today. An
- * emission-order consumer learns direction only from {@link IndexDescriptor.reverse}.
+ * Scan DIRECTION is not part of the plan KIND. A module runtime reads it from the
+ * `reverse=1` `idxStr` parameter (`idxStrWalksReverse`, idx-str.ts), which the planner
+ * stamps from {@link IndexDescriptor.reverse} — the one source of the fact. An
+ * emission-order consumer reads the descriptor directly.
  */
 export type IndexPlanKind =
 	| 'scan'             // plan=0 — ordered walk, no bounds
@@ -153,7 +153,15 @@ export function resolveIndexDescriptor(
 ): IndexDescriptor | undefined {
 	const supplied = accessPlan.indexDescriptor;
 	if (supplied && supplied.name === indexName) return supplied;
+	return schemaIndexDescriptor(tableSchema, indexName);
+}
 
+/**
+ * The forward descriptor the table SCHEMA gives `indexName`: {@link primaryKeyDescriptor}
+ * for either primary-key spelling, else a case-insensitive hit in `tableSchema.indexes`,
+ * else undefined. Steps 2–4 of {@link resolveIndexDescriptor}.
+ */
+function schemaIndexDescriptor(tableSchema: TableSchema, indexName: string): IndexDescriptor | undefined {
 	if (isPrimaryIndexName(indexName)) return primaryKeyDescriptor(tableSchema);
 
 	const lowered = indexName.toLowerCase();
@@ -170,6 +178,34 @@ export function resolveIndexDescriptor(
 		})),
 		unique: schemaIndex.unique === true,
 	};
+}
+
+/**
+ * The schema's descriptor for `indexName` with `reverse: true` — what a module returns as
+ * `indexDescriptor` when it serves a required ordering by walking that index backwards.
+ *
+ * `indexName` must be the name the plan carries (`indexName` / `orderingIndexName`), since
+ * the engine matches a supplied descriptor to the walked index by name. Throws for a name
+ * the schema cannot resolve: a module claiming a reversed walk of an index it cannot
+ * describe has a bug, and an unresolved reverse claim would be walked forwards.
+ */
+export function reversedIndexDescriptor(tableSchema: TableSchema, indexName: string): IndexDescriptor {
+	const forward = schemaIndexDescriptor(tableSchema, indexName);
+	if (!forward) {
+		quereusError(
+			`Cannot reverse index '${indexName}' of table '${tableSchema.name}': the schema has no such index`,
+			StatusCode.INTERNAL,
+		);
+	}
+	// The primary key is ordered by each column's collation, which `primaryKeyDefinition` can
+	// lag (the store's create-time PK re-collation). The engine reads the column for its own
+	// primary-key descriptor (`resolveIndexKeyCollations`, rule-select-access-path.ts), but
+	// trusts a supplied one, so this one states the column's collation too.
+	const keyColumns = forward.role === 'primary'
+		? forward.keyColumns.map(key => ({ ...key, collation: tableSchema.columns[key.columnIndex]?.collation }))
+		: forward.keyColumns;
+	// Keep the plan's spelling: `resolveIndexDescriptor` matches a supplied descriptor by name.
+	return { ...forward, name: indexName, keyColumns, reverse: true };
 }
 
 /**

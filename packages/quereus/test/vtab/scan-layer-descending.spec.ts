@@ -1,11 +1,10 @@
 /**
  * Regression: the memory-table `scanLayer` seek-start selection must depend on
  * the *physical* walk direction, not just the key's declared direction. A
- * descending range plan (`plan.descending = true` with leading-column bounds)
- * is not emitted by the current planner — `rule-select-access-path.ts` never
- * produces `plan=1`/`plan=4` and `ordCons` is never set — so these cases are
- * unreachable through SQL today. They are exercised here by constructing the
- * descending `ScanPlan` directly and scanning the committed memory layer.
+ * descending plan reaches here from SQL whenever the planner serves an ordering
+ * by walking an index backwards (`reverse=1` in `idxStr`); these cases construct
+ * the descending `ScanPlan` directly so each seek shape is pinned on its own,
+ * scanning the committed memory layer.
  *
  * Before the fix, a DESC-leading key always seeked from `upperBound` and an
  * ASC-leading key always seeked from `lowerBound`, regardless of direction, so
@@ -109,6 +108,31 @@ describe('scanLayer descending range seek-start (latent path)', () => {
 			};
 			const rows = await collect(getCommittedLayer(db, 'ta'), plan);
 			expect(rows.map(r => r[0]).sort(num)).to.deep.equal([15, 20, 25]);
+		});
+	});
+
+	describe('backwards walk from a start key shorter than the tree key', () => {
+		// The short seek tuple sorts before every key sharing it, so the seek lands at the
+		// START of that group; a backwards walk must start from the group's END instead.
+		it('prefix-only seek on a two-column secondary index returns the whole group', async () => {
+			await db.exec('create table sk (id integer primary key, k integer, r integer)');
+			await db.exec('create index idx_kr on sk (k, r)');
+			await db.exec('insert into sk values (1,0,1),(2,1,5),(3,1,7),(4,1,6),(5,2,1)');
+			const plan: ScanPlan = { indexName: 'idx_kr', descending: true, equalityPrefix: [1] };
+			const rows = await collect(getCommittedLayer(db, 'sk'), plan);
+			expect(rows.map(r => r[2])).to.deep.equal([7, 6, 5]);
+		});
+
+		it('inclusive bound on the leading column of a two-column primary key keeps the bound group', async () => {
+			await db.exec('create table pk2 (a integer, b integer, primary key (a, b))');
+			await db.exec('insert into pk2 values (3,1),(5,1),(5,2),(5,3),(7,1)');
+			const plan: ScanPlan = {
+				indexName: 'primary',
+				descending: true,
+				upperBound: { op: IndexConstraintOp.LE, value: 5 },
+			};
+			const rows = await collect(getCommittedLayer(db, 'pk2'), plan);
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[5, 3], [5, 2], [5, 1], [3, 1]]);
 		});
 	});
 

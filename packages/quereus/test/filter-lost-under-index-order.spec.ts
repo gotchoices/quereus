@@ -55,8 +55,8 @@ describe('Filter conjunct lost under index ordering', () => {
 		const absorbed = topLevelProgram(db, FAILING);
 		expect(absorbed, 'ascending order is satisfied by the primary-key walk')
 			.to.not.contain('sort(');
-		const notAbsorbed = topLevelProgram(db, `${FAILING} desc`);
-		expect(notAbsorbed, 'descending order is not, so its Sort survives')
+		const notAbsorbed = topLevelProgram(db, FAILING.replace('order by id', 'order by flag'));
+		expect(notAbsorbed, 'an order no index provides keeps its Sort')
 			.to.contain('sort(');
 	});
 

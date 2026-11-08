@@ -24,6 +24,16 @@ function findFirstSort(plan: PlanNode): SortNode | undefined {
 	return sorts[0];
 }
 
+/**
+ * `table` behind a LIMIT, as a derived table. A Sort over it cannot be absorbed into an
+ * index walk (the memory backend serves `pk DESC` by walking the key backwards), so it
+ * stays observable for these pins, while the table's keys and the WHERE's equivalences
+ * still reach it.
+ */
+function unabsorbable(table: string, columns: string, where?: string): string {
+	return `(SELECT ${columns} FROM ${table}${where ? ` WHERE ${where}` : ''} LIMIT 1000000) s`;
+}
+
 describe('ruleOrderByFdPruning', () => {
 	let db: Database;
 
@@ -36,12 +46,10 @@ describe('ruleOrderByFdPruning', () => {
 	});
 
 	it('PK-driven: ORDER BY pk DESC, name → ORDER BY pk DESC (Sort survives with one key)', async () => {
-		// Using `pk DESC` keeps the Sort in the plan (the IndexScan provides ASC
-		// ordering, so DESC cannot be served by the source).
 		await db.exec(
 			'CREATE TABLE t (pk INTEGER PRIMARY KEY, name TEXT) USING memory',
 		);
-		const plan = db.getPlan('SELECT pk, name FROM t ORDER BY pk DESC, name');
+		const plan = db.getPlan(`SELECT pk, name FROM ${unabsorbable('t', 'pk, name')} ORDER BY pk DESC, name`);
 		const sort = findFirstSort(plan);
 		expect(sort, 'sort node should survive in plan').to.not.equal(undefined);
 		expect(sort!.sortKeys, 'trailing PK-determined key dropped').to.have.length(1);
@@ -62,13 +70,10 @@ describe('ruleOrderByFdPruning', () => {
 	});
 
 	it('EC-driven: WHERE a = b ORDER BY a DESC, b → ORDER BY a DESC (EC drops b)', async () => {
-		// Use DESC on the first key so the heap index (ascending) can't satisfy
-		// the ordering via trySortAbsorbViaIndexOrdering — the Sort must survive
-		// for ruleOrderByFdPruning to reduce it using the EC from WHERE a = b.
 		await db.exec('CREATE TABLE e (a INTEGER, b INTEGER) USING memory');
-		const plan = db.getPlan('SELECT a, b FROM e WHERE a = b ORDER BY a DESC, b');
+		const plan = db.getPlan(`SELECT a, b FROM ${unabsorbable('e', 'a, b', 'a = b')} ORDER BY a DESC, b`);
 		const sort = findFirstSort(plan);
-		expect(sort, 'sort survives (DESC prevents index-ordering absorption)').to.not.equal(undefined);
+		expect(sort, 'sort survives').to.not.equal(undefined);
 		expect(sort!.sortKeys, 'EC equates b to a so b is droppable').to.have.length(1);
 		expect(sort!.sortKeys[0].direction, 'surviving key keeps DESC').to.equal('desc');
 	});
@@ -102,14 +107,13 @@ describe('ruleOrderByFdPruning', () => {
 		// `pk` is a unique key, so ordering by it is already total — the trailing
 		// `name || 'x'` can never break a tie (there are none) and is a no-op
 		// tiebreaker, even though it is a non-bare expression. Whole-tail pruning
-		// drops it. `pk DESC` keeps the Sort observable (the IndexScan only serves
-		// ASC).
+		// drops it.
 		await db.exec(
 			'CREATE TABLE x (pk INTEGER PRIMARY KEY, name TEXT) USING memory',
 		);
-		const plan = db.getPlan("SELECT pk, name FROM x ORDER BY pk DESC, name || 'x'");
+		const plan = db.getPlan(`SELECT pk, name FROM ${unabsorbable('x', 'pk, name')} ORDER BY pk DESC, name || 'x'`);
 		const sort = findFirstSort(plan);
-		expect(sort, 'sort survives (DESC cannot be served by the source)').to.not.equal(undefined);
+		expect(sort, 'sort survives').to.not.equal(undefined);
 		expect(sort!.sortKeys, 'trailing tiebreaker dropped once the leading unique key totally orders').to.have.length(1);
 		expect(sort!.sortKeys[0].direction).to.equal('desc');
 	});
@@ -119,7 +123,7 @@ describe('ruleOrderByFdPruning', () => {
 			'CREATE TABLE c (pk INTEGER PRIMARY KEY, name TEXT, email TEXT) USING memory',
 		);
 		const plan = db.getPlan(
-			'SELECT pk, name, email FROM c ORDER BY pk DESC, name, email',
+			`SELECT pk, name, email FROM ${unabsorbable('c', 'pk, name, email')} ORDER BY pk DESC, name, email`,
 		);
 		const sort = findFirstSort(plan);
 		expect(sort).to.not.equal(undefined);
@@ -131,7 +135,7 @@ describe('ruleOrderByFdPruning', () => {
 		await db.exec(
 			'CREATE TABLE md (a INTEGER PRIMARY KEY, b INTEGER) USING memory',
 		);
-		const plan = db.getPlan('SELECT a, b FROM md ORDER BY a DESC, b ASC');
+		const plan = db.getPlan(`SELECT a, b FROM ${unabsorbable('md', 'a, b')} ORDER BY a DESC, b ASC`);
 		const sort = findFirstSort(plan);
 		expect(sort).to.not.equal(undefined);
 		expect(sort!.sortKeys).to.have.length(1);
@@ -219,7 +223,7 @@ describe('ruleOrderByFdPruning', () => {
 		await db.exec(
 			'CREATE TABLE p (pk INTEGER PRIMARY KEY, name TEXT) USING memory',
 		);
-		const plan = db.getPlan('SELECT pk, name FROM p ORDER BY pk DESC, name');
+		const plan = db.getPlan(`SELECT pk, name FROM ${unabsorbable('p', 'pk, name')} ORDER BY pk DESC, name`);
 		const sort = findFirstSort(plan);
 		expect(sort).to.not.equal(undefined);
 		const sourceAttrs = sort!.source.getAttributes();

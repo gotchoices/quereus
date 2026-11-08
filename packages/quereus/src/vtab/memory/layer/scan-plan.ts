@@ -7,7 +7,7 @@ import type { IndexColumnSchema, PrimaryKeyColumnDefinition } from '../../../sch
 import type { IndexConstraint, IndexInfo } from '../../index-info.js';
 import { IndexConstraintOp as ActualIndexConstraintOp } from '../../../common/constants.js';
 import { normalizeCollationName } from '../../../util/comparison.js';
-import { decodeIdxStr } from '../../idx-str.js';
+import { decodeIdxStr, idxStrWalksReverse } from '../../idx-str.js';
 import { PRIMARY_INDEX_NAME } from '../../index-descriptor.js';
 
 /** Describes an equality constraint for a scan plan */
@@ -107,10 +107,6 @@ function resolveIndexSchema(
 		};
 	}
 	return tableSchema.indexes?.find(idx => idx.name === indexName);
-}
-
-function isDescendingScan(params: ReadonlyMap<string, string>, planType: number): boolean {
-	return params.get('ordCons') === 'DESC' || planType === 1 || planType === 4;
 }
 
 /**
@@ -304,7 +300,7 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 		? (spec.indexName === PRIMARY_INDEX_NAME ? 'primary' : spec.indexName)
 		: 'primary';
 	const planType = spec?.plan ?? 0;
-	const descending = isDescendingScan(params, planType);
+	const descending = idxStrWalksReverse(spec);
 	const argvMap = parseArgvMappings(params.get('argvMap'));
 	const indexSchema = resolveIndexSchema(indexName, tableSchema);
 
@@ -316,7 +312,7 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 
 	const isEqPlan = planType === 2;
 	const isMultiSeekPlan = planType === 5;
-	const isRangePlan = planType === 3 || planType === 4;
+	const isRangePlan = planType === 3;
 	const isPrefixRangePlan = planType === 7;
 	const isMultiRangePlan = planType === 6;
 

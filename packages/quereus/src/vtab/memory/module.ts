@@ -20,7 +20,7 @@ import type { ModuleCapabilities } from '../capabilities.js';
 import type { MappingAdvertisement } from '../mapping-advertisement.js';
 import type { Schema } from '../../schema/schema.js';
 import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-tags.js';
-import { PRIMARY_INDEX_NAME } from '../index-descriptor.js';
+import { PRIMARY_INDEX_NAME, reversedIndexDescriptor } from '../index-descriptor.js';
 import { combineConjunctive } from '../../planner/stats/selectivity-combine.js';
 import { costedRows } from '../../planner/util/row-estimates.js';
 import { normalizeCollationName } from '../../util/comparison.js';
@@ -224,6 +224,73 @@ function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): R
 function indexColumnSortsAsDeclared(tableInfo: TableSchema, indexCol: IndexColumnSchema): boolean {
 	const declared = tableInfo.columns[indexCol.index]?.collation;
 	return normalizeCollationName(indexCol.collation ?? 'BINARY') === normalizeCollationName(declared ?? 'BINARY');
+}
+
+/** Which way a walk of an index runs to deliver a required ordering. */
+type OrderingWalk = 'forward' | 'reverse';
+
+/**
+ * The plan fields that record a walk's direction: a reversed descriptor for a backwards
+ * walk, nothing for a forward one (the engine resolves the forward descriptor itself).
+ */
+function walkDirectionFields(
+	tableInfo: TableSchema,
+	indexName: string,
+	walk: OrderingWalk,
+): Pick<BestAccessPlanResult, 'indexDescriptor'> {
+	return walk === 'reverse' ? { indexDescriptor: reversedIndexDescriptor(tableInfo, indexName) } : {};
+}
+
+/** The `explains` suffix for an ordering claim served by `indexName`. */
+function orderingExplanation(indexName: string, walk: OrderingWalk): string {
+	return walk === 'reverse' ? `with ordering from ${indexName} (reverse walk)` : `with ordering from ${indexName}`;
+}
+
+/**
+ * The number of leading index columns a walk in one direction consumes to deliver
+ * `requiredOrdering`, or undefined when that walk cannot deliver it.
+ *
+ * Leading index columns bound by equality (constant for this scan) are skipped, and so are
+ * equality-bound columns interleaved after the matched prefix; they carry no direction.
+ * Every other required column must match its index column with direction
+ * `indexCol.desc !== reverse`, so all matched columns agree on one walk, and a partial
+ * flip (`order by a desc, b asc` over `(a, b)`) matches neither.
+ */
+function orderingPrefixWalked(
+	tableInfo: TableSchema,
+	index: IndexSchema,
+	requiredOrdering: readonly OrderingSpec[],
+	equalityCols: ReadonlySet<number>,
+	reverse: boolean,
+): number | undefined {
+	let i = 0; // pointer into index.columns
+	let j = 0; // pointer into requiredOrdering
+
+	while (i < index.columns.length && equalityCols.has(index.columns[i].index)) {
+		i++;
+	}
+
+	while (j < requiredOrdering.length) {
+		if (i >= index.columns.length) return undefined;
+		const required = requiredOrdering[j];
+		const indexCol = index.columns[i];
+
+		if (required.columnIndex === indexCol.index &&
+			required.desc === ((indexCol.desc ?? false) !== reverse) &&
+			indexColumnSortsAsDeclared(tableInfo, indexCol)) {
+			i++;
+			j++;
+			continue;
+		}
+
+		if (equalityCols.has(indexCol.index)) {
+			i++;
+			continue;
+		}
+
+		return undefined;
+	}
+	return i;
 }
 
 /**
@@ -641,11 +708,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Returns an empty object when the path is non-monotonic (multi-IN multi-seek,
 	 * OR_RANGE multi-range, or a single-row equality seek).
 	 *
-	 * Also empty when the leading column is a DESC key a NULL could reach: a
-	 * `direction: 'desc'` claim asserts the same physical order `providesOrdering` would,
-	 * and this module's DESC walk emits NULLs LAST while the engine's ORDER BY places them
-	 * FIRST — see {@link nullSafeOrderingPrefixLength}. `supportsAsofRight` implies
-	 * `monotonicOn`, so the two are dropped together.
+	 * Also empty when the leading column is walked descending (a DESC key walked forwards,
+	 * or an ASC key walked backwards) and a NULL could reach it: a `direction: 'desc'` claim
+	 * asserts the same physical order `providesOrdering` would, and such a walk emits NULLs
+	 * LAST while the engine's ORDER BY places them FIRST — see
+	 * {@link nullSafeOrderingPrefixLength}. `supportsAsofRight` implies `monotonicOn`, so
+	 * the two are dropped together.
 	 */
 	private buildMonotonicAdvertisement(
 		tableInfo: TableSchema,
@@ -679,10 +747,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		const leadingCol = trailingNonBound[0];
 		if (!indexColumnSortsAsDeclared(tableInfo, leadingCol)) return {};
 
-		// A nullable DESC leading column walks its NULLs to the END; the engine's ORDER BY
-		// wants them FIRST. `equalityBound` is the pinned set the helper needs (a pinned
-		// column never reached this point anyway — it was filtered out above).
-		if (nullSafeOrderingPrefixLength(tableInfo, request, [leadingCol], 1, equalityBound) === 0) {
+		// An ordering claim served backwards carries a reversed descriptor naming this index.
+		const reverse = bestPlan.indexDescriptor?.reverse === true;
+
+		// A nullable leading column walked descending sends its NULLs to the END; the
+		// engine's ORDER BY wants them FIRST. `equalityBound` is the pinned set the helper
+		// needs (a pinned column never reached this point anyway — it was filtered out above).
+		if (nullSafeOrderingPrefixLength(tableInfo, request, [leadingCol], 1, equalityBound, reverse) === 0) {
 			return {};
 		}
 
@@ -692,13 +763,9 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// column, the leading column may have duplicate values across rows.)
 		const strict = isUniqueIndex(usedIndex) && trailingNonBound.length === 1;
 
-		// Direction follows the index's natural sort order, but if the planner
-		// produced an explicit providesOrdering covering this column, honor that
-		// (adjustPlanForOrdering may have selected a descending ORDER BY against
-		// an asc index — for that we'd need to reverse-walk the index, which the
-		// memory-table scan-plan supports). For now, the index's own desc flag
-		// is the single source of truth.
-		const direction: 'asc' | 'desc' = leadingCol.desc ? 'desc' : 'asc';
+		// The direction the walk actually emits: the column's declared direction, flipped
+		// when the plan walks the index backwards.
+		const direction: 'asc' | 'desc' = (leadingCol.desc === true) !== reverse ? 'desc' : 'asc';
 
 		return {
 			monotonicOn: { columnIndex: leadingCol.index, direction, strict },
@@ -966,7 +1033,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 *           sort cost — the plan is returned unchanged and a `SortNode` will
 	 *           be inserted above it by the planner.
 	 *
-	 *   Plan B: scan an alternative index in its natural order, applying any
+	 *   Plan B: scan an alternative index forwards or backwards, applying any
 	 *           filters that don't seek into it as residuals. Useful when the
 	 *           filter index doesn't cover ordering and the table is small or
 	 *           the filter is unselective enough that scan-and-filter beats
@@ -997,9 +1064,9 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		const filterIndex = plan.indexName
 			? availableIndexes.find(idx => idx.name === plan.indexName)
 			: undefined;
-		const filterSatisfies = filterIndex
+		const filterWalk = filterIndex
 			? this.indexSatisfiesOrdering(tableInfo, request, filterIndex, request.requiredOrdering!, equalityCols)
-			: false;
+			: undefined;
 
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
 		const usesOrRange = request.filters.some(
@@ -1010,16 +1077,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				&& isMultiValueEquality(f)
 				&& orderingColumns.has(f.columnIndex)
 		);
-		const planACanClaimOrdering = filterSatisfies && !usesOrRange && !usesMultiInOnOrderedCol;
-
 		let planA: BestAccessPlanResult;
 		let planACost: number;
-		if (planACanClaimOrdering) {
+		if (filterWalk !== undefined && !usesOrRange && !usesMultiInOnOrderedCol) {
+			// A backwards walk costs what the forward one does: the B-tree steps either way.
 			planA = {
 				...plan,
 				providesOrdering: request.requiredOrdering,
 				orderingIndexName: filterIndex!.name,
-				explains: `${plan.explains} with ordering from ${filterIndex!.name}`,
+				...walkDirectionFields(tableInfo, filterIndex!.name, filterWalk),
+				explains: `${plan.explains} ${orderingExplanation(filterIndex!.name, filterWalk)}`,
 			};
 			planACost = plan.cost;
 		} else {
@@ -1028,7 +1095,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		}
 
 		// Plan B: cheapest competing plan that walks an ordering-providing
-		// index in its natural order (with any unpushable filters becoming
+		// index in either direction (with any unpushable filters becoming
 		// residuals). Returns undefined when no such index exists.
 		const planB = this.evaluateOrderingOnlyPlans(
 			tableInfo, request, availableIndexes, equalityCols, estimatedTableSize
@@ -1063,9 +1130,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
 
 		for (const index of availableIndexes) {
-			if (!this.indexSatisfiesOrdering(tableInfo, request, index, request.requiredOrdering!, equalityCols)) {
-				continue;
-			}
+			const walk = this.indexSatisfiesOrdering(tableInfo, request, index, request.requiredOrdering!, equalityCols);
+			if (walk === undefined) continue;
 
 			// See whether this index can also serve as a filter seek/range.
 			const candidate = this.evaluateIndexAccess(tableInfo, index, request, estimatedTableSize);
@@ -1108,7 +1174,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				providesOrdering: request.requiredOrdering,
 				orderingIndexName: index.name,
 				indexName: index.name,
-				explains: `${basePlan.explains} with ordering from ${index.name}`,
+				...walkDirectionFields(tableInfo, index.name, walk),
+				explains: `${basePlan.explains} ${orderingExplanation(index.name, walk)}`,
 			};
 
 			if (!best || ordered.cost < best.cost) {
@@ -1120,24 +1187,24 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	}
 
 	/**
-	 * Check if an index can satisfy ordering requirements.
+	 * Which way a walk of `index` delivers `requiredOrdering`: `'forward'` in its declared
+	 * key order, `'reverse'` backwards (every matched column flipped), or undefined when
+	 * neither does. Forward is tried first. {@link orderingPrefixWalked} does the match,
+	 * including the equality-bound columns it skips.
 	 *
-	 * Leading index columns that are bound by equality (and therefore constant
-	 * for this scan) are skipped before aligning against the required ordering
-	 * keys. The per-column direction comparison still applies to the remaining
-	 * (unbound) suffix.
-	 *
-	 * A match is additionally gated by {@link nullSafeOrderingPrefixLength}: this module's
-	 * DESC walk negates the ascending comparator, and NULL is the lowest value, so a DESC
-	 * column's NULLs come out LAST — while the engine's ORDER BY places them FIRST for
-	 * both directions (`orderByNullResult`, util/comparison.ts). The gate is a plain
-	 * boolean here rather than a truncation because both callers claim
-	 * `request.requiredOrdering` VERBATIM, all or nothing: one unsafe DESC column anywhere
-	 * in the matched key prefix means the whole index declines. Only the prefix actually
-	 * consumed by the match is judged — a nullable DESC column sitting BEYOND it is not
-	 * part of the claim and must not disqualify the index. The PK pseudo-index
-	 * ({@link gatherAvailableIndexes}) flows through here too, so a nullable DESC
-	 * primary-key member is covered with no `create index` involved.
+	 * A match is additionally gated by {@link nullSafeOrderingPrefixLength}, run with the
+	 * match's own direction: NULL is this module's lowest key value, so a column walked
+	 * descending (DESC walked forwards, ASC walked backwards) emits its NULLs LAST, while
+	 * the engine's ORDER BY places them FIRST for both directions (`orderByNullResult`,
+	 * util/comparison.ts). The two directions can disagree: a nullable ASC column passes
+	 * forwards and fails backwards. The gate is a plain boolean here rather than a
+	 * truncation because both callers claim `request.requiredOrdering` VERBATIM, all or
+	 * nothing: one unsafe column anywhere in the matched key prefix means that walk
+	 * declines. Only the prefix actually consumed by the match is judged — a nullable
+	 * column sitting BEYOND it is not part of the claim and must not disqualify the index.
+	 * The PK pseudo-index ({@link gatherAvailableIndexes}) flows through here too, so a
+	 * primary key is walked backwards, and its nullable members gated, with no
+	 * `create index` involved.
 	 *
 	 * NOTE: `OrderingSpec.nullsFirst` is not compared — nothing in the planner
 	 * populates it today, so every required spec leaves it undefined. If NULLS
@@ -1152,40 +1219,15 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		index: IndexSchema,
 		requiredOrdering: readonly OrderingSpec[],
 		equalityCols: ReadonlySet<number> = EMPTY_COLUMN_SET
-	): boolean {
-		let i = 0; // pointer into index.columns
-		let j = 0; // pointer into requiredOrdering
-
-		// Skip leading equality-bound index columns; they contribute no ordering.
-		while (i < index.columns.length && equalityCols.has(index.columns[i].index)) {
-			i++;
-		}
-
-		while (j < requiredOrdering.length) {
-			if (i >= index.columns.length) return false;
-			const required = requiredOrdering[j];
-			const indexCol = index.columns[i];
-
-			if (required.columnIndex === indexCol.index &&
-				required.desc === (indexCol.desc ?? false) &&
-				indexColumnSortsAsDeclared(tableInfo, indexCol)) {
-				i++;
-				j++;
-				continue;
-			}
-
-			// Allow equality-bound columns interleaved after the matched prefix:
-			// they don't break ordering on later columns.
-			if (equalityCols.has(indexCol.index)) {
-				i++;
-				continue;
-			}
-
-			return false;
-		}
-
-		// `i` is now the number of leading index columns the claim consumed.
-		return nullSafeOrderingPrefixLength(tableInfo, request, index.columns, i, equalityCols) === i;
+	): OrderingWalk | undefined {
+		const servesWalking = (reverse: boolean): boolean => {
+			const consumed = orderingPrefixWalked(tableInfo, index, requiredOrdering, equalityCols, reverse);
+			return consumed !== undefined
+				&& nullSafeOrderingPrefixLength(tableInfo, request, index.columns, consumed, equalityCols, reverse) === consumed;
+		};
+		if (servesWalking(false)) return 'forward';
+		if (servesWalking(true)) return 'reverse';
+		return undefined;
 	}
 
 	private gatherAvailableIndexes(tableInfo: TableSchema): IndexSchema[] {

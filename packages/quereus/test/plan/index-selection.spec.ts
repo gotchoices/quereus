@@ -123,12 +123,13 @@ describe('Plan shape: index selection', () => {
 		});
 
 		it('serves order by + limit from the seek, reading one row', async () => {
+			// `r desc` over the ascending key is a backwards walk, which must start from the
+			// END of the `k = 'a'` group rather than skipping it.
 			await db.exec('create table d (k text, r integer not null, x integer, primary key (k, r))');
-			await db.exec('create index d_kr on d (k, r desc)');
 			await db.exec("insert into d values ('a', 1, 10), ('a', 2, 20), ('a', 3, 30), ('b', 9, 90)");
 			const sql = "select x from d where k = 'a' order by r desc limit 1";
 
-			expect(await seekDetail(sql)).to.match(/USING d_kr\b/);
+			expect(await seekDetail(sql)).to.match(/USING primary\b/);
 			expect(await allRows(db, sql)).to.deep.equal([{ x: 30 }]);
 
 			db.setOption('runtime_metrics', true);

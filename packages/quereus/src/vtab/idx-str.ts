@@ -6,6 +6,11 @@
  *
  *     idx=<indexName>(<nameArg>);plan=<code>[;<key>=<value>]*
  *
+ * Scan direction is the `reverse=1` parameter ({@link REVERSE_PARAM}): present ⇒ the walk
+ * runs backwards over the index's declared key order. The planner stamps it from the
+ * resolved `IndexDescriptor.reverse`, so the text and the structured form agree; a module
+ * runtime reads it with {@link idxStrWalksReverse}.
+ *
  * plus two sentinels — `fullscan` (no index) and `empty` (provably no rows). Every
  * producer and consumer in the engine goes through this module, so the format is
  * defined in exactly one place. The structured, typed form of the same information
@@ -26,7 +31,7 @@ export interface IdxStrSpec {
 	readonly plan: number;
 	/**
 	 * Remaining `k=v` parameters in source order (inCount, seekWidth, prefixLen,
-	 * rangeCount, rangeOps, argvMap, ordCons, …). Insertion-ordered so that
+	 * rangeCount, rangeOps, argvMap, reverse, …). Insertion-ordered so that
 	 * `encodeIdxStr(decodeIdxStr(s))` reproduces `s` byte-for-byte.
 	 */
 	readonly params: ReadonlyMap<string, string>;
@@ -36,6 +41,12 @@ const IDX_NAME_ARG_RE = /^(.*?)\((\d+)\)$/;
 
 /** No parameters — shared to avoid allocating an empty Map per decode. */
 const NO_PARAMS: ReadonlyMap<string, string> = new Map();
+
+/**
+ * The parameter that marks a backwards walk: `reverse=1`. Absent ⇒ forward. Only the
+ * value `1` means reverse; the planner never writes any other.
+ */
+export const REVERSE_PARAM = 'reverse';
 
 /** The two sentinel `idxStr` values, which name no index. */
 const FULL_SCAN_SENTINEL = 'fullscan';
@@ -76,6 +87,14 @@ export function idxStrSentinel(idxStr: string | null): 'fullScan' | 'empty' | nu
 	if (idxStr === FULL_SCAN_SENTINEL) return 'fullScan';
 	if (idxStr === EMPTY_SENTINEL) return 'empty';
 	return null;
+}
+
+/**
+ * True when the decoded `idxStr` asks for a backwards walk of its index (`reverse=1`).
+ * False for `null` (a sentinel or unparseable string names no index to walk).
+ */
+export function idxStrWalksReverse(spec: IdxStrSpec | null): boolean {
+	return spec?.params.get(REVERSE_PARAM) === '1';
 }
 
 /** Render an {@link IdxStrSpec} to its wire form. */

@@ -22,7 +22,9 @@ import { seqScanCost } from '../../cost/index.js';
 import { provesEmpty, type ColumnMeta, type BestAccessPlanRequest, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import { makeEmptyFilterInfo, makeFullScanFilterInfo, type FilterInfo } from '../../../vtab/filter-info.js';
 import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
-import { encodeIdxStr, makeIdxStrSpec } from '../../../vtab/idx-str.js';
+import { encodeIdxStr, makeIdxStrSpec, REVERSE_PARAM } from '../../../vtab/idx-str.js';
+import { quereusError } from '../../../common/errors.js';
+import { StatusCode } from '../../../common/types.js';
 import type { IndexConstraint } from '../../../vtab/index-info.js';
 import type { SqlValue } from '../../../common/types.js';
 import type { ScalarType } from '../../../common/datatype.js';
@@ -67,9 +69,22 @@ function buildIndexAccessPath(
 }
 
 /**
+ * `params` plus `reverse=1` when `accessPath` walks its index backwards. Direction is read
+ * off the resolved descriptor, so `idxStr` and `accessPath` state the one fact the module
+ * supplied and cannot disagree about which way the walk runs.
+ */
+function withWalkDirection(
+	params: ReadonlyMap<string, string> | undefined,
+	accessPath: AccessPath,
+): ReadonlyMap<string, string> | undefined {
+	if (accessPath.kind !== 'index' || accessPath.index.reverse !== true) return params;
+	return new Map([...(params ?? []), [REVERSE_PARAM, '1']]);
+}
+
+/**
  * Derive a seek/scan FilterInfo from the arm's shared `base`: the encoded `idxStr` and
  * the structured `accessPath` are both projections of the same (indexName, plan, params)
- * triple, so they cannot drift.
+ * triple — direction included, see {@link withWalkDirection} — so they cannot drift.
  */
 function makeIndexFilterInfo(
 	base: FilterInfo,
@@ -80,12 +95,13 @@ function makeIndexFilterInfo(
 	constraints: ReadonlyArray<{ constraint: IndexConstraint; argvIndex: number }>,
 	params?: ReadonlyMap<string, string>,
 ): FilterInfo {
-	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, plan, params));
+	const accessPath = buildIndexAccessPath(tableSchema, accessPlan, indexName, plan);
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, plan, withWalkDirection(params, accessPath)));
 	return {
 		...base,
 		constraints,
 		idxStr,
-		accessPath: buildIndexAccessPath(tableSchema, accessPlan, indexName, plan),
+		accessPath,
 		indexInfoOutput: {
 			...base.indexInfoOutput,
 			idxStr,
@@ -107,11 +123,12 @@ function makeOrderedScanFilterInfo(
 	accessPlan: BestAccessPlanResult,
 	indexName: string,
 ): FilterInfo {
-	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, 'scan'));
+	const accessPath = buildIndexAccessPath(tableSchema, accessPlan, indexName, 'scan');
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, 'scan', withWalkDirection(undefined, accessPath)));
 	return {
 		...base,
 		idxStr,
-		accessPath: buildIndexAccessPath(tableSchema, accessPlan, indexName, 'scan'),
+		accessPath,
 		indexInfoOutput: {
 			...base.indexInfoOutput,
 			idxStr,
@@ -1063,7 +1080,7 @@ function selectPhysicalNodeFromPlan(
 
 	// Fall back to sequential scan
 	log('Using sequential scan (index %s: no usable seek/range constraints)', physicalIndexName);
-	return createSeqScan(tableRef, filterInfo, accessPlan.cost);
+	return createPlanSeqScan(tableRef, accessPlan, filterInfo);
 }
 
 /**
@@ -1246,6 +1263,27 @@ function selectPhysicalNodeLegacy(
 	}
 
 	log('Using sequential scan (no beneficial index access)');
+	return createPlanSeqScan(tableRef, accessPlan, filterInfo);
+}
+
+/**
+ * The sequential scan an arm falls back to when the module's plan drives no index walk.
+ *
+ * Refuses a plan whose `indexDescriptor` claims a REVERSED walk: that claim is how a
+ * module serves a descending ordering from an ascending index, so a Sort above may already
+ * have been deleted on its word, and a forward table scan would return the rows in the
+ * wrong order. A module that reverses must also claim the ordering, which routes to the
+ * ordering arm instead. An engine-side decline (collation) builds its own scan and is not
+ * affected: there the claim never survived to delete a Sort (`orderingClaimSurvivesCollation`).
+ */
+function createPlanSeqScan(tableRef: TableReferenceNode, accessPlan: BestAccessPlanResult, filterInfo: FilterInfo): SeqScanNode {
+	if (accessPlan.indexDescriptor?.reverse === true) {
+		quereusError(
+			`Access plan for table '${tableRef.tableSchema.name}' claims a reversed walk of index `
+			+ `'${accessPlan.indexDescriptor.name}' but drives no index access`,
+			StatusCode.INTERNAL,
+		);
+	}
 	return createSeqScan(tableRef, filterInfo, accessPlan.cost);
 }
 

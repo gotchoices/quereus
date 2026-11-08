@@ -14,8 +14,8 @@ import { planRows, planOps } from '../plan/_helpers.js';
  * must show the leaf stopping early (a plan can carry a LIMIT and still drain the
  * scan if the early stop is lost).
  *
- * Neither shipped backend walks an index backwards, so `min` needs an ASCENDING
- * index and `max` needs a DESCENDING one. The "declines" cases below are as
+ * The memory backend walks an index either way, so `min` and `max` both read the
+ * boundary off any index leading on the column. The "declines" cases below are as
  * load-bearing as the "fires" cases: a failed probe that leaves a Sort or a stray
  * Filter behind is the main way this rule could make a query slower.
  */
@@ -152,6 +152,23 @@ describe('minmax-index-boundary', () => {
 			expect(await withRuleDisabled(() => rowsScanned(sql))).to.equal(ROW_COUNT);
 		});
 
+		it('max over an ASC-only index walks it backwards and reads one row', async () => {
+			await createTable();
+			await db.exec('create index t_c on t(c)');
+
+			const sql = 'select max(c) from t';
+			const rows = await planRows(db, sql);
+			expect(rows.map(r => r.op)).to.include('LIMITOFFSET');
+			expect(rows.map(r => r.op)).to.not.include('SORT');
+
+			const leaf = rows.find(r => r.op === 'INDEXSCAN');
+			expect(leaf, 'no INDEXSCAN in the plan').to.not.equal(undefined);
+			expect(leaf!.detail).to.match(/USING t_c\b.*ORDER BY .*DESC/);
+
+			expect(await scalar(sql)).to.equal(120);
+			expect(await rowsScanned(sql)).to.equal(BOUNDARY_ROWS);
+		});
+
 		it('min over the primary key uses the _primary_ pseudo-index — no CREATE INDEX', async () => {
 			await createTable();
 
@@ -255,23 +272,14 @@ describe('minmax-index-boundary', () => {
 	});
 
 	describe('declines, leaving the plan byte-identical', () => {
-		it('max over an ASC-only index — no backwards index walk exists', async () => {
-			await createTable();
-			await db.exec('create index t_c on t(c)');
-
-			const withRule = await planShape('select max(c) from t');
-			const without = await withRuleDisabled(() => planShape('select max(c) from t'));
-			expect(withRule, 'a failed probe must not leave a Sort/Filter/Limit behind')
-				.to.deep.equal(without);
-			expect(withRule.some(r => r.includes('|SORT|')), 'no Sort may be introduced').to.equal(false);
-		});
-
 		it('no index at all', async () => {
 			await createTable();
 
 			const withRule = await planShape('select max(g) from t');
 			const without = await withRuleDisabled(() => planShape('select max(g) from t'));
-			expect(withRule).to.deep.equal(without);
+			expect(withRule, 'a failed probe must not leave a Sort/Filter/Limit behind')
+				.to.deep.equal(without);
+			expect(withRule.some(r => r.includes('|SORT|')), 'no Sort may be introduced').to.equal(false);
 		});
 
 		it('two aggregates — both ends of the index are needed', async () => {
