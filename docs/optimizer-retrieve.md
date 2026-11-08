@@ -93,7 +93,11 @@ Three details are load-bearing:
   and `'a'`, and `r` restarts in each; the same mismatch also makes the seek decline to a
   scan, which emits no claimed order. Every site that lets a `Sort` go therefore also asks
   `orderingClaimSurvivesCollation` (`rule-select-access-path`), which applies the
-  collation-cover analysis to the claim's index. On a mismatch the `Sort` stays. Whether the
+  collation-cover analysis to the claim's index. It finds that index through
+  `resolveIndexDescriptor`, as the access path does, so a differently-cased name or an alias
+  with a descriptor is checked against the same key collations; an index the engine cannot
+  resolve is checked as if every column had an unknown collation, which keeps the `Sort`
+  unless every bearing constraint is a BINARY equality. On a mismatch the `Sort` stays. Whether the
   ordered column itself sorts as the index does is the module's own check, since it can see
   both collations ([module authoring](module-authoring.md)).
 

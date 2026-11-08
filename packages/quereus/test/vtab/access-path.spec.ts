@@ -12,14 +12,19 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { SortNode } from '../../src/planner/nodes/sort.js';
 import {
 	EmptyResultNode,
 	IndexScanNode,
 	IndexSeekNode,
 	SeqScanNode,
 } from '../../src/planner/nodes/table-access-nodes.js';
-import type { AccessPath } from '../../src/vtab/index-descriptor.js';
+import { isPrimaryIndexName, type AccessPath } from '../../src/vtab/index-descriptor.js';
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
+import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
+import type { TableSchema } from '../../src/schema/table.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { ALIASED_PK_NAME, TestAliasedIndexModule, aliasedIndexStore } from './test-aliased-index-module.js';
 
 /** Every physical table-access leaf carries a FilterInfo. */
@@ -30,19 +35,51 @@ function isAccessNode(n: PlanNode): n is AccessNode {
 		|| n instanceof IndexSeekNode || n instanceof EmptyResultNode;
 }
 
-/** The `accessPath` of the single table-access leaf in the optimized plan for `sql`. */
-function accessPathOf(db: Database, sql: string): AccessPath {
-	const found: AccessNode[] = [];
-	const walk = (n: PlanNode): void => {
-		if (isAccessNode(n)) found.push(n);
-		for (const c of n.getChildren()) walk(c as PlanNode);
+/** The single table-access leaf in the optimized plan for `sql`, and the node directly above it. */
+function accessLeafOf(db: Database, sql: string): { leaf: AccessNode; parent: PlanNode | undefined } {
+	const found: { leaf: AccessNode; parent: PlanNode | undefined }[] = [];
+	const walk = (n: PlanNode, parent: PlanNode | undefined): void => {
+		if (isAccessNode(n)) found.push({ leaf: n, parent });
+		for (const c of n.getChildren()) walk(c as PlanNode, n);
 	};
-	walk(db.getPlan(sql));
+	walk(db.getPlan(sql), undefined);
 
 	expect(found, `expected exactly one table-access leaf for: ${sql}`).to.have.lengthOf(1);
-	const filterInfo: FilterInfo = found[0].filterInfo;
+	return found[0];
+}
+
+/** The `accessPath` of the single table-access leaf in the optimized plan for `sql`. */
+function accessPathOf(db: Database, sql: string): AccessPath {
+	const filterInfo: FilterInfo = accessLeafOf(db, sql).leaf.filterInfo;
 	expect(filterInfo.accessPath, `accessPath must be populated for: ${sql}`).to.not.be.undefined;
 	return filterInfo.accessPath!;
+}
+
+/** Whether `sql`'s plan is a seek with the predicate re-checked directly above it. */
+function seekShape(db: Database, sql: string): 'seek' | 'seek+filter' | 'other' {
+	const { leaf, parent } = accessLeafOf(db, sql);
+	if (!(leaf instanceof IndexSeekNode)) return 'other';
+	return parent instanceof FilterNode ? 'seek+filter' : 'seek';
+}
+
+function upperCaseSecondary(name: string | undefined): string | undefined {
+	return name === undefined || isPrimaryIndexName(name) ? name : name.toUpperCase();
+}
+
+/**
+ * A memory module that reports its secondary indexes' names in upper case, which the
+ * engine resolves case-insensitively to the same index. The memory runtime looks the name
+ * up exactly, so only plans that decline the module's seek can execute.
+ */
+class UpperCasedIndexNameModule extends MemoryTableModule {
+	override getBestAccessPlan(db: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+		const plan = super.getBestAccessPlan(db, tableInfo, request);
+		return {
+			...plan,
+			indexName: upperCaseSecondary(plan.indexName),
+			orderingIndexName: upperCaseSecondary(plan.orderingIndexName),
+		};
+	}
 }
 
 describe('FilterInfo.accessPath', () => {
@@ -181,6 +218,24 @@ describe('FilterInfo.accessPath', () => {
 			expect(path.index.keyColumns).to.deep.equal([{ columnIndex: 0, desc: false }]);
 		});
 
+		it('with an indexDescriptor, seeks under the collation the descriptor states', async () => {
+			// The column is BINARY, but the descriptor says the module keys it NOCASE.
+			await db.exec('create table n (k text primary key, v integer) using aliased_idx');
+			module.supplyDescriptor = true;
+			module.descriptorCollation = 'NOCASE';
+			expect(seekShape(db, "select v from n where k = 'x'")).to.equal('seek+filter');
+			expect(seekShape(db, "select v from n where k = 'x' collate nocase")).to.equal('seek');
+		});
+
+		it('without an indexDescriptor, re-checks a binary equality and declines a collated one', async () => {
+			// The index's collation is unknown: a BINARY-equal key is equal under any
+			// collation, so the seek over-fetches at worst; a NOCASE one may under-fetch.
+			await db.exec('create table n (k text primary key, v integer) using aliased_idx');
+			module.supplyDescriptor = false;
+			expect(seekShape(db, "select v from n where k = 'x'")).to.equal('seek+filter');
+			expect(seekShape(db, "select v from n where k = 'x' collate nocase")).to.equal('other');
+		});
+
 		it('plans an unfiltered select as a full scan (module advertises no ordering)', () => {
 			module.supplyDescriptor = false;
 			expect(accessPathOf(db, 'select * from a')).to.deep.equal({ kind: 'fullScan' });
@@ -199,6 +254,45 @@ describe('FilterInfo.accessPath', () => {
 				expect(seeks).to.have.lengthOf(1);
 				expect(seeks[0].filterInfo.idxStr).to.equal(`idx=${ALIASED_PK_NAME}(0);plan=2`);
 			}
+		});
+	});
+
+	describe('a module that names the chosen index in another letter case', () => {
+		let db: Database;
+
+		beforeEach(async () => {
+			db = new Database();
+			db.registerModule('upper_idx', new UpperCasedIndexNameModule());
+			await db.exec('create table t (id text primary key, b text, c text) using upper_idx');
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		it('keeps the sort the index cannot replace under a nocase equality over a binary index', async () => {
+			// The module claims `idx_bc` delivers `order by c` because `b` is pinned, but the
+			// NOCASE equality spans the 'X' and 'x' groups and `c` restarts in each.
+			await db.exec('create index idx_bc on t(b, c)');
+			await db.exec("insert into t values ('1', 'X', 'c'), ('2', 'x', 'a'), ('3', 'y', 'e'), ('4', 'x', 'd'), ('5', 'X', 'b')");
+			const sql = "select id from t where b = 'x' collate nocase order by c";
+
+			const ids: unknown[] = [];
+			for await (const row of db.eval(sql)) ids.push(row.id);
+			expect(ids).to.deep.equal(['2', '5', '1', '4']);
+
+			let sorts = 0;
+			const walk = (n: PlanNode): void => {
+				if (n instanceof SortNode) sorts++;
+				for (const c of n.getChildren()) walk(c as PlanNode);
+			};
+			walk(db.getPlan(sql));
+			expect(sorts).to.equal(1);
+		});
+
+		it('re-checks a binary equality over a nocase index', async () => {
+			await db.exec('create index idx_bc on t(b collate nocase, c)');
+			expect(seekShape(db, "select id from t where b = 'x'")).to.equal('seek+filter');
 		});
 	});
 });

@@ -274,9 +274,9 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		// those guards — or a hand-built bundle like this one — can carry it. `importIndex`
 		// deliberately warns and proceeds rather than bricking the open; this pins what
 		// "proceeds" actually costs, which is more than the shadowing the warning used to
-		// describe: two index entries under one name, neither reported by `index_info()`,
-		// `DROP INDEX` refusing, and a predicate over the imported index's column no longer
-		// filtering. Asserted so a future decision to reject or rename here visibly flips it.
+		// describe: two index entries under one name, neither reported by `index_info()`, and
+		// `DROP INDEX` refusing. Asserted so a future decision to reject or rename here
+		// visibly flips it.
 		const dst = new Database();
 		try {
 			await dst.exec('create table t (id integer primary key, a text, b text, constraint foo unique (a))');
@@ -292,9 +292,12 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 			try { await dst.exec('drop index foo'); } catch (e) { dropErr = e as Error; }
 			expect(dropErr?.message, 'the imported index is not droppable').to.match(/no such index/i);
 
-			// The constraint still enforces, but the imported index no longer filters.
+			// The module's seek on `foo` cannot be trusted to filter on `b`: the planner resolves
+			// `foo` to the constraint's index on `a`, finds no key column for `b` there, and so
+			// re-checks the predicate above the seek. That recovers the right row only because
+			// this seek over-fetches; the re-check cannot recover rows a seek leaves out.
 			const filtered = await rows(dst, "select id from t where b = 'q'");
-			expect(filtered, 'predicate over the shadowed index stops filtering (known damage)').to.have.length(2);
+			expect(filtered, 'the re-check above the seek on the shadowed index filters').to.deep.equal([{ id: 2 }]);
 		} finally {
 			await dst.close();
 		}

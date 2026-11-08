@@ -402,6 +402,18 @@ interface IndexDescriptor {
 key however it is named. `validateAccessPlan` rejects a descriptor whose `name` disagrees with
 the plan's index name.
 
+The planner's collation checks — whether a seek fully answers a predicate, needs it re-checked
+above the seek, or must be declined to a scan, and whether an ordering claim survives a collated
+predicate — resolve the index the same way and read each key column's collation from
+`keyColumns[].collation` (absent ⇒ BINARY). A module whose physical key folds case should say so
+there: a descriptor stating `NOCASE` gets a NOCASE seek for `k = 'x' collate nocase` and a seek
+plus re-check for a BINARY `k = 'x'`. (For `_primary_` with no descriptor of yours, the engine
+reads each key column's declared collation.) An index the engine cannot resolve has an unknown
+collation, so the checks assume the worst: a BINARY equality keeps the seek and re-checks the
+predicate above it, since a BINARY-equal key is equal under any collation; any other equality or
+range on that index is declined to a scan, and an ordering claim over it does not replace a
+`Sort` when such a constraint bears on it.
+
 Scan **direction** matters to the same order-sensitive consumers: a module that walks an index in
 reverse **must** set `reverse: true` on the descriptor, whether or not its `idxStr` or a per-plan
 index name also records the direction. An emission-order consumer (the isolation overlay's merged

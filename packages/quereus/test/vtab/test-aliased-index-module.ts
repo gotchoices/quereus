@@ -39,6 +39,11 @@ export class TestAliasedIndexModule
 {
 	/** When true, the plan carries a descriptor for the alias; when false, it does not. */
 	supplyDescriptor = false;
+	/**
+	 * Collation the descriptor states for every key column, whatever the columns declare:
+	 * a module whose physical key folds case describes it this way.
+	 */
+	descriptorCollation: string | undefined;
 
 	async create(db: Database, tableSchema: TableSchema): Promise<TestAliasedIndexTable> {
 		return new TestAliasedIndexTable(db, this, tableSchema);
@@ -88,7 +93,11 @@ export class TestAliasedIndexModule
 			const descriptor: IndexDescriptor = {
 				name: ALIASED_PK_NAME,
 				role: 'primary',
-				keyColumns: pk.map(col => ({ columnIndex: col.index, desc: col.desc === true })),
+				keyColumns: pk.map(col => ({
+					columnIndex: col.index,
+					desc: col.desc === true,
+					...(this.descriptorCollation ? { collation: this.descriptorCollation } : {}),
+				})),
 				unique: true,
 			};
 			builder.setIndexDescriptor(descriptor);

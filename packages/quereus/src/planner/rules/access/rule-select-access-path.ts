@@ -1533,28 +1533,42 @@ export function effectivePredicateCollation(constraint: PlannerPredicateConstrai
 }
 
 /**
- * Build a collation lookup for the columns of a module-provided index. Secondary
- * index columns carry their own (already-normalized) collation; the primary key
- * (`_primary_`/`primary`) falls back to the table column's declared collation.
+ * The normalized collation of each key column of the index `indexName` names, keyed by
+ * table column index, or undefined when the index cannot be resolved. The index is found
+ * through {@link resolveIndexDescriptor}, as every other consumer of the plan finds it, so
+ * a module's descriptor or a differently-cased name describes the same index here.
+ *
+ * A module's own descriptor states its key collations. The engine's primary-key descriptor
+ * copies `primaryKeyDefinition[].collation`, which can lag the column: the store's
+ * create-time rewrite (`reconcilePkCollations`) re-collates an undecorated text key column
+ * and leaves the definition as it was. The key is ordered by the column's collation, so
+ * that one reads the column.
+ */
+function resolveIndexKeyCollations(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	indexName: string | undefined,
+): ReadonlyMap<number, string> | undefined {
+	const index = indexName === undefined ? undefined : resolveIndexDescriptor(tableSchema, accessPlan, indexName);
+	if (!index) return undefined;
+	const readsColumnCollation = index.role === 'primary' && index !== accessPlan.indexDescriptor;
+	return new Map(index.keyColumns.map(key => {
+		const declared = readsColumnCollation ? tableSchema.columns[key.columnIndex]?.collation : key.collation;
+		return [key.columnIndex, normalizeCollationName(declared ?? 'BINARY')];
+	}));
+}
+
+/**
+ * Collation lookup for the key columns of the index a seek arm walks. Answers undefined
+ * for a column of an index the engine cannot resolve, or one not in the index;
+ * {@link classifyConstraintCover} treats that conservatively.
  */
 function indexColumnCollationLookup(
 	tableSchema: TableSchema,
-	accessPlan: Pick<BestAccessPlanResult, 'indexName'>
-): (colIdx: number) => string {
-	const indexName = accessPlan.indexName;
-	const isPrimary = isPrimaryIndexName(indexName);
-	const index = isPrimary ? undefined : tableSchema.indexes?.find(i => i.name === indexName);
-	return (colIdx: number): string => {
-		if (isPrimary) {
-			return normalizeCollationName(tableSchema.columns[colIdx]?.collation ?? 'BINARY');
-		}
-		const idxCol = index?.columns.find(c => c.index === colIdx);
-		return normalizeCollationName(idxCol?.collation ?? 'BINARY');
-	};
-}
-
-function isPrimaryIndexName(indexName: string | undefined): boolean {
-	return indexName === PRIMARY_INDEX_NAME || indexName === PRIMARY_PHYSICAL_INDEX_NAME;
+	accessPlan: BestAccessPlanResult,
+): (colIdx: number) => string | undefined {
+	const collations = resolveIndexKeyCollations(tableSchema, accessPlan, accessPlan.indexName);
+	return (colIdx: number) => collations?.get(colIdx);
 }
 
 /**
@@ -1570,6 +1584,8 @@ function isPrimaryIndexName(indexName: string | undefined): boolean {
  * Deliberately coarse: a mismatched equality on any column of the index disqualifies the
  * claim, even one past the columns the claim consumed. That costs one needless Sort in a
  * rare shape. A null test compares nothing under a collation, so it never bears on this.
+ * An index the engine cannot resolve may hold any column under any collation, so every
+ * bearing constraint is classified against an unknown collation, as the seek arms do.
  * `constraints` must be the array `handledFilters` is positional against.
  *
  * Whether the ordered columns themselves sort as the index does is the module's to answer,
@@ -1580,21 +1596,16 @@ export function orderingClaimSurvivesCollation(
 	accessPlan: BestAccessPlanResult,
 	constraints: readonly PlannerPredicateConstraint[],
 ): boolean {
-	const indexName = accessPlan.orderingIndexName ?? accessPlan.indexName;
-	const keyColumns = isPrimaryIndexName(indexName)
-		? tableSchema.primaryKeyDefinition
-		: tableSchema.indexes?.find(i => i.name === indexName)?.columns;
-	if (!keyColumns) return true;
-
-	const collationForColumn = indexColumnCollationLookup(tableSchema, { indexName });
+	const keyCollations = resolveIndexKeyCollations(
+		tableSchema, accessPlan, accessPlan.orderingIndexName ?? accessPlan.indexName);
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	return constraints.every((c, i) => {
 		if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return true;
 		const isEquality = c.op === '=' || c.op === 'IN';
 		const bearsOnClaim = isEquality ? c.usable : accessPlan.handledFilters[i] === true;
-		if (!bearsOnClaim || !keyColumns.some(col => col.index === c.columnIndex)) return true;
+		if (!bearsOnClaim || (keyCollations && !keyCollations.has(c.columnIndex))) return true;
 		const predColl = effectivePredicateCollation(c);
-		const indexColl = collationForColumn(c.columnIndex);
+		const indexColl = keyCollations?.get(c.columnIndex);
 		return classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
 	});
 }
@@ -1615,11 +1626,19 @@ function primaryKeyCollationLookup(tableSchema: TableSchema): (colIdx: number) =
  * runtime filters range bounds under the index collation rather than BINARY; it gates
  * the non-BINARY range MATCH and is ignored for equality.
  *
+ * `indexColl` undefined means the index's collation is unknown (an index the engine
+ * cannot resolve, or a column the resolved index does not hold). Only one cover holds
+ * under every collation: a BINARY equality, which over-fetches at worst. Anything else
+ * may under-fetch or walk the wrong window.
+ *
  * Exported for `rule-key-set-seek`, which applies the same equality lattice to its
  * runtime-materialized multi-seek (accepting MATCH and COARSER_SAFE, declining
  * MISMATCH_UNSAFE) rather than restating it.
  */
-export function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean, honorsCollatedRangeBounds: boolean): CollationCover {
+export function classifyConstraintCover(predColl: string, indexColl: string | undefined, isEquality: boolean, honorsCollatedRangeBounds: boolean): CollationCover {
+	if (indexColl === undefined) {
+		return isEquality && predColl === 'BINARY' ? 'COARSER_SAFE' : 'MISMATCH_UNSAFE';
+	}
 	if (isEquality) {
 		if (predColl === indexColl) return 'MATCH';
 		// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches
@@ -1663,7 +1682,7 @@ export function classifyConstraintCover(predColl: string, indexColl: string, isE
 function classifyCollationCover(
 	consumed: ConsumedConstraint[],
 	isEquality: boolean,
-	collationForColumn: (colIdx: number) => string,
+	collationForColumn: (colIdx: number) => string | undefined,
 	honorsCollatedRangeBounds: boolean
 ): CollationCoverDecision {
 	const allResiduals: ScalarPlanNode[] = [];
