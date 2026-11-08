@@ -569,13 +569,15 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(await rawPks(`${bare} order by pk desc`)).to.deep.equal([4, 3, 1]);
 				expect(mod.seen('dpk')[0]).to.match(multiSeekRe('_primary_'));
 
-				// ASC over a DESC key is NOT the walk order, so that Sort was never absorbed and
-				// survives as a real Sort — with the seek still taken underneath it.
+				// ASC over a DESC key is the REVERSE of the walk order: the leaf claims it as a
+				// backwards walk and the Sort is absorbed. The multi-seek has no backwards mode,
+				// so `seekPreservesTargetOrder` rejects the reversed leaf and the seek branch
+				// buffers and sorts back into the claimed order (`seekRestoresTargetOrder`).
 				expect(await planOps(`${bare} order by pk asc`),
-					'a real Sort, not an absorbed one').to.match(/SORT/);
+					'the backwards walk absorbs the Sort').to.not.match(/SORT/);
 				mod.reset();
 				expect(await rawPks(`${bare} order by pk asc`)).to.deep.equal([1, 3, 4]);
-				expect(mod.seen('dpk')[0], 'still a seek, just re-sorted above').to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('dpk')[0], 'still a seek, re-sorted by the seek branch').to.match(multiSeekRe('_primary_'));
 			});
 
 			it('a TEXT primary key under COLLATE NOCASE seeks and matches case-insensitively', async () => {

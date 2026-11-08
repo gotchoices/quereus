@@ -33,16 +33,15 @@
  * null and the plan is left byte-identical. No Sort, Filter or Limit is ever
  * introduced into a plan that cannot serve the ordering.
  *
- * Which walks qualify is the backend's ordering claim. The memory backend serves an
- * ordering by walking an index either way (a backwards walk when every ordered column
- * is flipped), so there:
+ * Which walks qualify is the backend's ordering claim. Both shipped backends (memory and
+ * store) serve an ordering by walking an index either way (a backwards walk when every
+ * ordered column is flipped), so:
  *
  *   min(c) or max(c) + an index leading on c (incl. the primary key) -> boundary read
  *   either + no index                                                -> unchanged, full scan
  *
- * The store backend only walks an index in its declared direction, so on it `max(c)`
- * with only an ascending index (and `min(c)` with only a descending one) stays a full
- * scan until `reverse-index-walk-store` lands.
+ * The store's one exception is a nullable `c` on a backend with costly row reads — see
+ * the NOTE on {@link buildIsNotNull}.
  */
 
 import { createLogger } from '../../../common/logger.js';

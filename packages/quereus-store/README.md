@@ -84,8 +84,22 @@ multi-seek above and leaves the bound as a residual — and it gives up the narr
 back to the plain prefix window, answer unchanged) when the bounded column's key bytes do not
 reproduce its collation's order, or when its bound value has no faithful key position under a
 semantically-ordered type. A bound on a *later* index column than the one right after the
-prefix is not seeked at all. No ordering is advertised for this path, so an `ORDER BY` on the
-bounded column keeps its `Sort`.
+prefix is not seeked at all.
+
+**`ORDER BY` from key order.** Each single-window shape above, and a full scan (primary-key
+order), tells the planner the order its rows come out in, so an `ORDER BY` that order
+already satisfies needs no `Sort` — `where a = ? order by b` over `(a, b)` included, since
+the pinned `a` is constant. A window can also be read **backwards**: an `ORDER BY` with every
+direction flipped from the key's (`order by c desc` over an ascending index on `c`,
+`order by id desc` over the primary key, `where k = ? order by r desc` over `(k, r)`) reads
+the same byte window in reverse, at the same price. With no usable predicate, an `ORDER BY`
+an index can serve in either direction may instead walk that whole index, when that prices
+below scanning and sorting. What still sorts: a partial flip (`order by a desc, b` over
+`(a, b)`); a secondary-index multi-seek, which claims no order; a primary-key multi-seek
+read against its key order (it has no backwards mode); a key column whose byte order differs
+from its declared collation's; and a nullable column read descending (an ascending column
+backwards, or a descending one forwards), which puts NULLs last where `ORDER BY` puts them
+first — unless a filter excludes the NULLs.
 
 **A seek priced above a full scan is dropped.** A secondary-index seek reads two things per
 matched row — the index entry, then the row it names — while a scan reads one, so the module

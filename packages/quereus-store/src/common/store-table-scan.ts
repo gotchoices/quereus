@@ -17,6 +17,7 @@ import {
 	hasSemanticOrdering,
 	BINARY_COLLATION,
 	decodeIdxStr,
+	idxStrWalksReverse,
 	planKindFromCode,
 	type IdxStrSpec,
 	type CollationFunction,
@@ -96,8 +97,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * All three access arms read the EFFECTIVE row state: the committed store
 	 * merged with this table's coordinator's pending ops when a transaction is
 	 * active (read-your-own-writes — see {@link iterateEffective} /
-	 * {@link readLiveRowByPk}). Merged emission stays in encoded-PK-key order,
-	 * preserving the module's `providesOrdering` / `monotonicOn` advertisements.
+	 * {@link readLiveRowByPk}). Merged emission stays in encoded key order (reversed for
+	 * a backwards walk), preserving the module's `providesOrdering` / `monotonicOn`
+	 * advertisements.
 	 */
 	async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
 		const store = await this.ensureStore();
@@ -113,6 +115,11 @@ export abstract class StoreTableScan extends StoreTableBase {
 			return;
 		}
 
+		// A backwards walk (`reverse=1`, stamped from the plan's reversed descriptor) iterates
+		// the same byte window with `reverse: true`. Windows are `[gte, lt)` ranges, so the
+		// result is the exact reverse of the forward read — the order the isolation overlay
+		// merges a reversed scan in. A PK point lookup yields one row and ignores it.
+		const reverse = idxStrWalksReverse(idxSpec);
 		const pkAccess = this.analyzePKAccess(filterInfo);
 
 		if (pkAccess.type === 'point') {
@@ -124,7 +131,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		}
 
 		if (pkAccess.type === 'range') {
-			yield* this.scanPKRange(store, pkAccess, filterInfo);
+			yield* this.scanPKRange(store, pkAccess, filterInfo, reverse);
 			return;
 		}
 
@@ -135,14 +142,15 @@ export abstract class StoreTableScan extends StoreTableBase {
 		const indexAccess = this.analyzeIndexAccess(filterInfo);
 		if (indexAccess) {
 			const indexStore = await this.ensureIndexStore(indexAccess.index.name);
-			yield* this.scanIndex(indexStore, indexAccess, filterInfo);
+			yield* this.scanIndex(indexStore, indexAccess, filterInfo, reverse);
 			return;
 		}
 
-		// Full table scan
+		// Full table scan — also the arm an ordering-only `_primary_` walk lands on, since
+		// `resolveIndexFromIdxStr` answers null for `_primary_`.
 		const collations = this.resolveFilterCollations(filterInfo);
 		const bounds = buildFullScanBounds();
-		for await (const entry of this.iterateEffective(store, bounds)) {
+		for await (const entry of this.iterateEffective(store, bounds, reverse)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo, collations)) {
 				yield row;
@@ -349,11 +357,12 @@ export abstract class StoreTableScan extends StoreTableBase {
 	protected async *scanPKRange(
 		store: KVStore,
 		access: PKAccessPattern,
-		filterInfo: FilterInfo
+		filterInfo: FilterInfo,
+		reverse: boolean,
 	): AsyncIterable<Row> {
 		const collations = this.resolveFilterCollations(filterInfo);
 		const bounds = this.buildPKRangeBounds(access);
-		for await (const entry of this.iterateEffective(store, bounds)) {
+		for await (const entry of this.iterateEffective(store, bounds, reverse)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo, collations)) {
 				yield row;
@@ -794,6 +803,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		indexStore: KVStore,
 		access: IndexAccessPattern,
 		filterInfo: FilterInfo,
+		reverse: boolean,
 	): AsyncIterable<Row> {
 		// Re-check each resolved row under the INDEX's per-column collation (see
 		// matchesFilters): the planner dropped the residual based on the index
@@ -801,7 +811,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// the table column's declared collation.
 		const indexCollations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
 		yield* this.resolveIndexEntries(
-			this.produceIndexEntries(indexStore, access.bounds, [filterInfo]),
+			this.produceIndexEntries(indexStore, access.bounds, [filterInfo], reverse),
 			indexCollations,
 		);
 	}
@@ -810,10 +820,11 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Producer half of the index-scan pair: walk one byte window's index entries —
 	 * {@link iterateEffective} yields the committed entries merged with this
 	 * transaction's pending index puts/deletes (read-your-own-writes over the index),
-	 * in index-key byte order, the order the isolation overlay merge relies on
-	 * (`isolated-table.ts` § buildSortKey) — and yield, per surviving entry, its data
-	 * key plus the FilterInfos a resolved row may match. Entries stay in visit order
-	 * end to end, so index-key order is preserved through the batching consumer.
+	 * in index-key byte order (descending when `reverse`), the order the isolation
+	 * overlay merge relies on (`isolated-table.ts` § buildSortKey) — and yield, per
+	 * surviving entry, its data key plus the FilterInfos a resolved row may match.
+	 * Entries stay in visit order end to end, so index-key order is preserved through the
+	 * batching consumer.
 	 *
 	 * Only the defenses that need nothing but the entry itself run here, BEFORE the
 	 * row read; everything row-dependent lives in {@link resolveRowBatch}.
@@ -822,9 +833,10 @@ export abstract class StoreTableScan extends StoreTableBase {
 		indexStore: KVStore,
 		bounds: IterateOptions,
 		infos: readonly FilterInfo[],
+		reverse: boolean,
 		seen?: Set<string>,
 	): AsyncIterable<PendingIndexEntry> {
-		for await (const entry of this.iterateEffective(indexStore, bounds)) {
+		for await (const entry of this.iterateEffective(indexStore, bounds, reverse)) {
 			// NOTE: a legacy index store (written before index values carried the data
 			// key) holds EMPTY values; a zero-length data key is not a row key, so skip
 			// it rather than resolve it to the wrong row. Because the access plan marked
@@ -1042,6 +1054,10 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * deleted-row defenses hold per seek key.
 	 */
 	protected async *scanMultiSeek(spec: IdxStrSpec, filterInfo: FilterInfo): AsyncIterable<Row> {
+		// Neither the primary-key nor the secondary arm has a backwards mode (both sort their
+		// windows ascending), and the access planner never claims a reverse multi-seek.
+		// Serving one forwards would hand a reversed ordering claim ascending rows.
+		if (idxStrWalksReverse(spec)) this.multiSeekMalformed(filterInfo, 'a multi-seek cannot walk backwards');
 		const { tuples, seekWidth } = this.decodeMultiSeekTuples(spec, filterInfo);
 
 		if (spec.indexName === '_primary_') {
@@ -1141,7 +1157,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		seen: Set<string>,
 	): AsyncIterable<PendingIndexEntry> {
 		for (const w of windows) {
-			yield* this.produceIndexEntries(indexStore, w.bounds, w.infos, seen);
+			yield* this.produceIndexEntries(indexStore, w.bounds, w.infos, false, seen);
 		}
 	}
 

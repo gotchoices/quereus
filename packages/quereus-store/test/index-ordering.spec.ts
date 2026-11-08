@@ -3,8 +3,8 @@
  * (`buildIndexOrderingAdvertisement` in store-module-access-plan.ts).
  *
  * A secondary index is stored in its columns' declared order and a single-window seek
- * walks it forward, so the `eq` (non-multi-seek), `prefixRange`, and `range` arms may
- * tell the planner the rows already arrive sorted — letting it drop the Sort above
+ * walks it forward or backward, so the `eq` (non-multi-seek), `prefixRange`, and `range`
+ * arms may tell the planner the rows already arrive sorted — letting it drop the Sort above
  * `where n > 900 order by n`. An ordering claim is the one part of an access plan where
  * "approximately right" is a WRONG ANSWER (the Sort is gone; nothing re-checks), so
  * every shape here is asserted at up to three levels:
@@ -190,10 +190,38 @@ describe('secondary-index ordering advertisement', () => {
 			expect(plan.providesOrdering).to.equal(undefined);
 		});
 
-		it('declines a direction mismatch rather than reversing the walk', () => {
+		it('serves a fully flipped ordering by walking the window backwards', () => {
 			const plan = planFor('t1', [gt(1, 900)], [desc(1)]);
 			expect(plan.indexName).to.equal('ix_n');
-			expect(plan.providesOrdering, 'no reverse secondary-index walk exists').to.equal(undefined);
+			expect(plan.providesOrdering).to.deep.equal([desc(1)]);
+			expect(plan.orderingIndexName).to.equal('ix_n');
+			expect(plan.indexDescriptor?.reverse).to.equal(true);
+		});
+
+		it('a nullable ASC column read backwards claims only under a NULL-excluding bound', async () => {
+			// A backwards walk of an ASC column emits its NULLs LAST; the engine's ORDER BY
+			// wants them FIRST, so the claim needs a filter that evicts them.
+			await db.exec(`create table t1n (id integer primary key, n integer null) using store`);
+			await db.exec(`create index ix_nn on t1n (n)`);
+
+			const bare = planFor('t1n', [], [desc(1)]);
+			expect(bare.providesOrdering).to.equal(undefined);
+			expect(bare.indexDescriptor).to.equal(undefined);
+
+			const bounded = planFor('t1n', [gt(1, 0)], [desc(1)]);
+			expect(bounded.indexName).to.equal('ix_nn');
+			expect(bounded.providesOrdering).to.deep.equal([desc(1)]);
+			expect(bounded.indexDescriptor?.reverse).to.equal(true);
+		});
+
+		it('an ascending primary key read backwards claims with the reversed _primary_ descriptor', () => {
+			const plan = planFor('t1', [], [desc(0)]);
+			expect(plan.providesOrdering).to.deep.equal([desc(0)]);
+			expect(plan.orderingIndexName).to.equal('_primary_');
+			expect(plan.indexDescriptor?.name).to.equal('_primary_');
+			expect(plan.indexDescriptor?.reverse).to.equal(true);
+			expect(plan.monotonicOn, 'the walk emits id descending').to.deep.equal(
+				{ columnIndex: 0, direction: 'desc', strict: true });
 		});
 
 		it('declines any explicit nullsFirst', () => {
@@ -278,12 +306,14 @@ describe('secondary-index ordering advertisement', () => {
 			expect(plan.providesOrdering).to.equal(undefined);
 		});
 
-		it('DESC index column: claims order by k desc, declines order by k', async () => {
+		it('DESC index column: claims order by k desc forwards, order by k backwards', async () => {
 			await db.exec(`create table t4 (id integer primary key, n integer) using store`);
 			await db.exec(`create index ix_nd on t4 (n desc)`);
 
 			expect(planFor('t4', [gt(1, 5)], [desc(1)]).providesOrdering).to.deep.equal([desc(1)]);
-			expect(planFor('t4', [gt(1, 5)], [asc(1)]).providesOrdering).to.equal(undefined);
+			const reversed = planFor('t4', [gt(1, 5)], [asc(1)]);
+			expect(reversed.providesOrdering).to.deep.equal([asc(1)]);
+			expect(reversed.indexDescriptor?.reverse).to.equal(true);
 		});
 	});
 
@@ -351,14 +381,19 @@ describe('secondary-index ordering advertisement', () => {
 			expect(plan.orderingIndexName, 'declaration order must not decide').to.equal('ix_narrow');
 		});
 
-		it('DESC index column: walks order by n desc, declines order by n', async () => {
+		it('DESC index column: walks forwards for order by n desc, backwards for order by n', async () => {
 			await db.exec(`create table t4 (id integer primary key, n integer) using store`);
 			await db.exec(`create index ix_nd on t4 (n desc)`);
 
 			const claimed = planFor('t4', [], [desc(1)]);
 			expect(claimed.orderingIndexName).to.equal('ix_nd');
 			expect(claimed.providesOrdering).to.deep.equal([desc(1)]);
-			expect(planFor('t4', [], [asc(1)]).providesOrdering, 'no reverse walk').to.equal(undefined);
+			expect(claimed.indexDescriptor, 'a forward walk carries no descriptor').to.equal(undefined);
+
+			const reversed = planFor('t4', [], [asc(1)]);
+			expect(reversed.orderingIndexName).to.equal('ix_nd');
+			expect(reversed.providesOrdering).to.deep.equal([asc(1)]);
+			expect(reversed.indexDescriptor?.reverse).to.equal(true);
 		});
 
 		it('a nullable DESC column declines the bare walk but claims under a NULL-excluding bound', async () => {
@@ -452,7 +487,7 @@ describe('secondary-index ordering advertisement', () => {
 			expect(await column(db, q, 'n')).to.deep.equal([905, 910, 925, 930, 945, 950, 965, 970, 985, 990]);
 		});
 
-		it('DESC index: order by n desc elides the Sort; order by n keeps it', async () => {
+		it('DESC index: order by n desc and order by n both elide the Sort', async () => {
 			await db.exec(`create table t (id integer primary key, n integer) using store`);
 			await db.exec(`create index ix_nd on t (n desc)`);
 			await db.exec(`insert into t values (1, 30), (2, 10), (3, 40), (4, 20)`);
@@ -462,7 +497,7 @@ describe('secondary-index ordering advertisement', () => {
 			expect(await column(db, qd, 'n')).to.deep.equal([40, 30, 20, 10]);
 
 			const qa = `select n from t where n > 5 order by n`;
-			expect(await planOps(db, qa), 'no reverse walk: Sort stays').to.match(SORT);
+			expect(await planOps(db, qa), 'the seek window is walked backwards').to.match(SEEK).and.to.not.match(SORT);
 			expect(await column(db, qa, 'n')).to.deep.equal([10, 20, 30, 40]);
 		});
 
@@ -666,7 +701,9 @@ describe('secondary-index ordering advertisement', () => {
 			const qd = `select n from t order by n desc`;
 			expect(await planOps(db, qd)).to.match(ISCAN).and.to.not.match(SORT);
 			expect(await column(db, qd, 'n')).to.deep.equal([...range(90)].reverse());
-			expect(await planOps(db, `select n from t order by n`), 'no reverse walk: Sort stays').to.match(SORT);
+			const qa = `select n from t order by n`;
+			expect(await planOps(db, qa), 'backwards walk').to.match(ISCAN).and.to.not.match(SORT);
+			expect(await column(db, qa, 'n')).to.deep.equal(range(90));
 
 			// NULLABLE: the engine's ORDER BY puts NULLs FIRST for BOTH directions
 			// (orderByNullResult, util/comparison.ts), but a DESC byte walk emits them

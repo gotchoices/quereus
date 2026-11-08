@@ -35,6 +35,7 @@ import {
 	hasSemanticOrdering,
 	isMultiValueEquality,
 	nullSafeOrderingPrefixLength,
+	reversedIndexDescriptor,
 	selectivityFromHistogram,
 } from '@quereus/quereus';
 import {
@@ -636,15 +637,18 @@ function computeFilterAccessPlan(
 		// the leading PK column. The scan seeks to the window start and
 		// early-terminates (StoreTable.buildPKRangeBounds derives the encoded
 		// bounds), and the leading-PK order guarantee holds throughout.
+		// `buildPKRangeBounds` addresses the window as a direction-agnostic `[gte, lt)` byte
+		// range, so a backwards walk of it (`order by id desc`) is the same window reversed.
 		const rangeRows = Math.max(1, Math.floor(estimatedRows * 0.3));
+		const ordering = buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix);
 		const plan = AccessPlanBuilder
 			.rangeScan(rangeRows, 0.2)
 			.setHandledFilters(claimFirstPerRole(request.filters, rangeRoles(firstPkColumn!)))
 			.setIndexName('_primary_')
 			.setSeekColumns([firstPkColumn!])
-			.setExplanation('Store primary key range scan')
+			.setExplanation(`Store primary key range scan${walkExplanationSuffix(ordering.indexDescriptor?.reverse === true)}`)
 			.build();
-		return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
+		return { ...plan, ...ordering };
 	}
 
 	// Check for secondary index usage. `StoreTable.query` now implements the
@@ -673,7 +677,7 @@ function computeFilterAccessPlan(
 		...AccessPlanBuilder
 			.fullScan(rowsToProduce(request, estimatedRows, scanOrdering.providesOrdering, scanHandledFilters))
 			.setHandledFilters(scanHandledFilters)
-			.setExplanation('Store full table scan')
+			.setExplanation(`Store full table scan${walkExplanationSuffix(scanOrdering.indexDescriptor?.reverse === true)}`)
 			.build(),
 		...scanOrdering,
 	};
@@ -872,7 +876,8 @@ function rowsToProduce(
  *    the engine never meant to evaluate that way. Same ONE rule as the seek-vs-scan
  *    veto exemption above.
  *  - some non-partial index's order-preserving prefix satisfies the required ordering
- *    with NO pinned columns (see {@link NO_PINNED_COLUMNS});
+ *    with NO pinned columns (see {@link NO_PINNED_COLUMNS}), walked forwards or
+ *    backwards ({@link indexOrderingSatisfies});
  *  - the cheapest such walk prices STRICTLY below `filterPlan` plus the external sort
  *    it would otherwise need. Ties keep `filterPlan` — it is the plan the store already
  *    produces, and the sort estimate is the softer of the two numbers.
@@ -916,23 +921,19 @@ function chooseOrderingPlan(
 		const indexKeyCollations = resolveIndexKeyCollations(index, tableInfo.columns);
 		const orderPreservingPrefix = indexOrderPreservingPrefixLength(
 			db, tableInfo.columns, index, indexKeyCollations);
-		const claimablePrefix = nullSafeOrderingPrefixLength(
-			tableInfo, request, index.columns, orderPreservingPrefix, NO_PINNED_COLUMNS);
-		if (claimablePrefix === 0) continue;
-		const indexOrdering: OrderingSpec[] = index.columns
-			.slice(0, claimablePrefix)
-			.map(col => ({ columnIndex: col.index, desc: !!col.desc }));
-		if (!indexOrderingSatisfies(indexOrdering, required, NO_PINNED_COLUMNS)) continue;
+		const direction = indexOrderingSatisfies(
+			tableInfo, request, index.columns, orderPreservingPrefix, required, NO_PINNED_COLUMNS);
+		if (!direction) continue;
 
-		const walk = buildOrderingWalkPlan(index, request, required, estimatedRows, profile);
+		const walk = buildOrderingWalkPlan(tableInfo, index, request, required, direction, estimatedRows, profile);
 		// Cheapest first, then NARROWEST. The cost is currently identical for every
 		// candidate — {@link buildOrderingWalkPlan} reads only the row count, the profile
-		// and the filter count, never the index — so cost alone would leave declaration
-		// order deciding, and `ix_wide(n, s, u)` would be walked in preference to
-		// `ix_narrow(n)` purely for being declared first. Both walks visit the same number
-		// of entries, but the wide one's keys carry two extra encoded columns per entry,
-		// so it reads strictly more bytes for the same rows. Ties on both keep the first
-		// candidate, matching the best-seek loop above.
+		// and the filter count, never the index or the direction — so cost alone would
+		// leave declaration order deciding, and `ix_wide(n, s, u)` would be walked in
+		// preference to `ix_narrow(n)` purely for being declared first. Both walks visit
+		// the same number of entries, but the wide one's keys carry two extra encoded
+		// columns per entry, so it reads strictly more bytes for the same rows. Ties on
+		// both keep the first candidate, matching the best-seek loop above.
 		const width = index.columns.length;
 		if (!bestWalk || walk.cost < bestWalk.cost || (walk.cost === bestWalk.cost && width < bestWidth)) {
 			bestWalk = walk;
@@ -963,13 +964,17 @@ function chooseOrderingPlan(
  * physicalizes through its legacy path's ordering branch: an `IndexScanNode` whose
  * idxStr is `idx=<name>(0);plan=0` (`makeOrderedScanFilterInfo`) and whose FilterInfo
  * carries no constraints. `StoreTableScan.analyzeIndexAccess` reads the `plan=0`
- * explicitly and walks the whole index store. `orderingIndexName` equals `indexName` —
- * `validateAccessPlan` rejects an ordering claim naming any index but the one walked.
+ * explicitly and walks the whole index store, backwards when `direction` is `'reverse'`
+ * (the reversed descriptor puts `reverse=1` in that idxStr). `orderingIndexName` equals
+ * `indexName` — `validateAccessPlan` rejects an ordering claim naming any index but the
+ * one walked.
  */
 function buildOrderingWalkPlan(
+	tableInfo: TableSchema,
 	index: TableIndexSchema,
 	request: BestAccessPlanRequest,
 	required: readonly OrderingSpec[],
+	direction: WalkDirection,
 	estimatedRows: number,
 	profile: ResolvedCostProfile,
 ): BestAccessPlanResult {
@@ -984,9 +989,14 @@ function buildOrderingWalkPlan(
 		.addCost(walkRows * request.filters.length * RESIDUAL_FILTER_COST_PER_ROW)
 		.setHandledFilters(handledFilters)
 		.setIndexName(index.name)
-		.setExplanation(`Store index ordering walk on ${index.name}`)
+		.setExplanation(`Store index ordering walk on ${index.name}${walkExplanationSuffix(direction === 'reverse')}`)
 		.build();
-	return { ...plan, providesOrdering: required, orderingIndexName: index.name };
+	return {
+		...plan,
+		providesOrdering: required,
+		orderingIndexName: index.name,
+		...walkDirectionFields(tableInfo, index.name, direction),
+	};
 }
 
 /**
@@ -1077,8 +1087,12 @@ function primaryKeyMultiSeekPlan(
 	// `scanMultiSeekPrimary` sorts its points ascending by encoded data key, which IS
 	// primary-key order (per-column DESC inversion is baked into the bytes), so the plan
 	// goes through the same ordering gate every other primary-key arm uses and
-	// `… where pk in (…) order by pk` elides its Sort.
-	return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
+	// `… where pk in (…) order by pk` elides its Sort. It has no backwards mode, so the
+	// reverse claim is disallowed: `… order by pk desc` keeps its Sort.
+	return {
+		...plan,
+		...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix, false),
+	};
 }
 
 /**
@@ -1383,7 +1397,7 @@ function tryIndexAccessPlan(
 			.setHandledFilters(handledFilters)
 			.setIndexName(index.name)
 			.setSeekColumns(seekCols)
-			.setExplanation(`Store index ${armLabel} on ${index.name}`)
+			.setExplanation(`Store index ${armLabel} on ${index.name}${walkExplanationSuffix(ordering.indexDescriptor?.reverse === true)}`)
 			.build(),
 		...ordering,
 	};
@@ -1411,16 +1425,19 @@ function tryIndexAccessPlan(
  * `providesOrdering` is set only when it actually matches what the caller
  * needs:
  *   - When the request carries `requiredOrdering`, claim it only if the
- *     requested keys form a prefix of the PK with matching directions.
- *     Claiming PK order against an `ORDER BY <other column>` would cause
- *     the absorb-Sort rule to drop the Sort and yield wrong-order rows.
- *   - When no `requiredOrdering` is present, advertise the full PK
+ *     requested keys form a prefix of the PK with matching directions — or, when
+ *     `allowReverse`, with every direction flipped, served by walking the key backwards
+ *     (the claim then carries the reversed `_primary_` descriptor). Claiming PK order
+ *     against an `ORDER BY <other column>` would cause the absorb-Sort rule to drop the
+ *     Sort and yield wrong-order rows. `allowReverse` is false only for the multi-seek
+ *     arm, whose point reads have no backwards mode.
+ *   - When no `requiredOrdering` is present, advertise the full forward PK
  *     ordering so downstream rules (merge-join, sort elision after a
- *     filter) can opportunistically use it.
+ *     filter) can opportunistically use it. Never a reverse one unasked.
  *
- * `monotonicOn` reflects the access path itself and is independent of any
- * `requiredOrdering`; it always advertises the leading PK column. Strict
- * monotonicity is claimed iff the PK is single-column — composite PKs can
+ * `monotonicOn` reflects the access path itself and always advertises the leading PK
+ * column, in the direction the walk runs it: forward unless the plan claims a backwards
+ * walk. Strict monotonicity is claimed iff the PK is single-column — composite PKs can
  * repeat values on the leading column. It is NOT independent of the gating below,
  * though: a `direction: 'desc'` claim asserts the same physical order
  * `providesOrdering` would, and the engine has a standing conversion back the other way
@@ -1455,55 +1472,57 @@ function buildPkOrderingAdvertisement(
 	tableInfo: TableSchema,
 	request: BestAccessPlanRequest,
 	orderPreservingPrefix: number,
-): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName' | 'monotonicOn' | 'supportsAsofRight'> {
+	allowReverse = true,
+): Pick<BestAccessPlanResult,
+	'providesOrdering' | 'orderingIndexName' | 'indexDescriptor' | 'monotonicOn' | 'supportsAsofRight'> {
 	const pk = tableInfo.primaryKeyDefinition;
 	if (pk.length === 0 || orderPreservingPrefix === 0) return {};
 
 	// The PK arms pin nothing this function can see: the pinning an equality/range arm does
-	// is already visible as a NULL-excluding entry in `request.filters`, which the helper
-	// consults itself.
-	const claimablePrefix = nullSafeOrderingPrefixLength(
-		tableInfo, request, pk, orderPreservingPrefix, NO_PINNED_COLUMNS);
-	// Prefix 0 means the LEADING member is an unclaimable DESC, so `monotonicOn` on it —
-	// and `supportsAsofRight`, which implies it — go with the ordering claim.
-	if (claimablePrefix === 0) return {};
-
-	const leading = pk[0];
-	const monotonicOn = {
-		columnIndex: leading.index,
-		direction: leading.desc ? 'desc' as const : 'asc' as const,
-		strict: pk.length === 1,
-	};
-
-	const pkOrdering: OrderingSpec[] = pk.slice(0, claimablePrefix).map(col => ({
-		columnIndex: col.index,
-		desc: !!col.desc,
-	}));
-
-	// Pick the providesOrdering to advertise based on requiredOrdering.
+	// is already visible as a NULL-excluding entry in `request.filters`, which the NULL gate
+	// consults itself. With no pinned columns, satisfying `required` means it is a prefix of
+	// the walked key; an explicit `nullsFirst` declines (see {@link orderingPrefixSatisfies}).
 	const required = request.requiredOrdering;
-	let providesOrdering: readonly OrderingSpec[] | undefined;
 	if (required && required.length > 0) {
-		// Only claim ordering when the requested keys form a prefix of the
-		// PK with matching directions. nullsFirst is intentionally not
-		// matched here — if the request specifies an explicit NULLS
-		// FIRST/LAST, leave the Sort in place rather than assume the PK
-		// scan's natural NULL placement matches.
-		if (required.length > pkOrdering.length) return { monotonicOn, supportsAsofRight: true };
-		for (let i = 0; i < required.length; i++) {
-			if (required[i].columnIndex !== pkOrdering[i].columnIndex) return { monotonicOn, supportsAsofRight: true };
-			if (required[i].desc !== pkOrdering[i].desc) return { monotonicOn, supportsAsofRight: true };
-			if (required[i].nullsFirst !== undefined) return { monotonicOn, supportsAsofRight: true };
+		const direction = indexOrderingSatisfies(
+			tableInfo, request, pk, orderPreservingPrefix, required, NO_PINNED_COLUMNS);
+		if (direction === 'forward' || (direction === 'reverse' && allowReverse)) {
+			return {
+				providesOrdering: required,
+				orderingIndexName: '_primary_',
+				...walkDirectionFields(tableInfo, '_primary_', direction),
+				...pkMonotonicAdvertisement(pk, direction),
+			};
 		}
-		providesOrdering = required;
-	} else {
-		providesOrdering = pkOrdering;
 	}
 
+	// No claim: the walk runs forwards. An empty prefix means the LEADING member is a DESC
+	// column a NULL could reach, so `monotonicOn` on it — and `supportsAsofRight`, which
+	// implies it — go too.
+	const forwardOrdering = walkOrdering(tableInfo, request, pk, orderPreservingPrefix, NO_PINNED_COLUMNS, false);
+	if (forwardOrdering.length === 0) return {};
+	const monotonic = pkMonotonicAdvertisement(pk, 'forward');
+	if (required && required.length > 0) return monotonic;
+	return { providesOrdering: forwardOrdering, orderingIndexName: '_primary_', ...monotonic };
+}
+
+/**
+ * The `monotonicOn` / `supportsAsofRight` pair for a walk of the primary key in
+ * `direction`: the leading member in the order that walk emits it. The caller has already
+ * NULL-gated the leading member for that direction.
+ */
+function pkMonotonicAdvertisement(
+	pk: TableSchema['primaryKeyDefinition'],
+	direction: WalkDirection,
+): Pick<BestAccessPlanResult, 'monotonicOn' | 'supportsAsofRight'> {
+	const leading = pk[0];
+	const descending = !!leading.desc !== (direction === 'reverse');
 	return {
-		providesOrdering,
-		orderingIndexName: '_primary_',
-		monotonicOn,
+		monotonicOn: {
+			columnIndex: leading.index,
+			direction: descending ? 'desc' : 'asc',
+			strict: pk.length === 1,
+		},
 		supportsAsofRight: true,
 	};
 }
@@ -1515,14 +1534,15 @@ function buildPkOrderingAdvertisement(
  * difference in what it measures.
  *
  * **Why the claim is sound at all.** A single-window arm walks ONE contiguous byte
- * region of the index store forward, and every layer between that walk and the caller
- * preserves entry order: batched row resolution answers positionally and skips
+ * region of the index store, forwards or backwards, and every layer between that walk and
+ * the caller preserves entry order: batched row resolution answers positionally and skips
  * dead entries without shifting later ones (`resolveIndexEntries` / `resolveRowBatch`,
  * store-table-scan.ts), and the read-your-own-writes merge interleaves pending puts /
- * deletes by byte comparison of the same keys (`iterateEffective`, store-table-base.ts).
- * `buildIndexKey` writes `{index columns}{PK}` with each column's DESC flag baked into
- * the bytes by inversion, so a forward byte walk IS a walk in each index column's
- * declared direction.
+ * deletes by byte comparison of the same keys, in either direction (`iterateEffective`,
+ * store-table-base.ts). `buildIndexKey` writes `{index columns}{PK}` with each column's
+ * DESC flag baked into the bytes by inversion, so a forward byte walk IS a walk in each
+ * index column's declared direction, and a backwards walk of the same `[gte, lt)` window
+ * is its exact reverse, primary-key suffix within one index value included.
  *
  * **What it measures — the declared collation, not the residual's.** The consumer of an
  * ordering claim is `ORDER BY`, which compares under the TABLE COLUMN's declared
@@ -1541,13 +1561,13 @@ function buildPkOrderingAdvertisement(
  * multi-seek's N merged windows emit in seek-key order, not column order.
  *
  * When `requiredOrdering` is present, the claim is the request verbatim, and only when
- * genuinely satisfied; declines on any explicit `nullsFirst` (no promise about NULL
- * placement — mirrors the PK version). Never reversed: the claim is only ever the index's
- * own declared directions — the store has no reverse secondary-index walk
- * (`iterateEffective` accepts `reverse` but no secondary arm passes it). Absent a request,
- * the index's own (truncated) ordering is advertised so merge-join / streaming-aggregate
- * rules can fire opportunistically — claiming the pinned leading columns there is sound
- * for the same reason the skip is: they are constant.
+ * genuinely satisfied — by the index's declared directions, or by all of them flipped,
+ * which the arm serves by walking its window backwards and records with the reversed
+ * descriptor ({@link indexOrderingSatisfies}); declines on any explicit `nullsFirst` (no
+ * promise about NULL placement — mirrors the PK version). Absent a request, the index's
+ * own (truncated) forward ordering is advertised so merge-join / streaming-aggregate rules
+ * can fire opportunistically — claiming the pinned leading columns there is sound for the
+ * same reason the skip is: they are constant. A reverse walk is never advertised unasked.
  *
  * NOTE: the `nullsFirst` decline is a belt on top of the engine's own braces, not the
  * thing that makes `order by <nullable indexed col> nulls last` safe. Nothing populates
@@ -1559,7 +1579,7 @@ function buildPkOrderingAdvertisement(
  * (`index-ordering.spec.ts` pins that the Sort survives). If `nullsFirst` ever starts
  * reaching `requiredOrdering`, this decline becomes load-bearing rather than redundant —
  * index bytes put NULLs FIRST on an ASC column and LAST on a DESC one (inversion), which
- * is the engine's default placement and nothing else.
+ * is the engine's default placement and nothing else (reversed on a backwards walk).
  *
  * NOTE: advertising the index's own ordering with no `requiredOrdering` can COST a
  * pushdown. `ruleGrowRetrieve` carries an equipped `providesOrdering` into its re-probe as
@@ -1580,71 +1600,150 @@ function buildIndexOrderingAdvertisement(
 	index: TableIndexSchema,
 	indexKeyCollations: ReadonlyArray<string | undefined>,
 	eqCols: readonly number[],
-): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName'> {
+): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName' | 'indexDescriptor'> {
 	const orderPreservingPrefix = indexOrderPreservingPrefixLength(
 		db, tableInfo.columns, index, indexKeyCollations);
-	// Additionally truncated at the first DESC column NULLs could reach: index bytes put
-	// them at the walk's END, the engine's ORDER BY puts them FIRST for both directions.
-	// See {@link nullSafeOrderingPrefixLength}.
-	const claimablePrefix = nullSafeOrderingPrefixLength(
-		tableInfo, request, index.columns, orderPreservingPrefix, new Set(eqCols));
-	if (claimablePrefix === 0) return {};
-
-	const indexOrdering: OrderingSpec[] = index.columns
-		.slice(0, claimablePrefix)
-		.map(col => ({ columnIndex: col.index, desc: !!col.desc }));
+	const pinnedCols = new Set(eqCols);
 
 	const required = request.requiredOrdering;
 	if (required && required.length > 0) {
-		return indexOrderingSatisfies(indexOrdering, required, new Set(eqCols))
-			? { providesOrdering: required, orderingIndexName: index.name }
+		const direction = indexOrderingSatisfies(
+			tableInfo, request, index.columns, orderPreservingPrefix, required, pinnedCols);
+		return direction
+			? {
+				providesOrdering: required,
+				orderingIndexName: index.name,
+				...walkDirectionFields(tableInfo, index.name, direction),
+			}
 			: {};
 	}
-	return { providesOrdering: indexOrdering, orderingIndexName: index.name };
+	const indexOrdering = walkOrdering(tableInfo, request, index.columns, orderPreservingPrefix, pinnedCols, false);
+	return indexOrdering.length > 0 ? { providesOrdering: indexOrdering, orderingIndexName: index.name } : {};
+}
+
+/** Which way a walk of an index (or of the primary key) runs to deliver a required ordering. */
+type WalkDirection = 'forward' | 'reverse';
+
+/**
+ * Which way a walk of `keyColumns` delivers `required`: `'forward'` in the key's declared
+ * order, `'reverse'` backwards (every matched column flipped), or undefined when neither
+ * does. Forward is tried first. The store's twin of `MemoryTableModule.indexSatisfiesOrdering`:
+ * the same equality-pinned skip, the same all-or-nothing direction agreement (a partial
+ * flip such as `order by a desc, b asc` over `(a, b)` matches neither), and the same NULL
+ * gate run with each attempt's own direction — a nullable ASC column passes forwards and
+ * fails backwards, a nullable DESC column the other way round.
+ *
+ * `orderPreservingPrefix` is how many leading key columns have byte order equal to their
+ * declared collation's order ({@link indexOrderPreservingPrefixLength} /
+ * {@link pkOrderPreservingPrefixLength}); that agreement holds read backwards too, so it
+ * bounds both attempts alike.
+ */
+function indexOrderingSatisfies(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	keyColumns: TableIndexSchema['columns'],
+	orderPreservingPrefix: number,
+	required: readonly OrderingSpec[],
+	pinnedCols: ReadonlySet<number>,
+): WalkDirection | undefined {
+	for (const direction of ['forward', 'reverse'] as const) {
+		const walked = walkOrdering(
+			tableInfo, request, keyColumns, orderPreservingPrefix, pinnedCols, direction === 'reverse');
+		if (orderingPrefixSatisfies(walked, required, pinnedCols)) return direction;
+	}
+	return undefined;
 }
 
 /**
- * True when `indexOrdering` (an index's declared column order, already truncated to its
- * order-preserving prefix) satisfies `required` — the position-for-position match of
- * `MemoryTableModule.indexSatisfiesOrdering`, over {@link OrderingSpec}s instead of a
- * schema. Leading pinned columns are skipped before aligning. Any explicit `nullsFirst`
- * declines — see {@link buildIndexOrderingAdvertisement}. An under-length index (fewer
- * unpinned columns than required keys) declines rather than claiming a prefix:
- * `orderingMatches` upstream would reject the short claim anyway, so emitting it would
- * only mislead.
+ * The ordering a walk of `keyColumns` provably emits in one direction: the
+ * order-preserving prefix, cut again at the first column whose NULLs that walk would emit
+ * LAST ({@link nullSafeOrderingPrefixLength} with the same `reverse`) — the key bytes put
+ * NULL lowest, the engine's ORDER BY puts it FIRST for both directions — with each
+ * column's direction flipped for a backwards walk.
+ */
+function walkOrdering(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	keyColumns: TableIndexSchema['columns'],
+	orderPreservingPrefix: number,
+	pinnedCols: ReadonlySet<number>,
+	reverse: boolean,
+): OrderingSpec[] {
+	const claimablePrefix = nullSafeOrderingPrefixLength(
+		tableInfo, request, keyColumns, orderPreservingPrefix, pinnedCols, reverse);
+	return keyColumns
+		.slice(0, claimablePrefix)
+		.map(col => ({ columnIndex: col.index, desc: !!col.desc !== reverse }));
+}
+
+/**
+ * True when `walked` (one direction's {@link walkOrdering}) satisfies `required` — the
+ * position-for-position match of the memory module's `orderingPrefixWalked`, over
+ * {@link OrderingSpec}s instead of a schema. Leading pinned columns are skipped before
+ * aligning. Any explicit `nullsFirst` declines — see {@link buildIndexOrderingAdvertisement}.
+ * An under-length walk (fewer unpinned columns than required keys) declines rather than
+ * claiming a prefix: `orderingMatches` upstream would reject the short claim anyway, so
+ * emitting it would only mislead.
  *
  * The mid-loop skip (a pinned column encountered AFTER the matched prefix, which a
  * constant column between two ordered ones would need) is kept for exact parity with the
- * memory module, where the pinned set can be non-contiguous. It is unreachable from THIS
- * caller: `pinnedCols` is `resolveEqualityPins`' `cols`, which stops at the first
- * unpinned index column, so the leading skip above already consumes every pinned column.
+ * memory module, where the pinned set can be non-contiguous. It is unreachable from this
+ * module: the secondary-index arms pin `resolveEqualityPins`' `cols`, which stops at the
+ * first unpinned index column, so the leading skip already consumes every pinned column,
+ * and the ordering walk and the primary-key arms pin nothing.
  */
-function indexOrderingSatisfies(
-	indexOrdering: readonly OrderingSpec[],
+function orderingPrefixSatisfies(
+	walked: readonly OrderingSpec[],
 	required: readonly OrderingSpec[],
 	pinnedCols: ReadonlySet<number>,
 ): boolean {
-	let i = 0; // pointer into indexOrdering
+	let i = 0; // pointer into walked
 	let j = 0; // pointer into required
 
-	while (i < indexOrdering.length && pinnedCols.has(indexOrdering[i].columnIndex)) i++;
+	while (i < walked.length && pinnedCols.has(walked[i].columnIndex)) i++;
 
 	while (j < required.length) {
 		if (required[j].nullsFirst !== undefined) return false;
-		if (i >= indexOrdering.length) return false;
-		if (required[j].columnIndex === indexOrdering[i].columnIndex
-			&& required[j].desc === indexOrdering[i].desc) {
+		if (i >= walked.length) return false;
+		if (required[j].columnIndex === walked[i].columnIndex
+			&& required[j].desc === walked[i].desc) {
 			i++;
 			j++;
 			continue;
 		}
-		if (pinnedCols.has(indexOrdering[i].columnIndex)) {
+		if (pinnedCols.has(walked[i].columnIndex)) {
 			i++;
 			continue;
 		}
 		return false;
 	}
 	return true;
+}
+
+/**
+ * The plan fields that record a walk's direction: the reversed descriptor of `indexName`
+ * for a backwards walk (the engine turns it into `reverse=1` in the idxStr the runtime
+ * reads), nothing for a forward one (the engine resolves the forward descriptor itself).
+ *
+ * NOTE: a backwards walk is priced exactly like the forward one, but IndexedDB reads
+ * backwards by stepping a cursor one request per row rather than with its batched forward
+ * read (see the NOTE on `readBatch` in quereus-plugin-indexeddb/src/store.ts; unmeasured).
+ * Under a LIMIT — the "newest N" and `max(c)` shapes this exists for — the walk reads only
+ * N entries, so this matters only for an unbounded descending read. If one profiles slower
+ * on IndexedDB than scan-plus-sort, add a reverse-read ratio to `KVCostProfile` and charge
+ * it here, or batch the reverse read as that NOTE describes.
+ */
+function walkDirectionFields(
+	tableInfo: TableSchema,
+	indexName: string,
+	direction: WalkDirection,
+): Pick<BestAccessPlanResult, 'indexDescriptor'> {
+	return direction === 'reverse' ? { indexDescriptor: reversedIndexDescriptor(tableInfo, indexName) } : {};
+}
+
+/** The `explains` suffix naming a backwards walk. */
+function walkExplanationSuffix(reverse: boolean): string {
+	return reverse ? ' (reverse walk)' : '';
 }
 
 // --- StoreTableModule interface implementation ---
