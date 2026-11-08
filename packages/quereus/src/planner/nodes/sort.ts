@@ -85,10 +85,12 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		// Establish monotonicOn from the leading sort key when it is a trivial
 		// column reference. Strict iff the input is provably row-unique on that
 		// single column (`isUniqueDeterminant` — kind-aware, not mere coverage).
+		// A NULLS LAST leading key gets none: `monotonicOn`, like `ordering`, means
+		// NULLs first in both directions (OPT-063).
 		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
 		if (this.sortKeys.length > 0) {
 			const leadingKey = this.sortKeys[0];
-			if (leadingKey.expression instanceof ColumnReferenceNode) {
+			if (leadingKey.expression instanceof ColumnReferenceNode && leadingKey.nulls !== 'last') {
 				const leadAttrId = leadingKey.expression.attributeId;
 				const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 				if (leadIdx >= 0) {

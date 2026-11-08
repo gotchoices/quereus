@@ -8,7 +8,12 @@ import type { MonotonicOnInfo, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 
 /**
- * Ordering specification for a column
+ * Ordering specification for a column.
+ *
+ * There is no NULL-placement field: an ordering always means the engine's default
+ * placement, NULLs first in both directions (`orderByNullResult`). A sort or window
+ * that asks for NULLS LAST therefore has no `Ordering` to advertise or require —
+ * see invariant OPT-063 in docs/invariants.md.
  */
 export interface Ordering {
 	/** Column index */
@@ -18,8 +23,10 @@ export interface Ordering {
 }
 
 /**
- * Extract ordering from sort keys if they are trivial column references
- * Returns undefined if any sort key is not a simple column reference
+ * Extract ordering from sort keys if they are trivial column references.
+ * Returns undefined if any sort key is not a simple column reference, or asks for
+ * NULLS LAST (which an `Ordering` cannot express). Explicit NULLS FIRST is the
+ * default placement and passes.
  *
  * NOTE: all-or-nothing. `order by a, b * 2` yields nothing, though the leading
  * `a` prefix alone would be a sound (weaker) claim that merge join and the
@@ -28,12 +35,18 @@ export interface Ordering {
  * above a computed secondary sort key.
  */
 export function extractOrderingFromSortKeys(
-	sortKeys: readonly { expression: ScalarPlanNode; direction: 'asc' | 'desc' }[],
+	sortKeys: readonly { expression: ScalarPlanNode; direction: 'asc' | 'desc'; nulls?: 'first' | 'last' }[],
 	sourceAttributes: readonly { id: number }[]
 ): Ordering[] | undefined {
 	const ordering: Ordering[] = [];
 
 	for (const sortKey of sortKeys) {
+		// No prefix either: the grow-retrieve Sort arm drops the whole Sort once a
+		// module serves the returned ordering.
+		if (sortKey.nulls === 'last') {
+			return undefined;
+		}
+
 		// Check if this is a trivial column reference
 		if (sortKey.expression.nodeType !== PlanNodeType.ColumnReference) {
 			return undefined; // Non-trivial expression, cannot determine ordering

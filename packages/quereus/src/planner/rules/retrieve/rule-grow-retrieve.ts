@@ -419,7 +419,7 @@ function fallbackIndexSupports(
 		const sort = node as unknown as SortNode;
 		const ordering = extractOrderingFromSortKeys(sort.getSortKeys(), sort.source.getAttributes());
 		if (!ordering) {
-			log('Sort node has non-trivial expressions; cannot translate to ordering spec');
+			log('Sort node has non-trivial expressions or NULLS LAST; cannot translate to ordering spec');
 			return undefined;
 		}
 		request.requiredOrdering = ordering.map(o => ({ columnIndex: o.column, desc: o.desc }));

@@ -261,10 +261,11 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 	 * optional; anything that is not `'desc'` is ascending — the same reading
 	 * `rule-monotonic-window` and the `monotonicOn` derivation use.
 	 */
-	private windowSortKeys(): { expression: ScalarPlanNode; direction: 'asc' | 'desc' }[] {
+	private windowSortKeys(): { expression: ScalarPlanNode; direction: 'asc' | 'desc'; nulls?: 'first' | 'last' }[] {
 		return this.orderByExpressions.map((expression, i) => ({
 			expression,
 			direction: this.windowSpec.orderBy[i]?.direction === 'desc' ? 'desc' : 'asc',
+			nulls: this.windowSpec.orderBy[i]?.nulls,
 		}));
 	}
 
@@ -279,12 +280,8 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		// WindowNode advertises as its emit order".
 		// Column indices from `extractOrderingFromSortKeys` are positions in the
 		// SOURCE row; the window only APPENDS columns, so they need no shifting.
-		// NOTE: like SortNode, the derived `ordering` carries no NULLS FIRST/LAST
-		// information — it is `{ column, desc }` only. Harmless while every ordering
-		// consumer is null-placement-blind (merge join skips NULL keys wherever they
-		// land); if one is ever taught to honour an explicit `nulls`, this derivation
-		// and SortNode's must both withhold the ordering when `windowSpec.orderBy[i]
-		// .nulls` contradicts that consumer's convention.
+		// Both claims mean the default NULL placement (OPT-063), so a NULLS LAST
+		// ORDER BY withholds them, as SortNode does.
 		// TODO: the partitioned case can be tightened (e.g. when the partition keys
 		// themselves are functionally determined by the candidate attribute) — out
 		// of scope for the carrier ticket.
@@ -305,7 +302,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 				ordering = extractOrderingFromSortKeys(this.windowSortKeys(), sourceAttrs);
 
 				const leadExpr = this.orderByExpressions[0];
-				if (leadExpr instanceof ColumnReferenceNode) {
+				if (leadExpr instanceof ColumnReferenceNode && this.windowSpec.orderBy[0]?.nulls !== 'last') {
 					const leadAttrId = leadExpr.attributeId;
 					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 					if (leadIdx >= 0) {

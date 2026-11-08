@@ -22,6 +22,7 @@
  *
  * The rule rejects all of:
  *   - `Sort` whose key isn't a single trivial column ref into the leaf
+ *   - `Sort` key asking for NULLS LAST (`monotonicOn` means NULLs first — OPT-063)
  *   - `Sort` direction mismatching the advertised `monotonicOn.direction`
  *   - any non-trivial intermediate node (Filter, Distinct, Aggregate, etc.)
  *   - leaf advertising `monotonicOn` but not `ordinalSeek`
@@ -171,6 +172,10 @@ export function ruleMonotonicLimitPushdown(node: PlanNode, _context: OptContext)
 		if (key.direction !== leafMonotonic.direction) {
 			log('Sort direction %s does not match leaf monotonicOn direction %s',
 				key.direction, leafMonotonic.direction);
+			return null;
+		}
+		if (key.nulls === 'last') {
+			log('Sort asks for NULLS LAST; leaf monotonicOn puts NULLs first');
 			return null;
 		}
 	}

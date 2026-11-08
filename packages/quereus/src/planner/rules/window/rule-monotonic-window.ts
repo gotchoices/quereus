@@ -27,6 +27,8 @@
  *
  * Bail conditions:
  *
+ *   - any ORDER BY key asks for NULLS LAST — no source advertises that placement
+ *     (OPT-063), so the source's order can never satisfy it
  *   - leading ORDER BY key is not a trivial column reference
  *   - source's `monotonicOn` doesn't cover the leading key (or direction differs)
  *   - source's `ordering` prefix doesn't include the full ORDER BY key set
@@ -273,6 +275,11 @@ export function ruleMonotonicWindow(node: PlanNode, _context: OptContext): PlanN
 	const orderBy = node.windowSpec.orderBy;
 	if (orderBy.length === 0) {
 		log('No ORDER BY; streaming requires at least one ORDER BY key');
+		return null;
+	}
+
+	if (orderBy.some(key => key.nulls === 'last')) {
+		log('ORDER BY asks for NULLS LAST; no source ordering can satisfy it');
 		return null;
 	}
 

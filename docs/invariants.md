@@ -617,6 +617,25 @@ construction, never afterwards; a provider built without those sources (or a nod
 without its `SchemaManager`) reads the catalog alone and may disagree with plans that saw a
 module count or an observation.
 
+### OPT-063 — An ordering claim means NULLs first; a NULLS LAST key has none
+
+- code: `packages/quereus/src/planner/framework/physical-utils.ts` — `extractOrderingFromSortKeys`
+- code: `packages/quereus/src/planner/nodes/sort.ts` — `computePhysical`
+- code: `packages/quereus/src/planner/nodes/window-node.ts` — `windowSortKeys`
+- code: `packages/quereus/src/planner/rules/window/rule-monotonic-window.ts` — `ruleMonotonicWindow`
+- code: `packages/quereus/src/planner/rules/access/rule-monotonic-limit-pushdown.ts` — `ruleMonotonicLimitPushdown`
+- guard: `packages/quereus/test/logic/27.4-window-nulls-placement.sqllogic`
+- doc: [Window Functions § What the `WindowNode` advertises as its emit order](window-functions.md#what-the-windownode-advertises-as-its-emit-order)
+
+`Ordering`, `monotonicOn`, and a `requiredOrdering` built from sort keys have no
+NULL-placement field, so each means the engine default: NULLs first in both directions
+(`orderByNullResult`). A sort or window key asking for NULLS LAST therefore neither
+advertises a claim nor accepts one: `extractOrderingFromSortKeys` returns nothing,
+`SortNode` and `WindowNode` withhold `monotonicOn` on a NULLS LAST leading key, and every
+rule matching sort keys against a source's claim declines. Explicit NULLS FIRST is the
+default and passes. `test/optimizer/explicit-nulls-ordering.spec.ts` covers the module
+path, where a module asked for plain `s asc` would otherwise serve a NULLS LAST sort.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no

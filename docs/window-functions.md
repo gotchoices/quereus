@@ -325,6 +325,12 @@ stream in a different order silently returns wrong rows — a merge join above a
 Column indices are positions in the *source* row, which are also their positions
 in the window's output row: the window only appends columns.
 
+Neither claim records where NULLs go; both mean the default, NULLs first. So a
+window ORDER BY key with NULLS LAST yields no `ordering`, a NULLS LAST leading key
+yields no `monotonicOn`, and `rule-monotonic-window` never streams a window that
+asks for NULLS LAST, since no source can advertise that order
+([OPT-063](invariants.md#opt-063--an-ordering-claim-means-nulls-first-a-nulls-last-key-has-none)).
+
 **Recognized functions** (the rule fires only when *all* functions in a single
 WindowNode are individually recognized):
 
@@ -342,6 +348,7 @@ WindowNode are individually recognized):
 
 **Bail conditions** (any one drops to the buffered path):
 
+- Any ORDER BY key asks for NULLS LAST (see above: no source advertises it).
 - The leading ORDER BY key is not a trivial column reference, or doesn't match
   source's `monotonicOn` direction.
 - Source's `physical.ordering` doesn't cover the full ORDER BY key set.
