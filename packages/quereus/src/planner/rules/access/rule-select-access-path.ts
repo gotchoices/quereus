@@ -664,16 +664,15 @@ function selectPhysicalNodeFromPlan(
 						exprs: Array.isArray(c.valueExpr) ? c.valueExpr : undefined,
 					});
 				} else {
-					// Single equality value for this column. Carry its dynamic value
-					// expression — an array for a single-element IN, one scalar node for a
-					// plain `= ?` / correlated binding — so the cross-product seeks on the
-					// bound expression rather than Literal(undefined), which the runtime's
-					// NULL-key skip would drop (same two shapes as `equalitySeekKey`).
+					// Single equality value for this column: seek on the same key a
+					// single-column equality seek uses. Hand-rolling the `valueExpr` shape
+					// dispatch here once missed the scalar `= ?` shape, seeking on
+					// Literal(undefined), which the runtime's NULL-key skip drops.
 					const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : c.value as SqlValue;
 					columnValues.push({
 						colIdx,
 						values: [val],
-						exprs: c.valueExpr === undefined ? undefined : Array.isArray(c.valueExpr) ? c.valueExpr : [c.valueExpr],
+						exprs: [equalitySeekKey(tableRef.scope, c, columnScalarType(tableRef, colIdx))],
 					});
 				}
 			}
