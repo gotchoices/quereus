@@ -57,6 +57,7 @@ export {
 	idxStrSentinel,
 	idxStrWalksReverse,
 	REVERSE_PARAM,
+	withWalkDirection,
 	retargetIdxStr,
 	makeIdxStrSpec,
 	planKindFromCode,

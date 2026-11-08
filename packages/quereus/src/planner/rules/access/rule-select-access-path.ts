@@ -21,8 +21,8 @@ import { SeqScanNode, IndexScanNode, IndexSeekNode, EmptyResultNode, type Access
 import { seqScanCost } from '../../cost/index.js';
 import { provesEmpty, type ColumnMeta, type BestAccessPlanRequest, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import { makeEmptyFilterInfo, makeFullScanFilterInfo, type FilterInfo } from '../../../vtab/filter-info.js';
-import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
-import { encodeIdxStr, makeIdxStrSpec, REVERSE_PARAM } from '../../../vtab/idx-str.js';
+import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexDescriptor, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
+import { encodeIdxStr, makeIdxStrSpec, withWalkDirection } from '../../../vtab/idx-str.js';
 import { quereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
 import type { IndexConstraint } from '../../../vtab/index-info.js';
@@ -68,17 +68,9 @@ function buildIndexAccessPath(
 	return { kind: 'unresolvedIndex', indexName, plan };
 }
 
-/**
- * `params` plus `reverse=1` when `accessPath` walks its index backwards. Direction is read
- * off the resolved descriptor, so `idxStr` and `accessPath` state the one fact the module
- * supplied and cannot disagree about which way the walk runs.
- */
-function withWalkDirection(
-	params: ReadonlyMap<string, string> | undefined,
-	accessPath: AccessPath,
-): ReadonlyMap<string, string> | undefined {
-	if (accessPath.kind !== 'index' || accessPath.index.reverse !== true) return params;
-	return new Map([...(params ?? []), [REVERSE_PARAM, '1']]);
+/** The descriptor an index `accessPath` walks, whose `reverse` flag the `idxStr` must restate. */
+function walkedIndex(accessPath: AccessPath): IndexDescriptor | undefined {
+	return accessPath.kind === 'index' ? accessPath.index : undefined;
 }
 
 /**
@@ -96,7 +88,7 @@ function makeIndexFilterInfo(
 	params?: ReadonlyMap<string, string>,
 ): FilterInfo {
 	const accessPath = buildIndexAccessPath(tableSchema, accessPlan, indexName, plan);
-	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, plan, withWalkDirection(params, accessPath)));
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, plan, withWalkDirection(params, walkedIndex(accessPath))));
 	return {
 		...base,
 		constraints,
@@ -124,7 +116,7 @@ function makeOrderedScanFilterInfo(
 	indexName: string,
 ): FilterInfo {
 	const accessPath = buildIndexAccessPath(tableSchema, accessPlan, indexName, 'scan');
-	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, 'scan', withWalkDirection(undefined, accessPath)));
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, 'scan', withWalkDirection(undefined, walkedIndex(accessPath))));
 	return {
 		...base,
 		idxStr,

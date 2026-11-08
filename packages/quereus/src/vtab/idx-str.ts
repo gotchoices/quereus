@@ -20,7 +20,7 @@
 
 import { quereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
-import type { IndexPlanKind } from './index-descriptor.js';
+import type { IndexDescriptor, IndexPlanKind } from './index-descriptor.js';
 
 /** Parsed form of an `idx=name(n);plan=N;…` string. */
 export interface IdxStrSpec {
@@ -95,6 +95,20 @@ export function idxStrSentinel(idxStr: string | null): 'fullScan' | 'empty' | nu
  */
 export function idxStrWalksReverse(spec: IdxStrSpec | null): boolean {
 	return spec?.params.get(REVERSE_PARAM) === '1';
+}
+
+/**
+ * `params` plus `reverse=1` when `index` is walked backwards. Every producer that mints an
+ * `idxStr` beside a structured `accessPath` stamps direction through here, reading it off the
+ * same descriptor, so the text and the structured form cannot disagree about which way the
+ * walk runs.
+ */
+export function withWalkDirection(
+	params: ReadonlyMap<string, string> | undefined,
+	index: Pick<IndexDescriptor, 'reverse'> | undefined,
+): ReadonlyMap<string, string> | undefined {
+	if (index?.reverse !== true) return params;
+	return new Map([...(params ?? []), [REVERSE_PARAM, '1']]);
 }
 
 /** Render an {@link IdxStrSpec} to its wire form. */

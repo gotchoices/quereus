@@ -42,7 +42,7 @@ async function collect(layer: Layer, plan: ScanPlan): Promise<Row[]> {
 /** Numeric ascending sort, for direction-agnostic assertions. */
 const num = (a: unknown, b: unknown) => (a as number) - (b as number);
 
-describe('scanLayer descending range seek-start (latent path)', () => {
+describe('scanLayer descending range seek-start', () => {
 	let db: Database;
 
 	beforeEach(() => {

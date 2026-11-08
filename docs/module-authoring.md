@@ -423,7 +423,8 @@ read) learns direction only from `reverse`, for a primary-key plan and a seconda
 alike. Without it, the consumer merges a reversed stream against a forward comparator, which
 scrambles row order and can return a committed row alongside its staged replacement. The planner
 projects the descriptor's `reverse` into the `idxStr` it builds as the `reverse=1` parameter
-(`REVERSE_PARAM`), which is how a module runtime learns the direction it was asked to walk.
+(`REVERSE_PARAM`), which is how a module runtime learns the direction it was asked to walk. Code
+that builds a `FilterInfo` by hand stamps it the same way, with `withWalkDirection(params, descriptor)`.
 
 **Multi-seek key order is a hard requirement, independent of `providesOrdering`.** A
 `multiSeek` access path (`plan=5`) must emit its rows in the scanned index's own key

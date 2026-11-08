@@ -2,7 +2,7 @@ import { IndexConstraintOp } from '../common/constants.js';
 import type { SqlValue } from '../common/types.js';
 import type { IndexConstraint, IndexInfo } from './index-info.js';
 import type { AccessPath, IndexDescriptor } from './index-descriptor.js';
-import { encodeIdxStr, makeIdxStrSpec, retargetIdxStr } from './idx-str.js';
+import { encodeIdxStr, makeIdxStrSpec, retargetIdxStr, withWalkDirection } from './idx-str.js';
 
 /**
  * Structure to pass all necessary filter and planning information
@@ -168,7 +168,7 @@ export function makeIndexEqSeekFilterInfo(
 		constraint: { iColumn: columnIndex, op: IndexConstraintOp.EQ, usable: true },
 		argvIndex: i + 1,
 	}));
-	const idxStr = encodeIdxStr(makeIdxStrSpec(index.name, 'eqSeek'));
+	const idxStr = encodeIdxStr(makeIdxStrSpec(index.name, 'eqSeek', withWalkDirection(undefined, index)));
 
 	return {
 		idxNum: 0,

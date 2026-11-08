@@ -9,7 +9,7 @@ import type { MaybePromise, Row, SqlValue } from '../../common/types.js';
 import { StatusCode } from '../../common/types.js';
 import { QuereusError, throwIfAborted } from '../../common/errors.js';
 import { IndexConstraintOp } from '../../common/constants.js';
-import { encodeIdxStr, makeIdxStrSpec } from '../../vtab/idx-str.js';
+import { encodeIdxStr, makeIdxStrSpec, withWalkDirection } from '../../vtab/idx-str.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import { buildJoinKeyExtractor } from './join-key-extractor.js';
 import { compareSqlValuesFast, createTypedOrderByComparator, normalizeCollationName } from '../../util/comparison.js';
@@ -45,7 +45,7 @@ export function stampMultiSeek(
 		argvIndex: i + 1,
 	}));
 	const idxStr = encodeIdxStr(makeIdxStrSpec(pushdown.indexName, 'multiSeek',
-		new Map([['inCount', String(keys.length)]])));
+		withWalkDirection(new Map([['inCount', String(keys.length)]]), pushdown.accessPath.index)));
 	return {
 		...base,
 		idxStr,

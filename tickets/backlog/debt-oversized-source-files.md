@@ -181,7 +181,7 @@ the start of that module.
 
 Measured with `wc -l` on 2026-08-21. The index-seek row-estimate ticket added ~123 lines of
 costing helpers (1,107 → 1,230) and pushed it past the seam; the DESC-ordering
-NULL-placement ticket added ~54 more (1,230 → 1,284), all of them in the costing half.
+NULL-placement ticket added ~54 more (1,230 → 1,284), all of them in the costing half. Re-measured with `wc -l` on 2026-11-07: 1,433 lines; the backwards-index-walk ticket (`reverse-index-walk-engine-and-memory`) added most of the growth, again all in the ordering/costing half (`orderingPrefixWalked`, `walkDirectionFields`, the tri-state `indexSatisfiesOrdering`).
 
 `MemoryTableModule` mixes two jobs that share almost nothing: the **module lifecycle**
 (create / connect / rename / destroy, schema-change events, the table registry) and the

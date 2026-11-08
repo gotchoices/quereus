@@ -1,10 +1,12 @@
-description: A query asking for descending order can now read an ascending index (or the primary key) backwards instead of sorting the whole table; this adds the engine-side plumbing for a backwards walk and turns it on for the in-memory table. Review the implementation.
+description: A query asking for descending order can now read an ascending index (or the primary key) backwards instead of sorting the whole table; this adds the engine-side plumbing for a backwards walk and turns it on for the in-memory table.
 architecture: docs/module-authoring.md
 files:
-  - packages/quereus/src/vtab/idx-str.ts                                  # REVERSE_PARAM, idxStrWalksReverse
+  - packages/quereus/src/vtab/idx-str.ts                                  # REVERSE_PARAM, idxStrWalksReverse, withWalkDirection (moved here in review)
+  - packages/quereus/src/vtab/filter-info.ts                              # makeIndexEqSeekFilterInfo stamps direction (review)
+  - packages/quereus/src/runtime/emit/key-set-semi-join.ts                # stampMultiSeek stamps direction (review)
   - packages/quereus/src/vtab/index-descriptor.ts                         # schemaIndexDescriptor (factored), reversedIndexDescriptor, IndexPlanKind comment
   - packages/quereus/src/index.ts                                         # exports reversedIndexDescriptor, idxStrWalksReverse, REVERSE_PARAM
-  - packages/quereus/src/planner/rules/access/rule-select-access-path.ts  # withWalkDirection, createPlanSeqScan assertion
+  - packages/quereus/src/planner/rules/access/rule-select-access-path.ts  # walkedIndex + withWalkDirection stamp, createPlanSeqScan assertion
   - packages/quereus/src/vtab/best-access-plan.ts                         # nullSafeOrderingPrefixLength(…, reverse)
   - packages/quereus/src/vtab/memory/module.ts                            # OrderingWalk, orderingPrefixWalked, tri-state indexSatisfiesOrdering, plan A/B descriptors, monotonic advertisement
   - packages/quereus/src/vtab/memory/layer/scan-plan.ts                   # descending = idxStrWalksReverse(spec); dead ordCons / plan 1 / plan 4 removed
@@ -24,7 +26,7 @@ files:
   - docs/optimizer-rules.md
 ----
 
-# Backwards index walks: engine contract + in-memory table (review)
+# Backwards index walks: engine contract + in-memory table (complete)
 
 The store half is `reverse-index-walk-store` (in `implement/`, depends on this). Its ticket already names the helpers this one exports, and the names match.
 
@@ -104,3 +106,26 @@ The store half is `reverse-index-walk-store` (in `implement/`, depends on this).
 ## Tripwire left in code
 
 - `scan-layer.ts` `lastKeyOfSeekGroup`: a `NOTE:` saying the group-end pass costs one extra forward pass over the group's keys; if a large duplicate group at a range boundary shows up in a profile, seek past the group with a high-sentinel comparator.
+
+## Review findings
+
+Reviewed the `ticket(implement): reverse-index-walk-engine-and-memory` diff first, then the handoff. Ran `yarn workspace @quereus/quereus lint` (clean), `yarn workspace @quereus/quereus test` (11116 passing, 26 pending), rebuilt quereus `dist` and ran `@quereus/isolation` (451 passing), and `yarn docs:check` (OK). `yarn test:store` was not re-run: the review's source change only adds `reverse=1` when a descriptor already says `reverse`, which no store path produces yet.
+
+**Correctness — checked, one latent defect fixed inline.**
+- Fixed: the direction stamp lived privately in `rule-select-access-path.ts`, so two other producers that mint an `idxStr` beside a structured `accessPath` did not stamp it: the key-set multi-seek (`stampMultiSeek`, key-set-semi-join.ts, which takes its descriptor from `resolveIndexDescriptor` over the module's probe answer) and `makeIndexEqSeekFilterInfo` (filter-info.ts). Today the probe carries no `requiredOrdering`, so no module returns a reversed descriptor there and nothing is wrong yet; but the moment one did, the `accessPath` would say "backwards" (the isolation overlay merges in reverse) while the runtime walked forwards. Moved the helper to `idx-str.ts` as exported `withWalkDirection(params, descriptor)` and used it in all three producers, so every engine-built `idxStr` restates the descriptor's direction. Also exported from `index.ts`, and docs/module-authoring.md now names it for hand-built `FilterInfo`. With this, the store follow-up's planned "multi-seek with `reverse` → `malformedFilterInfo`" assertion would actually see the flag. No test: the fix is a class-level invariant (one helper), and the dormant path is unreachable from SQL.
+- Checked by throwaway probes (deleted) shapes no test covers: a primary key `(a desc, b)` walked backwards with `>=`, `>`, `<=` bounds and prefix equality; a secondary index `(k, r desc)` read `order by r asc` under `k = 1` and under `k = 1 and r >= 6`; `order by k desc, r asc` with `k >= 1` / `k <= 1`; and the same reads inside an open transaction after an insert and a key-moving update. All answers correct and all served by a reverse walk with no Sort. The group-end start (`walkStartKey`) is direction-agnostic as it should be: it works from tree position, not column direction.
+- Checked: multi-value `IN` and `OR_RANGE` cannot reach a reversed walk (`collectEqualityBoundColumns` excludes multi-value IN; plan A and plan B both refuse `OR_RANGE` and multi-IN on an ordered column), so the multi-range path's existing `NOTE:` about visiting ranges in SQL-text order still holds. Multi-seek keys already sort reversed for a descending plan (`orderSeekKeys`).
+- Checked: no producer or consumer of the removed `ordCons=DESC` / `plan=1` / `plan=4` remains anywhere in `packages/*/src` or docs.
+- Checked: the monotonic advertisement's direction and NULL gate follow the reversed descriptor; `ruleMinMaxIndexBoundary` header and docs/optimizer-rules.md caveat match the new behaviour (memory both ways, store forward-only until `reverse-index-walk-store`).
+
+**Tests.** The implementer's additions each pin a distinct behaviour (scan-layer group-end start for two seek shapes; planner Sort absorption, PK reverse, partial flip, nullable gate; sqllogic answers across both backends). Kept all. Re-read the changed pins (`key-set-seek`, `monotonic-on`, `rule-orderby-fd-pruning`, `index-selection`, `filter-lost-under-index-order`, `minmax-index-boundary`): each still tests what its name says under the new behaviour. Renamed the `scan-layer-descending.spec.ts` describe from "… (latent path)" since the path is now reachable from SQL. No test added: the found defect is dormant and fixed structurally. No automated memory-under-isolation SQL case was added (implementer's open question): the overlay merge is pinned with a synthetic module in `isolation-layer.spec.ts`, the memory walk is pinned here, and `yarn test:store` will run the in-transaction sqllogic block through the isolation layer with reversed walks once `reverse-index-walk-store` lands.
+
+**Docs.** docs/module-authoring.md, docs/memory-table.md and docs/optimizer-rules.md read accurately; added one sentence to module-authoring.md for `withWalkDirection`. The stale "always ascending" header in `rule-asof-strategy-select.ts` the implementer noted is pre-existing and harmless (the rule reads `physical.ordering`); left as is.
+
+**Source hygiene / size.** `vtab/memory/module.ts` is now 1,433 lines (`wc -l`); already tracked by `debt-oversized-source-files` — appended the new measurement there rather than filing. `rule-select-access-path.ts` is 1,784 lines, also already tracked there. Comments in the diff state constraints and reasons rather than narrating.
+
+**Error handling / types.** `reversedIndexDescriptor` throws `INTERNAL` for an index it cannot resolve; `createPlanSeqScan` throws when a reversed claim would fall to a forward scan. No `any`, no swallowed errors.
+
+**Performance.** The group-end pass costs one extra forward pass over the boundary group's keys; the implementer's `NOTE:` tripwire in `scan-layer.ts` `lastKeyOfSeekGroup` covers it. Nothing new parked.
+
+**Tickets filed:** none. **Tripwires added:** none.
