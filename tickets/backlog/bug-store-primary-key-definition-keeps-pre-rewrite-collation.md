@@ -22,3 +22,5 @@ Neither arm has been run. An isolation-over-store test (beside `store-semantic-i
 ## Expected behaviour
 
 After CREATE, a primary-key member's `collation` in `primaryKeyDefinition` equals its column's `collation`, on every backend. The likely single site is `reconcilePkCollations` rewriting both together (as `rekeySchemaPrimaryKey` in `schema/table.ts` already does for ALTER PRIMARY KEY); check that persisted-DDL round trips and the materialized-view backing-shape comparison still agree afterwards.
+
+Once the definition is kept in step with the column, the planner's workaround can go: `resolveIndexKeyCollations` in `packages/quereus/src/planner/rules/access/rule-select-access-path.ts` reads the column collation for the engine's primary-key descriptor (`readsColumnCollation`) only because of this staleness, and `primaryKeyCollationLookup` in the same file does the same for the legacy seek arms.

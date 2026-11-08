@@ -93,7 +93,9 @@ Three details are load-bearing:
   and `'a'`, and `r` restarts in each; the same mismatch also makes the seek decline to a
   scan, which emits no claimed order. Every site that lets a `Sort` go therefore also asks
   `orderingClaimSurvivesCollation` (`rule-select-access-path`), which applies the
-  collation-cover analysis to the claim's index. It finds that index through
+  collation-cover analysis to the claim's index: `orderingIndexName`, else the index the
+  leaf would walk (the seek's `indexName`, or the primary key when the plan names no seek
+  index and the leaf is inferred from the primary key). It finds that index through
   `resolveIndexDescriptor`, as the access path does, so a differently-cased name or an alias
   with a descriptor is checked against the same key collations; an index the engine cannot
   resolve is checked as if every column had an unknown collation, which keeps the `Sort`

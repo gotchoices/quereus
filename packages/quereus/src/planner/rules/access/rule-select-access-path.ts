@@ -453,7 +453,7 @@ export function selectPhysicalNode(
 
 	// --- Index-aware path: use module-provided index identity ---
 	// --- Legacy fallback: infer access method from constraints and PK definition ---
-	const leaf = (accessPlan.indexName && accessPlan.seekColumnIndexes && accessPlan.seekColumnIndexes.length > 0)
+	const leaf = usesIndexAwarePath(accessPlan)
 		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing)
 		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
 
@@ -578,7 +578,7 @@ function selectPhysicalNodeFromPlan(
 		const cover = classifyCollationCover(
 			seekCols.map(colIdx => ({ colIdx, constraint: eqBySeekCol.get(colIdx)! })),
 			true,
-			indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+			indexColumnCollationLookup(tableRef.tableSchema, accessPlan, idxStrName),
 			honorsCollatedRangeBounds,
 		);
 		if (!cover.useIndex) {
@@ -841,7 +841,7 @@ function selectPhysicalNodeFromPlan(
 				const coverConstraints: ConsumedConstraint[] = [...prefixConstraints];
 				if (lower) coverConstraints.push({ colIdx: trailingRangeCol, constraint: lower });
 				if (upper) coverConstraints.push({ colIdx: trailingRangeCol, constraint: upper });
-				const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
+				const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan, idxStrName), honorsCollatedRangeBounds);
 				if (!cover.useIndex) {
 					log('Declining prefix-range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 					const scan = createSeqScan(tableRef);
@@ -922,7 +922,7 @@ function selectPhysicalNodeFromPlan(
 			const coverConstraints: ConsumedConstraint[] = [];
 			if (lower) coverConstraints.push({ colIdx: rangeCol, constraint: lower });
 			if (upper) coverConstraints.push({ colIdx: rangeCol, constraint: upper });
-			const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
+			const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan, idxStrName), honorsCollatedRangeBounds);
 			if (!cover.useIndex) {
 				log('Declining range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 				const scan = createSeqScan(tableRef);
@@ -983,7 +983,7 @@ function selectPhysicalNodeFromPlan(
 			const cover = classifyCollationCover(
 				[{ colIdx: orRangeConstraint.columnIndex, constraint: orRangeConstraint }],
 				false,
-				indexColumnCollationLookup(tableRef.tableSchema, accessPlan),
+				indexColumnCollationLookup(tableRef.tableSchema, accessPlan, idxStrName),
 				honorsCollatedRangeBounds,
 			);
 			if (!cover.useIndex) {
@@ -1547,9 +1547,9 @@ export function effectivePredicateCollation(constraint: PlannerPredicateConstrai
 function resolveIndexKeyCollations(
 	tableSchema: TableSchema,
 	accessPlan: BestAccessPlanResult,
-	indexName: string | undefined,
+	indexName: string,
 ): ReadonlyMap<number, string> | undefined {
-	const index = indexName === undefined ? undefined : resolveIndexDescriptor(tableSchema, accessPlan, indexName);
+	const index = resolveIndexDescriptor(tableSchema, accessPlan, indexName);
 	if (!index) return undefined;
 	const readsColumnCollation = index.role === 'primary' && index !== accessPlan.indexDescriptor;
 	return new Map(index.keyColumns.map(key => {
@@ -1559,15 +1559,16 @@ function resolveIndexKeyCollations(
 }
 
 /**
- * Collation lookup for the key columns of the index a seek arm walks. Answers undefined
- * for a column of an index the engine cannot resolve, or one not in the index;
+ * Collation lookup for the key columns of `indexName`, the index a seek arm walks. Answers
+ * undefined for a column of an index the engine cannot resolve, or one not in the index;
  * {@link classifyConstraintCover} treats that conservatively.
  */
 function indexColumnCollationLookup(
 	tableSchema: TableSchema,
 	accessPlan: BestAccessPlanResult,
+	indexName: string,
 ): (colIdx: number) => string | undefined {
-	const collations = resolveIndexKeyCollations(tableSchema, accessPlan, accessPlan.indexName);
+	const collations = resolveIndexKeyCollations(tableSchema, accessPlan, indexName);
 	return (colIdx: number) => collations?.get(colIdx);
 }
 
@@ -1596,8 +1597,7 @@ export function orderingClaimSurvivesCollation(
 	accessPlan: BestAccessPlanResult,
 	constraints: readonly PlannerPredicateConstraint[],
 ): boolean {
-	const keyCollations = resolveIndexKeyCollations(
-		tableSchema, accessPlan, accessPlan.orderingIndexName ?? accessPlan.indexName);
+	const keyCollations = resolveIndexKeyCollations(tableSchema, accessPlan, orderingClaimIndexName(accessPlan));
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	return constraints.every((c, i) => {
 		if (c.op === 'IS NULL' || c.op === 'IS NOT NULL') return true;
@@ -1608,6 +1608,25 @@ export function orderingClaimSurvivesCollation(
 		const indexColl = keyCollations?.get(c.columnIndex);
 		return classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
 	});
+}
+
+/**
+ * Whether the leaf for `accessPlan` is built from the module's named index
+ * ({@link selectPhysicalNodeFromPlan}) rather than inferred from the primary key
+ * ({@link selectPhysicalNodeLegacy}).
+ */
+function usesIndexAwarePath(accessPlan: BestAccessPlanResult): boolean {
+	return accessPlan.indexName !== undefined && (accessPlan.seekColumnIndexes?.length ?? 0) > 0;
+}
+
+/**
+ * The index whose collations decide {@link orderingClaimSurvivesCollation}: the one the
+ * ordering arm of whichever physical-selection path builds the leaf would walk. The legacy
+ * path walks the primary key unless the module named an ordering index.
+ */
+function orderingClaimIndexName(accessPlan: BestAccessPlanResult): string {
+	if (accessPlan.orderingIndexName !== undefined) return accessPlan.orderingIndexName;
+	return usesIndexAwarePath(accessPlan) ? accessPlan.indexName! : PRIMARY_INDEX_NAME;
 }
 
 /**
