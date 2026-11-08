@@ -181,6 +181,10 @@ function* scanLayerResolved(
 
 	// Multi-range: iterate over multiple range specs
 	if (plan.ranges && plan.ranges.length > 0) {
+		// NOTE: ranges are visited in SQL-text order, not index order (harmless: no multi-range
+		// seek advertises an ordering). If one ever does, or a backwards walk reaches here, sort
+		// the ranges by leading bound under the index comparator (reversed for a backwards
+		// walk), as `orderSeekKeys` does for multi-seek keys.
 		for (const range of plan.ranges) {
 			const singlePlan: ScanPlan = {
 				...plan,
@@ -265,22 +269,26 @@ function* scanLayerResolved(
 
 		const primaryTree = layer.getModificationTree('primary');
 
-		// PK-within-index-key order is observable and depended upon: `quereus-isolation`
-		// merges the overlay scan with this scan using sort key `[indexKeyParts…, pkParts…]`
-		// and assumes both streams share that order. The entry's `primaryKeys` Map is in
-		// insertion order, so fetch the PK-comparator-sorted view from the MemoryIndex
-		// (memoized there). The inline sort is a defensive fallback for an index name the
-		// layer's schema does not know (`primaryKeyComparator` is already in scope).
-		// This view is ASCENDING by PK for both walk directions, whereas the overlay merge
-		// reverses the WHOLE sort key (PK tie-break included) for a reversed scan. Nothing
-		// asks this backend for a reversed secondary-index scan today — no engine path emits
-		// `ordCons=DESC` and `scanEffective` only ever walks the primary tree — so the
-		// mismatch is unreachable; see backlog/debt-memory-reverse-secondary-pk-order.
+		// Emits rows in `(indexKey…, pk…)` order, and on a backwards walk the exact reverse of
+		// it, PK order inside one index value included. That is the composite sort key
+		// `quereus-isolation` sorts its overlay rows by (negated whole for `reverse: true`) and
+		// the order docs/design-isolation-layer.md documents for a secondary-index scan. The
+		// entry's `primaryKeys` Map is in insertion order, so the PK-comparator-sorted view
+		// comes from the MemoryIndex (memoized there); the inline sort is a defensive fallback
+		// for an index name the layer's schema does not know.
 		const secondaryIndex = layer.getSecondaryIndex(plan.indexName);
-		const sortedPrimaryKeys = (indexEntry: MemoryIndexEntry): readonly BTreeKeyForPrimary[] =>
-			secondaryIndex
+		const primaryKeysInWalkOrder = function* (indexEntry: MemoryIndexEntry): Generator<BTreeKeyForPrimary> {
+			const sorted = secondaryIndex
 				? secondaryIndex.getSortedPrimaryKeys(indexEntry)
 				: [...indexEntry.primaryKeys.values()].sort(primaryKeyComparator);
+			// Index backwards rather than `.reverse()`: `getSortedPrimaryKeys` returns its memo,
+			// and reversing that in place would corrupt later forward reads of the entry.
+			if (plan.descending) {
+				for (let i = sorted.length - 1; i >= 0; i--) yield sorted[i];
+			} else {
+				yield* sorted;
+			}
+		};
 
 		if (plan.equalityKey !== undefined) {
 			// NULL equality is UNKNOWN ⇒ no rows (see the primary branch above). Only
@@ -288,7 +296,7 @@ function* scanLayerResolved(
 			if (seekKeyHasNull(plan.equalityKey, comparators.keyIsTuple)) return;
 			const indexEntry = indexTree.get(plan.equalityKey as BTreeKeyForIndex);
 			if (indexEntry && primaryTree) {
-				for (const pk of sortedPrimaryKeys(indexEntry)) {
+				for (const pk of primaryKeysInWalkOrder(indexEntry)) {
 					const value = primaryTree.get(pk);
 					if (value) {
 						yield value as Row;
@@ -316,7 +324,7 @@ function* scanLayerResolved(
 				continue;
 			}
 			if (!primaryTree) continue;
-			for (const pk of sortedPrimaryKeys(indexEntry)) {
+			for (const pk of primaryKeysInWalkOrder(indexEntry)) {
 				const value = primaryTree.get(pk);
 				if (value) {
 					yield value as Row;

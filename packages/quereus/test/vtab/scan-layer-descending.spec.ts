@@ -146,6 +146,33 @@ describe('scanLayer descending range seek-start (latent path)', () => {
 			const rows = await collect(getCommittedLayer(db, 'sa'), plan);
 			expect(rows.map(r => r[0]).sort(num)).to.deep.equal([2, 3, 4]);
 		});
+
+		it('backwards walk is the exact reverse of the forward walk, PK order within a value included', async () => {
+			await db.exec('create table sg (id integer primary key, g integer)');
+			await db.exec('create index idx_g on sg (g)');
+			await db.exec('insert into sg values (1,10),(2,20),(3,10),(4,20),(5,30),(6,10)');
+			const layer = getCommittedLayer(db, 'sg');
+			const shapes: Record<string, Omit<ScanPlan, 'descending'>> = {
+				full: { indexName: 'idx_g' },
+				range: {
+					indexName: 'idx_g',
+					lowerBound: { op: IndexConstraintOp.GE, value: 10 },
+					upperBound: { op: IndexConstraintOp.LT, value: 30 },
+				},
+				equality: { indexName: 'idx_g', equalityKey: 10 },
+				multiSeek: { indexName: 'idx_g', equalityKeys: [20, 10] },
+			};
+			const ids = async (shape: Omit<ScanPlan, 'descending'>, descending: boolean) =>
+				(await collect(layer, { ...shape, descending })).map(r => r[0]);
+			for (const [name, shape] of Object.entries(shapes)) {
+				const forward = await ids(shape, false);
+				const backward = await ids(shape, true);
+				expect(backward, name).to.deep.equal([...forward].reverse());
+				// A forward read after the backwards one would expose a mutated PK memo.
+				expect(await ids(shape, false), `${name} (forward again)`).to.deep.equal(forward);
+			}
+			expect(await ids(shapes.full, true)).to.deep.equal([5, 4, 2, 6, 3, 1]);
+		});
 	});
 
 	describe('ascending walk parity (reachable path unchanged)', () => {

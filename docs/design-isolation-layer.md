@@ -625,6 +625,8 @@ backends — the in-memory table (`scan-layer.ts`) and the persistent store
 before visiting them for exactly this reason; see `docs/module-authoring.md` for the
 contract as stated to third-party module authors.
 
+The two merges differ in how much they lean on that order. The secondary-index merge (`mergedSecondaryIndexQuery`) drops shadowed committed rows by membership in the set of primary keys the transaction touched, so an underlying stream that is out of order *within one index value* only misplaces staged rows among that value's rows; it is the primary-key merge (`mergeStreams`) whose shadowing depends on order.
+
 `role` is authoritative, not `name`. A module that mints a per-plan alias for its primary
 key (lamina-quereus appends a counter: `_primary_` → `_primary_1`, `_primary_2`, …) is still
 recognised as a PK walk because it returns an `indexDescriptor` with `role: 'primary'`. When
