@@ -1,0 +1,15 @@
+-- A window's ORDER BY and its source's order must agree on where NULLs go, not just on
+-- column and direction. The engine default puts NULLs first in both directions.
+
+create table wn (id text primary key, s text null);
+insert into wn values ('1','b'), ('2',null), ('3','a');
+
+-- Source sorted NULLS LAST; the window asks for the default (NULLs first).
+select s, row_number() over (order by s) as rn from (select * from wn order by s nulls last) order by rn;
+→ [{"s":null,"rn":1},{"s":"a","rn":2},{"s":"b","rn":3}]
+
+-- Source sorted with the default; the window asks for NULLS LAST.
+select s, row_number() over (order by s nulls last) as rn from (select * from wn order by s) order by rn;
+→ [{"s":"a","rn":1},{"s":"b","rn":2},{"s":null,"rn":3}]
+
+drop table wn;
