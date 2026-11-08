@@ -749,7 +749,7 @@ function computeFilterAccessPlan(
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
 		// below — a cost-only plan performs this same sequential scan while advertising an
 		// index arm's (cheaper) cost, so falling through would undo the comparison.
-		return { ...scanPlan, explains: 'Store full table scan (cheaper than the best index seek)' };
+		return { ...scanPlan, explains: `${scanPlan.explains} (cheaper than the best index seek)` };
 	}
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'

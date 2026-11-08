@@ -511,6 +511,13 @@ export abstract class StoreTableScan extends StoreTableBase {
 			return { index, type: 'range', bounds };
 		}
 
+		// NOTE: a null here makes `query()` scan the DATA store in primary-key order. That is
+		// the right row set, but if the plan claimed this index's ordering (forwards or
+		// backwards) the Sort is already gone and the order is wrong. The planner gates on
+		// the same collation predicates, so the one known way here under a claim is an
+		// unfaithful semantic probe on the leading eq column (`semanticProbeIsKeyFaithful`
+		// above), which the planner cannot see. If such a probe can ever match a row, the
+		// planner must stop claiming order through a pinned semantic-ordering column.
 		return null;
 	}
 
