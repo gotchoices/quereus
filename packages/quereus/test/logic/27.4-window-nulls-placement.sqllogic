@@ -12,4 +12,8 @@ select s, row_number() over (order by s) as rn from (select * from wn order by s
 select s, row_number() over (order by s nulls last) as rn from (select * from wn order by s) order by rn;
 → [{"s":"a","rn":1},{"s":"b","rn":2},{"s":null,"rn":3}]
 
+-- The inner window sorts NULLS LAST; the outer window asks for the default.
+select s, inner_rn, row_number() over (order by s) as rn from (select s, row_number() over (order by s nulls last) as inner_rn from wn) order by rn;
+→ [{"s":null,"inner_rn":3,"rn":1},{"s":"a","inner_rn":1,"rn":2},{"s":"b","inner_rn":2,"rn":3}]
+
 drop table wn;

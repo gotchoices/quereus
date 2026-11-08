@@ -299,16 +299,16 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 			} else {
 				// Sorted by the window's ORDER BY; the source's order is gone.
 				const sourceAttrs = this.source.getAttributes();
-				ordering = extractOrderingFromSortKeys(this.windowSortKeys(), sourceAttrs);
+				const sortKeys = this.windowSortKeys();
+				ordering = extractOrderingFromSortKeys(sortKeys, sourceAttrs);
 
-				const leadExpr = this.orderByExpressions[0];
-				if (leadExpr instanceof ColumnReferenceNode && this.windowSpec.orderBy[0]?.nulls !== 'last') {
-					const leadAttrId = leadExpr.attributeId;
+				const lead = sortKeys[0];
+				if (lead.expression instanceof ColumnReferenceNode && lead.nulls !== 'last') {
+					const leadAttrId = lead.expression.attributeId;
 					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 					if (leadIdx >= 0) {
-						const direction = this.windowSpec.orderBy[0]?.direction === 'desc' ? 'desc' : 'asc';
 						const strict = isUniqueDeterminant(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length, this.source.getType().isSet);
-						monotonicOn = [{ attrId: leadAttrId, direction, strict }];
+						monotonicOn = [{ attrId: leadAttrId, direction: lead.direction, strict }];
 					}
 				}
 			}
