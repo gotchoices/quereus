@@ -36,3 +36,41 @@ select distinct id from c where a in (1, 1, 2) and b in (10, null) order by id;
 → [{"id":1},{"id":3}]
 
 drop table c;
+
+-- ===== Bound equality on one column + IN list on the other (composite seek) =====
+-- A plain `= ?` component must seek on its bound expression, not on an empty key.
+
+create table t (id text primary key, a text, b text);
+create index t_ab on t(a, b);
+insert into t values ('1','x','p'), ('2','x','q'), ('3','y','p'), ('4','x','r');
+
+-- params: ["x"]
+select id from t where a = ? and b in ('p','q') order by id;
+→ [{"id":"1"},{"id":"2"}]
+
+-- params: ["x", "p", "q"]
+select id from t where a = ? and b in (?,?) order by id;
+→ [{"id":"1"},{"id":"2"}]
+
+-- params: ["x", "y", "p"]
+select id from t where a in (?,?) and b = ? order by id;
+→ [{"id":"1"},{"id":"3"}]
+
+select id from t where a in ('x','y') and b = 'p' order by id;
+→ [{"id":"1"},{"id":"3"}]
+
+drop table t;
+
+-- Same shapes on a composite primary key.
+create table tk (a text, b text, primary key (a, b));
+insert into tk values ('x','p'), ('x','q'), ('y','p');
+
+-- params: ["x"]
+select a, b from tk where a = ? and b in ('p','q') order by a, b;
+→ [{"a":"x","b":"p"},{"a":"x","b":"q"}]
+
+-- params: ["x", "y", "p"]
+select a, b from tk where a in (?,?) and b = ? order by a, b;
+→ [{"a":"x","b":"p"},{"a":"y","b":"p"}]
+
+drop table tk;
