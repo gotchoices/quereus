@@ -73,16 +73,18 @@ it proves a rule *mentions* a signal, not that it acts on it correctly.
 
 ### OPT-004 — A custom-`execute` pass argues its own soundness
 
-- code: `packages/quereus/src/planner/framework/pass.ts` — `createMaterializationPass`
+- code: `packages/quereus/src/planner/framework/pass.ts` — `createMaterializationPass`, `createRequiredColumnsPass`
 - guard: none — a pass supplies its own traversal, so no registration-time check sees the transforms it performs; a violation shows up as a lost or duplicated write, not a crash.
-- doc: [Optimizer § Pass 3.5: Materialization Advisory](optimizer.md#pass-35-materialization-advisory-single-whole-tree-pass-order-35)
+- doc: [Optimizer § Pass 3.5: Materialization Advisory](optimizer.md#pass-35-materialization-advisory-single-whole-tree-pass-order-35), [Optimizer § Pass 3.6: Required Columns](optimizer.md#pass-36-required-columns-single-whole-tree-pass-order-36)
 
 A pass carrying a custom `execute` has an empty `rules` array, so it never passes through
 `addRuleToPass` and OPT-001's gate never fires on it. Its side-effect soundness argument
-must therefore live in a comment at the pass definition. `createMaterializationPass` is the
-one live instance; its argument is that `CacheNode` is a run-once fence, so a subtree the
-advisory wraps executes exactly once rather than once per reference — a count-changing but
-order-preserving rewrite.
+must therefore live in a comment at the pass definition. `createMaterializationPass` argues
+that `CacheNode` is a run-once fence, so a subtree the advisory wraps executes exactly once
+rather than once per reference — a count-changing but order-preserving rewrite.
+`createRequiredColumnsPass` argues that it changes only a scan's `FilterInfo.requiredColumns`
+and re-mints the path above it with otherwise identical children, so nothing runs a
+different number of times or in a different order.
 
 ### OPT-006 — Parallel-track rules refuse an impure branch
 

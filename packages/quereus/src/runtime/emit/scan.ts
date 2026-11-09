@@ -13,7 +13,7 @@ import { createValidatedInstruction, emitPlanNode } from "../emitters.js";
 import { disconnectVTable } from "../utils.js";
 import { buildRowDescriptor } from "../../util/row-descriptor.js";
 import { createRowSlot } from "../context-helpers.js";
-import { REPR_STRICT } from "../strict-flags.js";
+import { COLUMNS_STRICT, REPR_STRICT } from "../strict-flags.js";
 import { assertRowConforms, RepresentationError } from "../strict-representation.js";
 
 /**
@@ -192,6 +192,9 @@ export function emitSeqScan(
 			}
 
 			const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
+			// QUEREUS_COLUMNS_STRICT seam: behave as a module honouring `requiredColumns`
+			// would, so a reader the required-columns analysis missed sees null.
+			const unread = COLUMNS_STRICT ? unreadColumns(effectiveFilterInfo.requiredColumns, schema.columns.length) : undefined;
 			// Engine-to-module access counters for this table, resolved HERE — immediately
 			// after a `query()` that returned — so an entry exists exactly when the engine
 			// issued a call. Resolving it earlier would leave an all-zero entry behind on a
@@ -222,7 +225,7 @@ export function emitSeqScan(
 					: `${schema.schemaName}.${effectiveName}`.toLowerCase());
 			if (tableCounters) tableCounters.queryCalls++;
 			throwIfAborted(runtimeCtx.signal);
-			for await (const row of asyncRowIterable) {
+			for await (const moduleRow of asyncRowIterable) {
 				// Cooperative cancellation checkpoint: a request-timeout (or any
 				// caller abort) interrupts the scan between rows so the whole query
 				// pipeline unwinds promptly instead of draining the table.
@@ -232,7 +235,8 @@ export function emitSeqScan(
 				throwIfAborted(runtimeCtx.signal);
 				// Synchronous and inside this loop on purpose: enabling the flag must not
 				// introduce a microtask hop into the scan's fast path (docs/runtime.md).
-				if (REPR_STRICT) assertRowConforms(row, reprColumnTypes!, reprWhere, reprColumnNames);
+				if (REPR_STRICT) assertRowConforms(moduleRow, reprColumnTypes!, reprWhere, reprColumnNames);
+				const row = unread ? nullColumns(moduleRow, unread) : moduleRow;
 				// Counted HERE — before any downstream operator — so a scan that yields
 				// 10000 rows into a filter passing 3 reports 10000 scanned for the table
 				// and 3 out for the filter instruction. An early-terminating scan (LIMIT,
@@ -344,4 +348,20 @@ function walksOneWindow(plan: SeqScanNode | IndexScanNode | IndexSeekNode): bool
 	if (accessPath?.kind === 'fullScan') return true;
 	const kind = accessPathPlan(accessPath);
 	return kind === 'scan' || kind === 'eqSeek' || kind === 'rangeSeek' || kind === 'prefixRangeSeek';
+}
+
+/** The column indexes `requiredColumns` leaves out, or undefined when it leaves out none. */
+function unreadColumns(requiredColumns: ReadonlySet<number> | undefined, width: number): number[] | undefined {
+	if (!requiredColumns) return undefined;
+	const unread: number[] = [];
+	for (let i = 0; i < width; i++) {
+		if (!requiredColumns.has(i)) unread.push(i);
+	}
+	return unread.length > 0 ? unread : undefined;
+}
+
+function nullColumns(row: Row, columns: readonly number[]): Row {
+	const masked = row.slice();
+	for (const i of columns) masked[i] = null;
+	return masked;
 }

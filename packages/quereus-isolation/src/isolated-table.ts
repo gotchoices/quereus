@@ -495,7 +495,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const overlayFilterInfo = this.adaptFilterInfoForOverlay(filterInfo);
 		const overlayStream = this.queryOverlayAsMergeEntries(
 			overlay, overlayFilterInfo, mergeConfig.compareSortKey ?? mergeConfig.comparePK);
-		const underlyingStream = this.underlyingTable.query!(filterInfo);
+		const underlyingStream = this.underlyingTable.query!(this.underlyingFilterInfoForMerge(filterInfo, []));
 		yield* mergeStreams(overlayStream, underlyingStream, mergeConfig);
 	}
 
@@ -584,7 +584,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 		// Merge two sorted, disjoint streams
 		let oi = 0;
-		for await (const underlyingRow of this.underlyingTable.query!(filterInfo)) {
+		const underlyingFilterInfo = this.underlyingFilterInfoForMerge(filterInfo, indexInfo.columnIndices);
+		for await (const underlyingRow of this.underlyingTable.query!(underlyingFilterInfo)) {
 			if (modifiedPKs.has(pkShadowKey(underlyingRow))) {
 				continue; // Skip rows modified in overlay
 			}
@@ -683,11 +684,31 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * A genuine secondary scan (or the bare `_primary_`) is returned unchanged.
 	 */
 	private adaptFilterInfoForOverlay(filterInfo: FilterInfo): FilterInfo {
-		const path = filterInfo.accessPath;
+		// The merge reads the overlay's tombstone flag, primary key and window columns,
+		// none of which the plan's `requiredColumns` names, and the overlay module is
+		// configurable — so it is never told it may leave columns out.
+		const { requiredColumns: _requiredColumns, ...wholeRows } = filterInfo;
+		const path = wholeRows.accessPath;
 		if (path?.kind === 'index' && path.index.role === 'primary' && path.index.name !== PRIMARY_INDEX_NAME) {
-			return retargetFilterInfoIndex(filterInfo, PRIMARY_INDEX_NAME);
+			return retargetFilterInfoIndex(wholeRows, PRIMARY_INDEX_NAME);
 		}
-		return filterInfo;
+		return wholeRows;
+	}
+
+	/**
+	 * `filterInfo` for the underlying side of a merged read. The merge reads every
+	 * underlying row's primary key (to drop the rows the overlay shadows) and its sort key
+	 * (to interleave the overlay's rows), so those columns join the plan's
+	 * `requiredColumns` before it reaches the module beneath — see docs/module-authoring.md
+	 * § "Required columns". Unchanged when the field is absent (every column).
+	 */
+	private underlyingFilterInfoForMerge(filterInfo: FilterInfo, sortKeyColumns: readonly number[]): FilterInfo {
+		const required = filterInfo.requiredColumns;
+		if (!required) return filterInfo;
+		const widened = new Set(required);
+		for (const index of this.getPrimaryKeyIndices()) widened.add(index);
+		for (const index of sortKeyColumns) widened.add(index);
+		return widened.size === required.size ? filterInfo : { ...filterInfo, requiredColumns: widened };
 	}
 
 	/**

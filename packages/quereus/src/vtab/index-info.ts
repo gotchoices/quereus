@@ -52,9 +52,6 @@ export interface IndexInfo {
 	/** Array of ORDER BY terms */
 	aOrderBy: ReadonlyArray<IndexOrderBy>;
 
-	/** Mask of columns used by the statement (bit N set if column N is used) */
-	colUsed: bigint;
-
 	// --- Outputs ---
 
 	/** Usage details for each constraint */

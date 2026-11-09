@@ -400,12 +400,19 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 	// clause for shared materialization or injects a `CacheNode`. When such a path runs
 	// through a Filter's predicate — a scalar subquery in the `where` reading the CTE —
 	// `FilterNode.withChildren` drops the stamp with nothing left in that pass to
-	// restore it. `filter-selectivity-final` (`PassId.FinalEstimates`, order 37) is what
-	// recovers it, behind every plan-mutating pass.
+	// restore it. The required-columns pass (`PassId.RequiredColumns`, order 36) does the
+	// same to every path down to a scan it narrows — here the CTE body's scan of `o`,
+	// which reads only `cat` and `qty`. `filter-selectivity-final` (`PassId.FinalEstimates`,
+	// order 37) is what recovers it, behind every plan-mutating pass.
 
 	/** The CTE spellings below differ only in what trips the shared-materialization mark. */
 	const PLAIN_CTE_SQL =
 		'WITH c AS (SELECT cat, qty FROM o) '
+		+ "SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) AND o.cat = 'a'";
+	// The plain spelling with the CTE reading every column of `o`, so no scan is narrowed
+	// and nothing behind PostOptimization re-mints the Filter.
+	const PLAIN_WHOLE_ROW_CTE_SQL =
+		'WITH c AS (SELECT * FROM o) '
 		+ "SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) AND o.cat = 'a'";
 	const MATERIALIZED_CTE_SQL =
 		'WITH c AS MATERIALIZED (SELECT cat, qty FROM o) '
@@ -479,9 +486,12 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 			disabledRules: new Set([...(prev.disabledRules ?? []), 'filter-selectivity-final']),
 		});
 
-		expect(subqueryFilterOf(PLAIN_CTE_SQL).selectivity,
-			'no materialization mark here, so the PostOptimization re-stamp is enough')
+		expect(subqueryFilterOf(PLAIN_WHOLE_ROW_CTE_SQL).selectivity,
+			'no materialization mark and no narrowed scan here, so the PostOptimization re-stamp is enough')
 			.to.be.closeTo(1 / ndv['o.qty'], 1e-12);
+		expect(subqueryFilterOf(PLAIN_CTE_SQL).selectivity,
+			'the required-columns pass re-minted this predicate after the PostOptimization re-stamp')
+			.to.be.undefined;
 		expect(subqueryFilterOf(MATERIALIZED_CTE_SQL).selectivity,
 			'the materialization pass re-minted this predicate after the PostOptimization re-stamp')
 			.to.be.undefined;

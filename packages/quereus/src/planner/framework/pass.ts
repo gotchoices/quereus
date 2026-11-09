@@ -14,6 +14,7 @@ import { createLogger } from '../../common/logger.js';
 import { performConstantFolding } from '../analysis/const-pass.js';
 import { createRuntimeExpressionEvaluator, createRuntimeRelationalEvaluator } from '../analysis/const-evaluator.js';
 import { MaterializationAdvisory } from '../cache/materialization-advisory.js';
+import { stampRequiredColumns } from '../analysis/required-columns.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 
@@ -76,6 +77,9 @@ export enum PassId {
 
 	/** Cache materialization advisory — one whole-tree pass */
 	Materialization = 'materialization',
+
+	/** Name the columns the finished plan reads from each table scan — one whole-tree pass */
+	RequiredColumns = 'required-columns',
 
 	/** Re-derive plan estimates that a later-than-Physical pass invalidated */
 	FinalEstimates = 'final-estimates',
@@ -172,6 +176,37 @@ function createMaterializationPass(): OptimizationPass {
 }
 
 /**
+ * Create the required-columns pass: stamp each table scan's `FilterInfo` with the
+ * columns the plan reads from it (see `analysis/required-columns.ts`).
+ *
+ * The answer depends on every operator above the scan, so it is computed once over the
+ * whole plan after the last rewrite that can add or remove a reader — PostOptimization's
+ * rules and the Materialization advisory's CacheNodes (which pass rows through, but are
+ * still nodes the walk must see). It runs ahead of FinalEstimates because re-minting the
+ * path to a stamped scan can drop an estimate stamped on a node along it, and that pass
+ * is what re-derives them.
+ *
+ * Side-effect soundness (OPT-004 — a custom `execute` bypasses `sideEffectMode`
+ * validation): the rewrite changes one field, a scan's `FilterInfo.requiredColumns`, and
+ * re-mints the nodes above each changed scan through `withChildren` with otherwise
+ * identical children. No operator is added, removed, reordered or duplicated, and a
+ * subtree shared by several parents stays shared, so every write runs exactly as often
+ * and in the same order as before.
+ */
+function createRequiredColumnsPass(): OptimizationPass {
+	return {
+		id: PassId.RequiredColumns,
+		name: 'Required Columns',
+		description: 'Name the columns the plan reads from each table scan',
+		traversalOrder: TraversalOrder.BottomUp,
+		rules: [],
+		enabled: true,
+		order: 36,
+		execute: (plan: PlanNode) => stampRequiredColumns(plan),
+	};
+}
+
+/**
  * Standard pass definitions
  */
 export const STANDARD_PASSES: OptimizationPass[] = [
@@ -202,6 +237,8 @@ export const STANDARD_PASSES: OptimizationPass[] = [
 	),
 
 	createMaterializationPass(),
+
+	createRequiredColumnsPass(),
 
 	// Last plan-mutating pass. A node estimate is derived by a rule that holds an
 	// OptContext (node accessors carry none), so any later pass that re-mints the

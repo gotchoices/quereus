@@ -1108,6 +1108,14 @@ Set `QUEREUS_REPR_STRICT=1` (or run `yarn test:repr-strict` from `packages/quere
 
 This harness runs in the root `yarn check` chain via `test:repr-strict`, alongside `test:fork-strict` and `test:context-strict`.
 
+### Strict required-columns test mode
+
+Set `QUEREUS_COLUMNS_STRICT=1` (or run `yarn test:columns-strict` from `packages/quereus`) to make every table scan behave as a module honouring `FilterInfo.requiredColumns` may: the scan emitter (`runtime/emit/scan.ts`) replaces each column the field leaves out with null before the row reaches the plan. A reader the required-columns analysis (`planner/analysis/required-columns.ts`) failed to count then sees null where the module would have handed it the real value, and the test corpus reports the wrong answer. The field and what a module may do with it are described in [module-authoring.md § Required columns](module-authoring.md#required-columns).
+
+The masking sits above the module, so it exercises the engine's half of the contract for every module at once, including the isolation layer in store mode. It does not exercise a wrapping module's own widening (the isolation layer adding its merge keys before it forwards the field to the module beneath); `packages/quereus-isolation/test/required-columns-merge.spec.ts` covers that.
+
+**Cost & gating.** Zero-cost when off: a module-level `COLUMNS_STRICT` boolean guards the per-invocation mask build, and a scan whose `FilterInfo` carries no `requiredColumns` copies no rows even when it is on. This harness runs in the root `yarn check` chain via `test:columns-strict`.
+
 ## Incremental Delta Runtime
 
 Quereus runs a single reusable **change-driven delta kernel** at transaction

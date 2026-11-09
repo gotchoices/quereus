@@ -19,6 +19,7 @@ import { type PlanNode, type RelationalPlanNode, type UpdateSite, type Attribute
 import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
 import { EmissionContext } from '../src/runtime/emission-context.js';
 import { emitPlanNode } from '../src/runtime/emitters.js';
+import { stampRequiredColumns } from '../src/planner/analysis/required-columns.js';
 import { Scheduler } from '../src/runtime/scheduler.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../src/runtime/strict-fork.js';
 import { isAsyncIterable } from '../src/runtime/utils.js';
@@ -2032,7 +2033,9 @@ describe('Property-Based Tests', () => {
 		 */
 		async function materializeNode(node: RelationalPlanNode): Promise<SqlValue[][]> {
 			const emissionContext = new EmissionContext(db);
-			const rootInstruction = emitPlanNode(node, emissionContext);
+			// The plan's scans were told which columns the WHOLE statement reads; run on its
+			// own, this node's output is read whole, so restamp against it.
+			const rootInstruction = emitPlanNode(stampRequiredColumns(node), emissionContext);
 			const scheduler = new Scheduler(rootInstruction);
 			const runtimeCtx: RuntimeContext = {
 				db,

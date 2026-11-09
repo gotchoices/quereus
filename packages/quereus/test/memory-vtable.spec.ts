@@ -74,7 +74,6 @@ describe("Memory VTable Module", () => {
 				aConstraint: [],
 				nOrderBy: 0,
 				aOrderBy: [],
-				colUsed: 0n,
 				aConstraintUsage: [],
 				idxNum: 0,
 				idxStr: '',

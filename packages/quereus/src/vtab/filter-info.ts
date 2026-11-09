@@ -50,6 +50,24 @@ export interface FilterInfo {
 	 * field must be ignored (a slice operator above will buffer-and-discard).
 	 */
 	offset?: number;
+
+	/**
+	 * The table columns (0-based indexes into the table schema's `columns`) the plan
+	 * reads from the rows this scan emits. Present only when the engine has proven the
+	 * set from the final plan — see `planner/analysis/required-columns.ts`. **Absent
+	 * means every column**, so a module narrows its read only on the engine's say-so.
+	 *
+	 * A module may honour it by filling only these columns of each emitted row; every
+	 * other position may hold any valid SQL value (null is the natural choice), and the
+	 * engine never reads it. The row must keep its full width. The module still applies
+	 * its claimed constraints however it does — a constrained column need not be listed
+	 * here when nothing above the scan reads it. Ignoring the field is always correct.
+	 * See `docs/module-authoring.md` § "Required columns".
+	 *
+	 * A module that wraps another (the isolation layer) and reads columns of the rows it
+	 * gets back — to merge by key, say — must add those columns before forwarding it.
+	 */
+	readonly requiredColumns?: ReadonlySet<number>;
 }
 
 /**
@@ -103,7 +121,6 @@ export function makeFullScanFilterInfo(cost = 1_000_000, rows = 1_000_000): Filt
 			aConstraint: [],
 			nOrderBy: 0,
 			aOrderBy: [],
-			colUsed: 0n,
 			aConstraintUsage: [],
 			idxNum: 0,
 			idxStr: FULL_SCAN_IDX_STR,
@@ -131,7 +148,6 @@ export function makeEmptyFilterInfo(): FilterInfo {
 			aConstraint: [],
 			nOrderBy: 0,
 			aOrderBy: [],
-			colUsed: 0n,
 			aConstraintUsage: [],
 			idxNum: 0,
 			idxStr: EMPTY_IDX_STR,
@@ -181,7 +197,6 @@ export function makeIndexEqSeekFilterInfo(
 			aConstraint: constraints.map(c => c.constraint),
 			nOrderBy: 0,
 			aOrderBy: [],
-			colUsed: 0n,
 			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: false })),
 			idxNum: 0,
 			idxStr,

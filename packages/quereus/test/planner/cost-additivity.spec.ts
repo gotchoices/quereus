@@ -183,8 +183,10 @@ describe('Cost model: static convention guard (self-cost-only)', () => {
 			}
 
 			// The vtab leaf's own IndexInfo cost (`indexInfoOutput.estimatedCost`) is a
-			// genuine self-cost — every other `.estimatedCost` read is a child fold.
-			const withoutLeafCost = code.replace(/indexInfoOutput\.estimatedCost/g, '');
+			// genuine self-cost, and so is `this.estimatedCost` — a clone carrying its own
+			// self-cost forward (the scan nodes' `withFilterInfo`). Every other
+			// `.estimatedCost` read is a child fold.
+			const withoutLeafCost = code.replace(/indexInfoOutput\.estimatedCost|this\.estimatedCost/g, '');
 			if (/\.estimatedCost\b/.test(withoutLeafCost)) {
 				offenders.push(`${file}: reads a child's .estimatedCost (self-cost must exclude children)`);
 			}

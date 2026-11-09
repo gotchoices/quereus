@@ -36,3 +36,11 @@ export const CONTEXT_STRICT = readFlag('QUEREUS_CONTEXT_STRICT');
  * single already-false branch. See strict-representation.ts.
  */
 export const REPR_STRICT = readFlag('QUEREUS_REPR_STRICT');
+
+/**
+ * `QUEREUS_COLUMNS_STRICT` — required-columns emulation. Every table scan nulls the
+ * columns its `FilterInfo.requiredColumns` leaves out, as a module honouring that field
+ * may, so a consumer the required-columns analysis missed reads null and produces a
+ * wrong answer the test corpus catches. See planner/analysis/required-columns.ts.
+ */
+export const COLUMNS_STRICT = readFlag('QUEREUS_COLUMNS_STRICT');

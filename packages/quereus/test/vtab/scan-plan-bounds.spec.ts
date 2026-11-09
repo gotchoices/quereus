@@ -31,7 +31,6 @@ function makeRangeFilterInfo(
 		aConstraint,
 		nOrderBy: 0,
 		aOrderBy: [],
-		colUsed: 1n,
 		aConstraintUsage: aConstraint.map((_, i) => ({ argvIndex: i + 1, omit: false })),
 		idxNum: 0,
 		idxStr: null,

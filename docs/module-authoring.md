@@ -702,10 +702,23 @@ interface FilterInfo {
   argIndices: number[];       // Which constraints are provided
   limit?: number;             // Optional row cap (LIMIT pushdown)
   offset?: number;            // Optional kth-row seek (only valid when supportsOrdinalSeek was advertised)
+  requiredColumns?: ReadonlySet<number>; // Columns the plan reads from emitted rows; absent = all
 }
 ```
 
 The module receives individual constraints and returns matching rows.
+
+### Required columns
+
+`FilterInfo.requiredColumns` names the table columns (0-based indexes into the table schema's `columns`) that the plan reads from the rows this scan emits. A column store can use it to skip assembling the rest: for `select count(*) from t` the set is empty, and for `select a from t where b > 1` it is `{a, b}` unless the module claimed `b > 1`, in which case nothing above the scan reads `b` and the set is `{a}`.
+
+- **Absent means every column.** The engine sets the field only when it has proven the set from the final plan, so a module never narrows a read on a guess. Everything the engine cannot see through — `insert`/`update`/`delete` and their `returning`, constraint and foreign-key checks, triggers, set operations, `distinct`, window functions, and any operator the analysis does not model — counts as reading every column, so those scans arrive with the field absent.
+- **Honouring it is optional.** A module that ignores it is correct. A module that honours it fills only the listed columns of each emitted row; every other position may hold any valid SQL value (null is the natural choice) and the engine never reads it. The row keeps the table's full width.
+- **It says nothing about constraints.** A claimed constraint on a column the plan does not read still has to be applied; the column is simply absent from the set because nothing above the scan looks at it afterwards.
+- **A wrapping module adds what it reads.** A module that forwards `FilterInfo` to another module and then reads columns of the rows it gets back must add those columns first. The isolation layer adds the primary-key columns and the walked index's key columns before a merged read, since it merges the overlay and the underlying stream by those keys.
+- **The planning request does not carry it.** `getBestAccessPlan` runs while the plan above the scan is still being rewritten, and a module has no way to carry a planning-time answer into `query()`, so the set is computed once from the final plan and delivered with the `FilterInfo`.
+
+The analysis lives in `planner/analysis/required-columns.ts` (optimizer pass `required-columns`, which runs after materialization and before final estimates). The `QUEREUS_COLUMNS_STRICT=1` harness (`yarn workspace @quereus/quereus test:columns-strict`) nulls every unlisted column at the scan boundary for every module, which turns a consumer the analysis missed into a wrong answer the test corpus catches.
 
 **Pushdown directives**: `FilterInfo.limit` is a *runtime* row cap and — unlike the plan-time `BestAccessPlanRequest.limit` above — genuinely soft: a streaming guard above the leaf enforces the count either way, so ignoring it costs work, never answers. Modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query — modules without ordinal-seek support can ignore both fields safely (a streaming guard above the leaf still enforces correctness).
 

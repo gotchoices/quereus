@@ -112,6 +112,20 @@ export abstract class TableAccessNode extends PlanNode implements UnaryRelationa
 
 	abstract getAccessMethod(): 'sequential' | 'index-scan' | 'index-seek' | 'virtual';
 
+	/**
+	 * Clone whose `FilterInfo` names the columns the plan reads from this scan — the
+	 * stamp `planner/analysis/required-columns.ts` computes from the finished plan;
+	 * undefined (every column) removes it. The clone keeps this node's self-cost and
+	 * every other field.
+	 */
+	withRequiredColumns(requiredColumns: ReadonlySet<number> | undefined): TableAccessNode {
+		const { requiredColumns: _prior, ...filterInfo } = this.filterInfo;
+		return this.withFilterInfo(requiredColumns ? { ...filterInfo, requiredColumns } : filterInfo);
+	}
+
+	/** Same node with a different `FilterInfo` (and this node's self-cost). */
+	protected abstract withFilterInfo(filterInfo: FilterInfo): TableAccessNode;
+
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
 		if (newChildren.length !== 1) {
 			throw new Error(`${this.nodeType} expects 1 child, got ${newChildren.length}`);
@@ -169,6 +183,10 @@ export class SeqScanNode extends TableAccessNode {
 
 	getAccessMethod(): 'sequential' {
 		return 'sequential';
+	}
+
+	protected withFilterInfo(filterInfo: FilterInfo): SeqScanNode {
+		return new SeqScanNode(this.scope, this.source, filterInfo, this.estimatedCost, this.rangeBoundedOn, this.suppressMonotonic);
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -266,6 +284,21 @@ export class IndexScanNode extends TableAccessNode {
 		return 'index-scan';
 	}
 
+	protected withFilterInfo(filterInfo: FilterInfo): IndexScanNode {
+		return new IndexScanNode(
+			this.scope,
+			this.source,
+			filterInfo,
+			this.indexName,
+			this.providesOrdering,
+			this.estimatedCost,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
+			this.orderingLoadBearing,
+		);
+	}
+
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 		const lifted = liftAdvertisement(this.source, this.advertisement);
@@ -350,6 +383,10 @@ export class EmptyResultNode extends TableAccessNode {
 
 	getAccessMethod(): 'sequential' {
 		return 'sequential';
+	}
+
+	protected withFilterInfo(filterInfo: FilterInfo): EmptyResultNode {
+		return new EmptyResultNode(this.scope, this.source, filterInfo, this.estimatedCost);
 	}
 
 	computePhysical(): Partial<PhysicalProperties> {
@@ -504,6 +541,24 @@ export class IndexSeekNode extends TableAccessNode {
 
 	getAccessMethod(): 'index-seek' {
 		return 'index-seek';
+	}
+
+	protected withFilterInfo(filterInfo: FilterInfo): IndexSeekNode {
+		return new IndexSeekNode(
+			this.scope,
+			this.source,
+			filterInfo,
+			this.indexName,
+			this.seekKeys,
+			this.isRange,
+			this.providesOrdering,
+			this.estimatedCost,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
+			this.orderingLoadBearing,
+			this.pushedConstraints,
+		);
 	}
 
 	/**

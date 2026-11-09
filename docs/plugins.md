@@ -1515,7 +1515,6 @@ interface IndexInfo {
   aConstraint: ReadonlyArray<IndexConstraint>;
   nOrderBy: number;
   aOrderBy: ReadonlyArray<IndexOrderBy>;
-  colUsed: bigint;
   
   // Output fields
   aConstraintUsage: IndexConstraintUsage[];
@@ -1540,6 +1539,8 @@ interface FilterInfo {
   constraints: ReadonlyArray<{ constraint: IndexConstraint, argvIndex: number }>;
   args: ReadonlyArray<SqlValue>;
   indexInfoOutput: IndexInfo;
+  /** Columns the plan reads from emitted rows; absent = all. See module-authoring.md § Required columns. */
+  requiredColumns?: ReadonlySet<number>;
 }
 ```
 

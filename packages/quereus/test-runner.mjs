@@ -33,6 +33,9 @@ while (i < args.length) {
 		case '--repr-strict':
 			env.QUEREUS_REPR_STRICT = '1';
 			break;
+		case '--columns-strict':
+			env.QUEREUS_COLUMNS_STRICT = '1';
+			break;
 		case '--show-plan':
 			env.QUEREUS_TEST_SHOW_PLAN = 'true';
 			break;

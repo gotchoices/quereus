@@ -215,7 +215,6 @@ export class TestQueryTable extends VirtualTable {
 				estimatedCost: 100,
 				estimatedRows: 1000n,
 				idxFlags: 0,
-				colUsed: 0n,
 			}
 		});
 	}
