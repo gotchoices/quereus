@@ -638,6 +638,22 @@ rule matching sort keys against a source's claim declines. Explicit NULLS FIRST 
 default and passes. `test/optimizer/explicit-nulls-ordering.spec.ts` covers the module
 path, where a module asked for plain `s asc` would otherwise serve a NULLS LAST sort.
 
+### OPT-064 — A scan's `requiredColumns` names every column the plan reads from it
+
+- code: `packages/quereus/src/planner/analysis/required-columns.ts` — `childDemands`
+- code: `packages/quereus/src/planner/framework/pass.ts` — `createRequiredColumnsPass`
+- guard: `packages/quereus/test-runner.mjs` — `--columns-strict`
+- doc: [Module Authoring § Required columns](module-authoring.md#required-columns)
+
+When a scan's `FilterInfo` carries `requiredColumns`, nothing above the scan reads a column
+outside it, so a module that nulls those columns changes no answer. Every operator
+`childDemands` lists as passing rows through (`Filter`, `Sort`, `LimitOffset`, `Alias`,
+`Cache`, the joins) or as reading through expressions (`Project`, the aggregates) reads its
+input rows only through `ColumnReferenceNode` children, plus the attribute-id fields the walk
+adds by hand (hash and merge join `equiPairs`). An operator that reads a column any other way
+stays off those lists and so reads its inputs whole. The stamp is relative to the plan root:
+a subtree emitted on its own is re-stamped first.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no
