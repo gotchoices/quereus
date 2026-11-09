@@ -363,6 +363,5 @@ function workingTableAttributes(recursiveCTENode: RecursiveCTENode): Attribute[]
 		id: PlanNode.nextAttrId(),
 		name: attr.name,
 		type: attr.type,
-		sourceRelation: attr.sourceRelation,
 	}));
 }
