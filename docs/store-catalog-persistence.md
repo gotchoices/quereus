@@ -235,7 +235,9 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
   collation — an explicit `collate …` projection or a passthrough of a declared-collation
   source column — is keyed under it across the reconcile, while a genuinely-implicit MV
   column keeps the store-default reconcile, like an undecorated base-table PK.) Non-text PK columns (e.g. `integer primary key`) keep their declared
-  collation — collation governs key bytes only for text.
+  collation — collation governs key bytes only for text. The rewrite carries into the
+  primary-key definition's member collation, which the engine's event comparators and the
+  isolation overlay's key windows read (see [Schema § TableSchema](schema.md#tableschema)).
 - **Load path (`connect` / rehydrate).** The load path does **not** reconcile — the
   persisted DDL is the source of truth. The per-column key collation round-trips through
   the column's `COLLATE` clause (`generateTableDDL` elides the default `BINARY`, emits

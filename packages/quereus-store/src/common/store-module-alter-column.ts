@@ -26,6 +26,7 @@ import {
 	describeAlterColumn,
 	foldDefaultToType,
 	planRetypeConversion,
+	rederivePrimaryKeyCollations,
 	validateCollationForType,
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
@@ -138,12 +139,14 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 					ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
 			}))
 			: oldSchema.indexes;
-		const updatedSchema: TableSchema = {
+		// The primary-key definition's member collation follows its column too, as memory's
+		// `buildAlterColumnPlan` does — the engine's key comparators read the definition.
+		const updatedSchema: TableSchema = rederivePrimaryKeyCollations({
 			...oldSchema,
 			columns: Object.freeze(updatedColumns),
 			columnIndexMap: buildColumnIndexMap(updatedColumns),
 			indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
-		};
+		});
 
 		// SET DATA TYPE onto/off a type with a key transform (TIMESPAN's total-seconds
 		// groupKey, JSON's structural encoder — see `storeSemanticKeyTransform`)

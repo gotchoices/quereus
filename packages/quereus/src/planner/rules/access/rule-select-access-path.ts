@@ -1566,13 +1566,9 @@ export function effectivePredicateCollation(constraint: PlannerPredicateConstrai
  * The normalized collation of each key column of the index `indexName` names, keyed by
  * table column index, or undefined when the index cannot be resolved. The index is found
  * through {@link resolveIndexDescriptor}, as every other consumer of the plan finds it, so
- * a module's descriptor or a differently-cased name describes the same index here.
- *
- * A module's own descriptor states its key collations. The engine's primary-key descriptor
- * copies `primaryKeyDefinition[].collation`, which can lag the column: the store's
- * create-time rewrite (`reconcilePkCollations`) re-collates an undecorated text key column
- * and leaves the definition as it was. The key is ordered by the column's collation, so
- * that one reads the column.
+ * a module's descriptor or a differently-cased name describes the same index here. The
+ * engine's primary-key descriptor copies `primaryKeyDefinition[].collation`, which
+ * registration holds equal to the column's (`assertPrimaryKeyCollationsMatchColumns`).
  */
 function resolveIndexKeyCollations(
 	tableSchema: TableSchema,
@@ -1581,11 +1577,8 @@ function resolveIndexKeyCollations(
 ): ReadonlyMap<number, string> | undefined {
 	const index = resolveIndexDescriptor(tableSchema, accessPlan, indexName);
 	if (!index) return undefined;
-	const readsColumnCollation = index.role === 'primary' && index !== accessPlan.indexDescriptor;
-	return new Map(index.keyColumns.map(key => {
-		const declared = readsColumnCollation ? tableSchema.columns[key.columnIndex]?.collation : key.collation;
-		return [key.columnIndex, normalizeCollationName(declared ?? 'BINARY')];
-	}));
+	return new Map(index.keyColumns.map(key =>
+		[key.columnIndex, normalizeCollationName(key.collation ?? 'BINARY')]));
 }
 
 /**

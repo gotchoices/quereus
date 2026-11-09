@@ -530,6 +530,20 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('ROLLBACK');
 		});
+
+		// An undecorated text key reaches NOCASE through the store's CREATE-time column
+		// rewrite; the overlay filters staged rows with the primary-key definition's
+		// collation, so this pins that the definition follows the column.
+		it('an equality read finds a staged row differing in case on an undecorated text key', async () => {
+			await db.exec(`create table people (name text primary key, v text) using store`);
+			await db.exec('BEGIN');
+			await db.exec(`insert into people values ('ALICE', 'x')`);
+
+			const rows = await asyncIterableToArray(db.eval(`select name from people where name = 'alice'`));
+			expect(rows.map(r => r.name)).to.deep.equal(['ALICE']);
+
+			await db.exec('ROLLBACK');
+		});
 	});
 
 	// Secondary-index scan under isolation (store-index-scan-read-primitive): the

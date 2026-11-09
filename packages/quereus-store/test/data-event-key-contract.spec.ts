@@ -260,8 +260,8 @@ describe('data-change event key contract — store module with no emitter (engin
 		]);
 	});
 
-	it('agrees with the store that a NOCASE case-only rewrite moves nothing', async () => {
-		await db.exec('create table t (k text not null collate nocase, v text, primary key (k)) using store');
+	/** Rewrite 'apple' to 'APPLE' in `t` (k, v) and assert it is one in-place `update`. */
+	async function expectCaseOnlyRewriteIsOneUpdate(): Promise<void> {
 		await db.exec("insert into t values ('apple', 'x')");
 		events.length = 0;
 
@@ -270,5 +270,23 @@ describe('data-change event key contract — store module with no emitter (engin
 		assert.deepEqual(events.map(shape), [
 			{ type: 'update', key: ['APPLE'], oldRow: ['apple', 'x'], newRow: ['APPLE', 'x'] },
 		]);
+	}
+
+	it('agrees with the store that a NOCASE case-only rewrite moves nothing', async () => {
+		await db.exec('create table t (k text not null collate nocase, v text, primary key (k)) using store');
+		await expectCaseOnlyRewriteIsOneUpdate();
+	});
+
+	// The engine's comparators read the primary-key definition; these two shapes reach NOCASE
+	// by rewriting the column, so they pin that the definition follows.
+	it('agrees on an undecorated text key, which the store keys under its NOCASE default', async () => {
+		await db.exec('create table t (k text not null, v text, primary key (k)) using store');
+		await expectCaseOnlyRewriteIsOneUpdate();
+	});
+
+	it('agrees on a key column altered to NOCASE', async () => {
+		await db.exec('create table t (k text not null collate binary, v text, primary key (k)) using store');
+		await db.exec('alter table t alter column k set collate nocase');
+		await expectCaseOnlyRewriteIsOneUpdate();
 	});
 });

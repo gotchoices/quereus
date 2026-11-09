@@ -197,15 +197,8 @@ export function reversedIndexDescriptor(tableSchema: TableSchema, indexName: str
 			StatusCode.INTERNAL,
 		);
 	}
-	// The primary key is ordered by each column's collation, which `primaryKeyDefinition` can
-	// lag (the store's create-time PK re-collation). The engine reads the column for its own
-	// primary-key descriptor (`resolveIndexKeyCollations`, rule-select-access-path.ts), but
-	// trusts a supplied one, so this one states the column's collation too.
-	const keyColumns = forward.role === 'primary'
-		? forward.keyColumns.map(key => ({ ...key, collation: tableSchema.columns[key.columnIndex]?.collation }))
-		: forward.keyColumns;
 	// Keep the plan's spelling: `resolveIndexDescriptor` matches a supplied descriptor by name.
-	return { ...forward, name: indexName, keyColumns, reverse: true };
+	return { ...forward, name: indexName, reverse: true };
 }
 
 /**

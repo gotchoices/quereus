@@ -383,6 +383,67 @@ export function pruneStaleColumnStatistics(table: TableSchema): TableSchema {
 	return { ...table, statistics: { ...stats, columnStats: kept } };
 }
 
+/** A primary-key member's or column's collation, as the two are compared. */
+function effectiveKeyCollation(collation: string | undefined): string {
+	return normalizeCollationName(collation || 'BINARY');
+}
+
+/**
+ * Re-derive each `primaryKeyDefinition[i].collation` from its member column.
+ *
+ * The definition's collation is by construction a copy of the column's — no DDL form
+ * gives a key member a collation different from its column (see
+ * {@link assertPrimaryKeyCollationsMatchColumns}). A producer that changes a key
+ * column's `collation` (the store's CREATE-time default, ALTER COLUMN SET COLLATE)
+ * calls this after rewriting `columns`, so the definition every engine consumer reads
+ * (key comparators, primary-key access descriptors, data-change event keys) follows.
+ *
+ * Returns `schema` itself when every member already agrees; otherwise a copy carrying
+ * a fresh frozen definition. Other members' entries are kept as-is.
+ */
+export function rederivePrimaryKeyCollations(schema: TableSchema): TableSchema {
+	let changed = false;
+	const primaryKeyDefinition = schema.primaryKeyDefinition.map(def => {
+		const collation = schema.columns[def.index].collation || 'BINARY';
+		if (effectiveKeyCollation(def.collation) === effectiveKeyCollation(collation)) return def;
+		changed = true;
+		return { ...def, collation };
+	});
+	return changed ? { ...schema, primaryKeyDefinition: Object.freeze(primaryKeyDefinition) } : schema;
+}
+
+/**
+ * Assert that every primary-key member's definition collation equals its column's.
+ *
+ * Consumers read the key collation from either side — the store keys from the column,
+ * the engine's event and isolation-overlay comparators from the definition — so a
+ * disagreement makes them address the same row differently. Checked at registration
+ * (`Schema.addTable`) so a producer that forgets to call
+ * {@link rederivePrimaryKeyCollations} fails in tests rather than in whichever consumer
+ * happens to read the stale side. A mismatch is a producer bug, hence `INTERNAL`.
+ */
+export function assertPrimaryKeyCollationsMatchColumns(table: TableSchema): void {
+	for (const def of table.primaryKeyDefinition) {
+		const col = table.columns[def.index];
+		if (!col) {
+			quereusError(
+				`Table '${table.schemaName}.${table.name}': primary key column index ${def.index} out of range `
+					+ `(${table.columns.length} columns)`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const defCollation = effectiveKeyCollation(def.collation);
+		const colCollation = effectiveKeyCollation(col.collation);
+		if (defCollation !== colCollation) {
+			quereusError(
+				`Table '${table.schemaName}.${table.name}': primary key definition collation ${defCollation} `
+					+ `for column '${col.name}' disagrees with the column's collation ${colCollation}`,
+				StatusCode.INTERNAL,
+			);
+		}
+	}
+}
+
 /**
  * Builds a map from column names to their indices in the columns array
  *

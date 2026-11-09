@@ -225,7 +225,7 @@ export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewA
 // free spelling). Exported for out-of-tree vtab modules that mint their own constraint
 // names on an ALTER path — a parallel implementation is exactly the drift the differential
 // tests exist to catch.
-export { buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, disambiguateAutoConstraintName, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
+export { buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, disambiguateAutoConstraintName, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey, rederivePrimaryKeyCollations } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateChecksOverExistingRows, validateRowInvariantChecksOverExistingRows, validateForeignKeyOverExistingRows, validateAddedForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators

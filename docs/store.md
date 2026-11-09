@@ -952,7 +952,7 @@ under `BINARY`, not under the table key collation `K` — matching the `BINARY` 
 compares it under, so its range seeks and PK-order advertisement stand and its uniqueness
 is enforced bytewise. An `any` PK member keys under its declared collation (BINARY unless
 an explicit non-BINARY `COLLATE` is declared — the K-reconcile skips non-text columns).
-See "Per-column PK key collation" in [schema.md](schema.md).
+See [Per-column PK key collation](store-catalog-persistence.md#per-column-pk-key-collation).
 (A declared-`json` member takes no collation at all: its transform hands `encodeValue` a
 `Uint8Array`, which the BLOB path encodes verbatim — no normalizer runs.)
 

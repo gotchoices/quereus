@@ -9,7 +9,7 @@
  */
 
 import type { ForeignKeyConstraintSchema, TableSchema } from '@quereus/quereus';
-import { buildColumnIndexMap } from '@quereus/quereus';
+import { buildColumnIndexMap, rederivePrimaryKeyCollations } from '@quereus/quereus';
 
 /**
  * Reconcile each text PRIMARY KEY column's declared collation at CREATE time.
@@ -34,7 +34,9 @@ import { buildColumnIndexMap } from '@quereus/quereus';
  * (BINARY-elided) `COLLATE` clause round-trips the per-column key collation.
  *
  * Returns the schema unchanged when no implicit text PK column needs the default
- * applied; otherwise a new schema with a rebuilt `columns` array + `columnIndexMap`.
+ * applied; otherwise a new schema with a rebuilt `columns` array + `columnIndexMap`
+ * and a `primaryKeyDefinition` whose member collations follow the rewritten columns
+ * (`Schema.addTable` rejects a definition that disagrees with its columns).
  */
 export function reconcilePkCollations(
 	schema: TableSchema,
@@ -72,7 +74,7 @@ export function reconcilePkCollations(
 
 	if (!changed) return schema;
 	const columns = Object.freeze(newColumns);
-	return { ...schema, columns, columnIndexMap: buildColumnIndexMap(columns) };
+	return rederivePrimaryKeyCollations({ ...schema, columns, columnIndexMap: buildColumnIndexMap(columns) });
 }
 
 /**

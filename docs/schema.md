@@ -37,6 +37,12 @@ A named logical grouping of tables, views, functions, and assertions. Every data
 
 Columns, primary key definition, CHECK constraints, associated virtual table module, indexes, and mutation context definitions. A module-backed (physical) table always has `vtabModule` / `vtabModuleName`; a **logical** table (`isLogical: true`, held only in a lens slot — never registered or executed) carries no module, so `vtabModule` is optional (use `requireVtabModule(table)` at module-backed sites). An optional `tags` field holds arbitrary key-value metadata (see `WITH TAGS`) — likewise on the other schema-object types below.
 
+**Primary-key member collation.**
+
+> **Invariant:** [SCH-006](invariants.md#sch-006--a-primary-key-members-definition-collation-equals-its-columns)
+
+Each `primaryKeyDefinition[i].collation` is a copy of its member column's `collation`; no DDL form gives a key member a collation of its own. A module that changes a key column's collation — the store's CREATE-time key default, `alter column … set collate` on either backend — rewrites the definition with it (`rederivePrimaryKeyCollations`, or `rekeySchemaPrimaryKey` for `alter primary key`), and `Schema.addTable` refuses a schema where the two disagree.
+
 ### ColumnSchema
 
 A single column: name, logical type, nullability, primary key membership, default value expression, collation, and whether it is generated. Columns default to NOT NULL (Third Manifesto) unless `pragma default_column_nullability = 'nullable'`.

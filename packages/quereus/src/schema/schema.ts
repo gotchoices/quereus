@@ -1,4 +1,4 @@
-import { pruneStaleColumnStatistics, type TableSchema } from './table.js';
+import { assertPrimaryKeyCollationsMatchColumns, pruneStaleColumnStatistics, type TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import { getFunctionKey } from './function.js';
 import type { ViewSchema } from './view.js';
@@ -63,7 +63,8 @@ export class Schema {
 	 *
 	 * @param table The table schema object
 	 * @returns The schema actually registered — `table` itself unless it needed correcting
-	 * @throws QuereusError if a view with the same name exists
+	 * @throws QuereusError if a view with the same name exists, or (`INTERNAL`) if a
+	 *   primary-key member's definition collation disagrees with its column's
 	 */
 	addTable(table: TableSchema): TableSchema {
 		// Ensure no view conflict (maintained tables — materialized views — live
@@ -76,6 +77,9 @@ export class Schema {
 		// every registration passes through (CREATE TABLE, each module's ALTER result,
 		// ANALYZE's own write, the store's reopen-time stamp).
 		const registered = pruneStaleColumnStatistics(table);
+		// Same seam, same reason: a key member's definition collation must equal its
+		// column's — see {@link assertPrimaryKeyCollationsMatchColumns}.
+		assertPrimaryKeyCollationsMatchColumns(registered);
 		this.tables.set(table.name.toLowerCase(), registered);
 		return registered;
 	}

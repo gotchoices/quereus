@@ -1254,6 +1254,23 @@ answer is identical on every backend and a refusal persists nothing. The compari
 structure. Sharing a name makes one constraint enforce under a structure keyed on the other's
 columns, silently accepting duplicates. Import/rehydrate is unguarded so older catalogs open.
 
+### SCH-006 — A primary-key member's definition collation equals its column's
+
+- code: `packages/quereus/src/schema/table.ts` — `rederivePrimaryKeyCollations`
+- code: `packages/quereus-store/src/common/store-module-schema-rewrite.ts` — `reconcilePkCollations`
+- code: `packages/quereus/src/vtab/memory/layer/alter-column.ts` — `buildAlterColumnPlan`
+- guard: `packages/quereus/src/schema/table.ts` — `assertPrimaryKeyCollationsMatchColumns` (called by `Schema.addTable` on every registration)
+- doc: [Schema § TableSchema](schema.md#tableschema)
+
+`primaryKeyDefinition[i].collation` equals `columns[primaryKeyDefinition[i].index].collation`
+(each read as `BINARY` when absent, compared case-insensitively) in every registered table
+schema. Consumers read the key collation from either side: the store encodes key bytes from
+the column, while the engine's data-change event comparators and the isolation overlay's
+primary-key seek windows read the definition. Every producer that changes a key column's
+collation rewrites the definition in the same schema. A disagreement makes one row two
+different keys — a staged row a seek cannot find, a case-only update reported as a delete
+plus an insert.
+
 ## SYNC — Sync
 
 ### SYNC-001 — All DDL in a sync batch applies before any DML
