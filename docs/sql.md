@@ -460,7 +460,12 @@ qualifier          = "old" | "new" ;
 create_table_stmt  = "create" "table" [ "if" "not" "exists" ]
                      table_name "(" column_def { "," ( column_def | table_constraint ) } ")"
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ]
-                     { context_def_clause | tags_clause } ;
+                     { maintained_clause | context_def_clause | tags_clause } ;
+                     /* each trailing clause at most once, in any order */
+
+/* Declared-shape maintained table; see materialized-views.md. The body's own
+   trailing "with defaults (...)" belongs to the select, not to this clause. */
+maintained_clause  = "maintained" [ "(" identifier { "," identifier } ")" ] "as" select_stmt ;
 
 context_def_clause = "with" "context" "(" context_var_def { "," context_var_def } ")" ;
 

@@ -2754,6 +2754,9 @@ export class Parser {
 		const clauses: TableTrailingClauses = {};
 		for (;;) {
 			if (this.peekKeyword('MAINTAINED')) {
+				// NOTE: reached only when a `with` clause separates the two; a second `maintained`
+				// directly after a body is read as the body's bare alias and fails on `as` instead.
+				// If that message confuses users, bar `maintained` from the alias slot during the body.
 				if (clauses.maintained) {
 					throw this.error(this.peek(), "Duplicate MAINTAINED clause");
 				}
