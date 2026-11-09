@@ -128,7 +128,9 @@ time instead (also below). `emitCTE` (`src/runtime/emit/cte.ts`) then evaluates 
 marked CTE **exactly once per statement execution**, matching standard SQL
 `MATERIALIZED` semantics:
 
-- Every `CTEReferenceNode` emits its own copy of the CTE's source subtree
+- Each FROM mention of a CTE gets its own `CTEReferenceNode`, even two mentions
+  under the same name, so the advisory's reference count is the number of
+  mentions. Every `CTEReferenceNode` emits its own copy of the CTE's source subtree
   (`emitPlanNode` has no memoization). References usually share one `CTENode`
   instance, but that is not guaranteed — the constant-folding pass rebuilds a
   node reachable from two parents once per parent path — so the buffer key is
@@ -279,6 +281,8 @@ not `emitCTE`, but follow the same buffer-once-replay pattern when referenced
 - A multi-referenced recursive CTE whose body **reads an outer query's row** is
   refused at planning with `StatusCode.UNSUPPORTED` and an error naming the CTE.
   Sharing replays the first outer row, and not sharing brings back the runaway
-  above. Two mentions under one `WITH` alias can share one `CTEReferenceNode`; that
-  counts as one reference, so that shape streams and is not refused.
+  above. Every FROM mention counts, so two scalar subqueries that each name `c` are
+  refused the same as a self-join of `c`: each mention drives the recursion with the
+  same working-table descriptor, and the planner cannot tell mentions that run one
+  after the other from mentions that interleave.
 

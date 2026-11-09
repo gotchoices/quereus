@@ -18,10 +18,6 @@ import type { PlanningContext } from './planning-context.js';
  *    by `buildWithContext` from the body statement, not inherited. Clearing here is what
  *    closes the write path: `select-context.ts` falls back to `ctx.cteNodes` whenever the
  *    explicit `parentCTEs` argument is empty, so passing an empty map is not sufficient.
- *  - `cteReferenceCache` → cleared, so the body's own CTE references get fresh
- *    `CTEReferenceNode`s. The cache is keyed by bare `cteName:alias`, so a caller CTE and
- *    a body-local CTE that share a name would otherwise collide on the same entry and the
- *    body would read the caller's relation.
  *  - `storedBodyOf` → `schemaName`, marking this context AS that body's home environment.
  *    A write through a view is not executed as the body plan — it is *lowered* into a
  *    base-table INSERT/UPDATE/DELETE, and definition-derived fragments copied into that
@@ -59,7 +55,6 @@ export function storedBodyContext(ctx: PlanningContext, schemaName: string): Pla
 		...ctx,
 		schemaPath: ctx.db._homeSchemaPath(schemaName),
 		cteNodes: undefined,
-		cteReferenceCache: undefined,
 		storedBodyOf: schemaName,
 	};
 }

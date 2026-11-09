@@ -40,7 +40,6 @@ describe('View Mutation Substrate (single-source parity)', () => {
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
@@ -130,7 +129,6 @@ describe('View Mutation Substrate (cross-source cardinality)', () => {
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
@@ -170,7 +168,6 @@ describe('View Mutation Substrate (cross-source cardinality)', () => {
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
@@ -201,7 +198,6 @@ describe('View Mutation Substrate (with defaults unknown column)', () => {
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
@@ -242,7 +238,6 @@ describe('View Mutation Substrate (ordered multi-capture)', () => {
 			cteNodes: new Map(),
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
 			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};

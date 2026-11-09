@@ -78,7 +78,6 @@ function makeCtx(db: Database): PlanningContext {
 		cteNodes: new Map(),
 		schemaDependencies: new BuildTimeDependencyTracker(),
 		schemaCache: new Map(),
-		cteReferenceCache: new Map(),
 		cteDescriptors: new Map(),
 		outputScopes: new Map(),
 	};
@@ -3508,7 +3507,6 @@ describe('lens enforcement: parent-side FK is lens-routed-only (basis-direct DML
 				cteNodes: new Map(),
 				schemaDependencies: new BuildTimeDependencyTracker(),
 				schemaCache: new Map(),
-				cteReferenceCache: new Map(),
 				cteDescriptors: new Map(),
 				outputScopes: new Map(),
 			};

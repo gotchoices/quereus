@@ -5,7 +5,6 @@ import type { SchemaManager } from '../schema/manager.js';
 import type { Scope } from './scopes/scope.js';
 import type { PlanNode, ScalarPlanNode, TableDescriptor } from './nodes/plan-node.js';
 import type { CTEScopeNode } from './nodes/cte-node.js';
-import type { CTEReferenceNode } from './nodes/cte-reference-node.js';
 import type { RestorableRows } from '../vtab/rollback-states.js';
 
 /**
@@ -194,12 +193,6 @@ export interface PlanningContext {
   readonly schemaCache: Map<string, any>;
 
   /**
-   * Cache for CTE reference nodes to ensure consistent attribute IDs across multiple references
-   * to the same CTE with the same alias. Key format: "cteName:alias"
-   */
-  cteReferenceCache?: Map<string, CTEReferenceNode>;
-
-  /**
    * Per-statement memo of CTE runtime identities, keyed by the source `with` member.
    * Every `CTENode` built from one member — however many times the builders re-plan
    * that member (the view write-through path re-enters the same statement builder,
@@ -209,7 +202,7 @@ export interface PlanningContext {
    * than by nothing having re-planned it. Keyed on the AST member OBJECT, not its
    * name, so a nested statement's same-named member keeps its own identity.
    *
-   * REQUIRED (unlike the optional `cteNodes` / `cteReferenceCache` scope plumbing):
+   * REQUIRED (unlike the optional `cteNodes` scope plumbing):
    * a context missing it would silently mint one descriptor per build, which both
    * doubles a re-planned member's write and blinds `buildBlock`'s unreferenced-member
    * scan. Every context factory must supply a fresh map per statement build.

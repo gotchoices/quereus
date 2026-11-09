@@ -5,8 +5,9 @@
 -- the query names `c`. Every mention then replays one buffer of RETURNING rows.
 --
 -- This held only accidentally before: buffering was gated on the CTE's parent count
--- (two mentions sharing an alias collapse to ONE reference node, so the gate read
--- "referenced once") and the buffer was keyed on the plan node's id (which the
+-- (two mentions sharing an alias then collapsed to ONE reference node, so the gate
+-- read "referenced once" -- an undercount since fixed, each mention now gets its own
+-- reference node) and the buffer was keyed on the plan node's id (which the
 -- constant-folding pass can split into several ids for one CTE). A `values`-bodied
 -- INSERT folds to a table literal and hit both; a `select`-bodied one hit only the
 -- first. Both body shapes are covered below.

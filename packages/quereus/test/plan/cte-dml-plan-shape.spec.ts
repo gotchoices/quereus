@@ -209,8 +209,9 @@ function cteNodes(root: PlanNode): CTENode[] {
  *  1. **every** `CTENode` instance in the optimized plan carries `materialize = true`
  *     — set at build time in planner/building/with.ts rather than left to the
  *     reference-count gate in planner/cache/materialization-advisory.ts, which
- *     undercounts (two mentions sharing an alias collapse to one
- *     `CTEReferenceNode`, so the `CTENode` shows a single parent), and
+ *     honors a `NOT MATERIALIZED` hint that would license a second write (and at
+ *     the time also undercounted: two mentions sharing an alias collapsed to one
+ *     `CTEReferenceNode`, since fixed), and
  *  2. all those instances share **one** `tableDescriptor` object — the key
  *     `emitCTE` uses for its per-execution buffer. The optimizer does not promise a
  *     single instance: the constant-folding pass (planner/analysis/const-pass.ts)

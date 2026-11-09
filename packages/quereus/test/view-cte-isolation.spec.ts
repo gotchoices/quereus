@@ -6,9 +6,12 @@
  * matched a source the view's body read would silently shadow it — three
  * independent leak channels (the explicit `cteNodes` argument passed into the
  * body plan, `select-context.ts`'s fallback to `ctx.cteNodes` when that
- * argument was empty, and the shared, in-place-mutated `cteReferenceCache`).
- * `storedBodyContext` (`src/planner/stored-body-context.ts`) closes all three
- * by clearing both on the context a stored body plans under.
+ * argument was empty, and a statement-wide cache of CTE reference nodes keyed
+ * by bare `cteName:alias`). `storedBodyContext`
+ * (`src/planner/stored-body-context.ts`) closes the first two by clearing
+ * `cteNodes` on the context a stored body plans under; the third is closed
+ * because that cache no longer exists — every FROM mention of a CTE builds its
+ * own reference node.
  */
 
 import { expect } from 'chai';
@@ -68,10 +71,11 @@ describe('CTE namespace isolation for stored view bodies', () => {
 	});
 
 	it("isolates the view's OWN body-local CTE from a same-named caller CTE referenced in the caller's own FROM", async () => {
-		// This is the third, independently-discovered leak channel: the shared
-		// `cteReferenceCache` is keyed by bare `cteName:alias`, so a caller CTE `c`
-		// and the view body's own CTE `c` collided on the same cache entry even
-		// after the `cteNodes` map itself was isolated.
+		// This was the third, independently-discovered leak channel: a former
+		// statement-wide cache of CTE reference nodes was keyed by bare
+		// `cteName:alias`, so a caller CTE `c` and the view body's own CTE `c`
+		// collided on the same cache entry even after the `cteNodes` map itself
+		// was isolated. The cache has since been removed.
 		await db.exec('create table main.ct (id integer primary key, x integer)');
 		await db.exec('insert into main.ct values (1, 10)');
 		await db.exec('create view main.cv as with c as (select id, x from ct) select id, x from c');

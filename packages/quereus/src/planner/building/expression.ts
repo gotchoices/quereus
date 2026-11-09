@@ -187,15 +187,9 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
     case 'subquery': {
        // For scalar subqueries, create a context that allows correlation
        // The buildSelectStmt will create the proper scope chain with subquery tables taking precedence
-       // CRITICAL: Share the cteReferenceCache to ensure consistent attribute IDs across contexts
-       logger(`Building scalar subquery - ctx.cteReferenceCache size: ${ctx.cteReferenceCache?.size ?? 'undefined'}`);
-       const subqueryContext = {
-         ...ctx,
-         cteReferenceCache: ctx.cteReferenceCache || new Map()
-       };
        // Preserve input columns in scalar subqueries to ensure correlated predicates
        // have access to all underlying attributes.
-       const subqueryPlan = buildExpressionPositionQueryExpr(subqueryContext, expr.query, true, 'scalar subquery');
+       const subqueryPlan = buildExpressionPositionQueryExpr(ctx, expr.query, true, 'scalar subquery');
        logger(`Building scalar subquery with preserveInputColumns=true`);
        // Validate that scalar subquery returns exactly one column
        const scalarSubqueryType = subqueryPlan.getType();
@@ -249,11 +243,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 
        if (expr.subquery) {
          // IN subquery: expr IN (<QueryExpr>)
-         const inSubqueryContext = {
-           ...ctx,
-           cteReferenceCache: ctx.cteReferenceCache || new Map()
-         };
-         const inSubqueryPlan = buildExpressionPositionQueryExpr(inSubqueryContext, expr.subquery, true, 'IN subquery');
+         const inSubqueryPlan = buildExpressionPositionQueryExpr(ctx, expr.subquery, true, 'IN subquery');
          // Validate that subquery returns exactly one column
          const subqueryType = inSubqueryPlan.getType();
          if (subqueryType.typeClass === 'relation' && (subqueryType as RelationType).columns.length !== 1) {
@@ -279,11 +269,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 
     case 'exists': {
        // Build the EXISTS subquery
-       const existsSubqueryContext = {
-         ...ctx,
-         cteReferenceCache: ctx.cteReferenceCache || new Map()
-       };
-       const existsSubqueryPlan = buildExpressionPositionQueryExpr(existsSubqueryContext, expr.subquery, true, 'EXISTS subquery');
+       const existsSubqueryPlan = buildExpressionPositionQueryExpr(ctx, expr.subquery, true, 'EXISTS subquery');
        return new ExistsNode(ctx.scope, expr, existsSubqueryPlan);
 		}
 

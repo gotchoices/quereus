@@ -10,8 +10,8 @@ import type { PlanningContext } from '../planning-context.js';
  * anchor key default on a view write-through, the anchor BASE table's schema — not
  * the view's).
  *
- * Clears the two CTE-related fields so no statement's common table expressions — the
- * writing statement's own leading `with` clause, or ones it inherited from an enclosing
+ * Clears the CTE namespace so no statement's common table expressions — the writing
+ * statement's own leading `with` clause, or ones it inherited from an enclosing
  * statement — can shadow a real table out from under someone else's DDL:
  *
  *  - `cteNodes` → cleared, so `default (select count(*) from c)` keeps meaning the
@@ -19,11 +19,6 @@ import type { PlanningContext } from '../planning-context.js';
  *    CONTEXT is what closes it: `buildWithContext` seeds its map from `ctx.cteNodes`
  *    and prefers a non-empty explicit `parentCTEs` argument over it, so handing an
  *    empty map downstream is not sufficient.
- *  - `cteReferenceCache` → cleared for the same reason
- *    {@link import('../stored-body-context.js').storedBodyContext} clears it: the cache
- *    is keyed on bare `cteName:alias`, so a caller definition and one declared inside a
- *    `check` subquery's own `with` clause would collide on a single entry and the
- *    schema-authored SQL would read the caller's relation.
  *
  * And narrows the schema search path:
  *
@@ -69,7 +64,6 @@ import type { PlanningContext } from '../planning-context.js';
 export function schemaAuthoredContext(ctx: PlanningContext, schemaName: string): PlanningContext {
 	// Identity fast-path only when nothing would actually change: the CTE namespace is
 	// already empty AND the path is already exactly the owning schema.
-	if (!ctx.cteNodes && !ctx.cteReferenceCache
-		&& ctx.schemaPath?.length === 1 && ctx.schemaPath[0] === schemaName) return ctx;
-	return { ...ctx, cteNodes: undefined, cteReferenceCache: undefined, schemaPath: [schemaName] };
+	if (!ctx.cteNodes && ctx.schemaPath?.length === 1 && ctx.schemaPath[0] === schemaName) return ctx;
+	return { ...ctx, cteNodes: undefined, schemaPath: [schemaName] };
 }

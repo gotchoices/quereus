@@ -26,7 +26,6 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
-import { createLogger } from '../../common/logger.js';
 import { AliasNode } from '../nodes/alias-node.js';
 import { AssertedKeysNode } from '../nodes/asserted-keys-node.js';
 import { computeLensAssertedKeyFds } from '../../schema/lens-prover.js';
@@ -47,8 +46,6 @@ import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-
-const logger = createLogger('planner:cte');
 
 /**
  * Creates a logical query plan for a SELECT statement.
@@ -532,25 +529,11 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 
 				columnScope = registerColumnScope(fromTable, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 			} else {
-				// Regular CTE reference - cache by CTE name + alias to ensure consistent attribute IDs
-				const cacheKey = `${tableName}:${fromClause.alias || tableName}`;
-
-				// Initialize cache if not exists
-				if (!parentContext.cteReferenceCache) {
-					parentContext.cteReferenceCache = new Map();
-				}
-
-				let cteRefNode: CTEReferenceNode;
-				if (parentContext.cteReferenceCache.has(cacheKey)) {
-					cteRefNode = parentContext.cteReferenceCache.get(cacheKey)!;
-					const attrs = cteRefNode.getAttributes();
-					logger(`Using cached CTE reference ${cacheKey}, attrs=[${attrs.map(a => a.id).join(',')}]`);
-				} else {
-					cteRefNode = new CTEReferenceNode(parentContext.scope, cteNode as CTEPlanNode, fromClause.alias);
-					parentContext.cteReferenceCache.set(cacheKey, cteRefNode);
-					const attrs = cteRefNode.getAttributes();
-					logger(`Created new CTE reference ${cacheKey}, attrs=[${attrs.map(a => a.id).join(',')}]`);
-				}
+				// Every mention gets its own reference node: the materialization advisory
+				// counts the CTE's parents to decide whether to store its rows once, so
+				// mentions must not share a node. All of them still point at the one
+				// CTENode, whose descriptor keys the shared row buffer.
+				const cteRefNode = new CTEReferenceNode(parentContext.scope, cteNode as CTEPlanNode, fromClause.alias);
 
 				columnScope = registerColumnScope(cteRefNode, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 

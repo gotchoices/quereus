@@ -150,10 +150,9 @@ export class MaterializationAdvisory {
 	 *
 	 * A CTE with a data-modifying body never reaches here: it is built with
 	 * `materialize` already true, and the caller's `!node.materialize` guard short-
-	 * circuits. That is deliberate — this gate would get it wrong, because it reads a
-	 * reference count that undercounts (two mentions sharing an alias share one
-	 * CTEReferenceNode) and honors a NOT MATERIALIZED hint that would license a
-	 * second write.
+	 * circuits. That is deliberate — this gate honors a NOT MATERIALIZED hint that
+	 * would license a second write, and the write-once guarantee should not depend on
+	 * the reference count being right.
 	 *
 	 * Recursive CTEs ({@link RecursiveCTENode}) do NOT flow through here — they run
 	 * through the working-table machinery (emitRecursiveCTE), not emitCTE, and are

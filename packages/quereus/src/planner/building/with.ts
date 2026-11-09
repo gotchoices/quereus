@@ -195,15 +195,16 @@ export function buildCommonTableExpr(
 	// per statement execution no matter how many times the CTE is named, so
 	// `materialize` is forced on here rather than left to the advisory pass, and the
 	// hint is overridden (NOT MATERIALIZED on a writing body would license a second
-	// write). Rationale and the reference-count undercount it works around are in
-	// docs/runtime-caching.md § Shared CTE materialization.
+	// write). Deciding it here also keeps the write-once guarantee independent of the
+	// advisory's reference count. Rationale in docs/runtime-caching.md § Shared CTE
+	// materialization.
 	//
 	// NOTE: this also takes a data-modifying CTE off the streaming path, so its whole
 	// RETURNING set is held in memory for the statement even when referenced once and
 	// consumed under a LIMIT. Unavoidable for the multi-reference case, and today's
 	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
-	// buffering would have to become conditional on the reference count — which means
-	// first fixing that undercount, not relaxing this flag.
+	// buffering could become conditional on the reference count (one FROM mention, no
+	// replay needed), while still overriding a NOT MATERIALIZED hint.
 	//
 	// Resolve the CTE's runtime identity through the per-statement memo
 	// (PlanningContext.cteDescriptors): every build of THIS source member within one

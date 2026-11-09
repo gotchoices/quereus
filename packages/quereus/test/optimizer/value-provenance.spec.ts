@@ -30,7 +30,6 @@ function builtPlan(db: Database, sql: string): PlanNode {
 		cteNodes: new Map(),
 		schemaDependencies: new BuildTimeDependencyTracker(),
 		schemaCache: new Map(),
-		cteReferenceCache: new Map(),
 		cteDescriptors: new Map(),
 		outputScopes: new Map(),
 	};

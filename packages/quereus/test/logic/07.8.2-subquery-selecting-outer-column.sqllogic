@@ -85,14 +85,14 @@ select a, (with c as not materialized (select t.b as x from u) select c1.x + c2.
 select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+2) select max(x) from c) as v from t order by a;
 → [{"a":1,"v":7},{"a":2,"v":-3},{"a":3,"v":11}]
 
--- Two mentions under one alias share one reference, so this is not refused.
-select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+2) select (select max(x) from c) + (select min(x) from c)) as v from t order by a;
-→ [{"a":1,"v":12},{"a":2,"v":-8},{"a":3,"v":20}]
-
 -- ===== Refused: cannot be re-run safely and cannot be shared =====
 
 -- Non-deterministic with two references: re-running gives the references different values.
 select a, (with c as (select t.b + random() as x from u) select c1.x + c2.x from c c1 join c c2 on 1=1) as v from t;
+-- error: CTE 'c' reads a column of an outer query
+
+-- Two mentions under one name are two references too.
+select a, (with c as (select t.b + random() as x from u) select (select max(x) from c) + (select min(x) from c)) as v from t;
 -- error: CTE 'c' reads a column of an outer query
 
 -- Non-deterministic with the hint.
@@ -113,6 +113,13 @@ select a, (with c as not materialized (select t.b + random() as x from u) select
 
 -- Recursive with two references: sharing replays the first row, and not sharing runs away.
 select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+1) select max(c1.x + c2.x) from c c1 join c c2 on 1=1) as v from t;
+-- error: Recursive CTE 'c' reads a column of an outer query
+
+-- Two mentions under one name count as two references, so this is refused for the same
+-- reason. These two happen to run one after the other, but each drives the recursion with
+-- the same working table, and the planner cannot tell them apart from mentions that
+-- interleave as in the self-join above.
+select a, (with recursive c(x) as (select t.b union all select x+1 from c where x < t.b+2) select (select max(x) from c) + (select min(x) from c)) as v from t order by a;
 -- error: Recursive CTE 'c' reads a column of an outer query
 
 -- A constant expression in the body makes folding split the WITH query into one copy per

@@ -1,5 +1,6 @@
 -- adapted from SQLite test/with1.test, test/with2.test, test/with3.test, test/with4.test
--- CTE surface gaps: CTE name shadowing a base table, VALUES as CTE source,
+-- CTE surface gaps: CTE name shadowing a base table or an outer CTE, one CTE
+-- name mentioned twice, VALUES as CTE source,
 -- LIMIT applied inside a recursive CTE definition, nested WITH inside a recursive
 -- CTE base case, and CTE used inside a VIEW definition.
 
@@ -20,6 +21,30 @@ select id, val from cte_t order by id;
 → [{"id":1,"val":"base"},{"id":2,"val":"base2"}]
 
 drop table cte_t;
+
+-- A nested WITH that reuses an outer WITH's name reads its own rows, and the outer
+-- mention keeps reading the outer rows, whichever is built first.
+with c as (select 1 as x)
+select (select x from c) as a, (with c as (select 2 as x) select x from c) as b;
+→ [{"a":1,"b":2}]
+
+with c as (select 1 as x)
+select * from (with c as (select 2 as x) select x from c) s join c on 1=1;
+→ [{"x":2,"x:1":1}]
+
+-- =============================================================================
+-- One WITH name mentioned twice counts as two references, so the body is stored
+-- once and both mentions see the same non-deterministic value.
+-- =============================================================================
+
+create table cte_one (id integer primary key);
+insert into cte_one values (1);
+
+with c as (select random() as x from cte_one)
+select (select max(x) from c) = (select min(x) from c) as same;
+→ [{"same":true}]
+
+drop table cte_one;
 
 -- =============================================================================
 -- VALUES clause as direct CTE source — now supported via the orthogonal
