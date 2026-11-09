@@ -51,6 +51,13 @@ const DECLARE_ITEM_KEYWORDS: ReadonlySet<string> = new Set([
 /** Leading keyword of a `declare lens { … }` override; same separator-less shape. */
 const LENS_OVERRIDE_KEYWORDS: ReadonlySet<string> = new Set(['VIEW']);
 
+/** The optional clauses after a table's column list and module clause. */
+interface TableTrailingClauses {
+	maintained?: AST.MaintainedClause;
+	contextDefinitions?: AST.MutationContextVar[];
+	tags?: Record<string, SqlValue>;
+}
+
 /**
  * IMPORTANT: Any changes to parsed syntax must also be reflected in the corresponding emitters:
  *   - packages/quereus/src/emit/ast-stringify.ts          (AST-to-SQL string conversion)
@@ -2686,33 +2693,7 @@ export class Parser {
 		}
 
 		const moduleClause = this.parseModuleClause();
-
-		// Optional `maintained as <body … with defaults (…)>` clause — the declared-shape
-		// maintained-table form. `maintained` is contextual (an IDENTIFIER lexeme match), and
-		// this position (after the column list / USING clause, before the WITH clauses) is
-		// unambiguous, so no look-ahead guard is needed.
-		const maintained = this.parseMaintainedClause();
-
-		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
-		let contextDefinitions: AST.MutationContextVar[] | undefined;
-		let tags: Record<string, SqlValue> | undefined;
-		while (this.matchKeyword('WITH')) {
-			if (this.matchKeyword('CONTEXT')) {
-				if (contextDefinitions) {
-					throw this.error(this.previous(), "Duplicate WITH CONTEXT clause");
-				}
-				contextDefinitions = this.parseMutationContextDefinitions();
-			} else if (this.matchKeyword('TAGS')) {
-				if (tags) {
-					throw this.error(this.previous(), "Duplicate WITH TAGS clause");
-				}
-				tags = this.parseTags();
-			} else {
-				// Not a recognized WITH clause, backtrack
-				this.current--;
-				break;
-			}
-		}
+		const { maintained, contextDefinitions, tags } = this.parseTableTrailingClauses();
 
 		return {
 			type: 'createTable',
@@ -2755,6 +2736,48 @@ export class Parser {
 		}
 		this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
 		return { moduleName, moduleArgs: Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined };
+	}
+
+	/**
+	 * Parses the clauses that follow a table's column list and module clause —
+	 * `maintained [(cols)] as <body>`, `with context (…)`, `with tags (…)` — in any order,
+	 * each at most once. Shared by CREATE TABLE and the `declare schema` table item.
+	 *
+	 * Any order, not a fixed one: in a declaration block a clause written out of a fixed
+	 * order would not fail here but fall to the next item and be silently discarded as an
+	 * unrecognized one (see {@link Parser.declareIgnoredItem}). `maintained` is contextual (an
+	 * IDENTIFIER lexeme match); no statement or block item begins with it, so taking it
+	 * here is unambiguous. A body's own trailing `with defaults (…)` never reaches this
+	 * loop — the select spine consumes it.
+	 */
+	private parseTableTrailingClauses(): TableTrailingClauses {
+		const clauses: TableTrailingClauses = {};
+		for (;;) {
+			if (this.peekKeyword('MAINTAINED')) {
+				if (clauses.maintained) {
+					throw this.error(this.peek(), "Duplicate MAINTAINED clause");
+				}
+				clauses.maintained = this.parseMaintainedClause();
+			} else if (this.matchKeyword('WITH')) {
+				if (this.matchKeyword('CONTEXT')) {
+					if (clauses.contextDefinitions) {
+						throw this.error(this.previous(), "Duplicate WITH CONTEXT clause");
+					}
+					clauses.contextDefinitions = this.parseMutationContextDefinitions();
+				} else if (this.matchKeyword('TAGS')) {
+					if (clauses.tags) {
+						throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+					}
+					clauses.tags = this.parseTags();
+				} else {
+					// Not a table clause — give the WITH back to the caller.
+					this.current--;
+					return clauses;
+				}
+			} else {
+				return clauses;
+			}
+		}
 	}
 
 	/**
@@ -3800,30 +3823,7 @@ export class Parser {
 		}
 
 		const moduleClause = leadingModule ?? this.parseModuleClause();
-
-		// Optional `maintained as <body … with defaults (…)>` — the declared-shape
-		// maintained-table form, carried through the CreateTableStmt reuse.
-		const maintained = this.parseMaintainedClause();
-
-		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
-		let contextDefinitions: AST.MutationContextVar[] | undefined;
-		let tags: Record<string, SqlValue> | undefined;
-		while (this.matchKeyword('WITH')) {
-			if (this.matchKeyword('CONTEXT')) {
-				if (contextDefinitions) {
-					throw this.error(this.previous(), "Duplicate WITH CONTEXT clause");
-				}
-				contextDefinitions = this.parseMutationContextDefinitions();
-			} else if (this.matchKeyword('TAGS')) {
-				if (tags) {
-					throw this.error(this.previous(), "Duplicate WITH TAGS clause");
-				}
-				tags = this.parseTags();
-			} else {
-				this.current--;
-				break;
-			}
-		}
+		const { maintained, contextDefinitions, tags } = this.parseTableTrailingClauses();
 
 		// Build the CREATE TABLE AST node for this declared table
 		const tableStmt: AST.CreateTableStmt = {

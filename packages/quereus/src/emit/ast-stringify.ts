@@ -1885,7 +1885,8 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 }
 
 /** `maintained [(columns)] as <body>` clause of a CREATE TABLE, or '' when absent.
- *  Clause order matches the parser grammar: using → maintained [(columns)] as <body … with defaults> → with tags.
+ *  Emitted in the canonical order using → maintained [(columns)] as <body … with defaults> → with tags; the parser
+ *  also accepts `maintained` after the `with` clauses.
  *  Any omitted-insert defaults ride inside the body string (selectToString's `with defaults (…)`).
  *  The `(columns)` rename list is emitted only when present (an explicit MV-sugar rename); its absence is
  *  the lossless signal that the body is implicit and may reshape to follow its source on reopen. */

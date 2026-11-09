@@ -14,7 +14,7 @@ import { expect } from 'chai';
 import { parse } from '../src/parser/index.js';
 import { astToString } from '../src/emit/ast-stringify.js';
 import type {
-	DeclareSchemaStmt, DeclareIgnoredItem, DeclaredView, DeclaredMaterializedView, DeclaredSeed, DeclaredTable,
+	DeclareSchemaStmt, DeclareIgnoredItem, DeclaredView, DeclaredMaterializedView, DeclaredSeed, DeclaredTable, CreateTableStmt,
 	SelectStmt, TableSource, SubquerySource, FunctionSource, DeclareLensStmt,
 	Expression, ColumnExpr, ExistsExpr, SubqueryExpr,
 } from '../src/parser/ast.js';
@@ -450,6 +450,34 @@ describe('declare schema item boundaries', () => {
 		it('rejects `using` after the `with` clauses', () => {
 			expect(() => parse(`declare schema main { table t1 (id integer primary key) with tags (t = 1) using memory }`))
 				.to.throw(/USING/);
+		});
+	});
+
+	describe('`maintained as` after `with tags`', () => {
+
+		it('keeps the derivation on a declared table', () => {
+			const stmt = parseDeclared(
+				`declare schema main {
+					table t2 (id integer primary key) with tags (k = 'v') maintained as select id from t1
+					table t3 (id integer primary key)
+				}`
+			);
+			expect(itemKinds(stmt)).to.deep.equal(['declaredTable', 'declaredTable']);
+			const { maintained, tags } = (stmt.items[0] as DeclaredTable).tableStmt;
+			expect(tags).to.deep.equal({ k: 'v' });
+			expect(maintained).to.not.be.undefined;
+			expect(((maintained!.select as SelectStmt).from![0] as TableSource).alias).to.be.undefined;
+		});
+
+		it('keeps the derivation on create table', () => {
+			const stmt = parse(`create table t2 (id integer primary key) with tags (k = 'v') maintained as select id from t1`) as CreateTableStmt;
+			expect(stmt.tags).to.deep.equal({ k: 'v' });
+			expect(stmt.maintained).to.not.be.undefined;
+		});
+
+		it('rejects a second `maintained` clause', () => {
+			expect(() => parse(`create table t2 (id integer primary key) maintained as select id from t1 with tags (k = 'v') maintained as select id from t1`))
+				.to.throw(/Duplicate MAINTAINED/);
 		});
 	});
 
