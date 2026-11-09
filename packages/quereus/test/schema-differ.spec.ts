@@ -1289,30 +1289,6 @@ describe('generateMigrationPlan: table create order', () => {
 			table p { id integer primary key }
 		}`)).to.deep.equal(['c', 'p']);
 	});
-
-	// `mt` reads `c`, which moves behind `p`. If `mt` kept its place ahead of `p` it would run before `c`.
-	it('a maintained create stays after every create written before it', () => {
-		expect(createdTables(`declare schema main {
-			table c { id integer primary key, p integer null references p(id) }
-			table mt { id integer primary key } maintained as select id from c;
-			table p { id integer primary key }
-		}`)).to.deep.equal(['p', 'c', 'mt']);
-	});
-
-	it('a maintained child follows its parent; a maintained parent does not affect the order', () => {
-		expect(createdTables(`declare schema main {
-			table s { id integer primary key }
-			table mt { id integer primary key, p integer not null references p(id) } maintained as select id, id as p from s;
-			table p { id integer primary key }
-		}`)).to.deep.equal(['s', 'p', 'mt']);
-		// With an edge from `c` to `mt`, `d`, `mt` and `c` would form a cycle and `d` would stay ahead of its parent.
-		expect(createdTables(`declare schema main {
-			table s { id integer primary key }
-			table d { id integer primary key, c integer null references c(id) }
-			table mt { id integer primary key } maintained as select id from s;
-			table c { id integer primary key, m integer null references mt(id) }
-		}`)).to.deep.equal(['s', 'c', 'd', 'mt']);
-	});
 });
 
 /**

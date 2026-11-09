@@ -658,7 +658,8 @@ describe('generateMigrationPlan undo', () => {
 });
 
 // --- The no-movement guard: `generateMigrationDDL` over a diff touching every bucket,
-// pinned from the output BEFORE this undo work landed. ---
+// pinned from the output BEFORE this undo work landed. The maintained create has since
+// moved into stage 2 of the alters, beside the view create. ---
 
 function selectOf(sql: string): AST.QueryExpr {
 	const stmt = new Parser().parse(sql);
@@ -718,7 +719,6 @@ const BROAD_DDL_MAIN = [
 	'DROP VIEW IF EXISTS gone_v',
 	'DROP INDEX IF EXISTS gone_idx',
 	'create table fresh (id integer primary key, name text)',
-	'create materialized view mv1 as select id from fresh',
 	'ALTER TABLE new_t RENAME COLUMN a TO b',
 	'ALTER TABLE new_t ADD COLUMN extra integer',
 	`ALTER TABLE new_t ADD COLUMN more text default 'x'`,
@@ -734,6 +734,7 @@ const BROAD_DDL_MAIN = [
 	'ALTER TABLE new_t DROP CONSTRAINT ck_stale',
 	'ALTER TABLE new_t ALTER PRIMARY KEY (id, b desc)',
 	'create view fresh_v as select id from fresh',
+	'create materialized view mv1 as select id from fresh',
 	'ALTER TABLE new_t ADD constraint ck_fresh check (extra > 0)',
 	'ALTER TABLE new_t DROP COLUMN stale',
 	`ALTER TABLE new_t SET TAGS (owner = 'z')`,
@@ -755,7 +756,6 @@ const BROAD_DDL_ANALYTICS = [
 	'DROP VIEW IF EXISTS analytics.gone_v',
 	'DROP INDEX IF EXISTS analytics.gone_idx',
 	'create table fresh (id integer primary key, name text)',
-	'create materialized view mv1 as select id from fresh',
 	'ALTER TABLE analytics.new_t RENAME COLUMN a TO b',
 	'ALTER TABLE analytics.new_t ADD COLUMN extra integer',
 	`ALTER TABLE analytics.new_t ADD COLUMN more text default 'x'`,
@@ -771,6 +771,7 @@ const BROAD_DDL_ANALYTICS = [
 	'ALTER TABLE analytics.new_t DROP CONSTRAINT ck_stale',
 	'ALTER TABLE analytics.new_t ALTER PRIMARY KEY (id, b desc)',
 	'create view fresh_v as select id from fresh',
+	'create materialized view mv1 as select id from fresh',
 	'ALTER TABLE analytics.new_t ADD constraint ck_fresh check (extra > 0)',
 	'ALTER TABLE analytics.new_t DROP COLUMN stale',
 	`ALTER TABLE analytics.new_t SET TAGS (owner = 'z')`,

@@ -48,10 +48,10 @@ export interface MigrationCreate {
 	readonly sql: string;
 	readonly ast: AST.Statement;
 	/**
-	 * A view create only: the lowercased names its body names, plus the views reached from them
-	 * through declared view bodies. `generateMigrationPlan` orders creates by this, and it has no
-	 * catalog when it runs for `diff schema`, so the walk has to happen while the diff is computed.
-	 * Absent on a hand-built diff, where the planner falls back to the names in the body.
+	 * A view or maintained create only: the lowercased names its body names, plus the views reached
+	 * from them through declared view bodies. `generateMigrationPlan` orders creates by this, and it
+	 * has no catalog when it runs for `diff schema`, so the walk has to happen while the diff is
+	 * computed. Absent on a hand-built diff, where the planner falls back to the names in the body.
 	 */
 	readonly viewReach?: readonly string[];
 }
@@ -692,6 +692,11 @@ export function computeSchemaDiff(
 		return dt?.tableStmt.columns.some(c => c.name.toLowerCase() === column) ?? false;
 	};
 
+	// A maintained create and a view create both record the views their bodies reach through these.
+	const declaredViewBodies: ViewBodies = new Map([...declaredViews].map(([name, view]) => [name, view.viewStmt.select]));
+	const freshCreate = (name: string, tableStmt: AST.CreateTableStmt): MigrationCreate =>
+		freshTableCreate(name, tableStmt, declaredMaterializedViews, declaredViewBodies, targetSchemaName, defaultVtabModule, defaultVtabArgs);
+
 	// Tables: creates / alters. `dropSet` accumulates the destructive
 	// backing-module moves here (the live incarnation must be dropped) AND the
 	// orphan drops below — both flow through `orderDropsByFKDependency` together.
@@ -731,7 +736,7 @@ export function computeSchemaDiff(
 				// two names are identical.
 				const dropName = matchedActual.name.toLowerCase() !== name ? name : matchedActual.name.toLowerCase();
 				dropSet.add(dropName);
-				diff.tablesToCreate.push(freshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
+				diff.tablesToCreate.push(freshCreate(name, tableStmt));
 				diff.maintainedModuleMigrations.push({
 					name: tableStmt.table.name,
 					fromModule: alterDiff.maintainedModuleMigration.fromModule,
@@ -761,7 +766,7 @@ export function computeSchemaDiff(
 				diff.tablesToAlter.push(alterDiff);
 			}
 		} else {
-			diff.tablesToCreate.push(freshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
+			diff.tablesToCreate.push(freshCreate(name, tableStmt));
 		}
 	}
 
@@ -796,7 +801,6 @@ export function computeSchemaDiff(
 	// it). A pure name match whose definition is unchanged but tags drifted still
 	// takes the in-place `ALTER VIEW … SET TAGS`.
 	let viewRecreates = 0; // deliberate drop+create pairs, excluded from the require-hint counts
-	const declaredViewBodies: ViewBodies = new Map([...declaredViews].map(([name, view]) => [name, view.viewStmt.select]));
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
 		if (!matchedActual) {
@@ -1227,6 +1231,7 @@ function freshTableCreate(
 	name: string,
 	tableStmt: AST.CreateTableStmt,
 	declaredMaterializedViews: ReadonlyMap<string, AST.DeclaredMaterializedView>,
+	declaredViewBodies: ViewBodies,
 	targetSchemaName: string,
 	defaultVtabModule: string | undefined,
 	defaultVtabArgs: string | undefined,
@@ -1234,10 +1239,11 @@ function freshTableCreate(
 	const declaredMv = declaredMaterializedViews.get(name);
 	if (declaredMv) {
 		const mvStmt = applyViewSchemaDefault(declaredMv.viewStmt, targetSchemaName);
-		return { sql: createMaterializedViewToString(mvStmt), ast: mvStmt };
+		return { sql: createMaterializedViewToString(mvStmt), ast: mvStmt, viewReach: bodyReach(mvStmt.select, declaredViewBodies, targetSchemaName) };
 	}
 	const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
-	return { sql: createTableToString(effectiveStmt), ast: effectiveStmt };
+	const create = { sql: createTableToString(effectiveStmt), ast: effectiveStmt };
+	return effectiveStmt.maintained ? { ...create, viewReach: bodyReach(effectiveStmt.maintained.select, declaredViewBodies, targetSchemaName) } : create;
 }
 
 /**
@@ -1247,8 +1253,15 @@ function freshTableCreate(
  * makes text/AST disagreement unrepresentable.
  */
 function viewCreate(stmt: AST.CreateViewStmt, declaredViewBodies: ViewBodies, schemaName: string): MigrationCreate {
-	const viewReach = [...withViewsReached(objectsNamedIn(stmt.select, schemaName), declaredViewBodies, schemaName)];
-	return { sql: createViewToString(stmt), ast: stmt, viewReach };
+	return { sql: createViewToString(stmt), ast: stmt, viewReach: bodyReach(stmt.select, declaredViewBodies, schemaName) };
+}
+
+/**
+ * {@link MigrationCreate.viewReach} of a create whose body is `body`. Only view bodies are followed:
+ * planning a read of a maintained table does not plan that table's body.
+ */
+function bodyReach(body: AST.QueryExpr, declaredViewBodies: ViewBodies, schemaName: string): string[] {
+	return [...withViewsReached(objectsNamedIn(body, schemaName), declaredViewBodies, schemaName)];
 }
 
 /** The index analogue of {@link viewCreate}. */
@@ -3440,15 +3453,15 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 		pushText(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`, u => u.recreateIndex(indexName));
 	}
 
-	// Create new items. A fresh maintained table rides `tablesToCreate` (rendered
-	// as the `create materialized view` sugar) and re-materializes as part of its
-	// create.
-	pushCreates(orderTableCreates(diff.tablesToCreate, schemaName ?? 'main'), 'table');
-	// View creates do NOT go here: they are sorted in with stage 2 of the table alters.
-	// Index and assertion creates do NOT either — they run last, after the table
+	// Create the new plain tables. A fresh maintained table also rides `tablesToCreate`,
+	// but it plans its body as it runs, so it is sorted in with stage 2 of the table
+	// alters, as view creates are. Index and assertion creates run last, after the table
 	// alters and the maintained re-attaches. See the pushes at the end of this function.
+	const plainTableCreates = diff.tablesToCreate.filter(create => !isMaintainedCreate(create.ast));
+	const maintainedCreates = diff.tablesToCreate.filter(create => isMaintainedCreate(create.ast));
+	pushCreates(orderTableCreates(plainTableCreates, schemaName ?? 'main'), 'table');
 
-	pushTableAlters(diff.tablesToAlter, diff.viewsToCreate, { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo });
+	pushTableAlters(diff.tablesToAlter, [...diff.viewsToCreate, ...maintainedCreates], { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo });
 
 	// Attach / re-attach maintained tables (`set maintained as`) LATE — where MV
 	// creates ran — after every table create/alter, so the target's final shape and
@@ -3514,17 +3527,13 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 }
 
 /**
- * The table creates with each one after the tables its foreign keys name, so a module that checks
- * or resolves a foreign key as the child is created sees the parent first. Otherwise declaration
- * order holds, and tables in a cycle keep it.
+ * The plain table creates with each one after the tables its foreign keys name, so a module that
+ * checks or resolves a foreign key as the child is created sees the parent first. Otherwise
+ * declaration order holds, and tables in a cycle keep it.
  *
- * A maintained create plans its body as it runs, and that body can read any table written ahead of
- * it, so it stays after all of them. Otherwise a table moved ahead of its parent could overtake the
- * source of a body that applies today.
- *
- * A foreign key whose parent is a maintained create gives no edge. That leaves only later maintained
- * creates depending on a maintained create, so none is in a cycle and the rule above always holds.
- * The cost: a module that needs the parent first gets no help when the parent is maintained.
+ * A parent that is not in `creates` gives no edge: one in the catalog already exists, and a
+ * maintained create runs later, in stage 2 of `pushTableAlters`. So a module that needs the parent
+ * first gets no help when the parent is a new maintained table.
  *
  * NOTE: a table can move ahead of a table its CHECK or DEFAULT reads. Create does not plan those
  * expressions today; if it or a module ever does, add those reads as edges here.
@@ -3534,31 +3543,7 @@ function orderTableCreates(creates: readonly MigrationCreate[], schemaName: stri
 		const target = createdObjectTarget(create.ast);
 		return target ? objectRefKey(target.schema ?? schemaName, target.name) : create.sql;
 	};
-	const plainTables = new Set(creates.filter(create => !isMaintainedCreate(create.ast)).map(keyOf));
-	const ahead = createsAheadOfMaintained(creates, keyOf);
-	return orderDependenciesFirst(creates, keyOf, create => [
-		...(ahead.get(create) ?? []),
-		...foreignKeyParents(create.ast, schemaName).filter(parent => plainTables.has(parent)),
-	]);
-}
-
-/**
- * Per maintained create, the keys of the creates back to and including the previous maintained
- * create. That one follows everything further ahead, so the result is the same as naming every
- * create ahead, without an edge per pair: the sort walks the graph per edge, and naming them all
- * took 41 s to plan 500 maintained creates.
- */
-function createsAheadOfMaintained(creates: readonly MigrationCreate[], keyOf: (create: MigrationCreate) => string): Map<MigrationCreate, string[]> {
-	const ahead = new Map<MigrationCreate, string[]>();
-	let sincePreviousMaintained: string[] = [];
-	for (const create of creates) {
-		if (isMaintainedCreate(create.ast)) {
-			ahead.set(create, sincePreviousMaintained);
-			sincePreviousMaintained = [];
-		}
-		sincePreviousMaintained.push(keyOf(create));
-	}
-	return ahead;
+	return orderDependenciesFirst(creates, keyOf, create => foreignKeyParents(create.ast, schemaName));
 }
 
 const isMaintainedCreate = (ast: AST.Statement): boolean =>
@@ -3616,7 +3601,7 @@ interface AlterStepSink {
 	undo: UndoRenderer | undefined;
 }
 
-/** What stage 2 of {@link pushTableAlters} sorts: one table's steps, or one view create. */
+/** What stage 2 of {@link pushTableAlters} sorts: one table's steps, or one view or maintained create. */
 interface StageTwoItem {
 	key: string;
 	/** What has to run first. */
@@ -3644,12 +3629,13 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      arrives inside `ADD COLUMN` and cannot wait for stage 3. These stay per table rather than
  *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
  *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`.
- *      New views are sorted in here, because `CREATE VIEW` plans its body as it runs. A view
- *      follows every table's steps, unless a table's new column reads it, directly or through
- *      other declared views: then it goes ahead of that table. It is ordered after every altered
- *      table, not only those it names, because a table it reaches through an existing view is not
- *      in its statement, and `diff schema` plans with no catalog. It also follows the new views it
- *      reaches through declared views ({@link MigrationCreate.viewReach}).
+ *      New views and new maintained tables are sorted in here, because their creates plan the body
+ *      as they run. Such a create follows every table's steps, unless a table's new column reads
+ *      it, directly or through other declared views: then it goes ahead of that table. It is ordered
+ *      after every altered table, not only those it names, because a table it reaches through an
+ *      existing view is not in its statement, and `diff schema` plans with no catalog. It also
+ *      follows the new views and maintained tables it reaches through declared views
+ *      ({@link MigrationCreate.viewReach}).
  *   3. ADD CONSTRAINT, once every table has its columns and key. Two tables' named foreign keys
  *      can point at each other's new columns.
  *   4. DROP COLUMN, once every table's `DROP CONSTRAINT` has cleared the guards that refuse a drop
@@ -3657,9 +3643,9 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      drops precede those of the tables its dropped columns' expressions read.
  *   5. SET TAGS, last, because a constraint's tags can name a constraint from stage 3.
  */
-function pushTableAlters(alters: readonly TableAlterDiff[], viewCreates: readonly MigrationCreate[], sink: AlterStepSink): void {
+function pushTableAlters(alters: readonly TableAlterDiff[], bodyCreates: readonly MigrationCreate[], sink: AlterStepSink): void {
 	for (const alter of alters) pushColumnRenames(alter, sink);
-	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink)), ...viewStageTwoItems(viewCreates, alters, sink)];
+	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink)), ...createStageTwoItems(bodyCreates, alters, sink)];
 	const preferredTiers = [(i: StageTwoItem) => i.prefersToRunAfter, (i: StageTwoItem) => i.alsoPrefersToRunAfter];
 	for (const item of orderDependenciesFirst(stageTwo, i => i.key, i => i.runsAfter, preferredTiers)) item.push();
 	for (const alter of alters) pushConstraintAdds(alter, sink);
@@ -3683,31 +3669,45 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 }
 
 /**
- * A view has to follow only the new views it reaches, directly or through declared views, including
- * one this plan leaves alone: that one cannot be planned until the new view it reads exists. It merely
- * prefers to follow an altered table, because a new column on that table may read this view. A table
- * it names comes before the rest, which it may not need at all, so that following those cannot block
- * what it does need. The keys can share a sort with table names because tables and views share one
- * namespace.
+ * A view or maintained create has to follow only the new views and maintained tables it reaches,
+ * directly or through declared views, including a view this plan leaves alone: that one cannot be
+ * planned until the new object it reads exists. It merely prefers to follow an altered table, because
+ * a new column on that table may read the created object. A table it names comes before the rest,
+ * which it may not need at all, so that following those cannot block what it does need. The keys can
+ * share a sort with table names because tables and views share one namespace.
  *
- * NOTE: a table a view reaches only through an existing view sits in the weaker tier, so it can lose
- * to another view's unneeded preference and fail with `Column not found`. If that shows up, keep the
+ * A maintained create undoes as a table, a view create as a view.
+ *
+ * NOTE: a table a create reaches only through an existing view sits in the weaker tier, so it can lose
+ * to another create's unneeded preference and fail with `Column not found`. If that shows up, keep the
  * tables `MigrationCreate.viewReach` passes through, and put them in `prefersToRunAfter`.
  */
-function viewStageTwoItems(viewCreates: readonly MigrationCreate[], alters: readonly TableAlterDiff[], sink: AlterStepSink): StageTwoItem[] {
-	const viewKey = (create: MigrationCreate): string => (create.ast.type === 'createView' ? create.ast.view.name : create.sql).toLowerCase();
-	const newViews = new Set(viewCreates.map(viewKey));
+function createStageTwoItems(creates: readonly MigrationCreate[], alters: readonly TableAlterDiff[], sink: AlterStepSink): StageTwoItem[] {
+	const createKey = (create: MigrationCreate): string => (createdObjectTarget(create.ast)?.name ?? create.sql).toLowerCase();
+	const created = new Set(creates.map(createKey));
 	const alteredTables = alters.map(alterKey);
-	return viewCreates.map(create => {
-		const named = create.ast.type === 'createView' ? objectsNamedIn(create.ast.select, sink.schemaName) : [];
+	return creates.map(create => {
+		const body = plannedBodyOf(create.ast);
+		const named = body ? objectsNamedIn(body, sink.schemaName) : [];
+		const kind: CreatedObjectKind = create.ast.type === 'createView' ? 'view' : 'table';
 		return {
-			key: viewKey(create),
-			runsAfter: (create.viewReach ?? named).filter(name => newViews.has(name)),
-			prefersToRunAfter: named.filter(name => !newViews.has(name)),
+			key: createKey(create),
+			runsAfter: (create.viewReach ?? named).filter(name => created.has(name)),
+			prefersToRunAfter: named.filter(name => !created.has(name)),
 			alsoPrefersToRunAfter: alteredTables,
-			push: () => sink.pushCreate(create, 'view'),
+			push: () => sink.pushCreate(create, kind),
 		};
 	});
+}
+
+/** The body a view or maintained create plans as it runs. */
+function plannedBodyOf(ast: AST.Statement): AST.QueryExpr | undefined {
+	switch (ast.type) {
+		case 'createView':
+		case 'createMaterializedView': return ast.select;
+		case 'createTable': return ast.maintained?.select;
+		default: return undefined;
+	}
 }
 
 function pushColumnRenames(alter: TableAlterDiff, sink: AlterStepSink): void {

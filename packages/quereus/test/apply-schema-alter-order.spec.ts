@@ -196,6 +196,41 @@ describe('apply schema: table alters run in stages across tables', () => {
 				}`);
 			});
 		}
+
+		// A maintained create plans its body as it runs, so it is sorted with the view creates.
+		const maintainedReaders: Array<[string, string]> = [
+			['a column its source gains', `table t { id integer primary key, b integer null, d integer null }
+				materialized view m as select id, d from t`],
+			['a column renamed in the same apply', `table t { id integer primary key, b2 integer null with tags ("quereus.previous_name" = 'b') }
+				materialized view m as select id, b2 from t`],
+			['a new view', `table t { id integer primary key, b integer null }
+				view w as select id, b from t
+				materialized view m as select id, b from w`],
+			['a new table written after it', `table t { id integer primary key, b integer null }
+				table mt { id integer primary key } maintained as select id from c;
+				table c { id integer primary key }`],
+			['a new materialized view written after it', `table t { id integer primary key, b integer null }
+				materialized view m2 as select id from m1
+				materialized view m1 as select id from t`],
+		];
+
+		for (const [source, declaration] of maintainedReaders) {
+			it(`applies a new maintained table reading ${source}`, async () => {
+				await applies(`declare schema main {
+					${declaration}
+					table u { id integer primary key, y integer null }
+				}`);
+			});
+		}
+
+		it('applies a view reading a new materialized view', async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null }
+				table u { id integer primary key, y integer null }
+				view w as select id, b from m
+				materialized view m as select id, b from t
+			}`);
+		});
 	});
 
 	describe('a table giving up something another table still refers to, written first', () => {
