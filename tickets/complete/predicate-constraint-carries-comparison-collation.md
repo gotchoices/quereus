@@ -56,3 +56,33 @@ Adjusted (assertion relaxed from "SeqScan" to "no IndexSeek", since the memory m
 - `isolation` module forwards filter objects unchanged — checked by reading, not by a dedicated test.
 - The engine's `orderingClaimSurvivesCollation` is still deliberately coarse (any mismatched equality on any index column refuses the claim). A NOCASE equality on an *ordered* column, e.g. `where b = 'x' collate nocase order by b, c` over BINARY `(b, c)`, lets the memory module claim the ordering (walking the index is genuinely ordered there) and the engine refuses it. Pre-existing, rare, costs one Sort; not changed here.
 - The remaining callers of the lattice helpers in the extractor (`orBranchConstraintCollationOk`, `equalityConstraintCollationOk`, `inConstraintCollationOk`) still recompute from `sourceExpression` rather than reading the stamp. Left alone to keep the diff to the ticket's scope; they agree with the stamp by construction.
+
+## Review findings
+
+Reviewed `ticket(implement): predicate-constraint-carries-comparison-collation` diff first, then the handoff.
+
+**Checked**
+- Every engine site that mints a module-facing filter: only `constraint-extractor.ts` (binary, BETWEEN, IN, IS NULL, both OR collapses) and `rule-key-set-seek.ts`'s probe. All stamp `collation`; the planner type makes it required. Other probes (`rule-grow-retrieve`, `index-nested-loop`, `access-leaf`) pass extractor constraints through unchanged.
+- The stamp helpers return normalized names. IN and BETWEEN cannot newly throw at extraction: `InNode` already rejects a collation conflict when it is typed, and BETWEEN bounds that get extracted are literals, where an explicit COLLATE always wins.
+- The LIKE/GLOB/MATCH BINARY-on-conflict deviation is sound. Nothing reads the field for those ops except the coarse ordering check, and there BINARY behaves as it did before.
+- `equalityRefinesKey` without the `BinaryOpNode` shape gate: its caller already restricts to `op: '='`, and every `=` now carries its own resolved collation. The gate's reason ("unknown shape defaults to BINARY") no longer exists.
+- The deviation "a column with an unserved equality fills no role": confirmed against `rule-select-access-path`'s pickers (`handledByCol` is per column, so any `=` on a handled column gets picked). It is correct.
+- Pinning via "any refining equality": reasoned through the plan-B walk with residuals. A BINARY equality pins its column even as a residual, so any claim it supports is valid. Worst case the engine refuses it and adds one Sort.
+- Tests: the new module-level spec and the two extractor stamp tests pin real branching. The collation-blind helper keeps the engine-backstop tests exercising the engine rather than deleting them, and the two relaxed assertions ("no IndexSeek" in place of "SeqScan") are correct for the new plans. No tests cut.
+- Docs: `module-authoring.md`, `plugins.md`, `optimizer-retrieve.md`, `optimizer-fd.md` match the code. No stale `effectivePredicateCollation` references remain outside tickets.
+
+**Found and fixed (minor)**
+- **The memory module still offered a prefix-range seek the planner rejects.** This is the same class of bug the ticket targets. The rule's prefix-range arm checks the prefix equalities as range bounds (`classifyCollationCover(…, false, …)`, exact collation only). The module, however, accepted any refining prefix equality. Reproduced: `where b = 'x1' collate binary and c > 5` over NOCASE `idx_bc(b, c)` planned as a full SEQSCAN, while the prefix-equality seek was available. Fix: `findEqualityMatches` now reports `collationsExact`, and the prefix-range arm in `evaluateIndexAccess` requires it. Otherwise the plan falls through to the equality-only prefix seek, which the rule keeps with a residual. After the fix the query plans as INDEX SEEK plus residual filters. Regression test added to `test/vtab/memory-access-plan-collation.spec.ts`. The prefix-range rule is added to `docs/module-authoring.md`, and the `rangeServesIndexColumn` doc is updated.
+- The `findEqualityMatches` NOTE called itself an "accepted tradeoff", but no human had weighed it. Relabeled as a plain `NOTE:` tripwire.
+
+**Tripwires / not filed**
+- The engine's prefix-range cover is conservative: a BINARY prefix over a coarser index column is a real superset that a residual could trim. The module now matches the engine, so no plan is wasted; loosening the engine would be an enhancement, not a defect. Not filed.
+- Store module still ignores the field: already tracked by backlog `feat-store-access-plan-reads-predicate-collation`.
+- Coarse `orderingClaimSurvivesCollation` (NOCASE equality on an ordered column): pre-existing, already documented at the site. Unchanged.
+- The extractor gate helpers (`orBranchConstraintCollationOk` etc.) still recompute from `sourceExpression`. They agree with the stamp by construction, and they run before the stamp exists for OR branches. Left alone.
+
+**Validation**
+- `yarn workspace @quereus/quereus run lint`: clean.
+- Full quereus mocha suite (no bail): 11131 passing, 26 pending. `@quereus/isolation` tests: 453 passing.
+- Store mode not re-run. This pass only changed the memory module; the implementer's store run (11123 passing) covers the rest of the diff.
+

@@ -61,4 +61,22 @@ describe('memory module access plans read the predicate collation', () => {
 		expect(plan.indexName).to.equal('idx_bc');
 		expect(plan.providesOrdering).to.deep.equal([{ columnIndex: C, desc: false }]);
 	});
+
+	it('offers only the prefix seek when a BINARY prefix equality over a NOCASE index precedes a range', async () => {
+		// The engine's prefix-range arm checks prefix keys as range bounds (exact collation
+		// only), so claiming the trailing range here would get the seek declined to a scan.
+		await db.exec('create table n (id integer primary key, b text collate nocase, c integer) using memory');
+		await db.exec('create index idx_n_bc on n(b, c)');
+		const table = db.schemaManager.getTable('main', 'n')!;
+		const plan = module.getBestAccessPlan(db, table, {
+			columns: columnsOf(table),
+			filters: [
+				{ columnIndex: B, op: '=', value: 'x', usable: true, collation: 'BINARY' },
+				{ columnIndex: C, op: '>', value: 5, usable: true, collation: 'BINARY' },
+			],
+			estimatedRows: 1000,
+		});
+		expect(plan.indexName).to.equal('idx_n_bc');
+		expect(plan.handledFilters).to.deep.equal([true, false]);
+	});
 });

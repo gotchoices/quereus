@@ -218,10 +218,10 @@ function equalityServesIndexColumn(f: PredicateConstraint, indexCol: IndexColumn
 }
 
 /**
- * Whether a range bound (or OR_RANGE) can be walked on `indexCol`: the bound must compare
- * under the index's own collation, which this module's runtime then honours
- * (`honorsCollatedRangeBounds`). Any other pairing walks a window ordered differently from
- * the predicate.
+ * Whether a range bound (or OR_RANGE, or an equality in a prefix-range seek's prefix) can be
+ * walked on `indexCol`: it must compare under the index's own collation, which this module's
+ * runtime then honours (`honorsCollatedRangeBounds`). Any other pairing walks a window
+ * ordered differently from the predicate.
  */
 function rangeServesIndexColumn(f: PredicateConstraint, indexCol: IndexColumnSchema): boolean {
 	return filterCollation(f) === indexColumnCollation(indexCol);
@@ -881,7 +881,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// range scan. If multi-value-IN prefixes with trailing ranges ever show up as
 		// slow plans, teach the rule a cross-product prefix-range seek (or stop claiming
 		// the trailing range here so the estimate matches the plan).
-		if (equalityMatches.matchCount > 0 && equalityMatches.matchCount < indexCols.length) {
+		//
+		// Only over a prefix whose equalities compare under the index's own collations
+		// (`collationsExact`): the rule's prefix-range arm checks the prefix keys as range
+		// bounds, which admit no coarser-safe superset, so `b = 'x' collate binary and c > 5`
+		// over a NOCASE `(b, c)` would be declined to a full scan. Such a prefix falls through
+		// to the equality-only prefix seek below, which the rule keeps with a residual.
+		if (equalityMatches.collationsExact && equalityMatches.matchCount > 0 && equalityMatches.matchCount < indexCols.length) {
 			const trailingCol = indexCols[equalityMatches.matchCount];
 			const trailingRange = this.findRangeMatch(trailingCol, request.filters);
 			if (trailingRange.hasRange) {
@@ -989,7 +995,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * The prefix stops at a column whose first equality the index cannot serve
 	 * ({@link equalityServesIndexColumn}); that filter stays unhandled and becomes a residual.
 	 *
-	 * NOTE: accepted tradeoff — only the FIRST equality per column is considered, so
+	 * NOTE: only the FIRST equality per column is considered, so
 	 * `b = 'x' collate nocase and b = 'x'` over a BINARY `b` offers no seek although the
 	 * second could seek, and the second still pins `b` for an ordering claim the engine's
 	 * `orderingClaimSurvivesCollation` then refuses (it disqualifies an index carrying any
@@ -999,11 +1005,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	private findEqualityMatches(
 		indexCols: ReadonlyArray<IndexColumnSchema>,
 		filters: readonly PredicateConstraint[]
-	): { matchCount: number; handledFilters: boolean[]; inCardinality: number; isMultiSeek: boolean } {
+	): { matchCount: number; handledFilters: boolean[]; inCardinality: number; isMultiSeek: boolean; collationsExact: boolean } {
 		const handledFilters = new Array(filters.length).fill(false);
 		let matchCount = 0;
 		let inCardinality = 1;
 		let isMultiSeek = false;
+		let collationsExact = true;
 
 		for (const indexCol of indexCols) {
 			// `=` (whose value may be undefined for parameter bindings — the actual value is
@@ -1017,9 +1024,10 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			matchCount++;
 			inCardinality *= equalitySeekKeyCount(filters[i])!;
 			if (isMultiValueEquality(filters[i])) isMultiSeek = true;
+			if (!rangeServesIndexColumn(filters[i], indexCol)) collationsExact = false;
 		}
 
-		return { matchCount, handledFilters, inCardinality, isMultiSeek };
+		return { matchCount, handledFilters, inCardinality, isMultiSeek, collationsExact };
 	}
 
 	/**
