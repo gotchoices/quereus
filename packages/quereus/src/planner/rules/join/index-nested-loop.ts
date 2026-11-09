@@ -64,7 +64,6 @@ import { extractConstraints, createTableInfoFromNode, type PredicateConstraint }
 import {
 	selectPhysicalNode,
 	combineResidualExpressions,
-	effectivePredicateCollation,
 } from '../access/rule-select-access-path.js';
 import {
 	peelToSeekableAccessLeaf,
@@ -572,18 +571,12 @@ function enforcedKeys(tableSchema: TableSchema): EnforcedKey[] {
  * fails it, so a `NOCASE` join key over a `BINARY` unique column (which admits
  * `'a'` and `'A'`, two distinct stored rows that both match) declines.
  *
- * The source-shape gate is load-bearing, not defensive. `effectivePredicateCollation`
- * answers BINARY for a shape it does not recognize — a safe DECLINE for its own
- * caller (a BINARY-read predicate over a coarser index over-fetches and keeps its
- * residual Filter) but the STRONGEST possible claim here, where BINARY refines
- * everything. Every `op: '='` constraint today is minted by `extractBinaryConstraint`
- * carrying its own `BinaryOpNode` (OR collapse emits only 'IN' / 'OR_RANGE'), so
- * requiring that shape costs nothing now and makes a future `=` producer decline
- * rather than be proved unique on a default.
+ * The collation is the one the extractor stamped where it minted the constraint. No
+ * source-shape gate is needed: every mint site resolves its own shape, so there is no
+ * BINARY default for an unrecognised shape to be proved unique on.
  */
 function equalityRefinesKey(constraint: PredicateConstraint, keyCollation: string | undefined): boolean {
-	if (!(constraint.sourceExpression instanceof BinaryOpNode)) return false;
-	return collationRefines(effectivePredicateCollation(constraint), keyCollation);
+	return collationRefines(constraint.collation, keyCollation);
 }
 
 /**

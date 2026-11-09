@@ -87,8 +87,9 @@ Three details are load-bearing:
   never executes — so those arms are accepted only when the plan provides the requested
   ordering. A handled filter is not a licence to drop an `ORDER BY`.
 - **A module's ordering claim is not enough to drop a `Sort` when collations disagree.** A
-  module cannot see a predicate's collation, so it treats any equality as pinning its column
-  to one value and skips that column when matching an index against the required ordering.
+  module that ignores `PredicateConstraint.collation` (the memory module reads it; the store
+  does not yet) treats any equality as pinning its column to one value and skips that column
+  when matching an index against the required ordering.
   `where k = 'a' collate nocase order by r` over a BINARY `(k, r)` matches the groups `'A'`
   and `'a'`, and `r` restarts in each; the same mismatch also makes the seek decline to a
   scan, which emits no claimed order. Every site that lets a `Sort` go therefore also asks

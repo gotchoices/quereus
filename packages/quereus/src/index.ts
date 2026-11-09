@@ -138,6 +138,9 @@ export {
 	compareCodePoints,
 	builtinCollationResolver,
 	normalizeCollationName,
+	// Whether an equality under one collation can seek / pin an index column keyed under
+	// another — the test a module applies to `PredicateConstraint.collation`.
+	collationRefines,
 	resolveCollationFunctions,
 	// Core comparison functions (critical for module implementations)
 	compareSqlValues,

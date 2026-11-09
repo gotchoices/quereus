@@ -925,6 +925,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 				usable: true,
 				sourceExpression: lit(1),
 				targetRelation: 't',
+				collation: 'BINARY',
 			};
 		}
 
@@ -1632,6 +1633,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 				usable: true,
 				sourceExpression: expr,
 				targetRelation: 't',
+				collation: 'BINARY',
 			};
 			const result = createResidualFilter(expr, [constraint]);
 			expect(result).to.be.undefined;
@@ -1797,6 +1799,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('IN');
 			expect(result.allConstraints[0].value).to.deep.equal(['bob', 'x']);
+			expect(result.allConstraints[0].collation).to.equal('NOCASE');
 			expect(result.residualPredicate).to.be.undefined;
 		});
 
@@ -1808,6 +1811,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('OR_RANGE');
+			expect(result.allConstraints[0].collation).to.equal('NOCASE');
 		});
 
 		it('written order is immaterial: a NOCASE-folded literal on EITHER side of a BINARY-declared column makes the comparison NOCASE → collapse declined', () => {
@@ -1823,6 +1827,20 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(0);
 			expect(result.residualPredicate).to.exist;
+		});
+	});
+
+	describe('stamped comparison collation', () => {
+		it('a NOCASE-folded literal over a BINARY column stamps NOCASE', () => {
+			const result = extractConstraints(binOp('=', textColRef(102, 'b', 2), collatedLit('x', 'NOCASE')), [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].collation).to.equal('NOCASE');
+		});
+
+		it('BETWEEN stamps each bound with its own collation', () => {
+			const expr = betweenNode(textColRef(102, 'b', 2), lit('a'), collatedLit('m', 'NOCASE'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints.map(c => [c.op, c.collation])).to.deep.equal([['>=', 'BINARY'], ['<=', 'NOCASE']]);
 		});
 	});
 
@@ -2625,6 +2643,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 				usable: true,
 				sourceExpression: lit(1),
 				targetRelation: 't',
+				collation: 'BINARY',
 			};
 		}
 
@@ -2973,7 +2992,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			const expr = binOp('=', colRef(101, 'a', 1), lit(5));
 			const constraint: PredicateConstraint = {
 				columnIndex: 1, attributeId: 101, op: '=', value: 5,
-				usable: true, sourceExpression: expr, targetRelation: 't',
+				usable: true, sourceExpression: expr, targetRelation: 't', collation: 'BINARY',
 			};
 			const result = createResidualFilter(expr, [constraint]);
 			expect(result).to.equal(undefined);
@@ -2983,7 +3002,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			const expr = binOp('=', colRef(101, 'a', 1), lit(5));
 			const constraint: PredicateConstraint = {
 				columnIndex: 1, attributeId: 101, op: '=', value: 5,
-				usable: true, sourceExpression: expr, targetRelation: 't',
+				usable: true, sourceExpression: expr, targetRelation: 't', collation: 'BINARY',
 			};
 			const resultEmpty = createResidualFilter(expr, []);
 			const resultFull = createResidualFilter(expr, [constraint]);

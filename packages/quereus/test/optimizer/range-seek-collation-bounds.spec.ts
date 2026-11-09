@@ -286,8 +286,11 @@ describe('memory range/prefix seek honours index collation (memory-range-seek-co
 			await db.exec("CREATE INDEX idx_mm ON mm (name)"); // BINARY index
 			const q = "SELECT id FROM mm WHERE name > 'banana' COLLATE NOCASE ORDER BY id";
 			const ops = await planOps(q);
-			// predColl=NOCASE, indexColl=BINARY → mismatch → decline to scan + residual.
-			expect(ops).to.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+			// predColl=NOCASE, indexColl=BINARY → mismatch → no seek, scan + residual. The
+			// memory module reads the predicate's collation and never offers this seek (so the
+			// scan is its ordered primary-key walk); the engine's own decline of an offered one
+			// is pinned in pushed-constraints-recorded.spec.ts.
+			expect(ops).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 			expect(ops).to.match(/FILTER/i);
 			// NOCASE: CHERRY, date are > 'banana'.
 			expect((await rows(q)).map(r => r.id)).to.deep.equal([3, 4]);

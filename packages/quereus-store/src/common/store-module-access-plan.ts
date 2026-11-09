@@ -585,10 +585,10 @@ function computeFilterAccessPlan(
 	//
 	// The one divergence neither reason covers is PREDICATE-side and invisible from here:
 	// `where pk collate nocase in (…)` over a BINARY key column would seek exact-case
-	// windows and UNDER-fetch. `PredicateConstraint` carries no collation, so this module
-	// cannot see it and always claims; `rule-select-access-path`'s `classifyCollationCover`
-	// (which reads the predicate's effective collation off the source expression) is what
-	// declines that shape to a scan + residual. A new PK arm inherits that protection only
+	// windows and UNDER-fetch. `PredicateConstraint.collation` names that collation, but
+	// this module does not read it yet (backlog `feat-store-access-plan-reads-predicate-collation`)
+	// and always claims; `rule-select-access-path`'s `classifyCollationCover` (which reads
+	// the same stamp) is what declines that shape to a scan + residual. A new PK arm inherits that protection only
 	// by going through the rule's index-aware path — one more reason `setSeekColumns` on
 	// the point arm below is load-bearing.
 	const pkPins = resolvePrimaryKeyPins(request.filters, pkColumns);

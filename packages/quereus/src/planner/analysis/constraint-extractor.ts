@@ -19,7 +19,14 @@ import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
 import { collectColumnRefAttributeIds } from '../util/column-refs.js';
-import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
+import {
+	effectiveBetweenBoundCollation,
+	effectiveComparisonCollation,
+	effectiveInCollation,
+	isComparisonOperator,
+	operandCollation,
+	resolveComparisonCollation,
+} from './comparison-collation.js';
 import { collationRefines } from '../../util/comparison.js';
 import { isNoOpCast } from './scalar-invertibility.js';
 import { relationKeyHasNodeId, relationKeyOf, relationKeyOfRelation } from './relation-key.js';
@@ -82,6 +89,23 @@ export interface PredicateConstraint extends VtabPredicateConstraint {
 	correlated?: boolean;
 	/** Range specifications for OR_RANGE constraints */
 	ranges?: RangeSpec[];
+	/**
+	 * The comparison's effective collation, stamped where the constraint is minted and
+	 * normalized. Required here so a mint site that forgets it does not compile.
+	 *
+	 * Resolved through the shared helpers in `comparison-collation.ts`, the same ones the
+	 * runtime emitters call, so plan-time facts and runtime behaviour cannot drift: the
+	 * symmetric provenance lattice (explicit COLLATE > declared column collation >
+	 * defaults > BINARY). A binary comparison resolves both operands (`emitComparisonOp`);
+	 * an IN merges the condition with every listed value (`emitIn`); each BETWEEN bound
+	 * resolves against the tested expression on its own (`emitBetween`), so the `>=` and
+	 * `<=` halves of one BETWEEN may differ. Constant folding keeps `'x' collate nocase`
+	 * as a literal whose type carries NOCASE, which is why this is read off operand types
+	 * rather than off the expression's shape. An OR collapse carries the column operand's
+	 * collation, which its gate (`orBranchConstraintCollationOk`) has proved every branch
+	 * equals. A null test compares nothing and carries the column operand's collation.
+	 */
+	readonly collation: string;
 }
 
 /**
@@ -414,7 +438,8 @@ function extractBinaryConstraint(
 		value: constant,
 		usable: true, // Usable since we found table mapping
 		sourceExpression: expr,
-		targetRelation: tableInfo.relationKey
+		targetRelation: tableInfo.relationKey,
+		collation: binaryConstraintCollation(binaryOp),
   };
 
   // Attach dynamic binding metadata when RHS/LHS is not a literal
@@ -458,6 +483,23 @@ function extractBinaryConstraint(
   return result;
 }
 
+/**
+ * The collation a binary constraint's comparison runs under. A comparison operator's
+ * operands were checked against the lattice when the node was typed
+ * (`BinaryOpNode.generateType`), so the throwing helper cannot fire for one. LIKE, GLOB
+ * and MATCH are not checked there — LIKE applies no collation at all (`buildLikeOpSpec`)
+ * — so two differently-declared columns are legal around them; such a conflict takes the
+ * BINARY floor, as a conflict between defaults does, rather than failing a query that
+ * runs fine.
+ */
+function binaryConstraintCollation(expr: BinaryOpNode): string {
+	if (isComparisonOperator(expr.expression.operator)) {
+		return effectiveComparisonCollation(expr.left, expr.right);
+	}
+	const resolution = resolveComparisonCollation(expr.left.getType(), expr.right.getType());
+	return resolution.kind === 'resolved' ? resolution.name : 'BINARY';
+}
+
 function extractBetweenConstraints(
   expr: BetweenNode,
   attributeToTableMap: Map<number, TableInfo>
@@ -496,7 +538,8 @@ function extractBetweenConstraints(
       usable: true,
       bindingKind: 'literal',
       sourceExpression: expr,
-      targetRelation: tableInfo.relationKey
+      targetRelation: tableInfo.relationKey,
+      collation: effectiveBetweenBoundCollation(col, low),
     },
     {
       columnIndex,
@@ -506,7 +549,8 @@ function extractBetweenConstraints(
       usable: true,
       bindingKind: 'literal',
       sourceExpression: expr,
-      targetRelation: tableInfo.relationKey
+      targetRelation: tableInfo.relationKey,
+      collation: effectiveBetweenBoundCollation(col, up),
     }
   ];
 }
@@ -544,7 +588,8 @@ function extractInConstraint(
     value: values as any,
     usable: true,
     sourceExpression: expr,
-    targetRelation: tableInfo.relationKey
+    targetRelation: tableInfo.relationKey,
+    collation: effectiveInCollation(expr),
   };
 
   // Attach dynamic binding metadata when not all values are literals
@@ -586,7 +631,8 @@ function extractNullConstraint(
 		usable: true,
 		sourceExpression: expr,
 		targetRelation: tableInfo.relationKey,
-		bindingKind: 'literal'
+		bindingKind: 'literal',
+		collation: operandCollation(operand),
 	};
 }
 
@@ -722,14 +768,8 @@ function tryExtractOrBranches(
 	// Collation pre-gate covering both collapse cases below (IN and OR_RANGE
 	// both compare under the column's own collation): every branch constraint's
 	// effective collation must equal it, else the whole OR stays residual —
-	// a completeness loss only, never a semantics change. Reviewer note:
-	// `effectivePredicateCollation` (rule-select-access-path) still resolves an
-	// OR `sourceExpression` to BINARY, but post-gate every surviving collapsed
-	// constraint's true collation equals the column's declared collation, so
-	// the cover analysis is at worst conservative (BINARY-vs-NOCASE-index →
-	// COARSER_SAFE keeps the semantically-correct OR residual; ranges decline).
-	// Carrying the resolved collation on the constraint would make it precise —
-	// an optional follow-up, not required for correctness.
+	// a completeness loss only, never a semantics change. Post-gate that one
+	// collation is exact for the collapsed constraint, which carries it.
 	for (const b of branches) {
 		if (!b.constraints.every(orBranchConstraintCollationOk)) {
 			log('OR collapse declined: branch effective collation does not match column collation');
@@ -842,7 +882,9 @@ function collapseBranchesToIn(
 		sourceExpression: sourceExpr,
 		targetRelation: template.targetRelation,
 		valueExpr: hasNonLiteral ? valueExprs : undefined,
-		bindingKind: hasNonLiteral ? 'mixed' : 'literal'
+		bindingKind: hasNonLiteral ? 'mixed' : 'literal',
+		// The column operand's collation: the caller's gate proved every branch equals it.
+		collation: template.collation,
 	};
 	return { constraints: [result] };
 }
@@ -950,6 +992,8 @@ function tryCollapseToOrRange(
 		targetRelation: targetRelation,
 		...summarizeRangeBindings(rangeSpecs),
 		ranges: rangeSpecs,
+		// The column operand's collation: the caller's gate proved every branch equals it.
+		collation: branches[0].constraints[0].collation,
 	};
 
 	return { constraints: [result] };

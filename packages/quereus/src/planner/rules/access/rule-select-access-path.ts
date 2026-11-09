@@ -33,9 +33,7 @@ import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
-import { LiteralNode, BinaryOpNode, BetweenNode } from '../../nodes/scalar.js';
-import { InNode } from '../../nodes/subquery.js';
-import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation } from '../../analysis/comparison-collation.js';
+import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
 import type { TableSchema } from '../../../schema/table.js';
 import type * as AST from '../../../parser/ast.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
@@ -1526,43 +1524,6 @@ interface CollationCoverDecision {
 }
 
 /**
- * Resolve a predicate constraint's effective comparison collation at plan time
- * via the shared helpers in `analysis/comparison-collation.ts` (one resolution
- * for plan-time facts and runtime behavior — they cannot drift): the symmetric
- * provenance lattice (explicit COLLATE > declared column collation > defaults
- * > BINARY). An IN merges the condition with every listed value / the subquery
- * column (`emitIn`); a BETWEEN bound resolves against the tested expression
- * per bound (`emitBetween`). The result is normalized.
- *
- * Exported for `rules/join/index-nested-loop.ts`, whose at-most-one proof
- * compares each enforced equality's collation against the unique key's
- * enforcement collation — the same lattice, not a restatement of it.
- */
-export function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
-	const src = constraint.sourceExpression;
-	if (src instanceof BinaryOpNode) {
-		return effectiveComparisonCollation(src.left, src.right);
-	}
-	if (src instanceof InNode) {
-		return effectiveInCollation(src);
-	}
-	if (src instanceof BetweenNode) {
-		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison
-		// resolves its collation independently through the lattice.
-		// extractBetweenConstraints emits two constraints sharing this BetweenNode
-		// source — `op: '>='`/`'>'` for the lower bound, `'<='`/`'<'` for the
-		// upper — so the constraint's op selects which bound's collation applies. A
-		// `COLLATE` on a bound survives folding (it rides on the bound's type), so
-		// the bound collation can and must reach this point.
-		const bound = (constraint.op === '<=' || constraint.op === '<') ? src.upper : src.lower;
-		return effectiveBetweenBoundCollation(src.expr, bound);
-	}
-	// OR_RANGE carries an OR BinaryOpNode source (handled above); any other shape
-	// defaults to BINARY, which only ever drives a (safe) decline on mismatch.
-	return 'BINARY';
-}
-
-/**
  * The normalized collation of each key column of the index `indexName` names, keyed by
  * table column index, or undefined when the index cannot be resolved. The index is found
  * through {@link resolveIndexDescriptor}, as every other consumer of the plan finds it, so
@@ -1599,11 +1560,13 @@ function indexColumnCollationLookup(
  * Whether the leaf this rule would build can deliver `accessPlan`'s ordering claim, as far
  * as collation decides it. A caller must ask before dropping a Sort on the claim's word.
  *
- * A module cannot see a predicate's collation, so it takes any equality as pinning its
+ * A module that ignores `PredicateConstraint.collation` takes any equality as pinning its
  * column to one value and skips that column when matching an index against the required
  * ordering. A predicate coarser than the index breaks that: `k = 'a' collate nocase` over a
  * BINARY `(k, r)` matches the two groups `'A'` and `'a'`, and `r` restarts in each. The same
- * mismatch makes the seek arms decline to a scan, which emits no claimed order at all.
+ * mismatch makes the seek arms decline to a scan, which emits no claimed order at all. The
+ * memory module reads the field and does not make this claim; this check is the backstop
+ * for every module that does not.
  *
  * Deliberately coarse: a mismatched equality on any column of the index disqualifies the
  * claim, even one past the columns the claim consumed. That costs one needless Sort in a
@@ -1627,9 +1590,8 @@ export function orderingClaimSurvivesCollation(
 		const isEquality = c.op === '=' || c.op === 'IN';
 		const bearsOnClaim = isEquality ? c.usable : accessPlan.handledFilters[i] === true;
 		if (!bearsOnClaim || (keyCollations && !keyCollations.has(c.columnIndex))) return true;
-		const predColl = effectivePredicateCollation(c);
 		const indexColl = keyCollations?.get(c.columnIndex);
-		return classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
+		return classifyConstraintCover(c.collation, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
 	});
 }
 
@@ -1733,9 +1695,8 @@ function classifyCollationCover(
 
 	for (const { colIdx, constraint } of consumed) {
 		allResiduals.push(constraint.sourceExpression);
-		const predColl = effectivePredicateCollation(constraint);
 		const indexColl = collationForColumn(colIdx);
-		const cover = classifyConstraintCover(predColl, indexColl, isEquality, honorsCollatedRangeBounds);
+		const cover = classifyConstraintCover(constraint.collation, indexColl, isEquality, honorsCollatedRangeBounds);
 		if (cover === 'COARSER_SAFE') {
 			coarserResiduals.push(constraint.sourceExpression);
 		} else if (cover === 'MISMATCH_UNSAFE') {

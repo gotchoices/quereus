@@ -95,6 +95,15 @@ export interface PredicateConstraint {
 	 * Mutually exclusive with `value` — see {@link RuntimeSetSpec}.
 	 */
 	readonly runtimeSet?: RuntimeSetSpec;
+	/**
+	 * Normalized collation the comparison runs under at runtime (e.g. 'BINARY', 'NOCASE').
+	 * Absent means BINARY. Advice for the module: the engine re-checks collation itself.
+	 *
+	 * An equality pins its column on an index column of collation C only when
+	 * `collationRefines(collation ?? 'BINARY', C)`; a range bound is served by that index
+	 * column only when the two names are equal. See docs/module-authoring.md.
+	 */
+	readonly collation?: string;
 }
 
 /**

@@ -383,6 +383,7 @@ function probeModuleCosts(
 	context: OptContext,
 	leaf: KeySetTargetNode,
 	seekCol: number,
+	joinCollation: string,
 	keyRowsEstimate: number | undefined,
 ): { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; baselineCost: number } | null {
 	const tableSchema = leaf.tableSchema;
@@ -402,6 +403,7 @@ function probeModuleCosts(
 		columnIndex: seekCol,
 		op: 'IN',
 		usable: true,
+		collation: joinCollation,
 		runtimeSet: {
 			maxCount,
 			...(keyRowsEstimate !== undefined
@@ -446,7 +448,10 @@ function planPushdown(
 	right: RelationalPlanNode,
 	cols: SeekColumns,
 ): KeySetPushdown | null {
-	const costs = probeModuleCosts(context, leaf, cols.seekCol, right.estimatedRows);
+	// The join comparison collation — the same resolution emitBloomJoin makes, so the
+	// seek and the probe agree. The probe filters carry it, as every engine constraint does.
+	const joinCollation = normalizeCollationName(effectiveCollationOfTypes(cols.targetType, cols.keyType));
+	const costs = probeModuleCosts(context, leaf, cols.seekCol, joinCollation, right.estimatedRows);
 	if (!costs) return null;
 
 	const indexAt2 = claimedIndex(costs.seekAt2, cols.seekCol);
@@ -472,12 +477,11 @@ function planPushdown(
 		return null;
 	}
 
-	// Collation cover: the join comparison collation (the same resolution
-	// emitBloomJoin makes, so the seek and the probe agree) against the index's
-	// leading key column collation. MATCH = exact seek; COARSER_SAFE (BINARY
-	// join over a non-BINARY index) over-fetches a superset the probe trims;
-	// MISMATCH_UNSAFE (a finer index) under-fetches — decline.
-	const joinCollation = normalizeCollationName(effectiveCollationOfTypes(cols.targetType, cols.keyType));
+	// Collation cover: the join comparison collation against the index's leading
+	// key column collation. MATCH = exact seek; COARSER_SAFE (BINARY join over a
+	// non-BINARY index) over-fetches a superset the probe trims; MISMATCH_UNSAFE
+	// (a finer index) under-fetches — decline. A module that reads the probe
+	// filter's collation may already have declined; this is the engine's own check.
 	const indexCollation = normalizeCollationName(descriptor.keyColumns[0].collation ?? 'BINARY');
 	if (classifyConstraintCover(joinCollation, indexCollation, /*isEquality*/ true, false) === 'MISMATCH_UNSAFE') {
 		log('decline: collation cover unsafe (join %s vs index %s)', joinCollation, indexCollation);

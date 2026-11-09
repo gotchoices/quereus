@@ -24,6 +24,7 @@ import { BetweenNode, BinaryOpNode } from '../../src/planner/nodes/scalar.js';
 import { InNode } from '../../src/planner/nodes/subquery.js';
 import { combineResidualExpressions } from '../../src/planner/rules/access/rule-select-access-path.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { CollationBlindMemoryModule } from '../vtab/_collation-blind-memory-module.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
 import type { TableSchema } from '../../src/schema/table.js';
 
@@ -224,7 +225,10 @@ describe('IndexSeek records the predicate its FilterInfo enforces', () => {
 	});
 
 	it('stamps nothing when a collation mismatch declines the seek', async () => {
-		await db.exec('create table mm (id integer primary key, name text) using memory');
+		// The stock memory module reads the predicate's collation and never offers this
+		// seek; a collation-blind one does, so the engine's decline is what runs here.
+		db.registerModule('blind_mem', new CollationBlindMemoryModule());
+		await db.exec('create table mm (id integer primary key, name text) using blind_mem');
 		await db.exec("insert into mm values (1, 'apple'), (2, 'Banana'), (3, 'CHERRY'), (4, 'date')");
 		await db.exec('create index idx_mm on mm (name)'); // BINARY index
 

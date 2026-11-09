@@ -347,8 +347,9 @@ describe('Secondary index access path selection', () => {
 			const q = "SELECT id FROM coll_idx WHERE name > 'BOB' ORDER BY id";
 			const ops = await planOpsStr(q);
 			// The NOCASE-ordered index window is not a superset under BINARY ordering,
-			// so the seek must be declined in favor of a filtered scan.
-			expect(ops).to.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+			// so there must be no seek, only a filtered scan (the memory module never offers
+			// this range, since it reads the predicate's collation).
+			expect(ops).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 			expect(ops).to.match(/FILTER/i);
 
 			const results: ResultRow[] = [];

@@ -23,7 +23,7 @@ import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-
 import { PRIMARY_INDEX_NAME, reversedIndexDescriptor } from '../index-descriptor.js';
 import { combineConjunctive } from '../../planner/stats/selectivity-combine.js';
 import { costedRows } from '../../planner/util/row-estimates.js';
-import { normalizeCollationName } from '../../util/comparison.js';
+import { collationRefines, normalizeCollationName } from '../../util/comparison.js';
 import type { RestorableRowStates } from '../rollback-states.js';
 import type { ColumnStatistics, TableStatistics } from '../../planner/stats/catalog-stats.js';
 
@@ -197,20 +197,72 @@ function estimateSortCost(rows: number): number {
 	return rows * Math.log2(rows) * SORT_COST_PER_COMPARISON;
 }
 
+/** The collation an index key column compares under — what the engine's index descriptor reads. */
+function indexColumnCollation(indexCol: IndexColumnSchema): string {
+	return normalizeCollationName(indexCol.collation ?? 'BINARY');
+}
+
+/** The collation a filter's comparison runs under; an engine that sends none means BINARY. */
+function filterCollation(f: PredicateConstraint): string {
+	return normalizeCollationName(f.collation ?? 'BINARY');
+}
+
 /**
- * Collect column indexes bound by an equality predicate (`=` or single-value `IN`).
- * These columns are constants for the access plan and don't contribute ordering.
+ * Whether an equality can seek `indexCol`: every pair of values it treats as equal, the
+ * index treats as equal too (a BINARY predicate, or the index's own collation). Exactly the
+ * equalities `rule-select-access-path`'s collation cover accepts, so the engine never
+ * declines a seek this module offers on collation grounds.
+ */
+function equalityServesIndexColumn(f: PredicateConstraint, indexCol: IndexColumnSchema): boolean {
+	return collationRefines(filterCollation(f), indexColumnCollation(indexCol));
+}
+
+/**
+ * Whether a range bound (or OR_RANGE) can be walked on `indexCol`: the bound must compare
+ * under the index's own collation, which this module's runtime then honours
+ * (`honorsCollatedRangeBounds`). Any other pairing walks a window ordered differently from
+ * the predicate.
+ */
+function rangeServesIndexColumn(f: PredicateConstraint, indexCol: IndexColumnSchema): boolean {
+	return filterCollation(f) === indexColumnCollation(indexCol);
+}
+
+/** Position of the first usable filter on `indexCol` that fills the equality role, or -1. */
+function firstEqualityFilter(indexCol: IndexColumnSchema, filters: readonly PredicateConstraint[]): number {
+	return filters.findIndex(f => f.columnIndex === indexCol.index && f.usable && equalitySeekKeyCount(f) !== null);
+}
+
+/**
+ * True when `indexCol` carries an equality this index cannot serve. Such a column fills NO
+ * role on the index, range included: `rule-select-access-path` seeks the column's first
+ * equality whenever any filter on that column is handled, so a range offered beside it
+ * would be built as that equality's seek and then declined.
+ */
+function blockedByUnservedEquality(indexCol: IndexColumnSchema, filters: readonly PredicateConstraint[]): boolean {
+	const i = firstEqualityFilter(indexCol, filters);
+	return i >= 0 && !equalityServesIndexColumn(filters[i], indexCol);
+}
+
+/**
+ * The columns of `index` bound by an equality predicate (`=` or single-value `IN`) whose
+ * collation refines that index column's. These columns are constants for a walk of this
+ * index and don't contribute ordering. A coarser equality does not pin: `b = 'x' collate
+ * nocase` over a BINARY index admits both the `'X'` and `'x'` groups, and the next key
+ * column restarts in each.
  *
  * A runtime-valued `IN` set never qualifies: `isMultiValueEquality` reports it as
  * multi-valued because its member count is unknown at plan time.
  */
-function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): ReadonlySet<number> {
+function collectEqualityBoundColumns(filters: readonly PredicateConstraint[], index: IndexSchema): ReadonlySet<number> {
 	const cols = new Set<number>();
-	for (const f of filters) {
-		if (!f.usable) continue;
-		if (equalitySeekKeyCount(f) !== null && !isMultiValueEquality(f)) {
-			cols.add(f.columnIndex);
-		}
+	for (const indexCol of index.columns) {
+		const pinned = filters.some(f =>
+			f.columnIndex === indexCol.index
+			&& f.usable
+			&& equalitySeekKeyCount(f) !== null
+			&& !isMultiValueEquality(f)
+			&& equalityServesIndexColumn(f, indexCol));
+		if (pinned) cols.add(indexCol.index);
 	}
 	return cols.size === 0 ? EMPTY_COLUMN_SET : cols;
 }
@@ -740,7 +792,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Find the leading non-equality-bound column. Equality-bound columns are
 		// constants over the scan and don't contribute to monotonic ordering.
-		const equalityBound = collectEqualityBoundColumns(request.filters);
+		const equalityBound = collectEqualityBoundColumns(request.filters, usedIndex);
 		const trailingNonBound = usedIndex.columns.filter(c => !equalityBound.has(c.index));
 		if (trailingNonBound.length === 0) return {}; // single-row equality seek
 
@@ -933,6 +985,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * `isMultiSeek` is NOT `inCardinality > 1`: a runtime set is delivered as a multi-seek
 	 * whatever its ceiling, so a `maxCount === 1` set has cardinality 1 yet still walks the
 	 * index in seek-key order. {@link isMultiValueEquality} is the authority.
+	 *
+	 * The prefix stops at a column whose first equality the index cannot serve
+	 * ({@link equalityServesIndexColumn}); that filter stays unhandled and becomes a residual.
+	 *
+	 * NOTE: accepted tradeoff — only the FIRST equality per column is considered, so
+	 * `b = 'x' collate nocase and b = 'x'` over a BINARY `b` offers no seek although the
+	 * second could seek, and the second still pins `b` for an ordering claim the engine's
+	 * `orderingClaimSurvivesCollation` then refuses (it disqualifies an index carrying any
+	 * mismatched equality). Claiming the later one would break the positional contract (the
+	 * rule seeks the first); revisit only if this shape turns up in real queries.
 	 */
 	private findEqualityMatches(
 		indexCols: ReadonlyArray<IndexColumnSchema>,
@@ -944,27 +1006,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		let isMultiSeek = false;
 
 		for (const indexCol of indexCols) {
-			let foundMatch = false;
-			for (let i = 0; i < filters.length; i++) {
-				const filter = filters[i];
-				if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
-
-				// `=` (whose value may be undefined for parameter bindings — the actual
-				// value is supplied at runtime via seek key expressions), a well-formed
-				// literal `IN`, or a runtime-valued `IN` set. Anything else is null.
-				const keyCount = equalitySeekKeyCount(filter);
-				if (keyCount === null) continue;
-
-				handledFilters[i] = true;
-				foundMatch = true;
-				matchCount++;
-				inCardinality *= keyCount;
-				if (isMultiValueEquality(filter)) isMultiSeek = true;
-				break;
-			}
-			if (!foundMatch) {
+			// `=` (whose value may be undefined for parameter bindings — the actual value is
+			// supplied at runtime via seek key expressions), a well-formed literal `IN`, or a
+			// runtime-valued `IN` set.
+			const i = firstEqualityFilter(indexCol, filters);
+			if (i < 0 || !equalityServesIndexColumn(filters[i], indexCol)) {
 				break; // Can't use remaining index columns
 			}
+			handledFilters[i] = true;
+			matchCount++;
+			inCardinality *= equalitySeekKeyCount(filters[i])!;
+			if (isMultiValueEquality(filters[i])) isMultiSeek = true;
 		}
 
 		return { matchCount, handledFilters, inCardinality, isMultiSeek };
@@ -979,47 +1031,47 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * drop it from the residual filter without ever applying it — `where v > 10 and
 	 * v > 30` would wrongly return the `v > 10` rows. Redundant bounds stay unhandled
 	 * and survive as a residual `Filter`.
+	 *
+	 * Offers no range at all when either claimed bound compares under a collation other
+	 * than the index column's ({@link rangeServesIndexColumn}), or when the column carries
+	 * an equality the index cannot serve ({@link blockedByUnservedEquality}): the rule takes
+	 * the first bound of each side on any handled column, so claiming one bound would have
+	 * it build the other as well and decline the seek.
 	 */
 	private findRangeMatch(
 		indexCol: IndexColumnSchema,
 		filters: readonly PredicateConstraint[]
 	): { hasRange: boolean; handledFilters: boolean[] } {
 		const handledFilters = new Array(filters.length).fill(false);
-		let hasLower = false;
-		let hasUpper = false;
+		const noRange = { hasRange: false, handledFilters };
+		if (blockedByUnservedEquality(indexCol, filters)) return noRange;
 
-		for (let i = 0; i < filters.length; i++) {
-			const filter = filters[i];
-			if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
-			if (!hasLower && (filter.op === '>' || filter.op === '>=')) {
-				handledFilters[i] = true;
-				hasLower = true;
-			} else if (!hasUpper && (filter.op === '<' || filter.op === '<=')) {
-				handledFilters[i] = true;
-				hasUpper = true;
-			}
-		}
+		const onColumn = (i: number): boolean => filters[i].columnIndex === indexCol.index && filters[i].usable;
+		const lower = filters.findIndex((f, i) => onColumn(i) && (f.op === '>' || f.op === '>='));
+		const upper = filters.findIndex((f, i) => onColumn(i) && (f.op === '<' || f.op === '<='));
+		const bounds = [lower, upper].filter(i => i >= 0);
+		if (bounds.length === 0 || !bounds.every(i => rangeServesIndexColumn(filters[i], indexCol))) return noRange;
 
-		return { hasRange: hasLower || hasUpper, handledFilters };
+		for (const i of bounds) handledFilters[i] = true;
+		return { hasRange: true, handledFilters };
 	}
 
 	/**
-	 * Find OR_RANGE match for a column
+	 * Find OR_RANGE match for a column: the first OR_RANGE on it, when its collation is the
+	 * index column's. Declined beside an unserved equality for the reason
+	 * {@link findRangeMatch} gives.
 	 */
 	private findOrRangeMatch(
 		indexCol: IndexColumnSchema,
 		filters: readonly PredicateConstraint[]
 	): { handledFilters: boolean[]; rangeCount: number } | null {
-		for (let i = 0; i < filters.length; i++) {
-			const filter = filters[i];
-			if (filter.columnIndex === indexCol.index && filter.usable && filter.op === 'OR_RANGE') {
-				const handledFilters = new Array(filters.length).fill(false);
-				handledFilters[i] = true;
-				const rangeCount = filter.ranges ? filter.ranges.length : 2;
-				return { handledFilters, rangeCount };
-			}
-		}
-		return null;
+		if (blockedByUnservedEquality(indexCol, filters)) return null;
+		const i = filters.findIndex(f => f.columnIndex === indexCol.index && f.usable && f.op === 'OR_RANGE');
+		if (i < 0 || !rangeServesIndexColumn(filters[i], indexCol)) return null;
+		const handledFilters = new Array(filters.length).fill(false);
+		handledFilters[i] = true;
+		const rangeCount = filters[i].ranges ? filters[i].ranges!.length : 2;
+		return { handledFilters, rangeCount };
 	}
 
 	/**
@@ -1051,11 +1103,6 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		availableIndexes: IndexSchema[],
 		estimatedTableSize: number
 	): BestAccessPlanResult {
-		// Columns bound by an equality predicate are constants for this scan and
-		// therefore contribute no ordering information — they can be skipped when
-		// aligning an index against the required ordering.
-		const equalityCols = collectEqualityBoundColumns(request.filters);
-
 		// Determine whether plan A's existing access pattern can claim the
 		// required ordering. It can iff the chosen filter index satisfies the
 		// ordering AND the access pattern walks the index monotonically — i.e.,
@@ -1065,7 +1112,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			? availableIndexes.find(idx => idx.name === plan.indexName)
 			: undefined;
 		const filterWalk = filterIndex
-			? this.indexSatisfiesOrdering(tableInfo, request, filterIndex, request.requiredOrdering!, equalityCols)
+			? this.indexSatisfiesOrdering(tableInfo, request, filterIndex, request.requiredOrdering!)
 			: undefined;
 
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
@@ -1097,9 +1144,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// Plan B: cheapest competing plan that walks an ordering-providing
 		// index in either direction (with any unpushable filters becoming
 		// residuals). Returns undefined when no such index exists.
-		const planB = this.evaluateOrderingOnlyPlans(
-			tableInfo, request, availableIndexes, equalityCols, estimatedTableSize
-		);
+		const planB = this.evaluateOrderingOnlyPlans(tableInfo, request, availableIndexes, estimatedTableSize);
 
 		if (planB && planB.cost < planACost) {
 			return planB;
@@ -1123,14 +1168,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
-		equalityCols: ReadonlySet<number>,
 		estimatedTableSize: number
 	): BestAccessPlanResult | undefined {
 		let best: BestAccessPlanResult | undefined;
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
 
 		for (const index of availableIndexes) {
-			const walk = this.indexSatisfiesOrdering(tableInfo, request, index, request.requiredOrdering!, equalityCols);
+			const walk = this.indexSatisfiesOrdering(tableInfo, request, index, request.requiredOrdering!);
 			if (walk === undefined) continue;
 
 			// See whether this index can also serve as a filter seek/range.
@@ -1190,7 +1234,9 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Which way a walk of `index` delivers `requiredOrdering`: `'forward'` in its declared
 	 * key order, `'reverse'` backwards (every matched column flipped), or undefined when
 	 * neither does. Forward is tried first. {@link orderingPrefixWalked} does the match,
-	 * including the equality-bound columns it skips.
+	 * including the equality-bound columns it skips — those {@link collectEqualityBoundColumns}
+	 * finds pinned on THIS index, since whether an equality pins depends on the index
+	 * column's collation.
 	 *
 	 * A match is additionally gated by {@link nullSafeOrderingPrefixLength}, run with the
 	 * match's own direction: NULL is this module's lowest key value, so a column walked
@@ -1218,8 +1264,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		request: BestAccessPlanRequest,
 		index: IndexSchema,
 		requiredOrdering: readonly OrderingSpec[],
-		equalityCols: ReadonlySet<number> = EMPTY_COLUMN_SET
 	): OrderingWalk | undefined {
+		const equalityCols = collectEqualityBoundColumns(request.filters, index);
 		const servesWalking = (reverse: boolean): boolean => {
 			const consumed = orderingPrefixWalked(tableInfo, index, requiredOrdering, equalityCols, reverse);
 			return consumed !== undefined

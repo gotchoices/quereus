@@ -473,7 +473,8 @@ describe('provesAtMostOne (the at-most-one proof)', () => {
 	/**
 	 * `t.<colIdx> <op> 'x'` as the constraint `extractConstraints` would mint
 	 * for it. `predicateCollation` is the column reference's declared collation,
-	 * which the lattice resolves the comparison to (a literal contributes none).
+	 * which the lattice resolves the comparison to (a literal contributes none),
+	 * so it is also the collation the extractor stamps.
 	 */
 	function constraint(colIdx: number, predicateCollation?: string, op: PredicateConstraint['op'] = '='): PredicateConstraint {
 		const ast = { type: 'column', name: `c${colIdx}` } as AST.ColumnExpr;
@@ -481,7 +482,10 @@ describe('provesAtMostOne (the at-most-one proof)', () => {
 		const rhs = new LiteralNode(scope, { type: 'literal', value: 'x' } as AST.LiteralExpr);
 		const binAst = { type: 'binary', operator: op, left: ast, right: rhs.expression } as AST.BinaryExpr;
 		const src = new BinaryOpNode(scope, binAst, lhs, rhs);
-		return { columnIndex: colIdx, op, usable: true, attributeId: 1000 + colIdx, sourceExpression: src as ScalarPlanNode, bindingKind: 'literal' };
+		return {
+			columnIndex: colIdx, op, usable: true, attributeId: 1000 + colIdx, sourceExpression: src as ScalarPlanNode,
+			bindingKind: 'literal', collation: predicateCollation ?? 'BINARY',
+		};
 	}
 
 	it('proves a fully pinned primary key', () => {

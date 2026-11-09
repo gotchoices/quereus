@@ -155,7 +155,25 @@ interface BestAccessPlanRequest {
   offset?: number | null;  // travels with `limit`; the bound is `limit + offset`
   estimatedRows?: number;
 }
+
+interface PredicateConstraint {
+  columnIndex: number;
+  op: ConstraintOp;
+  value?: SqlValue;              // the plan-time value, when there is one
+  usable: boolean;
+  ranges?: RangeSpec[];          // OR_RANGE only
+  runtimeSet?: RuntimeSetSpec;   // an IN whose members arrive at query time
+  collation?: string;            // normalized collation the comparison runs under; absent = BINARY
+}
 ```
+
+**`collation` names the collation the comparison runs under** — `'NOCASE'` for `b = 'x' collate nocase`, or for a plain `b = 'x'` on a column declared `collate nocase`. It is normalized, and absent means BINARY. Read it before offering an index for a filter; let `C` be the collation of the index column the filter would use:
+
+- **An equality** (`=`, `IN`) seeks that column, and counts as pinning it to one value for an ordering claim, only when `collationRefines(constraint.collation ?? 'BINARY', C)` (exported from `@quereus/quereus`): the predicate is BINARY, or equal to `C`. A coarser one does neither. `b = 'x' collate nocase` over a BINARY `(b, c)` matches the `'X'` and `'x'` groups, so a seek would miss rows and `c` restarts in each group.
+- **A range bound or `OR_RANGE`** is served by that column only when its collation equals `C`. For a non-BINARY `C`, your runtime must also filter the bounds under `C` and you must advertise `honorsCollatedRangeBounds`.
+- **Only the first filter of each role on a column counts.** The planner seeks the first equality, the first lower bound and the first upper bound on every column you mark handled. If that first filter fails the test, claim nothing on that column for this index: not a later filter that passes, and not a range beside an equality that fails. Leave the filter unhandled and it becomes a residual.
+
+The engine does not depend on your answer. It declines a mismatched seek to a scan plus a residual, and refuses an ordering claim the predicate's collation breaks (`orderingClaimSurvivesCollation`), so a module that ignores the field still returns the right rows. Reading it stops you offering plans the engine will discard: such a plan is costed as the seek you described, can win that comparison, and is then rebuilt as a scan.
 
 **It is called more than once per statement, so keep it pure and cheap.** Planning probes the
 same table several times with different requests and keeps only the answer it wants: the
@@ -219,7 +237,7 @@ interface BestAccessPlanResult {
   - `keyColumns` is an `IndexColumnSchema[]`, so an index's `columns` and a table's `primaryKeyDefinition` both go in unchanged — **a nullable descending primary-key member is exposed by the same reasoning, with no `CREATE INDEX` involved.**
   - Truncating the returned prefix is the general form. A caller that claims a required ordering verbatim (all or nothing) wants the boolean `nullSafeOrderingPrefixLength(…) === matchedLength` instead.
   - Gate **every** claim, not only the one a `requiredOrdering` asked for: a bare advertisement made with no request is read by the merge-join rule under the same NULLs-first rule, and a `monotonicOn` `direction: 'desc'` (plus `supportsAsofRight`, which implies it) asserts the same physical order.
-- **`providesOrdering` and `monotonicOn` are read under each table column's declared collation,** whatever collation your key is stored under. `ORDER BY` and merge join both compare under the column's own, so a key on `(k collate nocase)` over a BINARY `k` claims nothing on `k`: it emits `'a'` before `'B'` and they want the reverse. The engine checks only the opposite direction, a predicate whose collation differs from your index, because you cannot see a predicate's collation. See `orderingClaimSurvivesCollation`.
+- **`providesOrdering` and `monotonicOn` are read under each table column's declared collation,** whatever collation your key is stored under. `ORDER BY` and merge join both compare under the column's own, so a key on `(k collate nocase)` over a BINARY `k` claims nothing on `k`: it emits `'a'` before `'B'` and they want the reverse. The engine also checks the opposite direction, a predicate whose collation differs from your index, as a backstop for modules that do not read `PredicateConstraint.collation`. See `orderingClaimSurvivesCollation`.
 - `monotonicOn` is the leaf's natural emit order (storage property, not request-dependent). Stronger than `providesOrdering` — implies a total order with no gaps in coverage.
 - `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.

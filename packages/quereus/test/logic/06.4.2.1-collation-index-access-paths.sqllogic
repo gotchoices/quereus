@@ -138,3 +138,22 @@ select id from rng_rtrim where val > 'cat' order by id;
 
 drop table rng_rtrim;
 
+
+-- =============================================================================
+-- OR collapse over a NOCASE column with a NOCASE index
+-- =============================================================================
+-- The collapsed IN / OR_RANGE carries the column's NOCASE collation, so it matches the
+-- index exactly and seeks with no residual re-check. The seek alone must return every
+-- case variant.
+
+create table or_nc (id integer primary key, n text collate NOCASE);
+insert into or_nc values (1, 'a'), (2, 'A'), (3, 'b'), (4, 'B'), (5, 'c'), (6, 'x'), (7, 'X'), (8, 'y'), (9, 'Y');
+create index idx_or_nc on or_nc (n);
+
+select id from or_nc where n = 'a' or n = 'B' order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+select id from or_nc where n < 'b' or n > 'x' order by id;
+→ [{"id":1},{"id":2},{"id":8},{"id":9}]
+
+drop table or_nc;

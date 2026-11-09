@@ -24,7 +24,7 @@ import { isPrimaryIndexName, type AccessPath } from '../../src/vtab/index-descri
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
 import type { TableSchema } from '../../src/schema/table.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { CollationBlindMemoryModule } from './_collation-blind-memory-module.js';
 import { ALIASED_PK_NAME, TestAliasedIndexModule, aliasedIndexStore } from './test-aliased-index-module.js';
 
 /** Every physical table-access leaf carries a FilterInfo. */
@@ -69,9 +69,10 @@ function upperCaseSecondary(name: string | undefined): string | undefined {
 /**
  * A memory module that reports its secondary indexes' names in upper case, which the
  * engine resolves case-insensitively to the same index. The memory runtime looks the name
- * up exactly, so only plans that decline the module's seek can execute.
+ * up exactly, so only plans that decline the module's seek can execute. It is also blind
+ * to predicate collation, so it makes the mismatched claims the engine must refuse.
  */
-class UpperCasedIndexNameModule extends MemoryTableModule {
+class UpperCasedIndexNameModule extends CollationBlindMemoryModule {
 	override getBestAccessPlan(db: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
 		const plan = super.getBestAccessPlan(db, tableInfo, request);
 		return {

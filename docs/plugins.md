@@ -1495,6 +1495,7 @@ interface PredicateConstraint {
   op: ConstraintOp;
   value?: SqlValue;
   usable: boolean;
+  collation?: string;  // normalized collation the comparison runs under; absent = BINARY (see module-authoring.md)
 }
 
 interface OrderingSpec {
