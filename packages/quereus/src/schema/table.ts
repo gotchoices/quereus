@@ -404,7 +404,10 @@ function effectiveKeyCollation(collation: string | undefined): string {
 export function rederivePrimaryKeyCollations(schema: TableSchema): TableSchema {
 	let changed = false;
 	const primaryKeyDefinition = schema.primaryKeyDefinition.map(def => {
-		const collation = schema.columns[def.index].collation || 'BINARY';
+		const column = schema.columns[def.index];
+		// An out-of-range member is left for registration's check to report as INTERNAL.
+		if (!column) return def;
+		const collation = column.collation || 'BINARY';
 		if (effectiveKeyCollation(def.collation) === effectiveKeyCollation(collation)) return def;
 		changed = true;
 		return { ...def, collation };
