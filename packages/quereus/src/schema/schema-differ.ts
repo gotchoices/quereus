@@ -3463,8 +3463,8 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 
 	pushTableAlters(diff.tablesToAlter, [...diff.viewsToCreate, ...maintainedCreates], { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo });
 
-	// Attach / re-attach maintained tables (`set maintained as`) LATE — where MV
-	// creates ran — after every table create/alter, so the target's final shape and
+	// Attach / re-attach maintained tables (`set maintained as`) LATE — after every
+	// table create/alter and every new view or maintained create, so the target's final shape and
 	// the body's sources already exist (and any reshape leg's `drop maintained` +
 	// column ops have run). A same-shape re-attach reconciles content in place (a
 	// refresh, not a recreate). Built as a synthetic `set maintained as` action and
