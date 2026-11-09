@@ -52,6 +52,18 @@ with recursive r(n) as (
 select * from r;
 → [{"n":1}]
 
+-- ===== Recursive CTE: start row selects one column twice =====
+
+-- The two output columns stay independent in the recursive step: at depth two
+-- (id 4) root must still be 1, not the parent's id.
+with recursive walk(root, id) as (
+  select id, id from ct where id = 1
+  union all
+  select w.root, ct.id from ct join walk w on ct.parent_id = w.id
+)
+select root, id from walk order by id;
+→ [{"root":1,"id":1},{"root":1,"id":2},{"root":1,"id":3},{"root":1,"id":4}]
+
 -- ===== CTE with EXISTS check =====
 
 -- Existing value

@@ -78,8 +78,12 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		const baseCaseType = this.baseCaseQuery.getType();
 		const columnNames = this.columns || baseCaseType.columns.map((c) => c.name);
 
+		// NOTE: the ids are the base case's, so a base case that selects one column twice
+		// repeats an id here. Every reader binds these by position today: CTEReferenceNode
+		// and the recursive step's working-table ref (buildRecursiveCTE) mint their own. If
+		// anything starts resolving this node's attributes by id, mint fresh ids here first.
 		return baseCaseAttributes.map((attr, index) => ({
-			id: attr.id, // Preserve original attribute ID for proper context resolution
+			id: attr.id,
 			name: columnNames[index] || attr.name,
 			type: attr.type,
 			sourceRelation: `recursive_cte:${this.cteName}`

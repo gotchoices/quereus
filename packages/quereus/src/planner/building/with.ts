@@ -8,7 +8,7 @@ import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { buildExpression } from './expression.js';
-import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import { PlanNode, type Attribute, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -327,7 +327,7 @@ function buildRecursiveCTE(
 	const internalRefNode = new InternalRecursiveCTERefNode(
 		ctx.scope,
 		cte.name,
-		recursiveCTENode.getAttributes(),
+		workingTableAttributes(recursiveCTENode),
 		recursiveCTENode.getType(),
 		recursiveCTENode.tableDescriptor
 	);
@@ -349,4 +349,20 @@ function buildRecursiveCTE(
 	recursiveCTENode.setRecursiveCaseQuery(recursiveCaseQuery);
 
 	return recursiveCTENode;
+}
+
+/**
+ * One fresh attribute per working-table column. The CTE's own attributes reuse the
+ * start row's ids, and a start row that selects one column twice (`select id, id`)
+ * publishes the same id in both positions — sharing them would bind both working-table
+ * columns to one slot, so the recursive step would read the first column as the second.
+ * Fresh ids also keep the step's reads from resolving to a slot of the start row's scan.
+ */
+function workingTableAttributes(recursiveCTENode: RecursiveCTENode): Attribute[] {
+	return recursiveCTENode.getAttributes().map((attr) => ({
+		id: PlanNode.nextAttrId(),
+		name: attr.name,
+		type: attr.type,
+		sourceRelation: attr.sourceRelation,
+	}));
 }
