@@ -27,3 +27,9 @@ A parameter whose only binding so far has been `null` still accepts a later non-
 ## Open design point
 
 A `null` binding could be treated as "no type yet": the parameter stays untyped and the existing rule "a plan built without a parameter's type is discarded when it is first bound" handles recompiling. Or the parameter could be typed ANY. ANY avoids the recompile but gives up the precise type that later values would have supplied. The first option matches what the doc already promises for parameters that have no type yet. Note: once `bug-any-typed-parameter-hint-rejects-every-value` lands, the bind-time check accepts any value for an ANY-typed parameter.
+
+## Decision (maintainer, 2026-11-10)
+
+A parameter with no declared type whose first bound value is NULL is typed ANY (nullable), not "not typed yet". No re-plan or rebinding when a non-null value arrives later: the plan built on the null binding stays, and ANY accepts whatever comes next. The maintainer wants where a parameter's type gets fixed to stay clear, which a deferred re-type would blur.
+
+Consequences to pin with tests: later non-null values of any type bind and run on the same plan; places that need a typed value at run time (for example the LIMIT/OFFSET runtime check for ANY parameters from `bug-null-limit-returns-no-rows`) apply their runtime checks. A declared type (the `db.prepare` type map) still wins over this rule. Document the rule beside the existing parameter-typing description.
