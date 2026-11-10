@@ -21,7 +21,7 @@ import { parseExpressionString } from '../../src/parser/index.js';
 import type * as AST from '../../src/parser/ast.js';
 import { walkSchemaExpressionScope, type ScopeWalkHandlers } from '../../src/schema/expr-scope/walk.js';
 import type { ScopeFrame } from '../../src/schema/expr-scope/frame.js';
-import { stripSelfQualifierInSchemaExpression } from '../../src/schema/rename-rewriter.js';
+import { OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression } from '../../src/schema/rename-rewriter.js';
 import { collectGeneratedColumnRefs } from '../../src/schema/generated-column-refs.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
@@ -267,7 +267,7 @@ describe('walkSchemaExpressionScope', () => {
 		it('rewrites nothing inside a sealed subtree', () => {
 			const expr = parseExpressionString('exists (select a with inverse (b = t.a) from other)');
 			const before = expressionToString(expr);
-			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false)).to.equal(false);
+			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', { columns: new Set(['a']) })).to.equal(false);
 			expect(expressionToString(expr)).to.equal(before);
 		});
 	});
@@ -437,8 +437,8 @@ describe('walkSchemaExpressionScope', () => {
 		it('rewrites nothing under a barrier, even though it now walks there', () => {
 			// The strip's predecessor traversal had no DML arms at all, so merging the
 			// two walks made it VISIT these subtrees for the first time. It must still
-			// rewrite none of them: every DML arm pushes an opaque frame, and
-			// `stripColumnQualifier` bails at the first frame with `hasOpaque`.
+			// rewrite none of them: every DML arm pushes a barrier frame, and
+			// `stripColumnQualifier` leaves a name under one as written.
 			const cases = [
 				'exists (insert into other select t.qty from src returning k)',
 				'exists (update other set v = t.qty where t.qty > 0 returning v)',
@@ -449,7 +449,7 @@ describe('walkSchemaExpressionScope', () => {
 			for (const sql of cases) {
 				const expr = parseExpressionString(sql);
 				const before = expressionToString(expr);
-				const changed = stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false);
+				const changed = stripSelfQualifierInSchemaExpression(expr, 't', 'main', { columns: new Set(['qty']) });
 				expect(changed, sql).to.equal(false);
 				expect(expressionToString(expr), sql).to.equal(before);
 			}
@@ -459,14 +459,14 @@ describe('walkSchemaExpressionScope', () => {
 			// Intended, and consistent with how the strip already treats `partition by` /
 			// `order by`: a frame bound is an ordinary correlated expression.
 			const expr = parseExpressionString('sum(v) over (rows between t.y preceding and current row)');
-			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false)).to.equal(true);
-			expect(expressionToString(expr)).to.not.contain('t.y');
+			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', { columns: new Set(['y']) })).to.equal(true);
+			expect(expressionToString(expr)).to.contain(`${OWN_ROW_QUALIFIER}.y`);
 		});
 
 		it('still strips a self-qualifier the walk can prove nothing rebinds', () => {
 			const expr = parseExpressionString('t.qty > 0');
-			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false)).to.equal(true);
-			expect(expressionToString(expr)).to.not.contain('t.qty');
+			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', { columns: new Set(['qty']) })).to.equal(true);
+			expect(expressionToString(expr)).to.contain(`${OWN_ROW_QUALIFIER}.qty`);
 		});
 
 	});

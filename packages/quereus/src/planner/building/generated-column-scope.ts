@@ -10,8 +10,7 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
-import { stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
-import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
+import { OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 
@@ -31,7 +30,8 @@ import { columnSchemaToScalarType } from '../type-utils.js';
  * | spelling                        | how it resolves                                  |
  * |---------------------------------|--------------------------------------------------|
  * | `<col>`                         | registered below                                  |
- * | `<table>.<col>`                 | folded to `<col>` by the self-qualifier strip     |
+ * | `<table>.<col>`                 | folded by the self-qualifier strip to the         |
+ * |                                 | `OWN_ROW_QUALIFIER` key registered below          |
  * | `<own-schema>.<table>.<col>`    | same                                              |
  * | `new.<col>`                     | registered below — an exact alias for the bare form|
  * | `old.<col>`                     | NOT registered: a generated value is computed from |
@@ -72,8 +72,8 @@ export function buildGeneratedColumnExpr(
 	 */
 	rowAttributes: ReadonlyArray<Attribute>,
 ): ScalarPlanNode {
-	// Fold `<table>.<col>` / `<schema>.<table>.<col>` to the bare form the scope
-	// registers, on a clone — never the stored AST. Done as a rewrite rather than by
+	// Fold `<table>.<col>` / `<schema>.<table>.<col>` to the `OWN_ROW_QUALIFIER` key the
+	// scope registers, on a clone — never the stored AST. Done as a rewrite rather than by
 	// seeding `<table>.<col>` scope keys for the reason `constraint-builder.ts`
 	// documents: this scope is an ancestor of every subquery planned inside the body,
 	// and qualified keys would let a join peer's parent-chain fallback resolve an
@@ -85,8 +85,8 @@ export function buildGeneratedColumnExpr(
 	// shows up in a profile, cache the stripped form on the column schema.
 	let expr = generatedExpr;
 	const stripped = cloneExpr(generatedExpr);
-	if (stripSelfQualifierInSchemaExpression(
-		stripped, tableSchema.name, tableSchema.schemaName, buildColumnSourceResolver(ctx.db))) {
+	const columns = new Set(tableSchema.columns.map(column => column.name.toLowerCase()));
+	if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, { columns })) {
 		expr = stripped;
 	}
 
@@ -120,6 +120,7 @@ export function buildGeneratedColumnExpr(
 		const colNameLower = column.name.toLowerCase();
 		scope.registerSymbol(colNameLower, makeRef);
 		scope.registerSymbol(`new.${colNameLower}`, makeRef);
+		scope.registerSymbol(`${OWN_ROW_QUALIFIER}.${colNameLower}`, makeRef);
 	});
 
 	// Schema-authored SQL: bare relation names inside the body resolve against the

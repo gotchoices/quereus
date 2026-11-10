@@ -344,12 +344,62 @@ select qty from t_selfq_r;
 
 drop table t_selfq_r;
 
--- a subquery over a VIEW that exposes the same name blocks the strip, exactly as a
--- real table exposing it would: the column-source resolver reads a view's published
--- columns (explicit list, or the body's projection / star), so the qualified
--- self-reference is NOT rewritten to a bare name the view would capture. The ref then
--- stays qualified and fails to resolve at write time — loud, instead of silently
--- comparing the view's column to itself (what the view-blind resolver used to produce).
+-- a subquery over a TABLE that has a same-named column: the bare `b` there would be the
+-- subquery's, while the qualified self-reference is still the constraint row's
+create table t_selfq_xv (b integer primary key);
+insert into t_selfq_xv values (1);
+
+create table t_selfq_x (
+	id integer primary key,
+	b integer,
+	constraint known_b check (exists (select 1 from t_selfq_xv where t_selfq_xv.b = t_selfq_x.b))
+);
+
+insert into t_selfq_x values (1, 1);
+
+insert into t_selfq_x values (2, 2);
+-- error: known_b
+
+select id, b from t_selfq_x;
+→ [{"id":1,"b":1}]
+
+drop table t_selfq_x;
+
+-- ...and on a DELETE-op check the same spelling names the OLD row
+create table t_selfq_xd (
+	id integer primary key,
+	b integer,
+	constraint del_known check on delete (exists (select 1 from t_selfq_xv where t_selfq_xv.b = t_selfq_xd.b))
+);
+insert into t_selfq_xd values (1, 1), (2, 2);
+
+delete from t_selfq_xd where id = 1;
+
+delete from t_selfq_xd where id = 2;
+-- error: del_known
+
+select id from t_selfq_xd;
+→ [{"id":2}]
+
+drop table t_selfq_xd;
+drop table t_selfq_xv;
+
+-- ...and as an argument of a table-valued function in the subquery's FROM
+create table t_selfq_gs (
+	id integer primary key,
+	b integer,
+	constraint reaches_two check (exists (select 1 from generate_series(1, t_selfq_gs.b) g where g.value = 2))
+);
+
+insert into t_selfq_gs values (1, 3);
+
+insert into t_selfq_gs values (2, 1);
+-- error: reaches_two
+
+drop table t_selfq_gs;
+
+-- a subquery over a VIEW that exposes the same name behaves as the table case above:
+-- `t_selfq_vw.n` is the view's column and `t_selfq_v.n` the constraint row's.
 create table t_selfq_vsrc (k integer primary key, n integer);
 create view t_selfq_vw as select n from t_selfq_vsrc;
 insert into t_selfq_vsrc values (1, 10);
@@ -361,12 +411,17 @@ create table t_selfq_v (
 );
 
 insert into t_selfq_v values (1, 50);
--- error: t_selfq_v.n isn't a column
+
+insert into t_selfq_v values (2, 5);
+-- error: over_view
+
+select id, n from t_selfq_v;
+→ [{"id":1,"n":50}]
 
 drop table t_selfq_v;
 
--- ...and when the view does NOT expose the name, the strip proceeds and the
--- self-reference correlates to the constraint row, same as the real-table case above.
+-- ...and over a view that does NOT expose the name, where the subquery's bare `k` is the
+-- view's and the self-reference again the constraint row's.
 create view t_selfq_vk as select k from t_selfq_vsrc;
 
 create table t_selfq_v2 (

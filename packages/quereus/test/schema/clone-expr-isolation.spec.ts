@@ -14,7 +14,7 @@
 import { expect } from 'chai';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { cloneExpr } from '../../src/planner/mutation/scope-transform.js';
-import { renameTableInAst, renameColumnInCheckExpression, stripSelfQualifierInSchemaExpression, objectRefKey, singleSchemaObjectRefResolver, NO_CONTEXT_VARIABLES, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInCheckExpression, OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression, objectRefKey, singleSchemaObjectRefResolver, NO_CONTEXT_VARIABLES, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
 // Single-schema resolver: these are clone-isolation tests, not resolution tests
@@ -119,9 +119,9 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (select sum(t.v) over (partition by t.v order by t.v) from u)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = stripSelfQualifierInSchemaExpression(clone, 't', 'main', () => false);
+		const changed = stripSelfQualifierInSchemaExpression(clone, 't', 'main', { columns: new Set(['v']) });
 		expect(changed, 'strip should hit the window function in the clone').to.equal(true);
-		expect(expressionToString(clone)).to.not.contain('t.v');
+		expect(expressionToString(clone)).to.contain(`${OWN_ROW_QUALIFIER}.v`);
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});
 });

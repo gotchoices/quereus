@@ -873,6 +873,15 @@ select a, who from SqNew
 drop table SqNew;
 drop table "new";
 
+-- A self-qualified variable that is no column of the table reads the variable there too, though
+-- the subquery's source has a column of that name.
+create table SqVar (a integer primary key, check (exists (select 1 from SqPeer where SqPeer.who = SqVar.who))) with context (who integer null);
+insert into SqVar with context who = 8 values (1);
+-- error: CHECK constraint failed
+insert into SqVar with context who = 7 values (2);
+select a from SqVar
+→ [{"a":2}]
+
 -- A CTE body cannot correlate to the written row, so the name stays unresolved there, as an
 -- unshadowed name does, rather than judging every row on the first row's value.
 create table SqCte (a integer primary key, who integer null, check ((with c as (select SqCte.who as x from SqPeer) select max(x) from c) > 0)) with context (who integer null);

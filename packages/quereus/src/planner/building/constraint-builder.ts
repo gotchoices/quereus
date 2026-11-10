@@ -4,7 +4,7 @@ import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { Attribute, RowDescriptor } from '../nodes/plan-node.js';
 import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
-import type { Scope } from '../scopes/scope.js';
+import type { ReferenceCallback, Scope } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import type { PlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -14,7 +14,6 @@ import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { OWN_ROW_QUALIFIER, stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
-import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 import { mutationContextVarNames, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
 
@@ -68,16 +67,15 @@ export function buildConstraintChecks(
   const applicableConstraints = [...tableSchema.checkConstraints, ...additionalConstraints]
     .filter(constraint => shouldCheckConstraint(constraint, operation));
 
-  const resolveColumnInSource = buildColumnSourceResolver(ctx.db);
-
-  // Bare column names a mutation context variable claims. The unqualified form is left
-  // to the context variable (the documented WITH CONTEXT precedence); the shadowed
-  // column stays reachable as `new.<col>` / `old.<col>`, and as `<table>.<col>`, which
-  // the strip below folds to the qualified name registered in place of the bare one.
-  const shadowedByContext = mutationContextVarNames(contextAttributes);
-  const shadowedColumns = new Set(
-    tableSchema.columns.map(column => column.name.toLowerCase()).filter(name => shadowedByContext.has(name)),
-  );
+  // A column whose name a mutation context variable claims leaves the bare name to the
+  // variable (the documented WITH CONTEXT precedence); it stays reachable as
+  // `new.<col>` / `old.<col>`, and as `<table>.<col>`, which the strip below folds to the
+  // `OWN_ROW_QUALIFIER` key every column is registered under.
+  const contextVariables = mutationContextVarNames(contextAttributes);
+  const ownRowNames = {
+    columns: new Set(tableSchema.columns.map(column => column.name.toLowerCase())),
+    contextVariables,
+  };
 
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {
@@ -105,7 +103,10 @@ export function buildConstraintChecks(
     tableSchema.columns.forEach((tableColumn, tableColIndex) => {
       const colNameLower = tableColumn.name.toLowerCase();
       // Which row image the operation judges is decided by this registration alone.
-      const ownRowKey = shadowedColumns.has(colNameLower) ? `${OWN_ROW_QUALIFIER}.${colNameLower}` : colNameLower;
+      const registerOwnRow = (reference: ReferenceCallback): void => {
+        constraintScope.registerSymbol(`${OWN_ROW_QUALIFIER}.${colNameLower}`, reference);
+        if (!contextVariables.has(colNameLower)) constraintScope.registerSymbol(colNameLower, reference);
+      };
 
       // Register NEW.col and unqualified col (defaults to NEW for INSERT/UPDATE, OLD for DELETE)
       const newAttrId = newAttrIdByCol[colNameLower];
@@ -126,7 +127,7 @@ export function buildConstraintChecks(
 
         // For INSERT/UPDATE, unqualified column defaults to NEW.
         if (operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) {
-          constraintScope.registerSymbol(ownRowKey, (exp, s) =>
+          registerOwnRow((exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
         }
       }
@@ -143,7 +144,7 @@ export function buildConstraintChecks(
 
         // For DELETE, unqualified column defaults to OLD.
         if (operation === RowOpFlag.DELETE) {
-          constraintScope.registerSymbol(ownRowKey, (exp, s) =>
+          registerOwnRow((exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttrId, tableColIndex));
         }
       }
@@ -168,15 +169,15 @@ export function buildConstraintChecks(
       // table drifted apart in the first place.
       const constraintCtx = { ...ctx, scope: constraintScope };
 
-      // Fold table-qualified self-references (`check (t.qty > 0)`) to the bare
-      // column form the row-context scope registers. Done as an AST rewrite on a
+      // Fold table-qualified self-references (`check (t.qty > 0)`) to the
+      // `OWN_ROW_QUALIFIER` key registered above. Done as an AST rewrite on a
       // clone (never the stored constraint) rather than by seeding `<table>.<col>`
       // scope keys: this scope is an ancestor of every subquery planned inside
-      // the CHECK, and qualified keys would shadow inner relations through join
+      // the CHECK, and those keys would shadow inner relations through join
       // peers' parent-chain fallback.
       let constraintExpr = constraint.expr;
       const stripped = cloneExpr(constraint.expr);
-      if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource, shadowedColumns)) {
+      if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, ownRowNames)) {
         constraintExpr = stripped;
       }
 

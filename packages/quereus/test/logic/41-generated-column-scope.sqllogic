@@ -327,3 +327,24 @@ select id, g from gd;
 drop table gd;
 drop table gi;
 drop table gi_src;
+
+-- ===================================
+-- 15. A self-qualified name reaches the row being computed even inside a subquery
+--     whose source has a same-named column, where the bare name is the source's.
+-- ===================================
+
+create table sq_src (k integer primary key, b integer);
+insert into sq_src values (1, 1), (2, 1), (3, 2);
+
+create table sq (
+	id integer primary key,
+	b integer,
+	c integer generated always as ((select count(*) from sq_src where sq_src.b = sq.b))
+);
+insert into sq (id, b) values (1, 1), (2, 2);
+
+select id, b, c from sq order by id;
+→ [{"id":1,"b":1,"c":2},{"id":2,"b":2,"c":1}]
+
+drop table sq;
+drop table sq_src;
