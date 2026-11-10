@@ -181,7 +181,9 @@ lists on semantically-ordered column types (TIMESPAN, JSON) fall back to the sca
 still correct, just not accelerated. When several secondary indexes can serve the same
 predicate, the lowest-cost seek wins (equal costs keep the first-declared index), so
 declaration order no longer decides whether a query does one seek or hundreds. The primary-key
-arms still take precedence over any secondary index whenever they apply.
+point and multi-seek arms still take precedence over any secondary index whenever they apply;
+a primary-key window (a leading-member range or a prefix equality, below) competes with the
+secondary seeks on cost, the sort each would force included.
 
 An `IN` covering the **whole primary key** takes the same path against the data store
 itself: `where pk in (1, 2, 3)`, or `a in (…) and b in (…)` on a composite key, becomes one
@@ -191,6 +193,14 @@ deduplicated point read per distinct key tuple rather than a scan. Every gate ab
 residual. Unlike a secondary multi-seek, this one **advertises primary-key order**: the point
 reads are emitted ascending by encoded data key, which is primary-key order (a `DESC` key
 member's inversion is baked into its bytes), so `where pk in (…) order by pk` needs no `Sort`.
+
+An equality on a **leading part of the primary key** (`where a = ?` on an `(a, b)` key),
+optionally with a bound on the next member (`where a = ? and b > ?`), is served as one
+contiguous primary-key window rather than a scan, and that window provides primary-key order
+on the remaining members, so `where a = ? order by b` (or `order by b desc`) needs no `Sort`.
+A partly pinned `IN` still scans: `a in (…)` alone offers no prefix, and on an `(a, b, c)` key
+the window stops before the first multi-value `IN` (`a = 1 and b in (…)` seeks `a` and
+filters `b`).
 
 The same multi-seek path also serves an `IN` whose values only exist once the query runs
 — `where v in (select … )`, which the engine may materialize into a set and hand down as

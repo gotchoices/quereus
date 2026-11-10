@@ -1,7 +1,7 @@
 /**
  * Access planning for a store-backed table: which physical access path
- * (`_primary_` point / range seek, a secondary-index seek or multi-seek, or a full
- * scan) this module advertises for a pushed predicate, which of the pushed filters it
+ * (`_primary_` point / prefix / range seek or multi-seek, a secondary-index seek or
+ * multi-seek, or a full scan) this module advertises for a pushed predicate, which of the pushed filters it
  * claims as handled, and what ordering the chosen path provides.
  *
  * The mirror of `store-table-scan.ts`: the planner here decides which access path to
@@ -145,7 +145,9 @@ type IndexArm =
  *
  * The leading-primary-key range ({@link leadingPkRangePlan}) is priced through the same
  * path, as a `range` arm on the leading PK column, so it falls back to the `range` entry
- * under exactly the conditions a secondary index's leading-column range does.
+ * under exactly the conditions a secondary index's leading-column range does. The
+ * primary-key prefix ({@link pkPrefixPlan}) is likewise an `eq` or `prefixRange` arm over
+ * its prefix.
  *
  * `prefixRange` sits between the two other factors, as its window does: narrower than a
  * bare leading-column range (the prefix pins every column ahead of the bound) and wider
@@ -604,14 +606,16 @@ export function computeBestAccessPlan(
  *  - A full primary-key equality returns early as a point lookup (the cheapest plan by
  *    construction), and a full primary-key IN as a `_primary_` multi-seek unless a gate
  *    declines it. Neither competes with anything below.
- *  - A bound on the leading PK column becomes a CANDIDATE ({@link leadingPkRangePlan}).
+ *  - One primary-key WINDOW becomes a CANDIDATE: an equality on a leading strict prefix of
+ *    the key, optionally bounded on the next member ({@link pkPrefixPlan}), else a bound
+ *    on the leading member alone ({@link leadingPkRangePlan}).
  *  - Each secondary-index seek faces the seek-versus-scan veto ({@link seekSurvivesVeto});
  *    the survivors compete for the lowest RANK ({@link seekRankingCost}: declared cost,
  *    plus the sort a plan would force when it misses a required ordering).
- *  - With a PK range candidate, the best surviving seek displaces it only when it ranks
- *    strictly lower; with no survivor, or only a cost-only advertisement, the PK range
- *    stands. Without a PK range, the best survivor wins, else the scan when every seek was
- *    vetoed, else the first cost-only advertisement, else the scan.
+ *  - With a PK window candidate, the best surviving seek displaces it only when it ranks
+ *    strictly lower; with no survivor, or only a cost-only advertisement, the PK window
+ *    stands. Without a PK window, the best survivor wins, else the scan when every seek
+ *    was vetoed, else the first cost-only advertisement, else the scan.
  */
 function computeFilterAccessPlan(
 	db: Database,
@@ -636,12 +640,12 @@ function computeFilterAccessPlan(
 	const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
 
 	// Hoisted ABOVE both primary-key arms: the multi-seek arm's ordering advertisement
-	// needs it, and it is cheap (a short loop over the PK members). Its other consumer is
-	// the leading-PK range arm below, which declines when the leading PK column's key
-	// bytes do not order the way its comparator does (`pkOrderPreservingPrefix === 0`):
-	// `StoreTable.analyzePKAccess` declines the byte window under exactly that condition,
-	// so claiming the range filters handled would drop the residual Filter and return the
-	// whole table.
+	// needs it, and it is cheap (a short loop over the PK members). Its other consumers
+	// are the PK window arms below, which decline a bound on member `i` unless
+	// `pkOrderPreservingPrefix > i` (the leading-PK range at `i = 0`, the prefix arm's
+	// trailing bound at the prefix length): `StoreTable.analyzePKAccess` declines the byte
+	// window under exactly that condition, so claiming the range filters handled would
+	// drop the residual Filter and return the whole table.
 	const pkOrderPreservingPrefix = pkOrderPreservingPrefixLength(
 		db,
 		tableInfo,
@@ -649,11 +653,11 @@ function computeFilterAccessPlan(
 		tableKeyCollation,
 	);
 
-	// Primary-key equality arms. Both return EARLY, before the leading-PK range candidate
-	// below is built: the point lookup because a single-row read is the cheapest plan by
+	// Primary-key equality arms. Both return EARLY, before the PK window candidate below
+	// is built: the point lookup because a single-row read is the cheapest plan by
 	// construction, and the multi-seek because returning first is what keeps a
-	// full-primary-key IN list from being shadowed by a range on the leading column. The
-	// leading-PK range, by contrast, is ranked against the secondary-index seeks.
+	// full-primary-key IN list from being shadowed by a prefix or a range window. The PK
+	// window, by contrast, is ranked against the secondary-index seeks.
 	//
 	// **No key-collation gate, and that is not an oversight.** The secondary-index arm gates
 	// its equality window on `indexPrefixSeekIsCollationExact` (do the key bytes agree with
@@ -704,13 +708,17 @@ function computeFilterAccessPlan(
 			tableInfo, request, pkColumns, pkPins, estimatedRows, pkOrderPreservingPrefix, costProfile);
 		// A gate decline FALLS THROUGH to the arms below rather than returning cost-only.
 		// That is safe: an `IN` is not a bound operator, so the leading-PK-range arm
-		// cannot grab it, and it lands on the secondary-index arms / full scan exactly as
-		// it did before this arm existed.
+		// cannot grab it, and {@link pkPrefixPlan} cuts its prefix ahead of the first
+		// multi-value pin, so the IN lands in the residual over a prefix window, a
+		// secondary-index arm, or the full scan.
 		if (plan) return plan;
 	}
 
-	// A candidate, not a return: it competes with the best secondary-index seek below.
-	const pkRangePlan = leadingPkRangePlan(tableInfo, request, estimatedRows, pkOrderPreservingPrefix);
+	// A candidate, not a return: it competes with the best secondary-index seek below. The
+	// prefix arm goes first because, wherever both apply (`a = 1 and a > 0` shapes), its
+	// window is at least as narrow, and the bound it does not claim survives as a residual.
+	const pkWindowPlan = pkPrefixPlan(tableInfo, request, estimatedRows, pkOrderPreservingPrefix)
+		?? leadingPkRangePlan(tableInfo, request, estimatedRows, pkOrderPreservingPrefix);
 
 	// Check for secondary index usage. `StoreTable.query` now implements the
 	// secondary-index scan arm (leading-prefix EQ point / leading-column range /
@@ -777,20 +785,21 @@ function computeFilterAccessPlan(
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
 	if (bestSeekPlan) {
-		if (!pkRangePlan) return bestSeekPlan.plan;
+		if (!pkWindowPlan) return bestSeekPlan.plan;
 		// Ranked on the same footing as the secondary seeks among themselves: declared
 		// `plan.cost`, not `vetoCost` (that parity repricing exists only for judging a shape
 		// constant against the scan), plus the sort each would force. Strict '<', so a tie
-		// keeps the PK range — the first candidate, as in the loop above.
-		return bestSeekRank < seekRankingCost(request, pkRangePlan, estimatedRows)
+		// keeps the PK window — the first candidate, as in the loop above.
+		return bestSeekRank < seekRankingCost(request, pkWindowPlan, estimatedRows)
 			? bestSeekPlan.plan
-			: pkRangePlan;
+			: pkWindowPlan;
 	}
-	// The leading-PK range needs no veto of its own (it always prices below the scan — see
-	// {@link leadingPkRangePlan}), so a vetoed secondary seek hands the plan to it rather
-	// than to the scan. It also goes ahead of `costOnlyFallback`: a cost-only plan is a full
-	// scan advertising an index arm's cheaper cost, and the PK range genuinely narrows.
-	if (pkRangePlan) return pkRangePlan;
+	// A PK window needs no veto of its own (it always prices below the scan — see
+	// {@link leadingPkRangePlan} and {@link pkPrefixPlan}), so a vetoed secondary seek hands
+	// the plan to it rather than to the scan. It also goes ahead of `costOnlyFallback`: a
+	// cost-only plan is a full scan advertising an index arm's cheaper cost, and the PK
+	// window genuinely narrows.
+	if (pkWindowPlan) return pkWindowPlan;
 	if (anySeekVetoed) {
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
@@ -928,10 +937,106 @@ function leadingPkRangePlan(
 }
 
 /**
+ * The `_primary_` window candidate for an equality on a leading STRICT prefix of a
+ * composite primary key (`where a = ?` over `primary key (a, b)`), optionally bounded on
+ * the next member (`where a = ? and b > ?`), or null when the request pins no such prefix.
+ * The data store is keyed by encoded primary key, so the rows sharing the prefix are one
+ * contiguous byte window, which `StoreTableScan.analyzePKAccess` builds and
+ * `scanPKRange` walks forwards or backwards.
+ *
+ * The prefix is the leading equality run ({@link resolveEqualityPins}) cut at its first
+ * multi-value pin (a multi-value `IN`, or any runtime-valued set). The cut is required:
+ * `rule-select-access-path` turns a multi-value seek column into a `_primary_` multi-seek,
+ * which `scanMultiSeekPrimary` serves only across the WHOLE key. So `a = 1 and b in (1, 2)`
+ * over `(a, b, c)` seeks `a` and leaves the `IN` residual, and `a in (1, 2)` over `(a, b)`
+ * offers no prefix at all. A full-length single-valued run never reaches here: the point
+ * arm returned first.
+ *
+ * The trailing bound on member `p` (the prefix length) mirrors the secondary
+ * `prefixRange` arm in {@link tryIndexAccessPlan}. It needs a prefix that is
+ * collation-exact (the rule checks a prefix-range's prefix equalities as range bounds), a
+ * bound {@link rangeServedOn} that member, and key bytes ordered like the comparator at
+ * position `p` (`pkOrderPreservingPrefix > p`). That last test also requires every prefix
+ * member to be order-safe, which an equality prefix does not strictly need; accepted as
+ * slightly conservative. It is also refused when the run was CUT at `p`: member `p` then
+ * carries a multi-value pin, and the rule would read it as an equality seek column and
+ * build the whole-key multi-seek the cut exists to avoid. A refused bound stays unclaimed
+ * and survives as a residual over the plain prefix window, the same degradation the
+ * secondary arm makes.
+ *
+ * No semantic-ordering decline is needed (the single-valued secondary `eq` arm has none
+ * either): an unfaithful probe makes the runtime cut the prefix short, which only widens
+ * the window.
+ *
+ * Rows come from {@link resolveArmEstimate} with the prefix as the equality columns, so a
+ * secondary index on the same columns competes on the same estimate. Cost is
+ * `AccessPlanBuilder.rangeScan` with no `pointRead` term, as {@link leadingPkRangePlan}'s
+ * is and for the same reason: the window reads rows straight out of the data store. The
+ * same argument therefore exempts it from the seek-versus-scan veto: `0.2 + 0.5·r < N`,
+ * and the scan never claims the prefix equality, so a LIMIT never shrinks the scan's `N`.
+ *
+ * The prefix members are constant inside the window, so they are passed to the ordering
+ * advertisement as pinned: `where a = ? order by b` and `order by b desc` claim a forward
+ * and a backwards walk.
+ *
+ * NOTE: on an un-analyzed table this arm and a secondary index's `eq` arm share the `eq`
+ * shape constant however many columns the index pins, so `index (a, c)` with
+ * `a = 1 and c = 5` prices this arm lower (no `pointRead`) and leaves `c = 5` residual.
+ * Same shape-constant limitation as the {@link ARM_SELECTIVITY} NOTE, with the same fix:
+ * `ANALYZE` makes the two estimates differ.
+ */
+function pkPrefixPlan(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	estimatedRows: number,
+	pkOrderPreservingPrefix: number,
+): BestAccessPlanResult | null {
+	const pk = tableInfo.primaryKeyDefinition;
+	const run = resolveEqualityPins(request.filters, pk);
+	const cut = run.cols.findIndex(colIdx =>
+		isMultiValueEquality(request.filters[firstRoleFilterIndex(request.filters, colIdx, EQ_OR_IN_OPS)]));
+	// Re-resolved over the cut key rather than sliced, so `collationsExact` describes the
+	// members actually seeked.
+	const prefix = cut < 0 ? run : resolveEqualityPins(request.filters, pk.slice(0, cut));
+	const prefixLen = prefix.cols.length;
+	if (prefixLen === 0 || prefixLen >= pk.length) return null;
+
+	const boundMember = cut < 0 && prefix.collationsExact && pkOrderPreservingPrefix > prefixLen
+		&& rangeServedOn(request.filters, pk[prefixLen])
+		? pk[prefixLen]
+		: undefined;
+	const boundCol = boundMember?.index;
+
+	const { selectivity } = resolveArmEstimate(
+		tableInfo, request.filters, boundCol === undefined ? 'eq' : 'prefixRange', prefix.cols, boundCol);
+	const rows = Math.max(1, Math.floor(estimatedRows * selectivity));
+	const ordering = buildPkOrderingAdvertisement(
+		tableInfo, request, pkOrderPreservingPrefix, true, new Set(prefix.cols));
+	const handledFilters = claimFirstPerRole(
+		request.filters,
+		boundCol === undefined
+			? equalityRoles(prefix.cols)
+			: [...equalityRoles(prefix.cols), ...rangeRoles(boundCol)],
+	);
+	const label = boundCol === undefined ? 'prefix seek' : 'prefix-range seek';
+	const plan = AccessPlanBuilder
+		.rangeScan(rowsToProduce(request, rows, ordering.providesOrdering, handledFilters), 0.2)
+		.setHandledFilters(handledFilters)
+		.setIndexName('_primary_')
+		// Primary-key definition order: the rule derives the window positionally from it.
+		.setSeekColumns(boundCol === undefined ? prefix.cols : [...prefix.cols, boundCol])
+		.setExplanation(
+			`Store primary key ${label}(prefix=${prefixLen})${walkExplanationSuffix(ordering.indexDescriptor?.reverse === true)}`)
+		.build();
+	return { ...plan, ...ordering };
+}
+
+/**
  * The empty pinned-column set an ordering-only walk ({@link chooseOrderingPlan}) and the
- * primary-key ordering advertisement ({@link buildPkOrderingAdvertisement}) align their key
- * under. Deliberately empty even when the request carries equality filters: the walk pushes
- * NO filters, so nothing pins a column to one value inside the walk itself. The residual
+ * unpinned primary-key ordering advertisements (the full scan, the leading-member range,
+ * the multi-seek — see {@link buildPkOrderingAdvertisement}) align their key under.
+ * Deliberately empty even when the request carries equality filters: those walks push no
+ * equality, so nothing pins a column to one value inside the walk itself. The residual
  * `Filter` above the leaf does make an equality column constant in the OUTPUT, which is the
  * argument `MemoryTableModule.evaluateOrderingOnlyPlans` leans on to skip pinned columns.
  * The collation half of that argument is answerable here now (`equalityServesKeyColumn` says
@@ -940,8 +1045,9 @@ function leadingPkRangePlan(
  *
  *  - On the primary key, the only shape where pinning changes the plan is an equality on a
  *    leading strict prefix of a composite key (`where a = ? order by b` over
- *    `primary key (a, b)`). A primary-key prefix seek serves that shape better, and this
- *    module does not offer one yet (backlog `feat-store-primary-key-prefix-equality-seek`).
+ *    `primary key (a, b)`), and {@link pkPrefixPlan} serves that shape with a window that
+ *    really pins the prefix — passing it as pinned — which beats a walk that merely
+ *    filters for it.
  *  - On a secondary index, a walk with a pinned column could only win where that index's
  *    own equality seek lost or was vetoed. The seek reads a subset of what the walk reads,
  *    so there the walk is worse than the seek it would replace. The underlying gap is that
@@ -950,11 +1056,11 @@ function leadingPkRangePlan(
  * Pinning would also make ordering claims that rest on a residual `Filter`, which adds
  * wrong-order risk for that small gain. Declining costs an optimization, never an answer.
  *
- * NOTE: if the primary-key prefix seek lands and the veto starts counting the sort, this
- * can stay empty for good. If a store plan is ever seen sorting after a residual equality
- * that a walk could have pinned, pin per key with `equalityServesKeyColumn` (single-valued
- * equalities only, `!isMultiValueEquality`), as `MemoryTableModule.collectEqualityBoundColumns`
- * does, and pass that set at the call sites that use this constant.
+ * NOTE: if a store plan is ever seen sorting after a residual equality that a secondary
+ * index walk could have pinned (the veto ignoring the sort the scan forces is the likely
+ * cause), pin per key with `equalityServesKeyColumn` (single-valued equalities only,
+ * `!isMultiValueEquality`), as `MemoryTableModule.collectEqualityBoundColumns` does, and
+ * pass that set at the {@link chooseOrderingPlan} call site.
  */
 const NO_PINNED_COLUMNS: ReadonlySet<number> = new Set();
 
@@ -1638,13 +1744,14 @@ function tryIndexAccessPlan(
 /**
  * Compute the PK-ordering advertisement for a scan-style plan. Returns the
  * `providesOrdering` / `monotonicOn` / `supportsAsofRight` fields for a plan
- * whose iteration is driven by the primary-key key order (full scan or PK
- * range scan).
+ * whose iteration is driven by the primary-key key order (full scan, PK
+ * range or prefix window, PK multi-seek).
  *
  * `providesOrdering` is set only when it actually matches what the caller
  * needs:
  *   - When the request carries `requiredOrdering`, claim it only if the
- *     requested keys form a prefix of the PK with matching directions — or, when
+ *     requested keys form a prefix of the PK, once the `pinnedCols` members a prefix
+ *     window holds constant are skipped, with matching directions — or, when
  *     `allowReverse`, with every direction flipped, served by walking the key backwards
  *     (the claim then carries the reversed `_primary_` descriptor). Claiming PK order
  *     against an `ORDER BY <other column>` would cause the absorb-Sort rule to drop the
@@ -1692,19 +1799,20 @@ function buildPkOrderingAdvertisement(
 	request: BestAccessPlanRequest,
 	orderPreservingPrefix: number,
 	allowReverse = true,
+	pinnedCols: ReadonlySet<number> = NO_PINNED_COLUMNS,
 ): Pick<BestAccessPlanResult,
 	'providesOrdering' | 'orderingIndexName' | 'indexDescriptor' | 'monotonicOn' | 'supportsAsofRight'> {
 	const pk = tableInfo.primaryKeyDefinition;
 	if (pk.length === 0 || orderPreservingPrefix === 0) return {};
 
-	// The PK arms pin nothing this function can see: the pinning an equality/range arm does
-	// is already visible as a NULL-excluding entry in `request.filters`, which the NULL gate
-	// consults itself. With no pinned columns, satisfying `required` means it is a prefix of
-	// the walked key; an explicit `nullsFirst` declines (see {@link orderingPrefixSatisfies}).
+	// `pinnedCols` is the leading key members the arm's own window holds constant — only
+	// {@link pkPrefixPlan}'s prefix; every other caller pins nothing. Satisfying `required`
+	// then means it is a prefix of the walked key once the pinned members are skipped; an
+	// explicit `nullsFirst` declines (see {@link orderingPrefixSatisfies}).
 	const required = request.requiredOrdering;
 	if (required && required.length > 0) {
 		const direction = indexOrderingSatisfies(
-			tableInfo, request, pk, orderPreservingPrefix, required, NO_PINNED_COLUMNS);
+			tableInfo, request, pk, orderPreservingPrefix, required, pinnedCols);
 		if (direction === 'forward' || (direction === 'reverse' && allowReverse)) {
 			return {
 				providesOrdering: required,
@@ -1718,7 +1826,7 @@ function buildPkOrderingAdvertisement(
 	// No claim: the walk runs forwards. An empty prefix means the LEADING member is a DESC
 	// column a NULL could reach, so `monotonicOn` on it — and `supportsAsofRight`, which
 	// implies it — go too.
-	const forwardOrdering = walkOrdering(tableInfo, request, pk, orderPreservingPrefix, NO_PINNED_COLUMNS, false);
+	const forwardOrdering = walkOrdering(tableInfo, request, pk, orderPreservingPrefix, pinnedCols, false);
 	if (forwardOrdering.length === 0) return {};
 	const monotonic = pkMonotonicAdvertisement(pk, 'forward');
 	if (required && required.length > 0) return monotonic;
@@ -1907,9 +2015,9 @@ function walkOrdering(
  * The mid-loop skip (a pinned column encountered AFTER the matched prefix, which a
  * constant column between two ordered ones would need) is kept for exact parity with the
  * memory module, where the pinned set can be non-contiguous. It is unreachable from this
- * module: the secondary-index arms pin `resolveEqualityPins`' `cols`, which stops at the
- * first unpinned index column, so the leading skip already consumes every pinned column,
- * and the ordering walk and the primary-key arms pin nothing.
+ * module: the secondary-index arms and the primary-key prefix arm pin a leading run of
+ * `resolveEqualityPins`' `cols`, which stops at the first unpinned key column, so the
+ * leading skip already consumes every pinned column, and the other arms pin nothing.
  */
 function orderingPrefixSatisfies(
 	walked: readonly OrderingSpec[],

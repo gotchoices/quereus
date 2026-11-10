@@ -566,16 +566,16 @@ describe('StoreModule predicate pushdown', () => {
 			pkKeyCollations: (string | undefined)[];
 			buildPKRangeBounds(access: {
 				type: 'range';
-				columnIndex: number;
-				constraints: Array<{ columnIndex: number; op: IndexConstraintOp; value?: SqlValue }>;
+				prefixValues: SqlValue[];
+				constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>;
 			}): IterateOptions;
 		}
 
 		const gtBananaBounds = (table: StoreTable): IterateOptions =>
 			(table as unknown as RangeBoundsProbe).buildPKRangeBounds({
 				type: 'range',
-				columnIndex: 0,
-				constraints: [{ columnIndex: 0, op: IndexConstraintOp.GT, value: 'banana' }],
+				prefixValues: [],
+				constraints: [{ op: IndexConstraintOp.GT, value: 'banana' }],
 			});
 
 		it('a NOCASE text PK narrows to a non-empty lower bound', async () => {
