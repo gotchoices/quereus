@@ -493,7 +493,9 @@ the same way, and avg divides the same exact total. The `inverse` is the
 retraction the aggregate algebra defines, `merge(state, negate(step(initial,
 value)))`, present when the aggregate declares both `merge` and `negate`; for
 SUM the exact-integer part retracts exactly and the floating-point part in
-float. `test/window-aggregate-equivalence.spec.ts` checks every such registry
+float — so a slid ROWS frame over REAL values can differ from a fresh fold,
+by more than rounding under cancellation (see the NOTE on
+`aggregateWindowParts`). `test/window-aggregate-equivalence.spec.ts` checks every such registry
 entry, on every execution shape, against the grouped aggregate over the same
 frame, storage class included. A new aggregate meant to work with `OVER`
 should be registered through the same adapter rather than given its own

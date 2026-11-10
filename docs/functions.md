@@ -211,7 +211,7 @@ select json_group_object(key, value) from config;
 
 ## Window Functions
 
-`count`, `sum`, `avg`, `min` and `max` can be used as window functions with an `OVER` clause, and compute exactly what their grouped forms compute over the same rows — `sum(x) over (…)` returns an exact integer past 2^53 just as `sum(x)` does. Quereus also provides dedicated ranking functions.
+`count`, `sum`, `avg`, `min` and `max` can be used as window functions with an `OVER` clause, and compute exactly what their grouped forms compute over the same rows — `sum(x) over (…)` returns an exact integer past 2^53 just as `sum(x)` does. One exception: a `rows between …` frame that slides removes departing floating-point values by subtraction, so a `sum`/`avg` over REAL values there can differ from the grouped result (badly, when a very large value leaves next to a small one). Quereus also provides dedicated ranking functions.
 
 **Syntax:**
 ```sql
