@@ -176,6 +176,29 @@ create table api_logs (
 );
 ```
 
+#### 7.4.1 Auto-Deferred Row-Level CHECKs
+
+Quereus automatically defers certain row-level CHECK constraints to COMMIT time to spare users from managing `DEFERRABLE`/`SET CONSTRAINTS`.
+
+- Immediate: Constraints that only reference the current row (including `OLD`/`NEW` references) are validated during the DML statement.
+- Auto-deferred: Constraints that reference other relations (e.g., contain subqueries) are validated at COMMIT using the same delta engine as global assertions. If any violation is found, COMMIT fails and the transaction is rolled back.
+- Row references: an unqualified column names the row being written (`NEW` for INSERT/UPDATE, `OLD` for DELETE); `new.<col>` / `old.<col>` name a row image explicitly. A self-reference qualified by the owning table — `check (t.qty > 0)` on table `t` — resolves like the unqualified form, except where a subquery inside the CHECK rebinds the table name (there it resolves to the subquery's relation, per normal scoping).
+
+Example:
+
+```sql
+create table inventory (
+  loc text,
+  sku text,
+  qty integer check (qty >= 0),
+  constraint enough_stock check (
+    new.qty <= (select sum(s.qty) from inventory s where s.sku = new.sku)
+  )
+);
+```
+
+`qty >= 0` is checked immediately; `enough_stock` is auto-deferred and validated at COMMIT.
+
 ### 7.5 DEFAULT Constraint
 
 The default constraint provides a default value for a column when no value is specified.

@@ -58,6 +58,7 @@
 		"docs/sql-dml.md": "Stable",
 		"docs/sql-functions.md": "Stable",
 		"docs/sql-select.md": "Stable",
+		"docs/sql-select-cte.md": "Stable",
 		"docs/sql-txn.md": "Stable",
 		"docs/sql-views.md": "Stable",
 		"docs/sql-vtab.md": "Stable",
