@@ -111,7 +111,7 @@ Aggregate functions perform a calculation on a set of values and return a single
 - `count(X)`: Returns the number of non-NULL values of X
 - `count(*)`: Returns the number of rows
 - `sum(X)`: Returns the sum of all non-NULL values of X
-- `avg(X)`: Returns the average of all non-NULL values of X
+- `avg(X)`: Returns the average of all non-NULL values of X. `sum`, `avg` and `total` take a numeric or boolean argument only: text, JSON, blob and date/time arguments are an error (cast them first), and so is a non-number met in an untyped column — see [functions.md § Aggregate Functions](functions.md#aggregate-functions)
 - `min(X)`: Returns the minimum value of all non-NULL values of X
 - `max(X)`: Returns the maximum value of all non-NULL values of X — `min`/`max`
   rank X the same way `order by X` does, so a `timespan` column compares by

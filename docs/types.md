@@ -113,7 +113,7 @@ on read paths:
 - **Bound parameters**: canonicalized as they are stored into the statement's bound-args
   map (per-bind, not per-row).
 - **Text read as a number**: `parseNumericText` (`util/coercion.ts`), behind arithmetic,
-  unary operators and `sum()`, reads a whole-number digit string past the safe range as
+  unary operators and aggregate-argument coercion, reads a whole-number digit string past the safe range as
   an exact `bigint`, agreeing with `cast(… as integer)`. Fractional and exponent spellings
   (`'9007199254740993.0'`, `'1e20'`) stay doubles.
 - **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
