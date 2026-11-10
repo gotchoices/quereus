@@ -38,3 +38,7 @@ An update that moves a committed row out of the query's window should fail the s
 ## Expected behaviour
 
 A query inside a transaction returns exactly the rows it would return after commit, whether or not the underlying module stops at a plan-time limit.
+
+## Wider reach coming (noted by the plan for GitHub #36)
+
+`sort-absorb-sees-constant-limit` and `sort-absorb-runtime-limit-choice` (implement/) send `request.limit` for a user-written `order by … limit n` / `limit ?` above an indexable Sort, not only for the synthesized `min`/`max` boundary read. Once they land, any such query inside a transaction reaches this path, so the likelihood of this bug rises for out-of-tree modules that stop at the limit.
