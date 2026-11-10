@@ -173,18 +173,18 @@ describe('Aggregate algebra declarations', () => {
 			const step = (v: SqlValue): AggValue => sumFunc.stepFunction(null, v);
 			// bigint and safe-integer number → exact part; the approx part stays empty.
 			// (A safe-range bigint narrows to number on the way in — R1, unrelated to routing.)
-			expect(step(9007199254740993n), 'bigint').to.deep.equal({ exact: 9007199254740993n, approx: 0, count: 1 });
-			expect(step(5n), 'safe-range bigint narrows').to.deep.equal({ exact: 5, approx: 0, count: 1 });
-			expect(step(5), 'safe integer').to.deep.equal({ exact: 5, approx: 0, count: 1 });
+			expect(step(9007199254740993n), 'bigint').to.deep.equal({ exact: 9007199254740993n, approx: 0, comp: 0, realCount: 0, count: 1 });
+			expect(step(5n), 'safe-range bigint narrows').to.deep.equal({ exact: 5, approx: 0, comp: 0, realCount: 0, count: 1 });
+			expect(step(5), 'safe integer').to.deep.equal({ exact: 5, approx: 0, comp: 0, realCount: 0, count: 1 });
 			// A fraction and a WHOLE number past the safe boundary both go to approx —
 			// routing 1e308 to the exact part is what produced a 309-digit integer total.
-			expect(step(0.5), 'fraction').to.deep.equal({ exact: 0, approx: 0.5, count: 1 });
-			expect(step(1e308), 'whole but not safe').to.deep.equal({ exact: 0, approx: 1e308, count: 1 });
+			expect(step(0.5), 'fraction').to.deep.equal({ exact: 0, approx: 0.5, comp: 0, realCount: 1, count: 1 });
+			expect(step(1e308), 'whole but not safe').to.deep.equal({ exact: 0, approx: 1e308, comp: 0, realCount: 1, count: 1 });
 			// decode applies the same rule to the single stored value.
 			expect(sumFunc.algebra!.decode!(7), 'decode integer')
-				.to.deep.equal({ exact: 7, approx: 0, count: Number.POSITIVE_INFINITY });
+				.to.deep.equal({ exact: 7, approx: 0, comp: 0, realCount: 0, count: Number.POSITIVE_INFINITY });
 			expect(sumFunc.algebra!.decode!(0.5), 'decode fraction')
-				.to.deep.equal({ exact: 0, approx: 0.5, count: Number.POSITIVE_INFINITY });
+				.to.deep.equal({ exact: 0, approx: 0.5, comp: 0, realCount: Number.POSITIVE_INFINITY, count: Number.POSITIVE_INFINITY });
 		});
 
 		it("sum's step skips only NULL: booleans add as 1 / 0, every other non-number raises", () => {
@@ -193,8 +193,8 @@ describe('Aggregate algebra declarations', () => {
 			const step = (acc: AggValue, v: SqlValue): AggValue => sumFunc.stepFunction(acc, v);
 			const counted = step(null, 5);
 			expect(step(counted, null), 'NULL leaves the accumulator untouched').to.equal(counted);
-			expect(step(null, true), 'true').to.deep.equal({ exact: 1, approx: 0, count: 1 });
-			expect(step(null, false), 'false').to.deep.equal({ exact: 0, approx: 0, count: 1 });
+			expect(step(null, true), 'true').to.deep.equal({ exact: 1, approx: 0, comp: 0, realCount: 0, count: 1 });
+			expect(step(null, false), 'false').to.deep.equal({ exact: 0, approx: 0, comp: 0, realCount: 0, count: 1 });
 			for (const v of ['abc', '7', '', new Uint8Array([1, 2]), { a: 1 }] as SqlValue[]) {
 				expect(() => step(counted, v), `refuses ${String(v)}`).to.throw(/cannot add/);
 			}
@@ -241,7 +241,7 @@ describe('Aggregate algebra declarations', () => {
 			if (!sumAlgebra) throw new Error('sum must declare algebra');
 			const broken: AggregateFunctionSchema = {
 				...sumFunc,
-				algebra: { ...sumAlgebra, decode: (_stored: SqlValue): AggValue => ({ exact: 1, approx: 0, count: 1 }) },
+				algebra: { ...sumAlgebra, decode: (_stored: SqlValue): AggValue => ({ exact: 1, approx: 0, comp: 0, realCount: 0, count: 1 }) },
 			};
 			expect(() => assertAggregateAlgebraLaws(broken, sumExactDomain)).to.throw(/decode-observational/);
 		});

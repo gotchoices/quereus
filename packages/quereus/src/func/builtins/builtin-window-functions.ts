@@ -102,13 +102,14 @@ function registerExtremumWindowFunction(direction: 'min' | 'max'): void {
  * declares both `merge` and `negate`. For sum (and avg, which accumulates as sum)
  * the exact-integer part retracts exactly.
  *
- * NOTE: the floating-point part of sum's accumulator retracts in float (accepted when
- * this adapter replaced the float window copies). A slid frame over REAL values can
- * therefore differ from a fresh fold — by more than the last digits under
- * cancellation (frame `1e20, 0.5` sliding to `0.5, 5` gives 5, not 5.5) — and an
- * inexact retraction leaves a residue for the rest of the partition, so a later
- * all-integer frame finalizes as a float (`5, 7` gives 11.5 after the same slide).
- * The streaming ROWS path is the only one affected; RANGE and buffered frames refold.
+ * NOTE: the floating-point part of sum's accumulator retracts in compensated float, so
+ * a slid frame over REAL values may differ from a fresh fold in the last digits — the
+ * order of additions is not specified — but a large value leaving the frame does not
+ * take the small ones beside it along (frame `1e20, 0.5` sliding to `0.5, 5` gives
+ * 5.5). Its storage class follows the frame's current contents: once the last REAL
+ * value leaves, the float part is reset and the frame finalizes exactly (`bigint` past
+ * 2^53). The streaming ROWS path is the only one that retracts; RANGE and buffered
+ * frames refold.
  */
 function aggregateWindowParts(aggSchema: AggregateFunctionSchema): WindowFunctionBinding {
 	const { stepFunction: step, finalizeFunction: finalize, algebra } = aggSchema;

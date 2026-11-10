@@ -106,27 +106,57 @@ function toSummand(label: string, value: SqlValue): number | bigint | null {
 // stays observational: merge(a, negate(a)) must finalize to NULL (the empty-group
 // value), which a bare running sum cannot distinguish from contributions cancelling
 // to 0. A fold that counted nothing still finalizes to NULL.
+//
+// `realCount` does the same for the floating-point part: the result's storage class
+// follows what the accumulator currently HOLDS, not whether its float total happens to
+// be 0. A window frame that slides past its last REAL value retracts back to an exact
+// total, and a fold whose REAL values cancel to 0 is still a REAL total (as in SQLite).
 type SumAccumulator = {
 	/** Exact integer part: every `bigint` and every safe-integer `number` contribution. */
 	exact: number | bigint;
 	/** Floating-point part: everything else — fractions, whole numbers outside the
-	 *  safe-integer range, ±Infinity, NaN.
+	 *  safe-integer range, ±Infinity, NaN. Its true value is `approx + comp`.
 	 *
-	 *  NOTE: plain IEEE-754 accumulation, NOT compensated (Kahan) — a fold over many
-	 *  REAL values carries the usual rounding error, and re-associating those rows can
-	 *  shift the last digits. That is why the delta-maintenance gate refuses a REAL
-	 *  argument (see `decode` below); revisit only if a REAL sum ever needs the fast
-	 *  path, which is a design change and not a relaxation of that gate. */
+	 *  NOTE: compensated (Neumaier) summation, so a large value cancelling out — added
+	 *  and later retracted by a sliding window frame — does not take the small values
+	 *  added beside it with it. It reduces rounding error; it does not make REAL
+	 *  retraction exact, and re-associating rows can still shift the last digits. That
+	 *  is why the delta-maintenance gate still refuses a REAL argument (see `decode`
+	 *  below); revisit only if a REAL sum ever needs the fast path, which is a design
+	 *  change and not a relaxation of that gate. */
 	approx: number;
+	/** Neumaier compensation: the accumulated rounding error of the additions into `approx`. */
+	comp: number;
+	/** How many contributions currently held went to `approx`. When it returns to 0,
+	 *  `merge` resets `approx` and `comp` to exactly 0, discarding the residue an
+	 *  inexact retraction leaves behind. */
+	realCount: number;
 	count: number;
 } | null;
 
+/** The rounding error of `sum = a + b` (Neumaier's two-sum): the exact sum is
+ *  `sum + error`. A non-finite `sum` has no error to recover — the formula would give
+ *  NaN (`Infinity - Infinity`) — so it contributes 0 and finalize uses `approx` alone. */
+function additionError(a: number, b: number, sum: number): number {
+	if (!Number.isFinite(sum)) return 0;
+	return Math.abs(a) >= Math.abs(b) ? (a - sum) + b : (b - sum) + a;
+}
+
 /** Fold one numeric contribution into the accumulator, routing it by `isExactIntegerDomain`. */
 function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAccumulator {
-	const base = acc ?? { exact: 0, approx: 0, count: 0 };
-	return isExactIntegerDomain(value)
-		? { exact: addWithPromotion(base.exact, value), approx: base.approx, count: base.count + 1 }
-		: { exact: base.exact, approx: base.approx + (value as number), count: base.count + 1 };
+	const base = acc ?? { exact: 0, approx: 0, comp: 0, realCount: 0, count: 0 };
+	if (isExactIntegerDomain(value)) {
+		return { ...base, exact: addWithPromotion(base.exact, value), count: base.count + 1 };
+	}
+	const real = value as number;
+	const approx = base.approx + real;
+	return {
+		exact: base.exact,
+		approx,
+		comp: base.comp + additionError(base.approx, real, approx),
+		realCount: base.realCount + 1,
+		count: base.count + 1,
+	};
 }
 
 /** SUM's step. Also AVG's: avg accumulates exactly as sum does (see avgFunc), so the
@@ -141,31 +171,44 @@ function mergeSum(a: SumAccumulator, b: SumAccumulator): SumAccumulator {
 	if (a === null) return b;
 	if (b === null) return a;
 	// Each part combines within its own domain — the exact parts exactly, the
-	// approx parts in float. Mixing them here is what made the fold order-dependent.
-	return {
-		exact: addWithPromotion(a.exact, b.exact),
-		approx: a.approx + b.approx,
-		count: a.count + b.count,
-	};
+	// approx parts in compensated float. Mixing them here is what made the fold
+	// order-dependent.
+	const exact = addWithPromotion(a.exact, b.exact);
+	const count = a.count + b.count;
+	const realCount = a.realCount + b.realCount;
+	// No REAL contribution left (a sliding frame retracted its last one): whatever
+	// remains in approx/comp is rounding residue, not value.
+	if (realCount === 0) return { exact, approx: 0, comp: 0, realCount, count };
+	const approx = a.approx + b.approx;
+	return { exact, approx, comp: a.comp + b.comp + additionError(a.approx, b.approx, approx), realCount, count };
 }
 
 function negateSum(a: SumAccumulator): SumAccumulator {
-	return a === null ? null : { exact: -a.exact, approx: -a.approx, count: -a.count };
+	return a === null
+		? null
+		: { exact: -a.exact, approx: -a.approx, comp: -a.comp, realCount: -a.realCount, count: -a.count };
 }
 
 function finalizeSum(acc: SumAccumulator): number | bigint | null {
 	// SQLite returns NULL for SUM of empty set, INTEGER or REAL result.
 	// count === 0 (all contributions retracted) is observationally the empty group.
 	if (acc === null || acc.count === 0) return null;
-	// An all-integer fold finalizes to its exact part untouched (still R1-canonical);
-	// only a fold that saw a non-exact contribution combines, and it lands in float.
+	// An accumulator holding only exact contributions finalizes to its exact part
+	// untouched (still R1-canonical); one holding a REAL contribution combines, and
+	// lands in float even when its REAL parts cancel to 0.
+	if (acc.realCount === 0) return acc.exact;
 	// NOTE: a non-finite total propagates (±Infinity, and NaN for Infinity + -Infinity)
 	// rather than becoming NULL. Deliberate: sum matches the other float-summing
 	// aggregates, `total()` and `avg()`, over identical rows. Binary `+` is the
 	// outlier — `runtime/emit/binary.ts` nulls a non-finite result — so a caller
 	// comparing `sum(v)` against a hand-written `a + b` sees them diverge at overflow.
-	if (acc.approx === 0) return acc.exact;
-	return Number(acc.exact) + acc.approx;
+	// NOTE: a non-finite approx does not survive retraction: a sliding window frame that
+	// drops an Infinity (or an addend of a finite total that overflowed) leaves NaN or
+	// Infinity in approx while other REAL values remain, so the frame finalizes
+	// non-finite until no REAL value is left in it. Tracked as
+	// `backlog/bug-sliding-window-sum-poisoned-by-non-finite-real`.
+	const real = Number.isFinite(acc.approx) ? acc.approx + acc.comp : acc.approx;
+	return Number(acc.exact) + real;
 }
 
 export const sumFunc = createAggregateFunction(
@@ -206,12 +249,16 @@ export const sumFunc = createAggregateFunction(
 			// core/database-materialized-views-plan-builders.ts), where the approx part is
 			// always empty and this decode IS observational. Do not relax that gate without
 			// giving the backing store somewhere to keep both parts.
+			// A float stored value gets an absorbing `realCount` for the same reason `count`
+			// is absorbing: its REAL contributions are unknown, so a finite retraction must
+			// not reach realCount 0 and reset the float part away.
 			decode: (stored: SqlValue): SumAccumulator => {
 				if (stored === null) return null;
 				const value = stored as number | bigint;
+				const count = Number.POSITIVE_INFINITY;
 				return isExactIntegerDomain(value)
-					? { exact: value, approx: 0, count: Number.POSITIVE_INFINITY }
-					: { exact: 0, approx: value as number, count: Number.POSITIVE_INFINITY };
+					? { exact: value, approx: 0, comp: 0, realCount: 0, count }
+					: { exact: 0, approx: value as number, comp: 0, realCount: Number.POSITIVE_INFINITY, count };
 			},
 		},
 	},
