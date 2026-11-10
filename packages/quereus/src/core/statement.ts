@@ -24,6 +24,7 @@ import type { BuildTimeDependencyTracker, RowSourceOverrides, SchemaDependency }
 import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
+import { ANY_TYPE } from '../types/builtin-types.js';
 import type { CombinedAbortSignal } from '../util/abort-signal.js';
 import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
 import { InterruptibleIteration } from './interruptible-iteration.js';
@@ -1085,6 +1086,9 @@ export class Statement {
 				}
 				continue;
 			}
+
+			// ANY has no single storage class; its placeholder physicalType (NULL) must not be compared.
+			if (expectedType.logicalType === ANY_TYPE) continue;
 
 			// Get the physical type of the declared logical type
 			const expectedPhysicalType = expectedType.logicalType.physicalType;

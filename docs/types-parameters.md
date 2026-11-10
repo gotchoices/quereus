@@ -185,6 +185,7 @@ Parameter type validation ensures type safety across executions:
 - BOOLEAN physical type accepts: `boolean`
 - BLOB physical type accepts: `Uint8Array`
 - OBJECT physical type accepts: plain objects, arrays (for JSON)
+- A parameter declared ANY accepts a value of any storage class, and NULL only if the hint is nullable
 
 ## Performance Benefits
 

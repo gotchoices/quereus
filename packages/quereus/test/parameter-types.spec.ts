@@ -3,6 +3,7 @@ import { Database } from '../src/core/database.js';
 import { getParameterTypes, normalizeParamKey } from '../src/core/param.js';
 import type { ScalarType } from '../src/common/datatype.js';
 import type { SqlValue } from '../src/common/types.js';
+import { ANY_TYPE } from '../src/types/builtin-types.js';
 
 type ResultRow = Record<string, SqlValue>;
 
@@ -584,6 +585,15 @@ describe('Parameter Type System', () => {
 			}
 			expect(rows).to.have.length(2);
 
+			await stmt.finalize();
+		});
+
+		it('accepts a value of any storage class for an ANY-typed hint', async () => {
+			const anyHint = { typeClass: 'scalar', logicalType: ANY_TYPE, nullable: true, isReadOnly: true } as ScalarType;
+			const stmt = db.prepare('select ? as v', new Map([[1, anyHint]]));
+			for (const value of [2, 'x', 1.5]) {
+				expect((await stmt.get([value]))?.v).to.equal(value);
+			}
 			await stmt.finalize();
 		});
 
