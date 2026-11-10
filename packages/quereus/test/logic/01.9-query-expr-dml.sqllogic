@@ -130,17 +130,18 @@ drop table log_cte;
 -- ===================================
 -- The theta join re-drives its right side per outer row; the cache over the
 -- DML source must run the insert once and replay its rows, at any size (here
--- past the cache's 1,000-row warning threshold).
+-- 2,500 rows, past the cache's 2,000-row warning threshold: default 1,000-row
+-- estimate x 2).
 
 create table nl_a (x integer primary key);
 insert into nl_a values (1), (2), (3);
 create table nl_src (k integer primary key);
-insert into nl_src select value from generate_series(1, 1500);
+insert into nl_src select value from generate_series(1, 2500);
 create table nl_w (k integer primary key);
 select count(*) as c from nl_a join (insert into nl_w (k) select k from nl_src returning k) as d on nl_a.x + d.k > 0;
-→ [{"c":4500}]
+→ [{"c":7500}]
 select count(*) as c from nl_w;
-→ [{"c":1500}]
+→ [{"c":2500}]
 drop table nl_a;
 drop table nl_src;
 drop table nl_w;

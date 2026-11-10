@@ -752,7 +752,7 @@ if (shouldCache(node, context)) {
     node.scope,
     node,
     'memory',
-    calculateThreshold(node.physical.estimatedRows)
+    CachingAnalysis.getCacheThreshold(node, context.tuning) // soft guard: warns past it, never stops buffering
   );
 }
 ```

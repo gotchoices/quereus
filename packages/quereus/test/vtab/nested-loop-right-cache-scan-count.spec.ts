@@ -55,10 +55,11 @@ describe('nested-loop right-side cache: scan count', () => {
 		expect(module.scanCounts.get('r'), 'right table scanned').to.equal(1);
 	});
 
-	it('scans an un-analyzed right table of over 1,000 rows once', async () => {
-		// Past the default-estimate cache threshold: the cache must keep its
-		// buffer rather than fall back to re-scanning per outer row.
-		await db.exec("INSERT INTO r SELECT value, value FROM generate_series(4, 1500)");
+	it('scans an un-analyzed right table larger than its cache threshold once', async () => {
+		// Un-analyzed, r is planned at the default 1,000-row estimate, so its
+		// cache threshold is 2,000; 2,500 rows overrun it. The cache must keep
+		// its buffer rather than fall back to re-scanning per outer row.
+		await db.exec("INSERT INTO r SELECT value, value FROM generate_series(4, 2500)");
 		module.scanCounts.clear();
 		await drain("SELECT l.v, r.v FROM l JOIN r ON l.v + r.v > 0");
 

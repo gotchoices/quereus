@@ -56,6 +56,11 @@ export function ruleMutatingSubqueryCache(node: PlanNode, context: OptContext): 
 
 	// The CacheNode runs the writing source once and replays its rows; the
 	// threshold only sets when an oversized result logs a misestimate warning.
+	// NOTE: streaming-first build — a consumer that stops before draining leaves
+	// nothing committed, so the next pass re-runs the writes. No such consumer
+	// reaches here today (inner/left/cross drain the right per outer row; every
+	// semi/anti producer refuses a side-effecting right side). If one ever does,
+	// build this CacheNode with `eager: true`.
 	const threshold = CachingAnalysis.getCacheThreshold(rightSide, context.tuning);
 
 	// Wrap the right side with a cache node
