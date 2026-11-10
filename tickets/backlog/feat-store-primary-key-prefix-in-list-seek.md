@@ -1,0 +1,10 @@
+description: On the persistent storage backend, a query that matches the first part of a multi-column primary key against a list of values (every line of orders 1, 2 and 3) still reads the whole table, even after single-value prefix lookups are served directly.
+prereq: feat-store-primary-key-prefix-equality-seek
+architecture: docs/module-authoring.md
+files: packages/quereus-store/src/common/store-module-access-plan.ts (`primaryKeyMultiSeekPlan`, the new primary-key prefix arm), packages/quereus-store/src/common/store-table-scan.ts (`scanMultiSeekPrimary`, `scanMultiSeek`), packages/quereus-store/README.md (§ IN-list index seeks)
+tradeoffs: Answers are already correct, and a secondary index on the leading column serves the same shape as a multi-seek today, so a maintainer may wait until a composite-key store table is measured scanning on this shape.
+----
+
+For `primary key (a, b)`, `where a in (1, 2, 3)` scans the table with the predicate as a residual (README: "a key only *partly* pinned … still scans"). `feat-store-primary-key-prefix-equality-seek` serves a single-valued prefix (`a = 1`) as one primary-key window, but it deliberately cuts its prefix at the first multi-value pin. The reason: `rule-select-access-path` turns a multi-value `IN` seek column into a multi-seek, and `StoreTableScan.scanMultiSeekPrimary` serves only whole-key point reads. It throws when `seekWidth` does not cover the primary key.
+
+Expected: a leading-prefix `IN` on the primary key, including a cross-product such as `a in (…) and b in (…)` on a three-member key, is served as one prefix window per distinct tuple. The windows are emitted in encoded-key order so the primary-key ordering advertisement still holds, and the same gates apply as for the secondary multi-seek: the 1000-key cap, the semantic-ordering decline (a merged multi-seek has no safe runtime fallback), and the predicate-collation gate. The secondary-index arm (`scanMultiSeek`) already windows prefixes this way for an index whose seek width is shorter than the index.
