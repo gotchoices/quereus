@@ -1001,8 +1001,11 @@ export class TransactionLayer implements Layer {
 						memoryIndex.removeEntry(oldIndexKey, primaryKey);
 						memoryIndex.addEntry(newIndexKey, primaryKey);
 					} else {
-						// Index key is same, but we might need to update the entry
-						// With inherited BTrees, the existing entry will be copied on write
+						// Same index key: re-file so the entry carries the row's current key bytes
+						// (a collation-equal rewrite such as NOCASE 'B' → 'b').
+						// NOTE: copies one root-to-leaf path per index even when no indexed column
+						// changed. Nothing reads the stored bytes back, so if update-heavy tables with
+						// many indexes show this in a profile, skip it.
 						memoryIndex.addEntry(newIndexKey, primaryKey);
 					}
 				} else { // INSERT

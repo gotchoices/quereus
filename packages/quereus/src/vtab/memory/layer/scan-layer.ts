@@ -154,6 +154,10 @@ function lastKeyOfSeekGroup<TKey, TEntry>(
  * whether the walk starts among those rows or past them: an inclusive seek bound (or a bare
  * equality prefix) starts on the walk's near side of the group, an exclusive one on its far side.
  * A shorter tuple sorts before the whole group whatever the sentinel.
+ *
+ * NOTE: so a forward walk from an exclusive short-tuple bound (`a = 1 and b > 5` over an index on
+ * (a, b, c)) steps through and rejects every row under (1, 5). If such a group is ever large in a
+ * profile, seek past it as {@link lastKeyOfSeekGroup}'s NOTE describes.
  */
 function seekSentinel(isAscending: boolean, seekBound: ScanPlanRangeBound | undefined): typeof PK_LOW | typeof PK_HIGH {
 	const skipsSeekValue = seekBound !== undefined && isExclusiveBound(seekBound);

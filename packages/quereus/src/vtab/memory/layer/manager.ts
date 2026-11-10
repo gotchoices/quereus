@@ -1344,11 +1344,10 @@ export class MemoryTableManager {
 			// REPLACE eviction whose index removal lands later in the batch), so a
 			// candidate whose row is gone, no longer carries the colliding values,
 			// or left a partial index's scope is skipped rather than raised as a
-			// false conflict (or, worse, REPLACE-evicting an innocent row). The
-			// entry now tracks PKs by value (removeEntry drops composite PKs
-			// correctly, so it no longer accumulates stale-by-reference members);
-			// this live re-check remains as defense-in-depth for that genuine
-			// intra-statement lag.
+			// false conflict (or, worse, REPLACE-evicting an innocent row). Index
+			// entries are identified by PK value under the PK comparator, so
+			// removeEntry never leaves a stale member behind; this live re-check
+			// remains as defense-in-depth for that genuine intra-statement lag.
 			// Compare under the INDEX's per-column collation (positionally aligned
 			// with uc.columns — findIndexForConstraint requires it): the index is
 			// the enforcing structure, and an explicit `create unique index …
