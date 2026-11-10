@@ -14,7 +14,7 @@ import { StatusCode } from '../../common/types.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import type * as AST from '../../parser/ast.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import { ANY_TYPE, NULL_TYPE } from '../../types/builtin-types.js';
+import { isNumericOrUnknownType } from '../../types/builtin-types.js';
 
 /**
  * Where one collected window function's result lives on the window phase's
@@ -257,7 +257,7 @@ function validateRangeOffsetFrame(windowSpec: WindowSpec, orderByExpressions: re
 	}
 
 	const keyType = orderByExpressions[0].getType().logicalType;
-	if (keyType.isNumeric === true || keyType === ANY_TYPE || keyType === NULL_TYPE) return;
+	if (isNumericOrUnknownType(keyType)) return;
 
 	const keyLoc = windowSpec.orderBy[0].expr.loc?.start;
 	if (keyType.isTemporal === true) {
