@@ -462,10 +462,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 *    later whole-tree swap (DDL rebuild, consolidation) leaves the in-flight
 	 *    walk on its own tree: stale but coherent, which is the documented
 	 *    semantics.
-	 * 4. **Collapse cannot strand the pinned layer.** The connection IS in the
-	 *    manager's `connections` map, so `isLayerInUse` walks its `readLayer`
-	 *    chain and `promoteCommittedHead` refuses to `clearBase()` any layer that
-	 *    chain reaches; `MemoryTable.disconnect` releases it after the scan.
+	 * 4. **Nothing detaches or rewrites the pinned layer.** `clearBase()` runs only
+	 *    in `TransactionLayer.freeze`, on a pending layer nothing derives from (and
+	 *    on trees a DDL rebuild has just created); publishing a head re-points only
+	 *    its layer-level parent link (`publishAsHead`), never its trees.
+	 *    `MemoryTable.disconnect` releases the connection after the scan.
 	 *
 	 * Point 3 is the fragile one, and it rests on a property every DDL path in
 	 * `layer/base.ts` currently has: each rebuild REPLACES the tree object

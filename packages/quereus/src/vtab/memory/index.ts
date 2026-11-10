@@ -323,7 +323,7 @@ export class MemoryIndex {
 		this.data = this.createBTree();
 	}
 
-	/** Detaches this index's BTree from its base inheritance (used during layer collapse) */
+	/** Detaches this index's BTree from its base inheritance (when its layer is frozen, or a frozen layer's index is rebuilt) */
 	clearBase(): void {
 		this.data.clearBase();
 	}

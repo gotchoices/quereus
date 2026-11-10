@@ -88,7 +88,17 @@ export interface PreparedColumnReshape {
  */
 export class TransactionLayer implements Layer {
 	private readonly layerId: number;
-	public readonly parentLayer: Layer;
+	/**
+	 * The layer this one was built over, until {@link publishAsHead} re-points it at the base
+	 * layer. Every rebuild that reads it ({@link newPrimaryTreeOverParent}, {@link reindexOwnWrites},
+	 * {@link adoptSchema}, {@link prepareRekeyedPrimaryKeyColumns}) runs only after the head has
+	 * been drained into the base, so for a published head the base is an accurate rebuild source.
+	 */
+	private parentLayer: Layer;
+	/** Whether {@link freeze} detached this layer's trees from their base — see {@link publishAsHead}. */
+	private treesDetached = false;
+	/** The manager's history generation this layer was published under as committed head; undefined until then. */
+	private publishedGeneration: number | undefined;
 	/**
 	 * Inherited verbatim from the parent layer: this layer's secondary BTrees are
 	 * built over the parent's (`new MemoryIndex(..., parentSecondaryTree)`), so the
@@ -162,9 +172,9 @@ export class TransactionLayer implements Layer {
 			return result;
 		};
 
-		// Before any tree is built over the parent's: from here on the parent may not be
-		// promoted, because `clearBase()` on it would move its `chainVersion()` out from
-		// under the snapshot this layer's trees are about to take.
+		// Before any tree is built over the parent's: from here on `freeze` must not detach the
+		// parent, because `clearBase()` on it would move its `chainVersion()` out from under the
+		// snapshot this layer's trees are about to take.
 		parent.noteDerivedChild();
 
 		const parentPrimaryTree = parent.getModificationTree('primary');
@@ -859,6 +869,36 @@ export class TransactionLayer implements Layer {
 		// access, so a chain that grows per statement is quadratic and overflows the stack at
 		// roughly 15,600 links.
 		this.clearBase();
+		this.treesDetached = true;
+	}
+
+	/**
+	 * Records that `MemoryTableManager.commitTransaction` has made this frozen layer the committed
+	 * head under history `generation`, and re-parents it onto `root` — the table's base layer — so
+	 * it stops keeping the savepoint snapshots and former heads below it reachable. Without the
+	 * re-parent every committed head holds the one before it, and a table retains one layer per
+	 * write statement it has ever run.
+	 *
+	 * Sound because {@link freeze} detached the trees: they hold the merged view on their own, so
+	 * the parent link is no longer a read path, only something the layer-chain walks follow. Those
+	 * walks need `root` rather than no parent at all: the DDL rebuilds replay {@link ownWrites} over
+	 * the parent's trees, and they run only after `ensureSchemaChangeSafety` has drained the head
+	 * into the base, so the base then holds exactly this layer's view and the replay rewrites the
+	 * same rows. When freeze could not detach, the trees still read through the parent, and
+	 * pointing the layer at the base would mis-describe what they hold — so the parent stays.
+	 */
+	publishAsHead(root: Layer, generation: number): void {
+		this.publishedGeneration = generation;
+		if (!this.treesDetached) {
+			warnLog('Published head %d still reads through its parent\'s trees; keeping its parent link', this.layerId);
+			return;
+		}
+		this.parentLayer = root;
+	}
+
+	/** The history generation this layer was published under as committed head — see {@link publishAsHead}. */
+	getPublishedGeneration(): number | undefined {
+		return this.publishedGeneration;
 	}
 
 	/**
@@ -876,19 +916,6 @@ export class TransactionLayer implements Layer {
 	 */
 	getPendingChanges(): readonly PendingChange[] {
 		return this.pendingChanges ?? [];
-	}
-
-	/**
-	 * Drops the pending-change event log (tracking stays enabled). Called when this
-	 * layer's content is drained into the base by ALTER's consolidation
-	 * (`MemoryTableManager.consolidateToBaseLayer`): its events were already delivered
-	 * when the layer originally committed, but the layer can remain in the DDL
-	 * connection's open-transaction parent chain — and once the base becomes the
-	 * committed head, the commit-time collection (`collectPendingChanges`) walks that
-	 * chain all the way down to the base and would re-deliver them.
-	 */
-	clearPendingChanges(): void {
-		if (this.pendingChanges) this.pendingChanges = [];
 	}
 
 	/** This layer's own structural writes, oldest-first — the rebase replay source. */
@@ -1047,8 +1074,7 @@ export class TransactionLayer implements Layer {
 	 * because committed layers, savepoint snapshots, and the base layer are never written in
 	 * place (a DDL rebuild replaces their tree objects instead).
 	 *
-	 * Callers: `MemoryTableManager.promoteCommittedHead` (layer collapse) and {@link freeze};
-	 * each checks {@link hasDerivedChildren} first.
+	 * Called by {@link freeze}, which checks {@link hasDerivedChildren} first.
 	 * {@link detachRebuiltTrees} applies the same detach to individual freshly built trees.
 	 */
 	public clearBase(): void {

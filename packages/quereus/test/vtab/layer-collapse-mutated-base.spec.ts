@@ -1,12 +1,14 @@
 /**
- * Regression: `MemoryTableManager.tryCollapseLayers` used to detach a committed layer
- * (`clearBase()`) that other live layers were still inheriting from. inheritree tracks the
- * base-immutability contract with a version total, and dropping the base pointer removes the
- * base's whole contribution from it — so every already-derived child's snapshot stops matching
- * and its next `checkBase()` raises `MutatedBaseError: Base tree was mutated while a derived
- * child was live`, even though no row moved.
+ * Regression: a since-removed layer collapse (`MemoryTableManager.tryCollapseLayers`) used to
+ * detach a committed layer (`clearBase()`) that other live layers were still inheriting from.
+ * The same detach now runs in `TransactionLayer.freeze`, behind the same derived-child guard,
+ * and these shapes — eager savepoints taken on the parent's connection — still drive it.
+ * inheritree tracks the base-immutability contract with a version total, and dropping the base
+ * pointer removes the base's whole contribution from it — so every already-derived child's
+ * snapshot stops matching and its next `checkBase()` raises `MutatedBaseError: Base tree was
+ * mutated while a derived child was live`, even though no row moved.
  *
- * The throw surfaces later than the collapse: `checkBase()` runs from `getCount()`, and
+ * The throw surfaces later than the detach: `checkBase()` runs from `getCount()`, and
  * `new BTree(…, { base })` calls `base.getCount()`, so it lands in the `TransactionLayer`
  * constructor the next commit builds.
  *

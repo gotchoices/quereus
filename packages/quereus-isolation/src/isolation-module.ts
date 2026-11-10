@@ -925,8 +925,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * `MemoryTable` pins its read layer at the first scan pull and serves that layer for
 	 * the life of the instance (`MemoryTable.ensureConnection`, the `readCommitted` arm).
 	 * A handle memoized for the table's lifetime would therefore serve the SAME committed
-	 * state forever, going arbitrarily stale, and would hold the layer chain against
-	 * collapse (`MemoryTableManager.isLayerInUse` walks the connection's `readLayer` chain)
+	 * state forever, going arbitrarily stale, and would keep that committed layer reachable
 	 * for as long as the table exists. A stale-forever snapshot is worse than the tear.
 	 * Not memoizing also keeps `destroy`/`renameTable`/the attach seams free of a second
 	 * eviction: nothing new ever lands in `underlyingTables`.
@@ -939,7 +938,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * is the accepted cost of not freezing the snapshot.
 	 *
 	 * The handle is released by {@link IsolatedTable.disconnect} — required on the memory
-	 * path, where disconnect is what drops the pinned read layer's collapse protection.
+	 * path, where disconnect is what removes the reader's connection, and with it the
+	 * committed layer it pinned, from the manager.
 	 */
 	private async connectCommitted(
 		db: Database,

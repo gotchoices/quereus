@@ -1,11 +1,10 @@
 /**
- * Unit contracts behind the layer-collapse fix. `layer-collapse-mutated-base.spec.ts`
- * covers the SQL-level symptom, but it passes if EITHER half of the fix is present, so
- * it cannot pin down which half. These tests take each half on its own:
+ * Unit contracts behind the derived-child guard. `layer-collapse-mutated-base.spec.ts`
+ * covers the SQL-level symptom; these tests take each half of the guard on its own:
  *
- *   - `TransactionLayer`'s constructor must mark its parent as derived-from, and
- *     `MemoryTableManager` must refuse to promote a marked layer (the `clearBase()`
- *     that promotion performs is what raises `MutatedBaseError` in a live child).
+ *   - `TransactionLayer`'s constructor must mark its parent as derived-from, which is what
+ *     `TransactionLayer.freeze` checks before it detaches a layer's trees (the `clearBase()`
+ *     it performs is what raises `MutatedBaseError` in a live child).
  *   - `disconnect` must keep a connection whose uncommitted rows live in an eager
  *     savepoint snapshot, which reports no pending layer at all.
  */
@@ -17,14 +16,13 @@ import { TransactionLayer } from '../../src/vtab/memory/layer/transaction.js';
 
 /** The private members these contracts assert over, named rather than cast to `any`. */
 type ManagerInternals = {
-	promoteCommittedHead(): boolean;
 	connections: Map<number, unknown>;
 };
 
 const internals = (manager: MemoryTableManager): ManagerInternals =>
 	manager as unknown as ManagerInternals;
 
-describe('layer collapse guards', () => {
+describe('derived-child guard', () => {
 	let db: Database;
 	let manager: MemoryTableManager;
 
@@ -69,20 +67,6 @@ describe('layer collapse guards', () => {
 		const solo = new TransactionLayer(manager.currentCommittedLayer);
 		expect(solo.hasDerivedChildren()).to.equal(false);
 		expect(() => solo.clearBase()).to.not.throw();
-	});
-
-	it('refuses to promote a committed head that has a derived child', async () => {
-		await db.exec("insert into t values (1, 'a')");
-		const head = manager.currentCommittedLayer;
-		expect(head, 'committed head is a transaction layer').to.be.instanceOf(TransactionLayer);
-
-		// Stand in for the live layer a still-registered connection holds: derived from the
-		// head, so promoting the head would strand it.
-		const derived = new TransactionLayer(head);
-		expect(head.hasDerivedChildren()).to.equal(true);
-
-		expect(internals(manager).promoteCommittedHead(), 'promotion refused').to.equal(false);
-		expect(derived.getParent()).to.equal(head);
 	});
 
 	it('keeps a disconnecting connection whose uncommitted rows sit in an eager savepoint', async () => {

@@ -37,7 +37,11 @@ export interface Layer {
 	/** Returns the layer ID (unique identifier, potentially timestamp or sequence) */
 	getLayerId(): number;
 
-	/** Returns the parent layer in the chain, or null for the BaseLayer */
+	/**
+	 * Returns the parent layer in the chain, or null for the BaseLayer. A published committed head
+	 * answers the base layer, not the layer it was built over (`TransactionLayer.publishAsHead`),
+	 * so a chain is only ever as long as the open transaction above the head it forked from.
+	 */
 	getParent(): Layer | null;
 
 	/**
@@ -51,9 +55,8 @@ export interface Layer {
 	getModificationTree(indexName: string | 'primary'): BTree<BTreeKeyForPrimary, Row> | null;
 
 	/**
-	 * Returns the table schema as it existed when this layer was created or relevant.
-	 * This is important for interpreting modifications during layer collapse, especially
-	 * if schema changes occurred after this layer was created.
+	 * Returns the table schema as it existed when this layer was created, or the one an
+	 * in-transaction DDL later handed it.
 	 */
 	getSchema(): TableSchema;
 
@@ -75,11 +78,11 @@ export interface Layer {
 	 * Records that a child layer has built its BTrees over this layer's — called by the
 	 * `TransactionLayer` constructor before it derives anything from its parent.
 	 *
-	 * The signal exists so `MemoryTableManager.tryCollapseLayers` can refuse to promote a
-	 * layer some other tree is inheriting from: promotion calls `clearBase()`, which drops
-	 * the base pointer and so removes the base's contribution from `chainVersion()` —
-	 * every already-derived child snapshotted that total at construction, so each one's
-	 * next `checkBase()` raises `MutatedBaseError` even though no row moved.
+	 * The signal exists so `TransactionLayer.freeze` can refuse to detach a layer some other
+	 * tree is inheriting from: the detach calls `clearBase()`, which drops the base pointer and
+	 * so removes the base's contribution from `chainVersion()` — every already-derived child
+	 * snapshotted that total at construction, so each one's next `checkBase()` raises
+	 * `MutatedBaseError` even though no row moved.
 	 */
 	noteDerivedChild(): void;
 
@@ -87,13 +90,9 @@ export interface Layer {
 	 * True once any child layer has built its BTrees over this layer's — see
 	 * {@link noteDerivedChild}.
 	 *
-	 * The count NEVER decrements. There is no layer-destruction hook to decrement from,
-	 * and `MemoryTableManager.connections` cannot stand in as a liveness registry: its
-	 * `disconnect` removes connections that are still live and are committed later
-	 * (`MemoryTable.ensureConnection` reuses exactly such a connection). So the signal has to
-	 * live on the layer, and it errs conservatively: collapse fires only on a head that has
-	 * *never* had a child derived from it, which is precisely the quiescent case where
-	 * detaching it changes no other tree's `chainVersion()`.
+	 * The count NEVER decrements: there is no layer-destruction hook to decrement from, so it
+	 * errs conservatively. `freeze` only ever meets a connection's pending layer, which nothing
+	 * derives from, so the guard does not fire in practice.
 	 */
 	hasDerivedChildren(): boolean;
 }

@@ -267,10 +267,8 @@ export class MemoryTable extends VirtualTable {
 		}
 	}
 
-	/** Sync operation (currently no-op for memory table layers) */
+	/** Sync operation (no-op for memory table layers) */
 	async sync(): Promise<void> {
-		// This might trigger background collapse in the manager in the future
-		// await this.manager.tryCollapseLayers(); // Optional: trigger collapse on sync?
 		return Promise.resolve();
 	}
 
@@ -384,20 +382,12 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	/**
-	 * Disconnects this connection instance from the manager.
-	 *
-	 * NOTE: for a `_readCommitted` instance this releases the pinned read layer's
-	 * protection — `MemoryTableManager.isLayerInUse` only sees connections still in
-	 * the manager's map, so once dropped, a layer collapse may `clearBase()` the
-	 * layer chain the snapshot was reading. Safe today because every caller
-	 * disconnects only after its `query()` iterator is exhausted or closed. If a
-	 * caller ever disconnects while an iterator is still live (a cancelled
-	 * concurrent read that tears down its scan connection eagerly, say), pin the
-	 * layer for the iterator's lifetime instead of relying on the connection.
+	 * Disconnects this connection instance from the manager. For a `_readCommitted`
+	 * instance this is what lets the committed layer it pinned be released.
 	 */
 	async disconnect(): Promise<void> {
 		if (this.connection) {
-			// Manager handles cleanup and potential layer collapse trigger
+			// The manager keeps the connection while it still holds uncommitted work.
 			await this.manager.disconnect(this.connection.connectionId);
 			this.connection = null;
 			this.cachedVtabConnection = null;

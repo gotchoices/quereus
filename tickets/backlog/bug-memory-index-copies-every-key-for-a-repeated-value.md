@@ -1,4 +1,4 @@
-description: When many separate statements write rows that share one value of an indexed column, such as a status flag, an in-memory table slows down and uses memory in proportion to the square of the number of statements, because each statement copies the whole list of rows filed under that value.
+description: When many separate statements write rows that share one value of an indexed column, such as a status flag, an in-memory table slows down (and, inside one transaction, uses memory) in proportion to the square of the number of statements, because each statement copies the whole list of rows filed under that value.
 architecture: docs/memory-table.md#performance-characteristics
 files:
   - packages/quereus/src/vtab/memory/index.ts               # addEntry / removeEntry — inherited entry copied as `new Map(existing.primaryKeys)`; MemoryIndexEntry layout; ownedEntries; getSortedPrimaryKeys
@@ -15,7 +15,7 @@ tradeoffs: The fix changes the secondary-index entry layout that scans, UNIQUE c
 
 ## Symptom (measured)
 
-A memory table's secondary index stores one B-tree entry per distinct index value: a `MemoryIndexEntry` whose `primaryKeys` is a `Map` holding every primary key filed under that value. A transaction layer that writes under an index value it inherited from its parent cannot modify the parent's entry, so `MemoryIndex.addEntry` / `removeEntry` copy it first with `new Map(existingEntry.primaryKeys)`. That copy costs O(k), where k is the number of rows sharing that value. There is one layer per write statement (each autocommit statement, and each statement inside a transaction through its statement savepoint). So N statements writing the same value cost O(N·k) time. Every layer is kept for the life of the table (`bug-memory-table-retains-every-committed-layer`), so each copy is kept too, and memory is O(N·k) as well.
+A memory table's secondary index stores one B-tree entry per distinct index value: a `MemoryIndexEntry` whose `primaryKeys` is a `Map` holding every primary key filed under that value. A transaction layer that writes under an index value it inherited from its parent cannot modify the parent's entry, so `MemoryIndex.addEntry` / `removeEntry` copy it first with `new Map(existingEntry.primaryKeys)`. That copy costs O(k), where k is the number of rows sharing that value. There is one layer per write statement (each autocommit statement, and each statement inside a transaction through its statement savepoint). So N statements writing the same value cost O(N·k) time. Inside one transaction every statement's savepoint snapshot stays on the open layer chain until commit, so each copy is kept and memory is O(N·k) until then; across autocommit statements a committed head no longer keeps the layers below it reachable (`bug-memory-table-retains-every-committed-layer`), so the copies are released as each statement commits.
 
 Measured on node v24.2.0. A table `t (id integer primary key, g integer)` with `create index t_g on t(g)` takes N prepared single-row inserts `insert into t values (?, 0)`. Every row has `g = 0`.
 
@@ -24,6 +24,8 @@ Measured on node v24.2.0. A table `t (id integer primary key, g integer)` with `
 | 2,000 | 0.29 s | 0.29 s | 85 MB |
 | 4,000 | 0.98 s | 0.95 s | 319 MB |
 | 8,000 | 3.2 s | 3.2 s | 1,244 MB |
+
+The heap column was measured before `bug-memory-table-retains-every-committed-layer`. After it, at N = 4,000 the open transaction still holds about 320 MB before its commit and releases it at commit, and the autocommit run retains about 3 MB.
 
 These numbers are with `bug-many-inserts-in-one-transaction-overflow-stack` in place. Before it, autocommit also paid a second quadratic term from the growing tree chain: 17 s at N = 8,000.
 

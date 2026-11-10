@@ -32,7 +32,7 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **Isolation:** Each connection sees a consistent snapshot of data throughout its transaction
 *   **Concurrency:** Multiple connections can read/write simultaneously with proper isolation
 *   **Savepoints:** Full support for nested savepoints within transactions (`SAVEPOINT`, `ROLLBACK TO`, `RELEASE`)
-*   **Layer Collapse:** Automatic promotion and cleanup of committed layers when safe — two required conditions, both in [Layer Management](#layer-management)
+*   **Layer Release:** Each newly committed head drops its link to the layers below it, so a table retains layers only for views a connection still holds, not one per statement it has ever run — see [Layer Management](#layer-management)
 
 #### Commit and sibling-layer rebase
 
@@ -40,22 +40,47 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 committed chain. Which of three relationships holds between the pending layer and
 the current committed head decides how:
 
+The **fork point** is the committed layer the transaction started from: walking down from the
+pending layer, the first layer that is either a base layer or a layer that was once published as
+committed head (`MemoryTableManager.forkedFrom`). Everything above it — the pending layer and its
+savepoint snapshots — is the transaction's own.
+
 *   **Head is an ancestor of pending** — the normal case: the pending layer forked
-    off (a descendant of) the current head, so its chain already contains
-    everything committed so far. It is published *wholesale* as the new head.
-*   **Head advanced past pending's fork point** — a *sibling* commit. Two
-    connections forked pending layers off the same base `B`; the first committed
-    and moved the head to `P1`, so the second's pending `P2` is now a sibling of
-    `P1` rather than a descendant. Publishing `P2` wholesale would splice `P1` (and
-    its rows) out of the chain — a silent last-writer-wins data loss. Instead the
-    second commit **rebases**: it builds a fresh `TransactionLayer` parented on the
-    advanced head and *replays `P2`'s own writes on top*, so `P1`'s rows survive.
-    Rebasing chains — `B ← P1 ← rebased-P2`, then a third sibling rebased onto
-    that — so any number of sibling commits to one table all land.
-*   **No common ancestor** — a genuinely stale commit (e.g. the base was
-    consolidated away by an `ALTER TABLE`). Outside a coordinated commit this rolls
-    back with `BUSY` so the caller can retry; a schema drift between pending and the
-    advanced head also aborts with `BUSY` rather than replay stale-schema rows.
+    off the current head, so its chain already contains everything committed so
+    far. It is published *wholesale* as the new head.
+*   **Head advanced past the fork point** — a *sibling* commit. Two connections
+    forked pending layers off the same head `H`; the first committed and moved the
+    head to `P1`, so the second's pending `P2` is now a sibling of `P1` rather than
+    a descendant. Publishing `P2` wholesale would drop `P1`'s rows — a silent
+    last-writer-wins data loss. Instead the second commit **rebases**: it builds a
+    fresh `TransactionLayer` over the advanced head and *replays the writes of `P2`
+    and its savepoint snapshots on top*, so `P1`'s rows survive. The rebased layer
+    is the new head, so a third sibling rebases onto it in turn, and any number of
+    sibling commits to one table all land.
+*   **Fork point is not an earlier state of the head** — a genuinely stale commit
+    (e.g. the base was replaced by a materialized-view refresh). Outside a
+    coordinated commit this rolls back with `BUSY` so the caller can retry; inside
+    one it publishes the pending layer wholesale. A schema drift between pending
+    and the advanced head also aborts with `BUSY` rather than replay stale-schema
+    rows.
+
+Publishing re-parents the new head onto the base layer (see [Layer Management](#layer-management)),
+so the head's own parent chain no longer records which heads came before it. That history is kept
+as a number instead: the manager's `historyGeneration`, stamped on each head as it is published.
+Every head published within one generation is an earlier state of the current head — a wholesale
+publish contains the previous head, a rebase is built over it, and consolidation for a schema change
+drains it into the base, which every chain ends at. So a fork point is valid for a rebase when it is
+the current base or a head stamped with the current generation. The generation is bumped wherever
+the head stops descending from its predecessor: a base replacement (`replaceBaseLayer`, `destroy`)
+and the coordinated-commit stale fallback.
+
+A sibling that forked from a head which a schema change later drained into the base, and that
+commits after a newer head, rebases only its own writes. (Before the history marker, the search fell
+through to the base and replayed the drained head's whole chain again on top of the newer head,
+reverting its rows.)
+
+Events follow the same boundary: commit delivers the pending-change events of the layers above the
+fork point, the only ones not already delivered when an earlier head was published.
 
 The replay source is an **always-on per-layer write log** (`TransactionLayer.getOwnWrites()`),
 maintained independently of the event-tracking `pendingChanges` so it is a reliable
@@ -187,7 +212,7 @@ await db.exec("alter table users rename column created_at to registration_date")
 ### **Layer Management:**
 *   **Connection Isolation:** Each connection maintains its own read layer and optional pending transaction layer
 *   **Detach on Freeze:** A pending layer's BTrees are detached from their base the moment it is frozen (below)
-*   **Automatic Promotion:** `MemoryTableManager.tryCollapseLayers` (run on `disconnect`) promotes the committed head when both conditions below hold
+*   **Re-parent on Publish:** A newly committed head's parent link is pointed at the base layer, releasing the layers below it (below)
 *   **Lock-Free Reads:** Read operations don't require locks, using the connection's current layer view
 *   **Efficient Writes:** Write operations use inherited BTrees to minimize data copying
 
@@ -200,9 +225,9 @@ statement savepoint, `insert or fail` opens one per row, and every autocommit st
 new head, and each next pending layer builds its trees over the frozen one's. inheritree walks the
 chain recursively on every tree access (`BTree.chainVersion()`), so a growing chain costs
 quadratic time and overflows the stack at roughly 15,600 links. The detach is legal by
-construction: the layer was the connection's pending head, so no tree derives from it yet
-(condition 2 below holds trivially). The layer-level parent chain (`Layer.getParent()`) is left
-intact; commit, rebase, `isLayerInUse` and the DDL passes still walk it.
+construction: the layer was the connection's pending head, so no tree derives from it yet (the
+derived-child guard below holds trivially). Freezing leaves the layer-level parent chain
+(`Layer.getParent()`) alone; publishing a head is what cuts it (below).
 
 In-transaction DDL keeps the chain shallow the same way. The oldest-first rebuilds
 (`adoptSchema`, `rekeyPrimaryKey`, `installRekeyedPrimaryKeyColumns`, `convertColumn`,
@@ -217,25 +242,36 @@ What detaching gives up: inheritree's `MutatedBaseError` guard no longer covers 
 That rests on a standing rule instead — committed layers, savepoint snapshots and the base layer
 are never written in place; every rebuild replaces their tree objects.
 
-Promotion means `clearBase()` on the head's BTrees: the head stops inheriting, and the chain
-below it becomes releasable. Since commit freezes every head it installs, promotion today only
-re-detaches an already-detached head. It is safe only when **both** hold:
+**The derived-child guard.** `freeze` detaches only a layer nothing has ever built a BTree over
+(`Layer.hasDerivedChildren()`, set by the `TransactionLayer` constructor on its parent and never
+cleared, since there is no layer-destruction hook). `clearBase()` drops the base pointer, which
+removes the base's contribution from inheritree's chain-version total — the total every tree already
+built over the layer snapshotted at construction — so each such tree would fail its next base check
+with `MutatedBaseError` even though no row moved. (A detached tree also goes on sharing nodes by
+identity with its former base, so base-immutability outlives the call.) A pending layer has no
+derived child, so the guard does not fire in practice; if it does, the layer stays linked and the
+publish below keeps its parent.
 
-1.  **No attached connection's read or pending chain reaches the head's parent** —
-    `isLayerInUse` walks both chains to the chain root.
-2.  **Nothing has ever derived a BTree from the head itself** — `Layer.hasDerivedChildren()`.
+**Publishing re-parents.** At the end of `commitTransaction`, after the commit has collected the
+transaction's events from the old chain, `TransactionLayer.publishAsHead` points the new head's
+parent at the base layer and stamps it with the current history generation (see
+[Commit and sibling-layer rebase](#commit-and-sibling-layer-rebase)). The head's trees were
+detached by `freeze`, so they hold its whole view on their own and its contents do not change; it
+simply stops referencing the savepoint snapshots and former heads below it. Those become garbage
+unless a connection still holds one — its own read layer, a savepoint marker, or a sibling's
+pending chain — so the layers a table retains are bounded by the views its connections hold, not
+by the statements it has run. Every chain is at most: pending → savepoint snapshots → the head it
+forked from → base.
 
-The second condition is the load-bearing one. `clearBase()` drops the base pointer, which removes
-the base's contribution from inheritree's chain-version total — the total every tree already built
-over the head snapshotted at construction — so each such tree fails its next base check with
-`MutatedBaseError` even though no row moved. (The detached tree also goes on sharing nodes by
-identity with its former base, so base-immutability outlives the call.) The first condition cannot
-stand in for it: the manager's connection map is not an authoritative liveness registry, because
-`disconnect` detaches connections that stay registered on the `Database` and commit later.
-
-The derived-child flag is set by the `TransactionLayer` constructor and never cleared (there is no
-layer-destruction hook), so collapse fires only on a head no writer has moved past. Reclaiming a
-chain under live children would have to copy (`BTree.flatten()`) rather than detach.
+The base, rather than no parent at all, because the layer-chain walks still need a root: the
+in-transaction DDL rebuilds (`adoptSchema`, `rekeyPrimaryKey`, `convertColumn`, the column
+reshape) replay a layer's own writes over its parent's trees, and `chainContains(pending, base)`
+must still find the base after consolidation has made it the head. Every DDL arm that rebuilds
+trees first runs `ensureSchemaChangeSafety`, which drains the head into the base, so the base then
+holds exactly the drained head's view and replaying the head's own writes over it rewrites the same
+rows. The one arm that does not drain, `rename`, only swaps schema pointers (every `IndexSchema`
+keeps its identity), so it rebuilds nothing over the nominal parent. A head whose trees `freeze`
+could not detach keeps its real parent, since its trees still read through it.
 
 ### **Index Consistency:**
 *   **Unified Updates:** Primary and secondary index updates are handled uniformly during mutations
@@ -263,8 +299,9 @@ a full scan that applies the constraint's own predicate and collations — slowe
 
 ### **Memory Management:**
 *   **Copy-on-Write Pages:** Only modified pages are copied, sharing immutable pages across layers
-*   **Layer Retention:** Layers are garbage collected when no longer referenced — but every layer references its parent (`TransactionLayer.parentLayer`), so the committed head keeps every earlier layer reachable, one per write statement, for the table's lifetime. Measured: 40,000 autocommit updates of one row retain about 58 MB
-*   **Base Clearing:** The `clearBase()` operation makes a layer's BTrees independent of its base (so the tree chain stays shallow); it does not release the ancestor layer objects — see [Layer Management](#layer-management)
+*   **Layer Retention:** Layers are garbage collected when no longer referenced. A committed head's parent is the base layer (`TransactionLayer.publishAsHead`), so the head keeps only itself and the base reachable; older heads and savepoint snapshots live only as long as a connection's read view, savepoint, or open transaction holds them. Measured (node 24, `--expose-gc`): from 10,000 to 40,000 autocommit updates of a one-row table the head's layer chain stays at 2 and the heap stays flat (95.1 MB, 94.9 MB); before the re-parent the chain grew one layer per statement and the heap about 1.4 KB per statement
+*   **Base Clearing:** The `clearBase()` operation makes a layer's BTrees independent of its base, so the tree chain stays one link deep and the parent link is free to be re-pointed at publish — see [Layer Management](#layer-management)
+*   **Abandoned Transactions:** A connection with open work is never disconnected, so a transaction abandoned without commit or rollback keeps its pending layer, savepoint snapshots and the head it forked from reachable for the table's lifetime
 
 ## DDL and transactions
 

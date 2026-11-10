@@ -183,6 +183,16 @@ export class MemoryTableManager {
 
 	private baseLayer: BaseLayer;
 	private _currentCommittedLayer: Layer;
+	/**
+	 * Numbers the current run of committed heads that each descend from the one before: a
+	 * wholesale publish contains the previous head, a rebase is built over it, and consolidation
+	 * drains it into the base. Within one generation, then, any head published earlier is an
+	 * earlier state of the current head, and so a valid fork point for a sibling's rebase
+	 * ({@link forkedFrom}) even though `publishAsHead` has cut it out of the head's layer chain.
+	 * Bumped wherever the head stops descending from its predecessor: a base replacement and the
+	 * stale-commit fallback publish in {@link commitTransaction}.
+	 */
+	private historyGeneration = 0;
 	private connections: Map<number, MemoryTableConnection> = new Map();
 	public readonly isReadOnly: boolean;
 	public tableSchema: TableSchema;
@@ -523,27 +533,19 @@ export class MemoryTableManager {
 		//
 		// `hasOpenWork()` rather than an uncommitted pending layer: an eager savepoint moves
 		// the connection's uncommitted rows into `readLayer` and nulls
-		// `pendingTransactionLayer`, so the narrower test dropped a connection that was still
-		// reading — and writing, at commit — a live layer, hiding it from `isLayerInUse` while
-		// the collapse below ran.
+		// `pendingTransactionLayer`, so the narrower test would drop a connection that is still
+		// reading — and writing, at commit — a live layer.
 		//
 		// NOTE: deferral has no timeout, so a transaction abandoned without commit or rollback
-		// keeps this connection — and the layer chain it reads — reachable for the table's
-		// lifetime. The same was already true of an abandoned pending layer; if abandoned
-		// transactions ever show up as a leak, the fix is a reaper over `connections`, not a
-		// narrower test here.
+		// keeps this connection — and its pending layer, savepoint snapshots and the head they
+		// forked from — reachable for the table's lifetime. If abandoned transactions ever show
+		// up as a leak, the fix is a reaper over `connections`, not a narrower test here.
 		if (connection.hasOpenWork()) {
 			logger.debugLog(`[Disconnect] Deferring disconnect of connection ${connectionId} while transaction pending for ${this._tableName}`);
 			return;
 		}
 
-		// No pending changes – safe to remove immediately.
 		this.connections.delete(connectionId);
-
-		// Attempt fast layer-collapse in the background (best-effort)
-		void this.tryCollapseLayers().catch(err => {
-			logger.error('Disconnect', this._tableName, 'Layer collapse failed', err);
-		});
 	}
 
 	public async commitTransaction(connection: MemoryTableConnection): Promise<void> {
@@ -612,74 +614,71 @@ export class MemoryTableManager {
 			// Case A — the head is an ancestor of the pending layer: pending forked
 			//   off (a descendant of) the current head, so its chain already
 			//   contains everything committed so far. Publish it wholesale.
-			// Case B — the head advanced past the pending layer's fork point
-			//   (a sibling connection committed a disjoint change to the same table
-			//   in a coordinated multi-connection commit): pending and head share a
-			//   common ancestor — the fork point — that is a *proper* ancestor of
-			//   the head. Rebase pending's own writes onto the head so the sibling's
-			//   already-committed rows are not discarded (the bug this guards).
-			// Case C — no common ancestor reachable: a genuinely stale commit. Roll
-			//   back with BUSY outside a coordinated commit (the caller can retry);
-			//   inside one, preserve the prior wholesale fallback.
-			const headIsAncestorOfPending = this.chainContains(pendingLayer, this._currentCommittedLayer);
-
+			// Case B — the head advanced past the committed layer the pending layer
+			//   forked from (a sibling connection committed a disjoint change to the
+			//   same table in a coordinated multi-connection commit), and that layer —
+			//   the fork point — is an earlier state of the current head. Rebase
+			//   pending's own writes onto the head so the sibling's already-committed
+			//   rows are not discarded (the bug this guards).
+			// Case C — the fork point is not an earlier state of the head: a genuinely
+			//   stale commit. Roll back with BUSY outside a coordinated commit (the
+			//   caller can retry); inside one, preserve the prior wholesale fallback.
+			const forkPoint = this.forkedFrom(pendingLayer);
 			let committedLayer: TransactionLayer;
-			let changes: ReturnType<TransactionLayer['getPendingChanges']>;
 
-			if (headIsAncestorOfPending) {
-				// Case A: the un-emitted in-transaction event span ends at the head.
-				changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
-				// `freeze`, not a bare `markCommitted`: the next pending layer builds over this
-				// head, so a linked one would grow the tree chain by one link per commit.
+			if (this.chainContains(pendingLayer, this._currentCommittedLayer)) {
+				// Case A. `freeze`, not a bare `markCommitted`: the next pending layer builds over
+				// this head, so a linked one would grow the tree chain by one link per commit.
 				pendingLayer.freeze();
 				committedLayer = pendingLayer;
-			} else {
-				// Find the fork point: the deepest layer present in BOTH chains.
-				const headChain = this.layerChainSet(this._currentCommittedLayer);
-				let forkPoint: Layer | null = pendingLayer.getParent();
-				while (forkPoint && !headChain.has(forkPoint)) {
-					forkPoint = forkPoint.getParent();
-				}
-
-				if (forkPoint) {
-					// Schema drift: an ALTER consolidated the head to a different schema
-					// since the pending layer forked. Replaying stale-schema rows onto
-					// the new-schema head is unsafe — abort with BUSY rather than corrupt
-					// the committed head (mirrors the stale-ancestor caution above).
-					//
-					// NOTE: `adoptSchemaOnOpenLayers` only walks the DDL connection's own chain,
-					// so a SIBLING connection's pending layer keeps its creation-time schema
-					// object even after a metadata-only change like `RENAME TO` that moves no
-					// rows — which would make this arm fire spuriously. Not reachable from SQL
-					// today: `renameTable` never calls `ensureSchemaChangeSafety`, and a single
-					// Database runs one transaction at a time. If sibling connections ever hold
-					// concurrent pending layers over one manager, compare column shape here
-					// rather than schema-object identity.
-					if (pendingLayer.getSchema() !== this.tableSchema) {
-						connection.pendingTransactionLayer = null;
-						connection.clearSavepoints();
-						logger.warn('Commit Transaction', this._tableName, 'Schema drift under sibling commit, rolling back', { connectionId: connection.connectionId });
-						throw new QuereusError(`Commit failed: schema changed under transaction on table ${this._tableName}. Retry.`, StatusCode.BUSY);
-					}
-					// Case B: rebase. Events come from the same fork-bounded pending-chain
-					// span; structural writes are replayed onto the advanced head.
-					changes = this.collectPendingChanges(pendingLayer, forkPoint);
-					committedLayer = this.rebaseLayerOntoHead(pendingLayer, forkPoint);
-				} else if (!this.db._inCoordinatedCommit()) {
+			} else if (forkPoint && this.isInCurrentHistory(forkPoint)) {
+				// Schema drift: an ALTER consolidated the head to a different schema
+				// since the pending layer forked. Replaying stale-schema rows onto
+				// the new-schema head is unsafe — abort with BUSY rather than corrupt
+				// the committed head (mirrors the stale-ancestor caution above).
+				//
+				// NOTE: `adoptSchemaOnOpenLayers` only walks the DDL connection's own chain,
+				// so a SIBLING connection's pending layer keeps its creation-time schema
+				// object even after a metadata-only change like `RENAME TO` that moves no
+				// rows — which would make this arm fire spuriously. Not reachable from SQL
+				// today: `renameTable` never calls `ensureSchemaChangeSafety`, and a single
+				// Database runs one transaction at a time. If sibling connections ever hold
+				// concurrent pending layers over one manager, compare column shape here
+				// rather than schema-object identity.
+				if (pendingLayer.getSchema() !== this.tableSchema) {
 					connection.pendingTransactionLayer = null;
 					connection.clearSavepoints();
-					logger.warn('Commit Transaction', this._tableName, 'Stale commit detected, rolling back', { connectionId: connection.connectionId });
-					throw new QuereusError(`Commit failed: concurrent update on table ${this._tableName}. Retry.`, StatusCode.BUSY);
-				} else {
-					// Case C fallback inside a coordinated commit: no safe rebase target,
-					// but aborting would roll back every connection. Preserve the prior
-					// wholesale publish.
-					changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
-					pendingLayer.freeze();
-					committedLayer = pendingLayer;
+					logger.warn('Commit Transaction', this._tableName, 'Schema drift under sibling commit, rolling back', { connectionId: connection.connectionId });
+					throw new QuereusError(`Commit failed: schema changed under transaction on table ${this._tableName}. Retry.`, StatusCode.BUSY);
 				}
+				// Case B: structural writes are replayed onto the advanced head.
+				committedLayer = this.rebaseLayerOntoHead(pendingLayer, forkPoint);
+			} else if (!this.db._inCoordinatedCommit()) {
+				connection.pendingTransactionLayer = null;
+				connection.clearSavepoints();
+				logger.warn('Commit Transaction', this._tableName, 'Stale commit detected, rolling back', { connectionId: connection.connectionId });
+				throw new QuereusError(`Commit failed: concurrent update on table ${this._tableName}. Retry.`, StatusCode.BUSY);
+			} else {
+				// Case C fallback inside a coordinated commit: no safe rebase target,
+				// but aborting would roll back every connection. Preserve the prior
+				// wholesale publish — which starts a new history, since this head does not
+				// descend from the one it replaces.
+				// NOTE: a second stale pending forked from the same retired fork point now lands
+				// here too and replaces this head wholesale; the old common-ancestor search
+				// rebased it onto this head instead. Unreachable today — a base replacement runs
+				// `ensureSchemaChangeSafety`, which refuses while another connection has open work,
+				// so at most one stale pending exists. If that changes, record the fork point
+				// this head descends from and accept it as a rebase target.
+				pendingLayer.freeze();
+				committedLayer = pendingLayer;
+				this.historyGeneration++;
 			}
 
+			// Before the publish, which cuts the pending layer off the chain this walks. Every
+			// case delivers the same span: the transaction's own layers, above the committed
+			// layer it forked from, whose events went out when that layer was published.
+			const changes = this.collectPendingChanges(pendingLayer, forkPoint);
+			committedLayer.publishAsHead(this.baseLayer, this.historyGeneration);
 			this._currentCommittedLayer = committedLayer;
 			logger.debugLog(`[Commit ${connection.connectionId}] CurrentCommittedLayer set to ${committedLayer.getLayerId()} for ${this._tableName}`);
 			connection.readLayer = committedLayer;
@@ -744,15 +743,31 @@ export class MemoryTableManager {
 		return undefined;
 	}
 
-	/** All layers in `layer`'s parent chain, including `layer` itself. */
-	private layerChainSet(layer: Layer): Set<Layer> {
-		const chain = new Set<Layer>();
-		let cur: Layer | null = layer;
-		while (cur) {
-			chain.add(cur);
-			cur = cur.getParent();
+	/**
+	 * The committed layer `pendingLayer`'s transaction forked from: the first layer below it that
+	 * is a published head or a base layer (this table's, or one a base replacement retired).
+	 * Everything above it is the transaction's own — the pending layer and its savepoint
+	 * snapshots. Null only for a chain that ends without reaching either, which no layer
+	 * construction produces.
+	 *
+	 * The search stops at the first published head even when that head belongs to an older
+	 * history: its parent link is nominal (`TransactionLayer.publishAsHead`), so the layers below
+	 * it do not describe how its rows came about, and no fork point further down is sound.
+	 */
+	private forkedFrom(pendingLayer: TransactionLayer): Layer | null {
+		for (let cur: Layer | null = pendingLayer.getParent(); cur; cur = cur.getParent()) {
+			if (!(cur instanceof TransactionLayer) || cur.getPublishedGeneration() !== undefined) return cur;
 		}
-		return chain;
+		return null;
+	}
+
+	/**
+	 * Whether `layer` is an earlier state of the current committed head: the base layer, or a
+	 * head published in the current {@link historyGeneration}.
+	 */
+	private isInCurrentHistory(layer: Layer): boolean {
+		if (layer === this.baseLayer) return true;
+		return layer instanceof TransactionLayer && layer.getPublishedGeneration() === this.historyGeneration;
 	}
 
 	/**
@@ -763,7 +778,7 @@ export class MemoryTableManager {
 	 * directly emitted are included; already-committed layers at/below the
 	 * boundary are not (their events were emitted when they committed).
 	 */
-	private collectPendingChanges(fromLayer: Layer, boundary: Layer): ReturnType<TransactionLayer['getPendingChanges']> {
+	private collectPendingChanges(fromLayer: Layer, boundary: Layer | null): ReturnType<TransactionLayer['getPendingChanges']> {
 		const eventChunks: ReturnType<TransactionLayer['getPendingChanges']>[] = [];
 		let layer: Layer | null = fromLayer;
 		while (layer && layer !== boundary) {
@@ -801,10 +816,10 @@ export class MemoryTableManager {
 		}
 		const ownWrites = writeChunks.reverse().flat();
 
+		// No change tracking: the commit delivers this transaction's events from the pending
+		// chain, and once published the rebased layer is a fork-point boundary no collection
+		// crosses, so a log here would never be read.
 		const rebased = new TransactionLayer(this._currentCommittedLayer);
-		if (this.eventEmitter?.hasDataListeners?.()) {
-			rebased.enableChangeTracking();
-		}
 
 		for (const write of ownWrites) {
 			// Re-derive the effective row at this PK on the NEW head (including
@@ -827,127 +842,6 @@ export class MemoryTableManager {
 
 		rebased.freeze();
 		return rebased;
-	}
-
-	async tryCollapseLayers(): Promise<void> {
-		const lockKey = `MemoryTable.Collapse:${this.schemaName}.${this._tableName}`;
-		let release: (() => void) | null = null;
-		try {
-			const acquirePromise = this.db.latches.acquire(lockKey);
-			const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 10)); // Short timeout
-			const result = await Promise.race([
-				acquirePromise.then(releaseFn => ({ release: releaseFn })),
-				timeoutPromise.then(() => ({ release: null }))
-			]);
-			release = result.release;
-			if (!release) {
-				logger.debugLog(`[Collapse] Lock busy for ${this._tableName}, skipping.`);
-				return;
-			}
-			logger.debugLog(`[Collapse] Acquired lock for ${this._tableName}`);
-			// At most ONE promotion per call, and no loop: promoting detaches the head's
-			// BTrees from their base but leaves the head exactly where it is, so there is
-			// never a second layer to promote afterwards. (The former `while` re-tested
-			// `_currentCommittedLayer`, which its body never reassigned, and so re-ran
-			// `clearBase()` on the same layer up to ten times per call.)
-			if (this.promoteCommittedHead()) {
-				logger.operation('Collapse Layers', this._tableName, { collapsedCount: 1 });
-			} else {
-				logger.debugLog(`[Collapse] No layers collapsed for ${this._tableName}. Current: ${this._currentCommittedLayer.getLayerId()}`);
-			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (e: any) {
-			logger.error('Collapse Layers', this._tableName, e);
-		} finally {
-			if (release) {
-				release();
-				logger.debugLog(`[Collapse] Released lock for ${this._tableName}`);
-			}
-		}
-	}
-
-	/**
-	 * Detaches the committed head from its parent (`clearBase()`), so the chain below it
-	 * can be released. Returns whether it did.
-	 *
-	 * Every head `commitTransaction` installs is already detached by `TransactionLayer.freeze`,
-	 * which skips the detach only for a layer with a derived child — and this refuses that layer
-	 * too. So today the `clearBase()` below re-detaches trees that have no base left.
-	 *
-	 * Caller holds the collapse latch.
-	 */
-	private promoteCommittedHead(): boolean {
-		if (!(this._currentCommittedLayer instanceof TransactionLayer)) return false;
-		if (!this._currentCommittedLayer.isCommitted()) return false;
-
-		const layerToPromote = this._currentCommittedLayer;
-		const parentLayer = layerToPromote.getParent();
-		if (!parentLayer) {
-			logger.error('Collapse Layers', this._tableName, 'Committed TransactionLayer has no parent', { layerId: layerToPromote.getLayerId() });
-			return false;
-		}
-
-		// A layer any child has EVER derived from must not be promoted. `clearBase()` drops
-		// the base pointer, which removes the base's whole contribution from the tree's
-		// `chainVersion()` — and every already-derived child snapshotted that total when it
-		// was built, so each one's next `checkBase()` raises `MutatedBaseError` although no
-		// row moved. inheritree forbids it for a second reason too: the detached tree keeps
-		// sharing nodes by identity with its former base, so the base-immutability contract
-		// outlives the call.
-		//
-		// The connection-based check below cannot cover this: `disconnect` detaches
-		// still-live connections from `this.connections`, so the map is not an authoritative
-		// liveness registry. The signal has to live on the layer.
-		//
-		// NOTE: the derived-child counter never decrements (no layer-destruction hook exists),
-		// so a long-lived table whose head always has a child may never collapse. If
-		// layer-chain memory growth ever shows up, switch the promotion to inheritree's
-		// `BTree.flatten()` — a real O(n) independent copy that leaves the old tree valid for
-		// its children — behind a chain-depth threshold, rather than loosening this guard.
-		if (layerToPromote.hasDerivedChildren()) {
-			logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} has derived children. Cannot promote it for ${this._tableName}.`);
-			return false;
-		}
-
-		// Check if anyone is still using the parent layer or any of its ancestors
-		if (this.isLayerInUse(parentLayer)) {
-			logger.debugLog(`[Collapse] Parent layer ${parentLayer.getLayerId()} or its ancestors in use. Cannot collapse layer ${layerToPromote.getLayerId()}.`);
-			return false;
-		}
-
-		logger.debugLog(`[Collapse] Promoting layer ${layerToPromote.getLayerId()} to become independent from parent ${parentLayer.getLayerId()} for ${this._tableName}`);
-
-		// With inherited BTrees, "collapsing" means making the transaction layer independent
-		// by calling clearBase() on its BTrees, effectively making it the new base data
-		layerToPromote.clearBase();
-
-		// No connection needs re-pointing off `parentLayer`: `isLayerInUse` above returns true
-		// for a connection whose read or pending chain reaches it — reading it directly
-		// included — so reaching here proves no attached connection holds it.
-		logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} is now independent for ${this._tableName}`);
-		return true;
-	}
-
-	/**
-	 * Whether any attached connection's read or write view still reaches `layer` — as its
-	 * read layer, its pending layer, or an ancestor of either.
-	 *
-	 * BOTH chains are walked, and each all the way to the chain root. An eager savepoint
-	 * (`MemoryTableConnection.createSavepoint`) moves the connection's uncommitted layer into
-	 * `readLayer` and leaves `pendingTransactionLayer` null, so walking only the pending chain
-	 * misses exactly the connection whose live snapshot the collapse would strand.
-	 *
-	 * Necessary but NOT sufficient as a collapse precondition: `disconnect` can drop a still-live
-	 * connection from `this.connections` (it stays registered on the Database and is committed
-	 * later), so a layer this reports unused may still have live derived trees. That is what
-	 * {@link Layer.hasDerivedChildren} covers.
-	 */
-	private isLayerInUse(layer: Layer): boolean {
-		for (const conn of this.connections.values()) {
-			if (this.chainContains(conn.readLayer, layer)) return true;
-			if (conn.pendingTransactionLayer && this.chainContains(conn.pendingTransactionLayer, layer)) return true;
-		}
-		return false;
 	}
 
 	/** Whether `layer` is `from` itself or any of its ancestors. */
@@ -1686,6 +1580,11 @@ export class MemoryTableManager {
 		// object, which fails `commitTransaction`'s snapshot-wrap identity check
 		// (`readLayer.getSchema() === this.tableSchema`) and drops the transaction's staged
 		// rows at COMMIT.
+		// NOTE: the only DDL arm that reaches the open layers without `ensureSchemaChangeSafety`
+		// draining the head first. That is sound only while the adoption rebuilds nothing: a
+		// published head's parent is the base in name only (`TransactionLayer.publishAsHead`),
+		// so a rebuild over it here would drop the head's inherited rows. If rename ever moves an
+		// `IndexSchema` object, drain first like the other arms.
 		this.adoptSchemaOnOpenLayers(renamed);
 
 		// No emit here (or in any other ALTER-arm manager method): the module-level
@@ -1742,8 +1641,7 @@ export class MemoryTableManager {
 			}
 			newBase.rebuildAllSecondaryIndexes();
 
-			this.baseLayer = newBase;
-			this._currentCommittedLayer = newBase;
+			this.installReplacementBase(newBase);
 
 			// Re-point any connection still reading the old base at the new base so
 			// the next statement observes refreshed contents.
@@ -3339,20 +3237,29 @@ export class MemoryTableManager {
 				if (connection.pendingTransactionLayer) connection.rollback();
 			}
 			this.connections.clear();
-			this.baseLayer = new BaseLayer(this.tableSchema, this.collationResolver);
-			this._currentCommittedLayer = this.baseLayer;
+			this.installReplacementBase(new BaseLayer(this.tableSchema, this.collationResolver));
 			logger.operation('Destroy', this._tableName, 'Manager destroyed and data cleared');
 		} finally {
 			release();
 		}
 	}
 
+	/**
+	 * Makes `newBase` both the base layer and the committed head. Starts a new history: the new
+	 * contents do not descend from any head published so far, so none of those may serve as a
+	 * sibling's fork point any more (see {@link historyGeneration}).
+	 */
+	private installReplacementBase(newBase: BaseLayer): void {
+		this.baseLayer = newBase;
+		this._currentCommittedLayer = newBase;
+		this.historyGeneration++;
+	}
+
 	private async ensureSchemaChangeSafety(): Promise<void> {
 		if (this._currentCommittedLayer !== this.baseLayer) {
 			logger.warn('Schema Change', this._tableName, 'Transaction layers exist. Attempting to consolidate to base...');
 
-			// For schema changes, we need to consolidate all data into the base layer
-			// instead of just promoting layers
+			// Schema changes rebuild the base layer, so every committed row must be in it first.
 			await this.consolidateToBaseLayer();
 
 			if (this._currentCommittedLayer !== this.baseLayer) {
@@ -3378,7 +3285,7 @@ export class MemoryTableManager {
 		}
 
 		// After ensuring we're at the base layer, update all connections to read from the base layer
-		// This is necessary because connections might still be reading from promoted/collapsed layers.
+		// This is necessary because connections might still be reading a former committed head.
 		// The DDL issuer's own open transaction is exempt: its read view is a pending layer or an
 		// eager savepoint snapshot holding its uncommitted rows, and re-pointing it at the base
 		// would silently drop them from every later read in that transaction.
@@ -3391,7 +3298,7 @@ export class MemoryTableManager {
 
 		// The manager's `connections` map covers only connections still attached to this
 		// manager. A connection can be DETACHED from the map (removed by disconnect after an
-		// autocommit collapse) while remaining REGISTERED in the Database connection registry —
+		// autocommit statement) while remaining REGISTERED in the Database connection registry —
 		// `MemoryTable.ensureConnection` reuses exactly such a connection for a later scan. The
 		// loop above misses it, so after an in-transaction schema change (e.g. ALTER TABLE ADD
 		// COLUMN, now permitted inside an explicit transaction) it keeps reading a stale
@@ -3956,11 +3863,13 @@ export class MemoryTableManager {
 	 * already be the new/converted/reshaped ones.
 	 *
 	 * NOTE: the walk takes every TransactionLayer below the view, which normally means the pending
-	 * layer and its savepoint snapshots. A committed layer already drained into the base by
-	 * `ensureSchemaChangeSafety` can also sit in the chain (the pending layer forked from it before
-	 * consolidation); it still shadows the base with its OWN unadapted rows while it remains the
-	 * view's copy-on-write base, so it must be adapted too — it cannot be skipped, since a savepoint
-	 * snapshot is `markCommitted()` as well. Both callers' per-layer work is idempotent and additive.
+	 * layer and its savepoint snapshots. The committed head the transaction forked from can also
+	 * sit in the chain, already drained into the base by `ensureSchemaChangeSafety`; it is the last
+	 * TransactionLayer before the base, because publishing it re-parented it there
+	 * (`TransactionLayer.publishAsHead`). It still shadows the base with its OWN unadapted rows
+	 * while it remains the view's copy-on-write base, so it must be adapted too — it cannot be
+	 * skipped, since a savepoint snapshot is `markCommitted()` as well. Its rebuild replays its own
+	 * writes over a base that already holds its whole view, so it rewrites the same rows.
 	 */
 	private openTransactionLayersOldestFirst(): TransactionLayer[] {
 		const connection = this.ddlConnection();
@@ -3991,16 +3900,9 @@ export class MemoryTableManager {
 				// Copy all data from the transaction layer to the base layer
 				await this.copyTransactionDataToBase(transactionLayer);
 
-				// The drained chain's pending-change event logs were already delivered when
-				// each layer committed, but the layers can remain in the DDL connection's own
-				// open-transaction parent chain. Once the base becomes the committed head, the
-				// commit-time collection (`collectPendingChanges`) walks that chain down to
-				// the base and would re-deliver them — clear the logs so consolidation is
-				// event-neutral. (Savepoint snapshots of the OPEN transaction sit above the
-				// committed head, not in this chain, so their un-emitted events are kept.)
-				for (let cur: Layer | null = transactionLayer; cur && cur !== this.baseLayer; cur = cur.getParent()) {
-					if (cur instanceof TransactionLayer) cur.clearPendingChanges();
-				}
+				// The drained head can stay in the DDL connection's open chain with its delivered
+				// event log intact; the next commit's collection stops at it (`forkedFrom`), so
+				// consolidation re-delivers nothing.
 
 				// Force all connections to read from the base layer
 				for (const conn of this.connections.values()) {

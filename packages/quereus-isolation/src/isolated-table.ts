@@ -2014,9 +2014,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * called `underlying.connect(...)` for THIS instance, so this instance releases it —
 	 * symmetric by contract, one disconnect per connect.
 	 *
-	 * Required, not merely tidy: on the memory path `MemoryTable.disconnect` is what drops
-	 * the pinned read layer's collapse protection (see its own NOTE), so without this every
-	 * committed read leaks a pinned layer chain for the life of the table.
+	 * Required, not merely tidy: on the memory path `MemoryTable.disconnect` is what removes
+	 * the reader's connection from the manager, so without this every committed read leaks a
+	 * connection — and the committed layer it pinned — for the life of the table.
 	 *
 	 * NOTE: symmetry does NOT imply exclusive ownership. An underlying module is free to
 	 * re-serve a cached instance from `connect` — `StoreModule` does exactly that, so over

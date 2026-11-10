@@ -11,6 +11,10 @@
  * These cases assert the invariant directly — no tree a connection reads or writes is more than one
  * base link deep — at sizes far below the overflow, so they neither cost seconds nor depend on the
  * stack size.
+ *
+ * The layer-level parent chain had the same shape: each committed head kept the one before it (and
+ * the statement savepoints below that) as its parent, so a table retained one layer per write
+ * statement it had ever run. The last case pins that a published head's chain stays head → base.
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
@@ -30,6 +34,13 @@ function baseLinks(tree: object | null): number {
 	let links = 0;
 	for (let t = (tree as Linked | null)?.base; t; t = t.base) links++;
 	return links;
+}
+
+/** Number of layers in `layer`'s parent chain, `layer` and the base included. */
+function layerChainLength(layer: Layer): number {
+	let length = 0;
+	for (let cur: Layer | null = layer; cur; cur = cur.getParent()) length++;
+	return length;
 }
 
 /** Deepest base chain among `layer`'s primary tree and the named secondary-index trees. */
@@ -106,5 +117,16 @@ describe('frozen memory-table layers keep the B-tree chain shallow', () => {
 	it('keeps the committed head one link deep across autocommit statements', async () => {
 		await insertRange(1, 40);
 		expect(deepestChain(manager.currentCommittedLayer, ['big_v'])).to.be.at.most(1);
+	});
+
+	it('releases the layers below each committed head', async () => {
+		await insertRange(1, 30);
+		expect(layerChainLength(manager.currentCommittedLayer), 'after 30 autocommit statements').to.equal(2);
+
+		await db.exec('begin');
+		await insertRange(31, 60);
+		await db.exec('commit');
+		expect(layerChainLength(manager.currentCommittedLayer), 'after a 30-statement transaction').to.equal(2);
+		expect(await db.get('select count(*) as n, sum(id) as s from big')).to.deep.equal({ n: 60, s: 1830 });
 	});
 });
