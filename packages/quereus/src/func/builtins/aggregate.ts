@@ -146,7 +146,13 @@ function additionError(a: number, b: number, sum: number): number {
 function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAccumulator {
 	const base = acc ?? { exact: 0, approx: 0, comp: 0, realCount: 0, count: 0 };
 	if (isExactIntegerDomain(value)) {
-		return { ...base, exact: addWithPromotion(base.exact, value), count: base.count + 1 };
+		return {
+			exact: addWithPromotion(base.exact, value),
+			approx: base.approx,
+			comp: base.comp,
+			realCount: base.realCount,
+			count: base.count + 1,
+		};
 	}
 	const real = value as number;
 	const approx = base.approx + real;
