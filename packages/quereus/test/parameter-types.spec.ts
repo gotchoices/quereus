@@ -289,6 +289,17 @@ describe('Parameter Type System', () => {
 			expect(error!.message).to.include('Parameter type mismatch');
 			await stmt.finalize();
 		});
+
+		it('types a parameter first bound to NULL as ANY, so later non-null values are accepted', async () => {
+			// A NULL first binding used to type the parameter NULL, which no later
+			// non-null value could match (docs/types-parameters.md).
+			const stmt = db.prepare('select ? as v', [null]);
+			expect(await stmt.get()).to.deep.equal({ v: null });
+			expect(await stmt.get([5])).to.deep.equal({ v: 5 });
+			expect(await stmt.get(['x'])).to.deep.equal({ v: 'x' });
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('ANY');
+			await stmt.finalize();
+		});
 	});
 
 	describe('A parameter first bound after the plan was built still gets its type', () => {

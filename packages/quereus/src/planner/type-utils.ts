@@ -2,10 +2,9 @@ import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { ColumnSchema } from '../schema/column.js';
 import { collationRefines } from '../util/comparison.js';
 import type { RelationType, ColumnDef, ScalarType, ColRef } from '../common/datatype.js';
-import { StatusCode, type DeepReadonly, type SqlValue } from '../common/types.js';
+import { StatusCode, type DeepReadonly } from '../common/types.js';
 import type { AstNode } from '../parser/ast.js';
 import { QuereusError } from '../common/errors.js';
-import { inferLogicalTypeFromValue } from '../common/type-inference.js';
 
 /**
  * Converts a TableSchema (from src/schema/table.ts) to a RelationType (from src/common/datatype.ts).
@@ -94,22 +93,6 @@ function enforcementCollationCoversDeclared(
     const declared = tableSchema.columns[ic.index]?.collation;
     return collationRefines(declared, ic.collation ?? declared);
   });
-}
-
-/**
- * Creates a ScalarType for a given SqlValue, typically for parameters.
- * @param value The SqlValue to determine the type for.
- * @returns A ScalarType representing the inferred type of the value.
- */
-export function getParameterScalarType(value: SqlValue): ScalarType {
-  const logicalType = inferLogicalTypeFromValue(value);
-
-  return {
-    typeClass: 'scalar',
-    logicalType,
-    nullable: true,	// No guarantees about the value, so it's nullable
-    isReadOnly: true, // Parameters are read-only within the query execution context
-  };
 }
 
 export function checkColumnsAssignable(source: DeepReadonly<ColumnDef[]>, target: DeepReadonly<ColumnDef[]>, astNode?: AstNode): void {

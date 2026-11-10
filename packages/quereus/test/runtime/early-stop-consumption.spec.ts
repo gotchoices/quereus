@@ -142,9 +142,26 @@ describe('early-stop consumption', () => {
 			expect(mod.rowCounts.get('counting') ?? 0).to.equal(0);
 		});
 
-		it('a NULL bound to the parameter is rejected when the statement is prepared', async () => {
-			await rejects('select k from counting limit ?', [null], /LIMIT expression may be NULL/);
+		it('a NULL bound to the parameter raises at execution, before the first source row is pulled', async () => {
+			// A NULL first binding types the parameter ANY, not NULL, so the prepare-time
+			// nullability check lets it through and the runtime check rejects the value.
+			await rejects('select k from counting limit ?', [null], /LIMIT must not be NULL/);
 			expect(mod.rowCounts.get('counting') ?? 0).to.equal(0);
+		});
+
+		it('a statement first run with a NULL limit runs once rebound to a number', async () => {
+			const stmt = db.prepare('select k from counting limit ?', [null]);
+			let error: unknown;
+			try {
+				for await (const _ of stmt.all()) { /* drain */ }
+			} catch (e) {
+				error = e;
+			}
+			expect((error as Error | undefined)?.message).to.match(/LIMIT must not be NULL/);
+			const out: Record<string, SqlValue>[] = [];
+			for await (const r of stmt.all([2])) out.push(r);
+			expect(out).to.deep.equal([{ k: 1 }, { k: 2 }]);
+			await stmt.finalize();
 		});
 
 		it('over a writing source, the write never starts', async () => {

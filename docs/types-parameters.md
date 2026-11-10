@@ -21,7 +21,7 @@ When you pass parameter values, Quereus automatically infers the logical type ba
 
 | JavaScript Type | Logical Type | Example |
 |----------------|--------------|---------|
-| `null` | NULL | `null` |
+| `null` | ANY (nullable) | `null` |
 | `number` (safe integer) | INTEGER | `42`, `0`, `-100` |
 | `number` (fractional, or whole past 2^53−1) | REAL | `3.14`, `-0.5`, `1e308` |
 | `bigint` | INTEGER | `9007199254740991n` |
@@ -35,7 +35,9 @@ The integer split is `Number.isSafeInteger`, not `Number.isInteger`: INTEGER's v
 is a safe-integer `number` or an out-of-range `bigint`, so a whole double past 2^53 − 1
 inhabits REAL's space as bound — calling it INTEGER would rewrite it as an exact `bigint`
 the caller never passed. The single mapping lives in `inferLogicalTypeFromValue`
-(`common/type-inference.ts`) and is shared with literal typing.
+(`common/type-inference.ts`) and is shared with literal typing — with one exception: a
+`null` *literal* is typed NULL, but a `null` *parameter value* is typed ANY (see
+[A first binding of `null`](#a-first-binding-of-null)).
 
 A parameter with neither a bound value nor an explicit hint at plan time announces **ANY**,
 not a guess: `ANY` imposes no representation constraint, its `parse` is pass-through, and it
@@ -88,6 +90,30 @@ validation and its run-time value all resolve through the same key whichever spe
 caller used. The full contract, including why binding two spellings of one parameter in a
 single object is a `MisuseError`, is stated in [Usage](usage.md) under the
 prepared-statement binding methods.
+
+### A first binding of `null`
+
+A `null` value says nothing about what the parameter will hold on later executions, so a
+parameter with no declared type whose first bound value is `null` is typed **ANY, nullable**,
+and that type is frozen for the statement's life like any other (rule 2). It is not re-planned
+when a non-null value arrives later: the plan built on the `null` binding stays, and ANY accepts
+a value of any storage class, so `db.prepare('select ? as v', [null])` then `get([5])` and
+`get(['x'])` all run. (Typing it NULL instead pinned the parameter to NULL's storage class, and
+every later non-null value was rejected as a type mismatch.) An explicit hint map still wins:
+this rule is about inference from values only.
+
+The cost is that such a parameter plans as ANY everywhere it is used, which has two visible
+consequences:
+
+- **Comparisons get no column-affinity conversion.** No comparison-site coercion is minted for
+  an ANY parameter, so a cross-type comparison compares storage classes as they are. With
+  `create table u (k integer primary key, n integer)` holding `(1, 5)`, `where n = ?` prepared
+  with `[null]` and later run with `['5']` returns nothing, while the same statement prepared
+  with `['5']` (typed TEXT, so the comparison converts) returns `k = 1`. Bind the first value
+  with its real type, or declare the type with a hint map, when that conversion matters.
+- **LIMIT / OFFSET are checked on each execution.** `limit ?` first bound to `null` is not
+  rejected when prepared; the execution with `null` fails with "LIMIT must not be NULL", and a
+  later execution with `2` returns two rows (see [SQL SELECT §3.6](sql-select.md)).
 
 ## Examples
 
@@ -171,7 +197,7 @@ Parameter type validation ensures type safety across executions:
 - **Physical type validation**: Validates that JavaScript values are compatible with the **physical type** of the declared logical type
 - **Type preservation**: Once established, parameter types are preserved across all executions of a prepared statement
 - **Validation on execution**: Each execution validates that parameter values match the established physical types
-- **NULL compatibility**: NULL values are compatible with any nullable parameter type
+- **NULL compatibility**: NULL values are compatible with any nullable parameter type. A type inferred from a non-null value is not nullable, so binding `null` to a parameter first bound to `5` is a mismatch; a parameter first bound to `null` is ANY (nullable) and accepts both (see [A first binding of `null`](#a-first-binding-of-null))
 - **Flexible logical types**: Different logical types with the same physical type are compatible (e.g., `number` and `bigint` both work for INTEGER physical type)
 - **Canonical form at bind**: A bound value is canonicalized as it is stored (see [Physical representation](types.md#physical-representation)) — a `bigint` inside the safe-integer range narrows to `number`, so `stmt.bind(1, 5n)` is used, stored, and returned as `5`
 - **No implicit conversion**: Physical type mismatches are rejected with clear error messages

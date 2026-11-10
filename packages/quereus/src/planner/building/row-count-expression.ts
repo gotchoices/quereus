@@ -31,10 +31,13 @@ export function buildRowCountExpression(
 }
 
 /**
- * A parameter still ANY when the plan is built (no declared type, no bind-time hint) is
- * nullable only because nothing is known about it yet. Rejecting it would break
- * `prepare('… limit ?')` before any bind, so its value is left to the runtime check. A
- * typed parameter carries its own nullability and is judged like any other expression.
+ * A parameter typed ANY when the plan is built is either still unbound (no declared type,
+ * no bind-time hint) or was first bound to NULL, which types it ANY rather than NULL (see
+ * `getParameterScalarType` in core/param.ts). Either way it is nullable only because
+ * nothing is known about its later values. Rejecting it would break `prepare('… limit ?')`
+ * before any bind, and would pin a statement first run with NULL to failing forever, so
+ * its value is left to the runtime check. A typed parameter carries its own nullability
+ * and is judged like any other expression.
  */
 function isUntypedParameter(node: ScalarPlanNode): boolean {
 	let cur: ScalarPlanNode = node;

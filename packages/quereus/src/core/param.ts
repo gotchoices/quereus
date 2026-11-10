@@ -3,13 +3,14 @@ import { describeSqlValueViolation, isSqlValue, type SqlParameters, type SqlValu
 import { inferLogicalTypeFromValue } from '../common/type-inference.js';
 import { MisuseError } from '../common/errors.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
+import { ANY_TYPE } from '../types/builtin-types.js';
 
 /**
  * Generate type hints for parameters based on their JavaScript values.
  * This is used during planning to assign strong types to parameters.
  *
  * Type inference rules:
- * - null → NULL
+ * - null → ANY (nullable) — see {@link getParameterScalarType}
  * - number (integer) → INTEGER
  * - number (float) → REAL
  * - bigint → INTEGER
@@ -147,16 +148,21 @@ export function normalizeParamKey(name: string): string | number {
 /**
  * Infer the ScalarType for a parameter value based on its JavaScript type.
  *
+ * A null value says nothing about what the parameter will hold next, so it types the
+ * parameter ANY (nullable) rather than NULL: a NULL-typed parameter would reject every
+ * later non-null binding, and the type is frozen for the statement's life. Literal
+ * typing keeps `null → NULL`, which is why this is not done in
+ * `inferLogicalTypeFromValue`. See docs/types-parameters.md.
+ *
  * @param value The parameter value
  * @returns The inferred ScalarType
  */
 function getParameterScalarType(value: SqlValue): ScalarType {
-	const logicalType = inferLogicalTypeFromValue(value);
-
+	const isNull = value === null;
 	return {
 		typeClass: 'scalar',
-		logicalType,
-		nullable: value === null,
+		logicalType: isNull ? ANY_TYPE : inferLogicalTypeFromValue(value),
+		nullable: isNull,
 		isReadOnly: true,
 	};
 }
