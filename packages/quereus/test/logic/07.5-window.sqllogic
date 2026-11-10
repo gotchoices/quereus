@@ -746,6 +746,40 @@ FROM range_null ORDER BY val, id;
 DROP TABLE range_slide;
 DROP TABLE range_null;
 
+-- A numeric RANGE offset is arithmetic on the ORDER BY value, so it needs exactly
+-- one ORDER BY key of numeric type. Anything else raises rather than quietly
+-- answering with the peer group (or with the first key only).
+create table range_types (id integer primary key, k text, n integer, a any null, d date);
+insert into range_types values (1, 'a', 1, 1, '2024-01-01'), (2, 'b', 2, 2, '2024-01-02'), (3, 'b', 3, 'x', '2024-01-03');
+
+select id, count(*) over (order by k range between 1 preceding and 1 following) as c from range_types;
+-- error: RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key; got TEXT
+
+select id, count(*) over (order by d range between 1 preceding and current row) as c from range_types;
+-- error: over a DATE ORDER BY key requires an interval offset, which is not supported yet
+
+select id, count(*) over (order by n, id range between 1 preceding and 1 following) as c from range_types;
+-- error: RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY key; got 2
+
+select id, count(*) over (range between 1 preceding and 1 following) as c from range_types;
+-- error: RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY key; got 0
+
+-- An ANY key is only checked once the frame is computed: numeric values work...
+select id, count(*) over (order by a range between 1 preceding and 1 following) as c
+from range_types where id < 3 order by id;
+→ [{"id":1,"c":2},{"id":2,"c":2}]
+
+-- ...and a text value among them raises.
+select id, count(*) over (order by a range between 1 preceding and 1 following) as c from range_types;
+-- error: RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key; got a text value
+
+-- RANGE frames bounded only by UNBOUNDED / CURRENT ROW still take any key type.
+select id, count(*) over (order by k range between unbounded preceding and current row) as c
+from range_types order by id;
+→ [{"id":1,"c":1},{"id":2,"c":3},{"id":3,"c":3}]
+
+drop table range_types;
+
 -- =============================================================================
 -- Window function nested inside an arithmetic / scalar projection expression.
 --

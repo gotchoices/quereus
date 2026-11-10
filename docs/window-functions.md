@@ -169,7 +169,7 @@ The implementation correctly handles all SQL standard frame types:
 
 **RANGE vs ROWS:**
 - **ROWS**: Frame bounds are physical row offsets from the current row
-- **RANGE**: Frame bounds are value-based offsets on the first ORDER BY expression. `CURRENT ROW` includes all peer rows (rows with the same ORDER BY values)
+- **RANGE**: Frame bounds are value-based offsets on the ORDER BY value. `CURRENT ROW` includes all peer rows (rows with the same ORDER BY values). A numeric `n PRECEDING` / `n FOLLOWING` bound requires exactly one ORDER BY key, of numeric type; anything else raises when the statement is prepared (see below). RANGE frames bounded only by `UNBOUNDED` / `CURRENT ROW` accept any number of keys of any type
 
 ## Usage Examples
 
@@ -208,6 +208,24 @@ FROM products;
 Frame offsets must be non-negative **integer** literals, in `RANGE` as well as
 `ROWS`; anything else (a fraction, a parameter, an expression) raises
 `Invalid window frame offset`.
+
+A `RANGE` offset is arithmetic on the ORDER BY value (`[v - n, v + m]`), so the
+frame is checked against its ORDER BY when the statement is prepared, as in
+PostgreSQL and SQLite:
+
+- zero ORDER BY keys, or more than one, raise `RANGE with offset
+  PRECEDING/FOLLOWING requires exactly one ORDER BY key`;
+- a temporal key (`DATE`, `DATETIME`, …) raises an error saying an interval
+  offset is required, which is not supported yet;
+- any other non-numeric key type (`TEXT`, `BLOB`, `BOOLEAN`, …) raises
+  `RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key`;
+- a NULL-typed key (`order by null`) is accepted — every frame is the peer
+  group, per the NULL rule below;
+- an `ANY`-typed key is accepted at prepare time and checked per value when
+  the frame is computed: a non-NULL value that is not a number (text,
+  including a numeric-looking string, blob, boolean, JSON) raises the same
+  "requires a numeric ORDER BY key" error. Ranking functions (`row_number`,
+  `rank`, …) never compute a frame, so they do not trigger this check.
 
 In `RANGE` mode, a row whose ORDER BY value is NULL has no position on the
 numeric line, so its frame is its peer group — every other NULL-keyed row, and
@@ -367,11 +385,14 @@ WindowNode are individually recognized):
 - Frame carries an exclusion other than `NO OTHERS` (not currently parseable
   either — see *Future Enhancements*).
 - For RANGE-mode sliding frames: more than one ORDER BY key, or a single key
-  whose logical type is not numeric. A numeric RANGE offset is arithmetic on
-  the ORDER BY value, which the SQL standard only defines for one sort key of a
-  type arithmetic applies to. The buffered walk falls back to peer-group
-  scanning for a non-numeric key and the streaming scan does not, so the rule
-  leaves that case buffered rather than answer differently.
+  whose declared logical type is not numeric. A non-zero offset over such a key
+  never gets this far — the builder rejects it (see *Frame Specifications*) —
+  so two cases remain. An `ANY` key is checked per value only by the buffered
+  walk, which raises on a non-numeric value where the streaming scan would
+  coerce it. And the offset-zero shapes (`CURRENT ROW AND CURRENT ROW` and its
+  one-sided kin) are legal peer-group frames over any key, but the streaming
+  scan finds peers in `Number` space on the first key alone, which would merge
+  peer groups the buffered walk keeps apart.
 - A frame offset that is not a non-negative *integer* literal. The buffered
   frame walk raises `Invalid window frame offset` for those, so recognizing a
   wider set here would make the query's success depend on the chosen plan.
@@ -430,7 +451,9 @@ Window functions are comprehensively tested through SQL Logic Tests (`test/logic
 - Navigation functions (LAG, LEAD with offset/default, FIRST_VALUE, LAST_VALUE)
 - Statistical ranking (PERCENT_RANK, CUME_DIST with ties)
 - NTILE bucket distribution
-- RANGE BETWEEN value-based frames (CURRENT ROW peers, N PRECEDING/FOLLOWING)
+- RANGE BETWEEN value-based frames (CURRENT ROW peers, N PRECEDING/FOLLOWING),
+  and rejection of a RANGE offset over a non-numeric, temporal, ANY-with-text,
+  multi-key or missing ORDER BY
 - Window functions in a GROUPED query (window over the groups, HAVING interaction,
   plan-time rejection of an ungrouped column in the window specification)
 - `*` alongside a window column (position, duplicate-name disambiguation) — column

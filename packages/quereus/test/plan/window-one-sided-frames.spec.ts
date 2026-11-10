@@ -40,8 +40,8 @@ describe('Window one-sided sliding frames', () => {
 		await db.exec('create table sn (id integer primary key, v integer null)');
 		await db.exec('insert into sn values (1,10),(2,null),(3,null),(4,40)');
 		// A TEXT ordering key, indexed so `order by kt` would otherwise stream. A
-		// numeric RANGE offset is not defined against it, and the two emitters do
-		// not agree there — the rule must leave these buffered.
+		// numeric RANGE offset is rejected against it; the peer-group frame is
+		// legal but must stay buffered.
 		await db.exec('create table rtext (id integer primary key, kt text, v integer)');
 		await db.exec('create index rtext_kt on rtext (kt)');
 		await db.exec("insert into rtext values (1,'a',1),(2,'a',2),(3,'b',4),(4,'c',8)");
@@ -266,23 +266,32 @@ describe('Window one-sided sliding frames', () => {
 			]);
 		});
 
-		it('a non-numeric ORDER BY key keeps every RANGE sliding frame buffered', async () => {
-			// The streaming range scan does its bound arithmetic in `Number` space;
-			// the buffered walk falls back to peer-group scanning for a value that
-			// isn't numeric. They disagree, so the rule must not fire — including
-			// for the one-sided shapes, whose peer-group reading is otherwise the
-			// one that looks most obviously safe.
+		it('a non-numeric ORDER BY key rejects RANGE offsets and keeps the peer-group frame buffered', async () => {
+			// A numeric offset has no meaning against a TEXT key, so the builder
+			// rejects it on both shapes rather than answering with a peer group.
 			for (const bounds of [
 				'between 1 preceding and 1 following',
 				'between 1 preceding and current row',
 				'between current row and 1 following',
-				'between current row and current row',
 			]) {
 				const sql = `select id, count(*) over (order by kt range ${bounds}) as c`
 					+ ' from rtext order by kt, id';
-				expect(await windowModes(streamingDb, sql), sql).to.deep.equal([null]);
-				await bothShapes(sql);
+				for (const db of [streamingDb, bufferedDb]) {
+					expect(await errorOf(db, sql), sql).to.match(/requires a numeric ORDER BY key; got TEXT/);
+				}
 			}
+			// The offset-zero frame is legal, but the streaming range scan finds
+			// peers in `Number` space, where every TEXT key is one NaN span — so
+			// the rule must not fire.
+			const sql = 'select id, count(*) over (order by kt range between current row and current row) as c'
+				+ ' from rtext order by kt, id';
+			expect(await windowModes(streamingDb, sql), sql).to.deep.equal([null]);
+			expect(await bothShapes(sql)).to.deep.equal([
+				{ id: 1, c: 2 },
+				{ id: 2, c: 2 },
+				{ id: 3, c: 1 },
+				{ id: 4, c: 1 },
+			]);
 		});
 
 		it('a NULL ordering key stays outside every finite row\'s interval', async () => {

@@ -8,7 +8,7 @@ import { bindWindowSchema, resolveWindowFunction, type WindowFunctionSchema } fr
 import { argComparisonContext } from './aggregate-setup.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { createTypedComparator, createTypedOrderByComparator, semanticKeyTransform } from '../../util/comparison.js';
+import { createTypedComparator, createTypedOrderByComparator, getSqlDataTypeName, semanticKeyTransform } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createLogger } from '../../common/logger.js';
@@ -715,17 +715,31 @@ function arePeerRows(
  * finite-valued row's `[v - n, v + m]` interval, and coercing it to zero would
  * silently pull the NULL rows into any frame whose interval happens to span
  * zero. Mirrors the streaming emitter's `orderByVal0Num`, so both paths agree.
+ *
+ * Any other non-numeric value is an error, not a peer group: the builder rejects
+ * a non-numeric key type at prepare time (`validateRangeOffsetFrame`,
+ * select-window.ts), so only an ANY-typed key can deliver one here. A bound scan
+ * may stop before reaching the offending row, but every row computes its own
+ * frame, so that row still raises once it is current; the query fails either way.
+ * Ranking functions compute no frame and so never reach this.
  */
 function rangeOrdinal(value: SqlValue): number {
-	return value === null ? NaN : Number(value);
+	if (value === null) return NaN;
+	if (typeof value === 'number') return value;
+	if (typeof value === 'bigint') return Number(value);
+	const valueType = typeof value === 'boolean' ? 'boolean' : getSqlDataTypeName(value);
+	throw new QuereusError(
+		`RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key; got a ${valueType} value`,
+		StatusCode.ERROR
+	);
 }
 
 /**
- * RANGE `n PRECEDING` / `n FOLLOWING` start bound. A row whose ordering key has
- * no place on the numeric line — SQL NULL above all — is not `offset` away from
- * anything, so its frame is its peer group, exactly the reading `CURRENT ROW`
- * gets. The streaming emitter's non-finite peer span is the same rule; the two
- * paths must not answer differently for the same frame.
+ * RANGE `n PRECEDING` / `n FOLLOWING` start bound. A row whose ordering key is
+ * SQL NULL (or a non-finite number) has no place on the numeric line, so it is
+ * not `offset` away from anything and its frame is its peer group, exactly the
+ * reading `CURRENT ROW` gets. The streaming emitter's non-finite peer span is the
+ * same rule; the two paths must not answer differently for the same frame.
  */
 function rangeOffsetStart(
 	currentIndex: number,
@@ -739,8 +753,8 @@ function rangeOffsetStart(
 		return findFirstPeer(currentIndex, totalRows, orderByValues, equalityComparators);
 	}
 
-	// First row whose ordering value is >= the target. Uses the first ORDER BY
-	// expression only (a numeric RANGE offset requires a single sort key).
+	// First row whose ordering value is >= the target. Reads key 0 only: the
+	// builder rejects a numeric RANGE offset over any other key count.
 	const targetVal = currentVal + offset;
 	for (let i = 0; i < totalRows; i++) {
 		const rowVal = rangeOrdinal(orderByValues[i][0]);

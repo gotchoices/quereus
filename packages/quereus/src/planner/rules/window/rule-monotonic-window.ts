@@ -38,8 +38,8 @@
  *   - frame is anything other than the default (or the explicit equivalent
  *     `UNBOUNDED PRECEDING TO CURRENT ROW` in `ROWS` or `RANGE`), or a
  *     supported sliding shape (see above)
- *   - `RANGE` sliding frame whose ORDER BY is not a single numeric key
- *     (`isRangeSlidingEligible`)
+ *   - `RANGE` sliding frame whose ORDER BY is not a single key of a declared
+ *     numeric type (`isRangeSlidingEligible`)
  *   - frame offset that is not a non-negative integer literal (`readFrameOffset`)
  *
  * Every bail is a *performance* decision, never a semantic one: a shape this
@@ -174,13 +174,19 @@ function recognizeSlidingFrame(
  * Whether a RANGE-mode sliding frame may stream on this WindowNode at all.
  *
  * A numeric RANGE offset is arithmetic on the ORDER BY value (`[v - n, v + m]`),
- * which the SQL standard only defines for a single ORDER BY key of a type that
- * arithmetic applies to. The streaming range scan does that arithmetic in
- * `Number` space; the buffered frame walk falls back to peer-group scanning when
- * the value isn't numeric, and the two do NOT agree there — e.g. under a TEXT
- * ORDER BY key the buffered walk still bounds the frame at peer-group edges
- * while the streaming scan treats the whole non-numeric run as one span. So a
- * non-numeric ORDER BY key must keep the buffered path.
+ * defined only for a single numeric ORDER BY key; the builder rejects a non-zero
+ * offset over anything else (`validateRangeOffsetFrame`, select-window.ts). Two
+ * cases still reach this check and must stay buffered:
+ *
+ *   - an ANY-typed key — the builder defers it to the buffered walk's per-value
+ *     check (`rangeOrdinal`), which raises on a non-numeric value. The streaming
+ *     scan coerces with `Number(...)` and would not, so ANY must stay buffered.
+ *   - the offset-zero shapes (`CURRENT ROW AND CURRENT ROW` and its one-sided
+ *     kin are `0 PRECEDING` / `0 FOLLOWING` here) over a non-numeric or
+ *     multi-key ORDER BY, which the builder legitimately accepts as peer-group
+ *     frames. The streaming scan finds peers in `Number` space, where every
+ *     non-numeric key is one NaN span and later keys are unseen, so it would
+ *     merge distinct peer groups the buffered walk keeps apart.
  */
 function isRangeSlidingEligible(orderByExpressions: readonly ScalarPlanNode[]): boolean {
 	if (orderByExpressions.length !== 1) return false;

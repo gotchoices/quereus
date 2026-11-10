@@ -14,6 +14,7 @@ import { StatusCode } from '../../common/types.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import type * as AST from '../../parser/ast.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
+import { ANY_TYPE, NULL_TYPE } from '../../types/builtin-types.js';
 
 /**
  * Where one collected window function's result lives on the window phase's
@@ -106,6 +107,7 @@ export function buildWindowPhase(
 		const orderByExpressions = windowSpec.orderBy.map(orderClause =>
 			redirect(buildExpression(selectContext, orderClause.expr, false))
 		);
+		validateRangeOffsetFrame(windowSpec, orderByExpressions);
 
 		// Build the function argument expressions FIRST (off the original nodes)
 		// so each re-created WindowFunctionCallNode can be handed its argument
@@ -224,6 +226,62 @@ function rejectUncollectedAggregates(
 	for (const partitionExpr of window?.partitionBy ?? []) check(partitionExpr, 'PARTITION BY');
 	for (const orderClause of window?.orderBy ?? []) check(orderClause.expr, 'ORDER BY');
 	for (const arg of func.expression.function.args ?? []) check(arg, 'arguments');
+}
+
+/**
+ * Rejects a RANGE frame with a numeric `n PRECEDING` / `n FOLLOWING` bound that the
+ * engine cannot evaluate as written. Such a bound is arithmetic on the ORDER BY value
+ * (`[v - n, v + m]`), so it needs exactly one ORDER BY key, and one of numeric type.
+ * Left unchecked, the frame walk reads only the first key and treats a value it cannot
+ * do arithmetic on as its own peer group — a different frame from the one asked for,
+ * returned without complaint.
+ *
+ * A NULL-typed key (`order by null`) passes: every key is NULL, so every frame is the
+ * peer group, which is the defined NULL behaviour. An ANY-typed key passes here and is
+ * checked per value when the frame is computed (`rangeOrdinal`, runtime/emit/window.ts).
+ */
+function validateRangeOffsetFrame(windowSpec: WindowSpec, orderByExpressions: readonly ScalarPlanNode[]): void {
+	const frame = windowSpec.frame;
+	if (frame?.type !== 'range') return;
+	const offsetBound = [frame.start, frame.end].find(isOffsetBound);
+	if (!offsetBound) return;
+
+	if (orderByExpressions.length !== 1) {
+		throw new QuereusError(
+			`RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY key; got ${orderByExpressions.length}`,
+			StatusCode.ERROR,
+			undefined,
+			offsetBound.value.loc?.start.line,
+			offsetBound.value.loc?.start.column,
+		);
+	}
+
+	const keyType = orderByExpressions[0].getType().logicalType;
+	if (keyType.isNumeric === true || keyType === ANY_TYPE || keyType === NULL_TYPE) return;
+
+	const keyLoc = windowSpec.orderBy[0].expr.loc?.start;
+	if (keyType.isTemporal === true) {
+		throw new QuereusError(
+			`RANGE with offset PRECEDING/FOLLOWING over a ${keyType.name} ORDER BY key requires an interval offset, which is not supported yet`,
+			StatusCode.UNSUPPORTED,
+			undefined,
+			keyLoc?.line,
+			keyLoc?.column,
+		);
+	}
+	throw new QuereusError(
+		`RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key; got ${keyType.name}`,
+		StatusCode.ERROR,
+		undefined,
+		keyLoc?.line,
+		keyLoc?.column,
+	);
+}
+
+function isOffsetBound(
+	bound: AST.WindowFrameBound | null
+): bound is Extract<AST.WindowFrameBound, { value: AST.Expression }> {
+	return bound?.type === 'preceding' || bound?.type === 'following';
 }
 
 /**
