@@ -62,11 +62,11 @@ const CASES: readonly Case[] = [
 		table: 't', filters: [filter(B, '=', 'x', 'NOCASE'), filter(B, '>', 'a', 'BINARY')],
 		indexName: undefined, handled: [false, false],
 	},
-	// u(id, a integer, b text) with a BINARY ix_ab(a, b): the trailing bound of a prefix-range.
+	// u(id, b integer, c text) with a BINARY ix_u_bc(b, c): the trailing bound of a prefix-range.
 	{
 		name: 'a prefix-range whose trailing bound fails keeps the equality-prefix seek',
 		table: 'u', filters: [filter(B, '=', 1, 'BINARY'), filter(C, '>', 'm', 'NOCASE')],
-		indexName: 'ix_ab', handled: [true, false],
+		indexName: 'ix_u_bc', handled: [true, false],
 	},
 	// n(id, b text collate nocase, c integer) with ix_n_bc(b, c), NOCASE on b.
 	{
@@ -131,8 +131,8 @@ describe('store module access plans read the predicate collation', () => {
 		db.registerModule('store', storeModule);
 		await db.exec('create table t (id integer primary key, b text, c integer) using store');
 		await db.exec('create index ix_bc on t (b, c)');
-		await db.exec('create table u (id integer primary key, a integer, b text) using store');
-		await db.exec('create index ix_ab on u (a, b)');
+		await db.exec('create table u (id integer primary key, b integer, c text) using store');
+		await db.exec('create index ix_u_bc on u (b, c)');
 		await db.exec('create table n (id integer primary key, b text collate nocase, c integer) using store');
 		await db.exec('create index ix_n_bc on n (b, c)');
 		await db.exec('create table p (id text primary key, v integer) using store');
