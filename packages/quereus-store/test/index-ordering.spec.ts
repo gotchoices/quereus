@@ -236,10 +236,12 @@ describe('secondary-index ordering advertisement', () => {
 			// THE critical decline. name is declared BINARY; the index stores NOCASE bytes.
 			// The window is exact (key NOCASE == residual NOCASE) so the seek is sound, but
 			// ORDER BY name compares BINARY, where 'Z' < 'a' and the NOCASE walk disagrees.
+			// The bound is `name > 'M' collate nocase`: only a NOCASE bound may walk the
+			// NOCASE index (a plain `name > 'M'` compares BINARY and gets no seek at all).
 			await db.exec(`create table t3 (id integer primary key, name text) using store`);
 			await db.exec(`create index ix_name on t3 (name collate nocase)`);
 
-			const plan = planFor('t3', [gt(1, 'M')], [asc(1)]);
+			const plan = planFor('t3', [{ ...gt(1, 'M'), collation: 'NOCASE' }], [asc(1)]);
 			expect(plan.indexName).to.equal('ix_name');
 			expect(plan.seekColumnIndexes).to.deep.equal([1]);
 			expect(plan.providesOrdering, 'NOCASE bytes do not emit BINARY order').to.equal(undefined);

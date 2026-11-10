@@ -175,6 +175,8 @@ interface PredicateConstraint {
 - **A prefix-range seek** (equalities on leading columns, then a range on the next) holds its prefix equalities to the range rule: each must equal its column's `C`, not merely refine it. The planner checks the whole prefix-range as range bounds, so a BINARY prefix over a NOCASE column gets the seek declined to a full scan. Offer the equality-only prefix seek instead and leave the range unhandled.
 - **Only the first filter of each role on a column counts.** The planner seeks the first equality, the first lower bound and the first upper bound on every column you mark handled. If that first filter fails the test, claim nothing on that column for this index: not a later filter that passes, and not a range beside an equality that fails. Leave the filter unhandled and it becomes a residual.
 
+`equalityServesKeyColumn(constraint, keyCol)` and `rangeServesKeyColumn(constraint, keyCol)` (exported from `@quereus/quereus`) are the first two tests ready-made, taking the index column's (or primary-key member's) `IndexColumnSchema`. Both bundled modules use them; the positional pick stays yours, since it depends on how you track roles.
+
 The engine does not depend on your answer. It declines a mismatched seek to a scan plus a residual, and refuses an ordering claim the predicate's collation breaks (`orderingClaimSurvivesCollation`), so a module that ignores the field still returns the right rows. Reading it stops you offering plans the engine will discard: such a plan is costed as the seek you described, can win that comparison, and is then rebuilt as a scan.
 
 **It is called more than once per statement, so keep it pure and cheap.** Planning probes the

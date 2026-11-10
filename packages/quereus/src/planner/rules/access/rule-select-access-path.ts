@@ -1564,9 +1564,9 @@ function indexColumnCollationLookup(
  * column to one value and skips that column when matching an index against the required
  * ordering. A predicate coarser than the index breaks that: `k = 'a' collate nocase` over a
  * BINARY `(k, r)` matches the two groups `'A'` and `'a'`, and `r` restarts in each. The same
- * mismatch makes the seek arms decline to a scan, which emits no claimed order at all. The
- * memory module reads the field and does not make this claim; this check is the backstop
- * for every module that does not.
+ * mismatch makes the seek arms decline to a scan, which emits no claimed order at all. Both
+ * bundled modules (memory and store) read the field and do not make this claim; this check
+ * is the backstop for third-party modules that do not.
  *
  * Deliberately coarse: a mismatched equality on any column of the index disqualifies the
  * claim, even one past the columns the claim consumed. That costs one needless Sort in a

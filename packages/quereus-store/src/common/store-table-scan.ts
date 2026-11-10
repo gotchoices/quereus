@@ -47,8 +47,8 @@ import { StoreTableBase } from './store-table-base.js';
 
 /**
  * The pushed constraint ops that bound a byte window from one side. The scan-side twin of
- * `store-module-access-plan.ts`'s `RANGE_OPS` (which names the same four in the planner's
- * `PredicateConstraint` spelling), shared by all three window builders below so a new
+ * `store-module-access-plan.ts`'s `LOWER_BOUND_OPS` / `UPPER_BOUND_OPS` (which name the same
+ * four in the planner's `PredicateConstraint` spelling), shared by all three window builders below so a new
  * bound operator cannot reach one arm and not the others.
  */
 const RANGE_CONSTRAINT_OPS: readonly IndexConstraintOp[] = [

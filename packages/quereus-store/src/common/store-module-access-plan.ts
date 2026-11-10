@@ -32,9 +32,11 @@ import {
 	AccessPlanBuilder,
 	combineConjunctive,
 	equalitySeekKeyCount,
+	equalityServesKeyColumn,
 	hasSemanticOrdering,
 	isMultiValueEquality,
 	nullSafeOrderingPrefixLength,
+	rangeServesKeyColumn,
 	reversedIndexDescriptor,
 	selectivityFromHistogram,
 } from '@quereus/quereus';
@@ -73,8 +75,6 @@ const EQ_OR_IN_OPS = ['=', 'IN'] as const;
 const LOWER_BOUND_OPS = ['>', '>='] as const;
 
 const UPPER_BOUND_OPS = ['<', '<='] as const;
-
-const RANGE_OPS = [...LOWER_BOUND_OPS, ...UPPER_BOUND_OPS] as readonly string[];
 
 /**
  * Ceiling on the seek keys a single IN-list multi-seek may claim (the cross-product
@@ -232,8 +232,9 @@ function rangeBoundSelectivity(
 	const histogram = colStats.histogram;
 	if (!histogram) return undefined;
 	const boundSel = (ops: readonly string[]): { present: boolean; sel: number | undefined } => {
-		const bound = filters.find(f => f.columnIndex === colIdx && ops.includes(f.op));
-		if (!bound) return { present: false, sel: undefined };
+		const i = firstRoleFilterIndex(filters, colIdx, ops);
+		if (i < 0) return { present: false, sel: undefined };
+		const bound = filters[i];
 		return {
 			present: true,
 			sel: bound.value === undefined
@@ -393,15 +394,56 @@ function claimFirstPerRole(
 ): boolean[] {
 	const claimed = new Set<number>();
 	for (const { colIdx, ops } of roles) {
-		// An 'IN' fills an equality role only when well-formed — a non-empty literal list
-		// or a runtime-valued set. Same shape gate the rule's pick applies, so a malformed
-		// IN is neither claimed here nor seeked there and survives as a residual.
-		const i = filters.findIndex(f =>
-			f.columnIndex === colIdx && ops.includes(f.op)
-			&& (f.op !== 'IN' || equalitySeekKeyCount(f) !== null));
+		const i = firstRoleFilterIndex(filters, colIdx, ops);
 		if (i >= 0) claimed.add(i);
 	}
 	return filters.map((_f, i) => claimed.has(i));
+}
+
+/**
+ * Position in `filters` of the filter that fills the (`colIdx`, `ops`) role, or -1: the
+ * FIRST filter on the column with an operator in the group, which is the pick
+ * `rule-select-access-path` seeks on. Every positional decision in this file (claiming,
+ * equality pins, the range collation gate, the histogram-priced bound) goes through it, so
+ * the filter judged is always the filter served.
+ *
+ * An 'IN' fills an equality role only when well-formed (a non-empty literal list or a
+ * runtime-valued set, {@link equalitySeekKeyCount}). The rule's pick applies the same shape
+ * gate, so a malformed IN is neither claimed here nor seeked there and survives as a residual.
+ */
+function firstRoleFilterIndex(
+	filters: readonly PredicateConstraint[],
+	colIdx: number,
+	ops: readonly string[],
+): number {
+	return filters.findIndex(f =>
+		f.columnIndex === colIdx && ops.includes(f.op)
+		&& (f.op !== 'IN' || equalitySeekKeyCount(f) !== null));
+}
+
+/**
+ * Whether a range seek may walk key column `keyCol` for the bounds `filters` carries on it,
+ * as far as the predicate's collation decides it ({@link rangeServesKeyColumn}). True when
+ * the column has a lower or an upper bound, the first of each that is present compares under
+ * `keyCol`'s own collation, and the column's first equality, if it has one, may seek it
+ * ({@link equalityServesKeyColumn}).
+ *
+ * All or nothing per column, because the rule builds every role it finds on a handled
+ * column: claiming the lower bound would have it build the upper too, and claiming a bound
+ * beside an equality it cannot serve would have it build that equality's seek. Either way
+ * the rule then declines the whole seek to a scan, after this module has costed it as the
+ * seek. A later bound that would pass is never claimed in place of a failing first one.
+ */
+function rangeServedOn(
+	filters: readonly PredicateConstraint[],
+	keyCol: TableIndexSchema['columns'][number],
+): boolean {
+	const eq = firstRoleFilterIndex(filters, keyCol.index, EQ_OR_IN_OPS);
+	if (eq >= 0 && !equalityServesKeyColumn(filters[eq], keyCol)) return false;
+	const bounds = [LOWER_BOUND_OPS, UPPER_BOUND_OPS]
+		.map(ops => firstRoleFilterIndex(filters, keyCol.index, ops))
+		.filter(i => i >= 0);
+	return bounds.length > 0 && bounds.every(i => rangeServesKeyColumn(filters[i], keyCol));
 }
 
 /** The lower-bound + upper-bound roles a single-column range seek on `colIdx` fills. */
@@ -426,11 +468,18 @@ interface EqualityPins {
 	readonly seekKeyCount: number;
 	/** true ⇒ delivered as a `plan=5` multi-seek, not a single point read. */
 	readonly isMultiSeek: boolean;
+	/**
+	 * true ⇒ every pin compares under its key column's own collation
+	 * ({@link rangeServesKeyColumn}), not merely a finer one. A prefix-range seek needs it:
+	 * the rule checks a prefix-range's prefix equalities as range bounds, so a BINARY pin over
+	 * a NOCASE key column would have the whole seek declined.
+	 */
+	readonly collationsExact: boolean;
 }
 
 /**
- * The longest LEADING run of `colIdxs` whose every column carries a filter that can fill
- * an equality role, and what that run costs to seek.
+ * The longest LEADING run of `keyColumns` whose every column carries a filter that can fill
+ * an equality role on it, and what that run costs to seek.
  *
  * Per column the pin is the FIRST such filter ({@link equalitySeekKeyCount} — a `'='`, a
  * non-empty literal `IN`, or a runtime-valued `IN` set). That is the same positional pick
@@ -438,6 +487,20 @@ interface EqualityPins {
  * so this module's claim and the rule's pick cannot disagree. A runtime-valued set
  * contributes its `maxCount` ceiling — the worst case the engine may deliver — so every
  * gate downstream judges the largest multi-seek it could ever be asked to perform.
+ *
+ * The run also stops at a column whose first equality compares under a collation coarser
+ * than, or incomparable with, the key column's ({@link equalityServesKeyColumn} against
+ * `keyCol.collation`, the collation the engine's index descriptor reports for that key).
+ * `b = 'x' collate nocase` over a BINARY key matches both the `'X'` and `'x'` groups, so a
+ * seek would under-fetch and the rule declines it. That filter stays unclaimed and becomes a
+ * residual; every consumer of `cols` (claiming, the row estimate, the ordering
+ * advertisement's pinned set, the seek columns) is gated by the stop without a check of its
+ * own.
+ *
+ * NOTE: only the FIRST equality per column counts, so `b = 'x' collate nocase and b = 'x'`
+ * over a BINARY `b` offers no seek although the second equality could seek. Claiming the
+ * later one would break the positional contract (the rule seeks the first). Same limitation
+ * as `MemoryTableModule.findEqualityMatches`; revisit if the shape turns up in real queries.
  *
  * ONE helper for both the primary-key arms ({@link resolvePrimaryKeyPins}, which needs the
  * run to cover the whole key) and the secondary-index arm (which takes whatever prefix it
@@ -452,19 +515,22 @@ interface EqualityPins {
  */
 function resolveEqualityPins(
 	filters: readonly PredicateConstraint[],
-	colIdxs: readonly number[],
+	keyColumns: TableIndexSchema['columns'],
 ): EqualityPins {
 	const cols: number[] = [];
 	let seekKeyCount = 1;
 	let isMultiSeek = false;
-	for (const colIdx of colIdxs) {
-		const pin = filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
-		if (!pin) break;
-		cols.push(colIdx);
+	let collationsExact = true;
+	for (const keyCol of keyColumns) {
+		const i = firstRoleFilterIndex(filters, keyCol.index, EQ_OR_IN_OPS);
+		if (i < 0 || !equalityServesKeyColumn(filters[i], keyCol)) break;
+		const pin = filters[i];
+		cols.push(keyCol.index);
 		seekKeyCount *= equalitySeekKeyCount(pin)!;
 		if (isMultiValueEquality(pin)) isMultiSeek = true;
+		if (!rangeServesKeyColumn(pin, keyCol)) collationsExact = false;
 	}
-	return { cols, seekKeyCount, isMultiSeek };
+	return { cols, seekKeyCount, isMultiSeek, collationsExact };
 }
 
 /**
@@ -476,14 +542,20 @@ function resolveEqualityPins(
  * pinned", claim both filters handled, then — with no complete PK equality set to seek —
  * degrade to a sequential scan whose residual has already been discarded, returning the
  * whole table.
+ *
+ * A member whose first equality's collation the key cannot serve also leaves the key
+ * unpinned (see {@link resolveEqualityPins}), so `where id = 'x' collate rtrim` over a
+ * NOCASE text key falls through to the arms below rather than claiming a point lookup the
+ * rule would decline. A secondary index on the same column under the predicate's
+ * collation can then serve it.
  */
 function resolvePrimaryKeyPins(
 	filters: readonly PredicateConstraint[],
-	pkColumns: readonly number[],
+	pkDefinition: TableSchema['primaryKeyDefinition'],
 ): EqualityPins | null {
-	if (pkColumns.length === 0) return null;
-	const pins = resolveEqualityPins(filters, pkColumns);
-	return pins.cols.length === pkColumns.length ? pins : null;
+	if (pkDefinition.length === 0) return null;
+	const pins = resolveEqualityPins(filters, pkDefinition);
+	return pins.cols.length === pkDefinition.length ? pins : null;
 }
 
 /**
@@ -583,9 +655,10 @@ function computeFilterAccessPlan(
 	// full-primary-key IN list from being shadowed by a range on the leading column. The
 	// leading-PK range, by contrast, is ranked against the secondary-index seeks.
 	//
-	// **No collation gate, and that is not an oversight.** The secondary-index arm gates
-	// its equality window on `indexPrefixSeekIsCollationExact`; the PK arms need no
-	// equivalent, for two independent reasons:
+	// **No key-collation gate, and that is not an oversight.** The secondary-index arm gates
+	// its equality window on `indexPrefixSeekIsCollationExact` (do the key bytes agree with
+	// the comparator the residual re-checks under?); the PK arms need no equivalent, for two
+	// independent reasons:
 	//  - `reconcilePkCollations` (store-module-schema-rewrite.ts) rewrites an undecorated
 	//    text PK column's declared collation to the table key collation K at CREATE time,
 	//    so for every PK member the key collation, the declared collation, and the
@@ -597,18 +670,16 @@ function computeFilterAccessPlan(
 	//  - `StoreTableScan.scanMultiSeekPrimary` re-applies `matchesFilters` per resolved
 	//    row, so even a hypothetical coarser window over-fetches and is trimmed rather
 	//    than under-fetching.
-	// The multi-seek is exactly the point arm run N times, so its collation exposure is
+	// The multi-seek is exactly the point arm run N times, so its key-collation exposure is
 	// the point arm's, unchanged.
 	//
-	// The one divergence neither reason covers is PREDICATE-side and invisible from here:
-	// `where pk collate nocase in (…)` over a BINARY key column would seek exact-case
-	// windows and UNDER-fetch. `PredicateConstraint.collation` names that collation, but
-	// this module does not read it yet (backlog `feat-store-access-plan-reads-predicate-collation`)
-	// and always claims; `rule-select-access-path`'s `classifyCollationCover` (which reads
-	// the same stamp) is what declines that shape to a scan + residual. A new PK arm inherits that protection only
-	// by going through the rule's index-aware path — one more reason `setSeekColumns` on
-	// the point arm below is load-bearing.
-	const pkPins = resolvePrimaryKeyPins(request.filters, pkColumns);
+	// The PREDICATE's collation is a different question, and it is gated: `resolvePrimaryKeyPins`
+	// pins a member only when its first equality may seek it under
+	// `primaryKeyDefinition[i].collation`, the collation the engine's `_primary_` descriptor
+	// reports. `where pk collate nocase in (…)` over a BINARY key, which would seek exact-case
+	// windows and under-fetch, therefore falls through to the arms below instead of being
+	// claimed. {@link leadingPkRangePlan} gates its bounds the same way.
+	const pkPins = resolvePrimaryKeyPins(request.filters, tableInfo.primaryKeyDefinition);
 	if (pkPins && !pkPins.isMultiSeek) {
 		// Full PK match - point lookup (single row; no monotonic advertisement).
 		//
@@ -632,7 +703,7 @@ function computeFilterAccessPlan(
 		const plan = primaryKeyMultiSeekPlan(
 			tableInfo, request, pkColumns, pkPins, estimatedRows, pkOrderPreservingPrefix, costProfile);
 		// A gate decline FALLS THROUGH to the arms below rather than returning cost-only.
-		// That is safe: an `IN` is not in {@link RANGE_OPS}, so the leading-PK-range arm
+		// That is safe: an `IN` is not a bound operator, so the leading-PK-range arm
 		// cannot grab it, and it lands on the secondary-index arms / full scan exactly as
 		// it did before this arm existed.
 		if (plan) return plan;
@@ -807,9 +878,11 @@ function seekSurvivesVeto(
 
 /**
  * The `_primary_` range-scan candidate for a bound on the LEADING primary-key column, or
- * null when the request has none or the leading member's key bytes do not order the way
+ * null when the request has none, when the leading member's key bytes do not order the way
  * its comparator does (`orderPreservingPrefix === 0`, where `StoreTable.analyzePKAccess`
- * declines the byte window, so a claim would drop the residual and return the whole table).
+ * declines the byte window, so a claim would drop the residual and return the whole table),
+ * or when the bounds' collation is not the leading member's ({@link rangeServedOn} against
+ * `primaryKeyDefinition[0]`, which the rule would decline to a scan).
  *
  * Leading column only: `rule-select-access-path`'s legacy PK path forwards range bounds
  * for `primaryKeyDefinition[0]` alone, so a claimed bound on a later member would be
@@ -835,9 +908,10 @@ function leadingPkRangePlan(
 	estimatedRows: number,
 	pkOrderPreservingPrefix: number,
 ): BestAccessPlanResult | null {
-	const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
-	if (firstPkColumn === undefined || pkOrderPreservingPrefix < 1) return null;
-	if (!request.filters.some(f => f.columnIndex === firstPkColumn && RANGE_OPS.includes(f.op))) return null;
+	const firstPkMember = tableInfo.primaryKeyDefinition[0];
+	if (firstPkMember === undefined || pkOrderPreservingPrefix < 1) return null;
+	if (!rangeServedOn(request.filters, firstPkMember)) return null;
+	const firstPkColumn = firstPkMember.index;
 
 	const { selectivity } = resolveArmEstimate(tableInfo, request.filters, 'range', [], firstPkColumn);
 	const rows = Math.max(1, Math.floor(estimatedRows * selectivity));
@@ -854,13 +928,33 @@ function leadingPkRangePlan(
 }
 
 /**
- * The empty pinned-column set an ordering-only walk aligns its index under. Deliberately
- * empty even when the request carries equality filters: the walk pushes NO filters, so
- * nothing pins a column to one value inside the walk itself. (The residual `Filter` above
- * the leaf does make an equality column constant in the OUTPUT, which is the argument
- * `MemoryTableModule.evaluateOrderingOnlyPlans` leans on to skip pinned columns — but that
- * argument quietly assumes the equality's comparison collation equates only rows the walk
- * emits adjacently. Declining the skip costs an optimization, never an answer.)
+ * The empty pinned-column set an ordering-only walk ({@link chooseOrderingPlan}) and the
+ * primary-key ordering advertisement ({@link buildPkOrderingAdvertisement}) align their key
+ * under. Deliberately empty even when the request carries equality filters: the walk pushes
+ * NO filters, so nothing pins a column to one value inside the walk itself. The residual
+ * `Filter` above the leaf does make an equality column constant in the OUTPUT, which is the
+ * argument `MemoryTableModule.evaluateOrderingOnlyPlans` leans on to skip pinned columns.
+ * The collation half of that argument is answerable here now (`equalityServesKeyColumn` says
+ * whether the equality equates only rows the walk emits adjacently); the pinning is still
+ * declined because it would buy almost nothing:
+ *
+ *  - On the primary key, the only shape where pinning changes the plan is an equality on a
+ *    leading strict prefix of a composite key (`where a = ? order by b` over
+ *    `primary key (a, b)`). A primary-key prefix seek serves that shape better, and this
+ *    module does not offer one yet (backlog `feat-store-primary-key-prefix-equality-seek`).
+ *  - On a secondary index, a walk with a pinned column could only win where that index's
+ *    own equality seek lost or was vetoed. The seek reads a subset of what the walk reads,
+ *    so there the walk is worse than the seek it would replace. The underlying gap is that
+ *    the seek-versus-scan veto ignores the sort the scan forces.
+ *
+ * Pinning would also make ordering claims that rest on a residual `Filter`, which adds
+ * wrong-order risk for that small gain. Declining costs an optimization, never an answer.
+ *
+ * NOTE: if the primary-key prefix seek lands and the veto starts counting the sort, this
+ * can stay empty for good. If a store plan is ever seen sorting after a residual equality
+ * that a walk could have pinned, pin per key with `equalityServesKeyColumn` (single-valued
+ * equalities only, `!isMultiValueEquality`), as `MemoryTableModule.collectEqualityBoundColumns`
+ * does, and pass that set at the call sites that use this constant.
  */
 const NO_PINNED_COLUMNS: ReadonlySet<number> = new Set();
 
@@ -1206,11 +1300,25 @@ function primaryKeyMultiSeekPlan(
  * plus a LT/LE/GT/GE range on the NEXT index column (`prefixRange`, `plan=7`). These
  * mirror the three windows `StoreTable.analyzeIndexAccess` can build.
  *
- * **Collation safety.** Index-column key bytes are encoded under each column's own key
+ * **Collation safety.** Three gates, asking two different questions.
+ *
+ * The first asks whether the PREDICATE compares under a collation the index column can
+ * serve, reading `PredicateConstraint.collation` against `index.columns[i].collation` (the
+ * collation the engine's index descriptor reports). An equality pins a column only when it
+ * refines that collation ({@link resolveEqualityPins}); a range bound, and every equality in
+ * a prefix-range's prefix, must equal it ({@link rangeServedOn}, `collationsExact`). These
+ * are the engine's own collation-cover rules, so `rule-select-access-path` never declines a
+ * plan offered here on collation grounds. A predicate this gate rejects leaves its column
+ * out of every arm, and when no arm remains the function returns null: the index cannot
+ * serve this predicate. Not cost-only, which would advertise the arm's cheaper shape for
+ * what is really a sequential scan.
+ *
+ * The other two ask whether the index's KEY BYTES agree with the comparator the residual
+ * re-checks under. Index-column key bytes are encoded under each column's own key
  * collation (`resolveIndexKeyCollations`); `StoreTable.matchesFilters` re-checks a fetched
  * row under the index column's `COLLATE` else the table column's declared collation. Both
- * arms below ask whether those two agree — the question is no longer about the table key
- * collation K at all, which is why this function never sees it:
+ * key-byte gates ask whether those two agree — the question is no longer about the table
+ * key collation K at all, which is why this function never sees it:
  *
  *  - EQUALITY — {@link indexPrefixSeekIsCollationExact}: agreement makes the window
  *    EXACTLY the qualifying set. A `text` or `any` column always agrees (both key under
@@ -1224,8 +1332,9 @@ function primaryKeyMultiSeekPlan(
  *    whose PREFIX additionally passes the EQUALITY gate above.
  *
  * `StoreTable.analyzeIndexAccess` gates its windows on the same two helpers, so the "mark
- * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
- * plan: cheaper cost, filters unhandled, residual retained; correct, just not sped up.
+ * handled" and "build a window" decisions cannot disagree. A key-byte decline returns a
+ * cost-only plan: cheaper cost, filters unhandled, residual retained; correct, just not
+ * sped up.
  *
  * **Rows.** Each arm's row estimate comes from {@link resolveArmEstimate}: per-predicate
  * when the table's `ANALYZE`-collected statistics cover the arm's columns, the
@@ -1258,18 +1367,19 @@ function tryIndexAccessPlan(
 	// Mirrors MemoryTableModule.getAvailableIndexes (`if (idx.predicate) continue`).
 	if (index.predicate) return null;
 
-	const indexColIndexes = index.columns.map(c => c.index);
-
 	// Contiguous leading-prefix equality → point/prefix seek. An IN filter counts as an
 	// equality here (it is N equalities, served as one multi-seek by
 	// StoreTable.scanMultiSeek); `inCount` is the cross-product of the per-column seek-key
 	// counts, matching the rule's seek-key count. See {@link resolveEqualityPins} for the
-	// positional pick and the runtime-set ceiling both arms share.
-	const { cols: eqCols, seekKeyCount: inCount, isMultiSeek } = resolveEqualityPins(request.filters, indexColIndexes);
-	const leadingCol = indexColIndexes[0];
-	const hasLeadingRange = request.filters.some(
-		f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),
-	);
+	// positional pick, the predicate-collation stop and the runtime-set ceiling both arms share.
+	const {
+		cols: eqCols,
+		seekKeyCount: inCount,
+		isMultiSeek,
+		collationsExact: prefixCollationsExact,
+	} = resolveEqualityPins(request.filters, index.columns);
+	const leadingCol = index.columns[0].index;
+	const hasLeadingRange = rangeServedOn(request.filters, index.columns[0]);
 
 	// Prefix-equality + trailing-range: the equality prefix is a STRICT, non-empty prefix
 	// of the index columns and the NEXT index column carries a bound. `StoreTable
@@ -1280,12 +1390,19 @@ function tryIndexAccessPlan(
 	// as a sequential scan with both predicates residual — worse than the multi-seek this
 	// index can still serve on the IN alone. MemoryTableModule.evaluateIndexAccess records
 	// the same restriction for the same reason.
-	const nextCol = eqCols.length > 0 && eqCols.length < indexColIndexes.length
-		? indexColIndexes[eqCols.length]
+	//
+	// So is a prefix whose equalities merely refine their key columns' collations rather
+	// than equal them (`prefixCollationsExact`): the rule checks a prefix-range's prefix as
+	// range bounds, so a BINARY `a = 'x'` over a NOCASE `a` would have the whole seek
+	// declined. The trailing bounds need their own collation match ({@link rangeServedOn});
+	// when the equality run stopped at the next column because its first equality failed,
+	// that test fails and the arm stays `eq` on the prefix.
+	const nextKeyCol = eqCols.length > 0 && eqCols.length < index.columns.length
+		? index.columns[eqCols.length]
 		: undefined;
-	const trailingRangeCol = (!isMultiSeek && nextCol !== undefined
-		&& request.filters.some(f => f.columnIndex === nextCol && RANGE_OPS.includes(f.op)))
-		? nextCol
+	const trailingRangeCol = (!isMultiSeek && prefixCollationsExact && nextKeyCol !== undefined
+		&& rangeServedOn(request.filters, nextKeyCol))
+		? nextKeyCol.index
 		: undefined;
 
 	let seekCols: readonly number[];

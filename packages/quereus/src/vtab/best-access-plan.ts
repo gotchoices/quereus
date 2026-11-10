@@ -8,6 +8,7 @@ import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import { validateIndexDescriptor, type IndexDescriptor } from './index-descriptor.js';
 import type { IndexColumnSchema, TableSchema } from '../schema/table.js';
+import { collationRefines, normalizeCollationName } from '../util/comparison.js';
 
 /**
  * Constraint operators that can be pushed down to virtual tables
@@ -159,6 +160,39 @@ export function isMultiValueEquality(f: PredicateConstraint): boolean {
 	if (f.op !== 'IN') return false;
 	if (f.runtimeSet) return equalitySeekKeyCount(f) !== null;
 	return Array.isArray(f.value) && (f.value as unknown[]).length > 1;
+}
+
+/** The collation a key column compares under, which is what the engine's index descriptor reads. */
+function keyColumnCollation(keyCol: Pick<IndexColumnSchema, 'collation'>): string {
+	return normalizeCollationName(keyCol.collation ?? 'BINARY');
+}
+
+/** The collation a filter's comparison runs under; a filter that carries none means BINARY. */
+function filterCollation(f: PredicateConstraint): string {
+	return normalizeCollationName(f.collation ?? 'BINARY');
+}
+
+/**
+ * Whether equality `f` may seek key column `keyCol`, and count as pinning it to one value:
+ * every pair of values the predicate treats as equal, the key treats as equal too (a BINARY
+ * predicate, or the key column's own collation). Exactly the equalities
+ * `rule-select-access-path`'s collation cover accepts, so the engine never declines a seek
+ * offered on this answer. `keyCol` is a secondary-index column or a `primaryKeyDefinition`
+ * member. See docs/module-authoring.md § `PredicateConstraint.collation`.
+ */
+export function equalityServesKeyColumn(f: PredicateConstraint, keyCol: Pick<IndexColumnSchema, 'collation'>): boolean {
+	return collationRefines(filterCollation(f), keyColumnCollation(keyCol));
+}
+
+/**
+ * Whether range bound `f` (or an `OR_RANGE`, or an equality in a prefix-range seek's prefix)
+ * may be walked on key column `keyCol`: it must compare under the key column's own collation.
+ * A non-BINARY match also requires the module's runtime to filter the bounds under that
+ * collation and to advertise `honorsCollatedRangeBounds`. Any other pairing walks a window
+ * ordered differently from the predicate.
+ */
+export function rangeServesKeyColumn(f: PredicateConstraint, keyCol: Pick<IndexColumnSchema, 'collation'>): boolean {
+	return filterCollation(f) === keyColumnCollation(keyCol);
 }
 
 /**

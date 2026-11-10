@@ -121,6 +121,8 @@ export {
 	validateAccessPlanRequest,
 	equalitySeekKeyCount,
 	isMultiValueEquality,
+	equalityServesKeyColumn,
+	rangeServesKeyColumn,
 	nullSafeOrderingPrefixLength,
 } from './vtab/best-access-plan.js';
 

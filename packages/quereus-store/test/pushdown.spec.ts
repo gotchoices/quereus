@@ -280,10 +280,14 @@ describe('StoreModule predicate pushdown', () => {
 			});
 
 			it('collation-mismatched bound still declines to scan + residual', async () => {
+				// The module reads the BINARY predicate collation and offers no primary-key
+				// range, so the leaf is its plain full scan (a whole-key `_primary_` walk)
+				// under the residual Filter.
 				const q = `select n from fruits where name > 'banana' collate BINARY order by n`;
 				const ops = await planOps(q);
 				expect(ops).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
-				expect(ops).to.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+				expect(ops).to.match(/SEQSCAN|INDEXSCAN/i);
+				expect(ops).to.match(/FILTER/i);
 				// BINARY: only 'date' is greater than 'banana'.
 				expect(await values(q)).to.deep.equal([4]);
 			});
