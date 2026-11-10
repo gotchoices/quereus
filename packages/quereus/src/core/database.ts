@@ -24,6 +24,7 @@ import { buildBlock } from '../planner/building/block.js';
 import { noEnvelopeCheckScope } from '../planner/building/mutation-context.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { refreshMaintainedTable } from '../runtime/emit/materialized-view.js';
+import { withEngineGeneratedColumnGraph } from '../runtime/emit/alter-table.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
@@ -1714,7 +1715,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/**
 	 * Programmatically defines or replaces a table in the 'main' schema.
 	 * This is an alternative/supplement to using `CREATE TABLE`.
-	 * @param definition The schema definition for the table.
+	 * @param definition The schema definition for the table. Its generated-column
+	 *   evaluation order (`generatedColumnDependencies` / `generatedColumnTopoOrder`) is
+	 *   derived here from its columns; any value the caller supplies is replaced.
 	 */
 	defineTable(definition: TableSchema): void {
 		this.checkOpen();
@@ -1722,7 +1725,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			throw new MisuseError("Programmatic definition only supported for 'main' schema currently");
 		}
 
-		this.schemaManager.getMainSchema().addTable(definition);
+		this.schemaManager.getMainSchema().addTable(withEngineGeneratedColumnGraph(this, definition));
 	}
 
 	/** Wraps function registration with consistent error logging and re-throw. */

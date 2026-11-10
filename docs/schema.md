@@ -47,7 +47,7 @@ Each `primaryKeyDefinition[i].collation` is a copy of its member column's `colla
 
 > **Invariant:** [SCH-007](invariants.md#sch-007--every-generated-column-is-in-the-tables-evaluation-order)
 
-`generatedColumnDependencies` maps each generated column's index to the column indices its expression reads, and `generatedColumnTopoOrder` lists the generated columns dependencies-first; INSERT and UPDATE compute generated columns by walking that order. Both are derived by the engine (`withGeneratedColumnGraph`) from the column list, never supplied by a module: CREATE TABLE computes them, and every ALTER arm that registers a module's answer re-derives them first (`withEngineGeneratedColumnGraph`), because a module builds that answer from its own cached schema. `Schema.addTable` refuses a schema whose order does not cover exactly its generated columns, so a DDL path that forgets fails at the statement instead of writing NULL into the column on later writes.
+`generatedColumnDependencies` maps each generated column's index to the column indices its expression reads, and `generatedColumnTopoOrder` lists the generated columns dependencies-first; INSERT and UPDATE compute generated columns by walking that order. Both are derived by the engine (`withGeneratedColumnGraph`) from the column list, never supplied by a module: CREATE TABLE and `Database.defineTable` compute them, and every ALTER arm that registers a module's answer re-derives them first (`withEngineGeneratedColumnGraph`), because a module builds that answer from its own cached schema. `Schema.addTable` refuses a schema whose order does not cover exactly its generated columns, so a DDL path that forgets fails at the statement instead of writing NULL into the column on later writes.
 
 ### ColumnSchema
 
