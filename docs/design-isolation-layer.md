@@ -327,12 +327,12 @@ underlying's own atomic commit one level up.
 The dedicated handle is deliberately **not memoized** either. A `_readCommitted` memory table
 pins its read layer at the first scan pull and serves that layer for the life of the instance,
 so a handle cached for the table's lifetime would serve the same committed state forever and
-hold the layer chain against collapse. Not memoizing also keeps `destroy` / `renameTable` / the
+keep that committed layer reachable for as long as the table exists. Not memoizing also keeps `destroy` / `renameTable` / the
 attach seams free of a second eviction.
 
 `IsolatedTable.disconnect()` releases the handle it opened (and only that one). This is
-required, not tidy: on the memory path `disconnect` is what drops the pinned read layer's
-collapse protection. `IsolatedTable.createConnection()` throws on a committed instance — a
+required, not tidy: on the memory path `disconnect` is what removes the reader's connection,
+and with it the committed layer it pinned, from the manager. `IsolatedTable.createConnection()` throws on a committed instance — a
 `_readCommitted` connection must not join the writer's transaction.
 
 Consequently `IsolationModule.readCommittedSnapshot` **mirrors the underlying** rather than

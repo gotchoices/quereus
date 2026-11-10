@@ -74,10 +74,10 @@ the current base or a head stamped with the current generation. The generation i
 the head stops descending from its predecessor: a base replacement (`replaceBaseLayer`, `destroy`)
 and the coordinated-commit stale fallback.
 
-A sibling that forked from a head which a schema change later drained into the base, and that
-commits after a newer head, rebases only its own writes. (Before the history marker, the search fell
-through to the base and replayed the drained head's whole chain again on top of the newer head,
-reverting its rows.)
+Consolidation leaves the generation alone, so a transaction that issued a schema change keeps the
+drained head it forked from as a valid fork point: if another connection commits a newer head first,
+this transaction's commit rebases only its own writes onto it. (It is the only connection that can
+hold open work across the drain — `ensureSchemaChangeSafety` refuses while any other one does.)
 
 Events follow the same boundary: commit delivers the pending-change events of the layers above the
 fork point, the only ones not already delivered when an earlier head was published.
