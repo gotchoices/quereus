@@ -5,6 +5,7 @@ import type { Attribute, RelationalPlanNode, ScalarPlanNode } from '../nodes/pla
 import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { CollateNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
 
 /**
@@ -59,30 +60,33 @@ export function buildSelectListEntries(
 }
 
 /**
- * If `expr` is a bare integer literal (or a unary `+`/`-` applied to one), treats
- * it as a 1-based positional reference into `selectList` and returns the
- * corresponding entry. Out-of-range / zero / negative ordinals raise an error.
- * Any other expression shape returns null so the caller can fall through to
- * normal expression building (e.g., `group by 1 + 0` keeps its
- * constant-expression semantics).
+ * If `expr` is a positional reference — a bare integer literal, optionally under a
+ * unary `+`/`-` and/or `collate` wrappers (`order by 2 collate nocase`) — returns the
+ * 1-based entry of `selectList` it names. Out-of-range / zero / negative ordinals
+ * raise an error, collate wrapper or not. Any other expression shape returns null so
+ * the caller can fall through to normal expression building (e.g., `group by 1 + 0`
+ * keeps its constant-expression semantics).
+ *
+ * The collate wrapper is not reported here; {@link buildOrdinalAwareExpression}
+ * applies it to the resolved column.
  */
 export function resolveOrdinalReference(
 	expr: AST.Expression,
 	selectList: readonly SelectListEntry[],
 	clauseName: 'GROUP BY' | 'ORDER BY',
 ): SelectListEntry | null {
-	const value = extractOrdinalValue(expr);
-	if (value === null) return null;
-	if (value < 1 || value > selectList.length) {
-		throw new QuereusError(
-			`${clauseName} position ${value} is not in the SELECT list (1..${selectList.length})`,
-			StatusCode.ERROR,
-			undefined,
-			expr.loc?.start.line,
-			expr.loc?.start.column,
-		);
-	}
-	return selectList[value - 1];
+	return resolveOrdinalTerm(expr, selectList, clauseName)?.entry ?? null;
+}
+
+function resolveOrdinalTerm(
+	expr: AST.Expression,
+	selectList: readonly SelectListEntry[],
+	clauseName: 'GROUP BY' | 'ORDER BY',
+): { readonly entry: SelectListEntry; readonly collate?: AST.CollateExpr } | null {
+	const term = parseOrdinalTerm(expr);
+	if (!term) return null;
+	assertOrdinalInRange(term.position, selectList.length, clauseName, expr);
+	return { entry: selectList[term.position - 1], collate: term.collate };
 }
 
 /**
@@ -95,7 +99,8 @@ export function resolveOrdinalReference(
  * group by 4` would re-resolve `v` to whichever side happens to be first in
  * scope. When the resolved entry carries its source attribute, reference that
  * attribute directly; otherwise re-plan the authored expression, which is what
- * the ordinal literally stands for.
+ * the ordinal literally stands for. A `collate` suffix on the ordinal is applied
+ * to whichever of the two the ordinal resolved to.
  */
 export function buildOrdinalAwareExpression(
 	context: PlanningContext,
@@ -104,12 +109,14 @@ export function buildOrdinalAwareExpression(
 	clauseName: 'GROUP BY' | 'ORDER BY',
 	allowAggregates: boolean = false,
 ): ScalarPlanNode {
-	const entry = resolveOrdinalReference(expr, selectList, clauseName);
-	if (!entry) {
+	const resolved = resolveOrdinalTerm(expr, selectList, clauseName);
+	if (!resolved) {
 		return buildExpression(context, expr, allowAggregates);
 	}
-	const sourceRef = buildSourceAttributeReference(entry, context.scope);
-	return sourceRef ?? buildExpression(context, entry.expr, allowAggregates);
+	const { entry, collate } = resolved;
+	const target = buildSourceAttributeReference(entry, context.scope)
+		?? buildExpression(context, entry.expr, allowAggregates);
+	return applyOrdinalCollate(context.scope, collate, target);
 }
 
 /**
@@ -146,8 +153,11 @@ function buildSourceAttributeReference(entry: SelectListEntry, scope: Scope): Co
  * select list, so it has no output attributes to bind to (see
  * {@link buildOrdinalAwareExpression}).
  *
- * Returns null for any non-ordinal expression shape (mirrors
- * `extractOrdinalValue`) so the caller falls through to normal expression
+ * A `collate` suffix (`order by 1 collate nocase`) wraps the returned reference in
+ * that collation, overriding the column's own.
+ *
+ * Returns null for any non-ordinal expression shape (same recognition as
+ * `resolveOrdinalReference`) so the caller falls through to normal expression
  * building. Out-of-range / zero / negative ordinals raise the same prepare-time
  * error as `resolveOrdinalReference`.
  */
@@ -155,29 +165,96 @@ export function resolveOrdinalOutputColumn(
 	expr: AST.Expression,
 	outputRelation: RelationalPlanNode,
 	scope: Scope,
-): ColumnReferenceNode | null {
-	const value = extractOrdinalValue(expr);
-	if (value === null) return null;
+): ScalarPlanNode | null {
+	const term = parseOrdinalTerm(expr);
+	if (!term) return null;
 	// NOTE: the range is the relation's full output arity. A `SetOperationNode` that
 	// surfaces membership flag columns advertises them here too, so an ordinal could
 	// address one; harmless today because flags are introduced by optimizer rewrites,
 	// long after this runs at build time. If a flagged set-op ever reaches ORDER BY
 	// building, bound the range to the compound's data arity instead.
 	const columns = outputRelation.getType().columns;
-	if (value < 1 || value > columns.length) {
-		throw new QuereusError(
-			`ORDER BY position ${value} is not in the SELECT list (1..${columns.length})`,
-			StatusCode.ERROR,
-			undefined,
-			expr.loc?.start.line,
-			expr.loc?.start.column,
-		);
-	}
-	const index = value - 1;
+	assertOrdinalInRange(term.position, columns.length, 'ORDER BY', expr);
+	const index = term.position - 1;
 	const column = columns[index];
 	const attr = outputRelation.getAttributes()[index];
 	const colExpr: AST.ColumnExpr = { type: 'column', name: column.name || attr.name };
-	return new ColumnReferenceNode(scope, colExpr, column.type, attr.id, index);
+	const columnRef = new ColumnReferenceNode(scope, colExpr, column.type, attr.id, index);
+	return applyOrdinalCollate(scope, term.collate, columnRef);
+}
+
+/** A positional term as written: its (unchecked) 1-based position and any collate suffix. */
+interface OrdinalTerm {
+	readonly position: number;
+	/** The OUTERMOST `collate` wrapper — the effective one, as for nested `CollateNode`s. */
+	readonly collate?: AST.CollateExpr;
+}
+
+/**
+ * Recognises a positional reference: an integer literal (optionally signed) under
+ * any number of `collate` wrappers. Seeing through the wrappers before deciding
+ * whether the term is positional matches SQLite (`sqlite3ExprSkipCollate`), so
+ * `order by 5 collate nocase` is an out-of-range position, not a constant key.
+ */
+function parseOrdinalTerm(expr: AST.Expression): OrdinalTerm | null {
+	let collate: AST.CollateExpr | undefined;
+	let inner = expr;
+	while (inner.type === 'collate') {
+		collate ??= inner;
+		inner = inner.expr;
+	}
+	const position = extractOrdinalValue(inner);
+	return position === null ? null : { position, collate };
+}
+
+function assertOrdinalInRange(
+	position: number,
+	count: number,
+	clauseName: 'GROUP BY' | 'ORDER BY',
+	expr: AST.Expression,
+): void {
+	if (position >= 1 && position <= count) return;
+	throw new QuereusError(
+		`${clauseName} position ${position} is not in the SELECT list (1..${count})`,
+		StatusCode.ERROR,
+		undefined,
+		expr.loc?.start.line,
+		expr.loc?.start.column,
+	);
+}
+
+/**
+ * Applies a positional term's collate suffix to the column it resolved to.
+ *
+ * The node's AST is synthesized as `<resolved column> collate <name>` rather than
+ * reusing the user's wrapper, whose text is `1 collate nocase`: grouped-query
+ * coverage and post-aggregate redirection match expressions by AST fingerprint, so a
+ * grouping key must fingerprint as the column it stands for — exactly like the named
+ * form `group by a collate nocase` — and never as the constant `1 collate nocase`.
+ *
+ * An operand that already carries the same explicit collation is returned as is.
+ * Rewrapping would not change how it compares, but its fingerprint (`a collate nocase
+ * collate nocase`) would stop `select a collate nocase k … group by 1 collate nocase`
+ * from recognising its own SELECT-list column as the grouping key.
+ */
+function applyOrdinalCollate(
+	scope: Scope,
+	collate: AST.CollateExpr | undefined,
+	operand: ScalarPlanNode,
+): ScalarPlanNode {
+	if (!collate) return operand;
+	const operandType = operand.getType();
+	if (operandType.collationSource === 'explicit'
+		&& operandType.collationName?.toUpperCase() === collate.collation.toUpperCase()) {
+		return operand;
+	}
+	const expression: AST.CollateExpr = {
+		type: 'collate',
+		expr: operand.expression,
+		collation: collate.collation,
+		loc: collate.loc,
+	};
+	return new CollateNode(scope, expression, operand);
 }
 
 function extractOrdinalValue(expr: AST.Expression): number | null {
