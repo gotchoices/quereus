@@ -44,3 +44,13 @@ For every frame, a streaming ROWS sliding `sum`/`avg` returns the same value and
 - `sum`'s accumulator is also what materialized views persist and decode (`algebra.decode` with an absorbing count); a shape change has to keep `aggregate-algebra.spec.ts`'s laws.
 - Options seen during review, not chosen: (a) let `inverse` decline when the departing value is a float contribution, and have the ROWS path refold the buffer then (exact, but a refold per slide on REAL columns — the RANGE path already pays this, measured ~25–33% slower end to end at 100-row frames); (b) count floating-point contributions in the accumulator and reset the float total to exactly 0 when that count reaches 0 (fixes the residue, not cancellation); (c) compensated (Neumaier) summation for the float total (reduces both, guarantees neither).
 - Once fixed, widen the equivalence spec's value domain to non-dyadic and large-magnitude floats so the property covers this.
+
+## Decision (maintainer, 2026-11-10)
+
+Define the operator to match the cheap implementation, and fix the two defects that break even that definition. No refold per slide.
+
+- **Semantics (all paths: grouped, window, sliding, materialized rollup).** Integer and boolean contributions are exact, past 2^53 included. REAL contributions are approximate: a window result may differ from grouped `sum` in the last digits, since the order of additions is not specified. The storage class follows the frame's current contents: a frame holding no REAL value finalizes as an integer (`bigint` past the safe range), never a float.
+- **Residue: count REAL contributions.** Add a count of REAL contributions to the accumulator; when it returns to 0 the approximate part (and its compensation) is reset to exactly 0. Pins `5, 7` → `12` and `9007199254740993, 5` → `9007199254740998n` from the repro.
+- **Cancellation: Neumaier-compensated approximate part.** Keep a compensation term beside the approximate total, in step, merge and negate, for grouped and window alike; finalize adds them. Pins the repro's id 3 frame `0.5, 5` → `5.5`.
+- **Persisted shape.** Materialized views store the finalized value and `decode` rebuilds the accumulator, so the new fields are in-memory only; keep `aggregate-algebra.spec.ts`'s laws (decode with the absorbing count included). `avg` shares the accumulator and inherits both fixes.
+- **Tests and docs.** Widen the window-aggregate equivalence spec's domain to non-dyadic and large/small-magnitude REALs: compare integer-only frames and the storage class exactly, REAL frames within a relative tolerance. Replace the REAL-sliding exception in `docs/functions.md` (Window Functions) with the semantics above.

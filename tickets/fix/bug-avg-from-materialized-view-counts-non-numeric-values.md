@@ -25,3 +25,13 @@ Direct `avg(x)` and the view-rolled-up `avg(x)` agree for every column, includin
 ## Class-level guard
 
 The decomposition law in `aggregate-algebra.spec.ts` runs each aggregate over a numeric-only domain, which is why this was not caught. Checking the decomposition law of every aggregate that declares `decompose` over a domain that also includes non-numeric text, blobs and booleans would catch this and any future decomposed aggregate with the same mismatch.
+
+## Decision (maintainer, 2026-11-10)
+
+Stop skipping non-numbers; make them errors. This replaces the "expected behaviour" above (the skip rule is no longer the documented semantics).
+
+- **Compile time.** `sum` and `avg` require an argument whose logical type is numeric, boolean, or ANY. A text, JSON or blob argument is rejected at prepare time, with a message saying to `cast`. This breaks `sum(text_col)` over numeric text, which is converted today; that is intended.
+- **Run time, ANY only.** Numbers add; booleans add as 1 / 0; NULL is skipped as before. Any other value, text included (even numeric text such as `'4'`), raises an error. An ANY column is not looser than a text column.
+- **Why this closes the bug.** Every value the `count(x)` partial counts is either one `sum` added or one that raised, so the decomposed and direct `avg` cannot differ. Keep `count(x)` as the divisor partial.
+- **Consequence to pin with tests.** With a materialized view that sums an ANY column, inserting a non-numeric value into the base table fails during view maintenance; without one, the query that sums it fails. `count`, `min`, `max` are unaffected.
+- **Check other aggregates on the same accumulator** (`total`, if present, and anything else built on `stepSum`) and apply the same rule. Extend the decomposition-law check in `aggregate-algebra.spec.ts` to a domain with text, blobs and booleans, as the class-level guard above says, now asserting both sides raise on the non-numeric values. Update `docs/functions.md` and any doc describing sum's skip rule.
