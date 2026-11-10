@@ -133,6 +133,17 @@ describe('primary-key prefix equality seek', () => {
 		expect(c).to.deep.equal([...c].sort((x, y) => x - y));
 	});
 
+	it('leaves a bound on the member a multi-value IN cut the prefix at as a residual', async () => {
+		// Claiming `b > 1` would hand the rule seek columns [a, b] with an IN on b, which it
+		// builds as a `_primary_` multi-seek narrower than the key, which the scan rejects.
+		await db.exec(`create table t (a integer, b integer, c integer, primary key (a, b, c)) using store`);
+		await db.exec(`insert into t values (1, 1, 1), (1, 2, 1), (1, 2, 2), (1, 3, 1), (2, 2, 1)`);
+		const q = `select b, c from t where a = 1 and b in (1, 2) and b > 1 order by b, c`;
+
+		expect(await planText(q)).to.match(/INDEX SEEK t USING primary\b/);
+		expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ b: 2, c: 1 }, { b: 2, c: 2 }]);
+	});
+
 	it('swaps the window ends for a bound on a DESC member', async () => {
 		await db.exec(`create table t (a integer, b integer, primary key (a, b desc)) using store`);
 		await db.exec(`insert into t values (1, 5), (2, 1), (2, 2), (2, 3), (2, 4), (3, 0), (3, 7)`);

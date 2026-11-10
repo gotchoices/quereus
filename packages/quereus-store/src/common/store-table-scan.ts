@@ -254,7 +254,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		}
 
 		const spec = decodeIdxStr(filterInfo.idxStr);
-		if (spec && spec.indexName.toLowerCase() === '_primary_') {
+		if (spec?.indexName === '_primary_') {
 			const window = this.pkPrefixWindow(filterInfo, eqRun);
 			if (window) return window;
 		}

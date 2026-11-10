@@ -72,6 +72,7 @@ that also *narrow the bytes read*:
 | Equality on every primary-key column | one data-store point read |
 | `IN` on every primary-key column | one data-store point read per distinct key tuple (`plan=5`, see below) |
 | `<` / `<=` / `>` / `>=` on the **leading** primary-key column | one data-store byte window |
+| Equality on a **strict** leading prefix of the primary key, optionally **plus** a bound on the very next key column | one data-store byte window over the rows sharing that prefix (`plan=2`, or `plan=7` with the bound) |
 | Equality on a contiguous **leading prefix** of a secondary index | one index byte window (`plan=2`) |
 | `IN` on a contiguous leading prefix of a secondary index | one index window per distinct list value (`plan=5`, see below) |
 | `<` / `<=` / `>` / `>=` on the **leading** column of a secondary index | one index byte window (`plan=3`) |
