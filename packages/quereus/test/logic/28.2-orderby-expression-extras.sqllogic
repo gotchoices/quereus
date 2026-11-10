@@ -131,7 +131,9 @@ drop table nk;
 -- A `collate` suffix does not stop a term being positional (SQLite strips it
 -- before testing): the ordinal still names an output column, and the collation
 -- applies to that column. Binary order of `a` here is B D a c; nocase is a B c D.
-create table nc (a text primary key, b text);
+-- The key is declared BINARY so 'a' and 'A' (inserted below) are distinct rows
+-- under every module: the store otherwise keys an undecorated text PK NOCASE.
+create table nc (a text collate binary primary key, b text);
 insert into nc values ('a','1'), ('B','9'), ('c','5'), ('D','3');
 
 select a from nc order by 1 collate nocase;
