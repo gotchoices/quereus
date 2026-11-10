@@ -22,8 +22,10 @@ export interface ScalarFunctionSchema {
   // Option A: Fixed return type
   returnType?: ScalarType;
 
-  // Option B: Type inference function (for polymorphic functions)
-  inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+  // Option B: Type inference function (for polymorphic functions).
+  // argNullable[i] says whether argument i's announced type admits NULL; it is
+  // absent when the caller does not know.
+  inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
 
   // Optional: Validate argument types at planning time
   validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
@@ -55,6 +57,15 @@ export const absFunc = createScalarFunction({
   }),
   validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 }, absImpl);
+```
+
+**Nullability from the arguments**: `coalesce` announces non-null when any argument is non-null, which is what lets `coalesce((select max(n) from cfg), 10)` stand as a `limit` ([sql-select.md §3.6](sql-select.md#36-limit-and-offset-clauses)):
+```typescript
+inferReturnType: (argTypes, argNullable) => ({
+  typeClass: 'scalar',
+  logicalType: findCommonType(argTypes),
+  nullable: argNullable === undefined || argNullable.every(nullable => nullable),
+})
 ```
 
 ### Omitting the return type

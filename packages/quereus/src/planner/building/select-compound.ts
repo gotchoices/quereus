@@ -7,10 +7,10 @@ import type { Scope } from '../scopes/scope.js';
 import { SetOperationNode, alignSetOpOperands, type SetOpMembershipSpec } from '../nodes/set-operation-node.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
 import { LimitOffsetNode } from '../nodes/limit-offset.js';
-import { LiteralNode } from '../nodes/scalar.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
+import { buildRowCountExpression } from './row-count-expression.js';
 import { resolveOrdinalOutputColumn } from './select-ordinal.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 import { buildValuesStmt } from './select.js';
@@ -189,9 +189,8 @@ function applyOuterLimitOffset(
 	selectContext: PlanningContext
 ): RelationalPlanNode {
 	if (outerLimit || outerOffset) {
-		const literalNull = new LiteralNode(selectContext.scope, { type: 'literal', value: null });
-		const limitExpr = outerLimit ? buildExpression(selectContext, outerLimit) : literalNull;
-		const offsetExpr = outerOffset ? buildExpression(selectContext, outerOffset) : literalNull;
+		const limitExpr = outerLimit ? buildRowCountExpression(selectContext, outerLimit, 'LIMIT') : undefined;
+		const offsetExpr = outerOffset ? buildRowCountExpression(selectContext, outerOffset, 'OFFSET') : undefined;
 		return new LimitOffsetNode(selectContext.scope, input, limitExpr, offsetExpr);
 	}
 	return input;

@@ -6,11 +6,10 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { DistinctNode } from '../nodes/distinct-node.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
 import { LimitOffsetNode } from '../nodes/limit-offset.js';
-import { LiteralNode } from '../nodes/scalar.js';
 import { ShadowScope } from '../scopes/shadow.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
-import { buildExpression } from './expression.js';
+import { buildRowCountExpression } from './row-count-expression.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { buildOrdinalAwareExpression, resolveOrdinalOutputColumn, type SelectListEntry } from './select-ordinal.js';
 import { redirectPostAggregate, type GroupedRedirectContext } from './select-aggregates.js';
@@ -195,9 +194,8 @@ export function applyLimitOffset(
 			limitContext = { ...selectContext, scope: combinedScope };
 		}
 
-		const literalNull = new LiteralNode(limitContext.scope, { type: 'literal', value: null });
-		const limitExpression = stmt.limit ? buildExpression(limitContext, stmt.limit) : literalNull;
-		const offsetExpression = stmt.offset ? buildExpression(limitContext, stmt.offset) : literalNull;
+		const limitExpression = stmt.limit ? buildRowCountExpression(limitContext, stmt.limit, 'LIMIT') : undefined;
+		const offsetExpression = stmt.offset ? buildRowCountExpression(limitContext, stmt.offset, 'OFFSET') : undefined;
 		return new LimitOffsetNode(limitContext.scope, input, limitExpression, offsetExpression);
 	}
 	return input;

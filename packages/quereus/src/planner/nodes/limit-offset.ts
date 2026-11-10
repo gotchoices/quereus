@@ -12,6 +12,29 @@ import { literalValue } from '../analysis/predicate-shape.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
+ * Resolve a LIMIT / OFFSET expression to a compile-time-constant finite number, or
+ * `undefined` when it is not one (a parameter, a subquery, any other expression, or a
+ * literal that does not coerce to a finite number). Peels `CastNode`/`CollateNode` to find
+ * a `LiteralNode`, mirroring `literalSqlValueOf` in `fd-utils.ts`; `Number(value)`
+ * coercion matches the runtime's `toRowCount`.
+ *
+ * NOTE: peeling a cast reads the literal under it, not the cast's result, so a cast that
+ * changes the number (`cast(-0.5 as integer)` is 0) is judged by its operand. Only a
+ * contrived LIMIT spells a cast that way; if one ever matters, evaluate the cast here.
+ */
+export function constantNumber(node: ScalarPlanNode): number | undefined {
+	let cur: ScalarPlanNode = node;
+	while (cur instanceof CastNode || cur instanceof CollateNode) {
+		cur = cur.operand;
+	}
+	if (!(cur instanceof LiteralNode)) return undefined;
+	const v = literalValue(cur.expression);
+	if (v === undefined || v === null) return undefined;
+	const n = Number(v);
+	return Number.isFinite(n) ? n : undefined;
+}
+
+/**
  * Represents a LIMIT/OFFSET operation.
  * It takes an input relation and returns at most 'limit' rows, skipping 'offset' rows.
  */
@@ -61,31 +84,9 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		return [this.source];
 	}
 
-	/**
-	 * Resolve the LIMIT expression to a compile-time-constant numeric value, or
-	 * `undefined` when it is not a known constant. Peels `CastNode`/`CollateNode`
-	 * to find a `LiteralNode`, mirroring `literalSqlValueOf` in `fd-utils.ts`.
-	 *
-	 * `Number(value)` coercion matches the emitter (`runtime/emit/limit-offset.ts`).
-	 * A literal NULL means "no limit" (the emitter treats it as `Infinity`), so it
-	 * is reported as non-constant. A non-finite / non-numeric literal is likewise
-	 * not constant-known. A parameter / expression / subquery limit stays
-	 * undefined — those are unknown at plan time.
-	 */
+	/** The LIMIT as a compile-time-constant number, or `undefined` when it is not one. */
 	private constantLimit(): number | undefined {
-		if (this.limit === undefined) return undefined;
-		let cur: ScalarPlanNode = this.limit;
-		while (cur instanceof CastNode || cur instanceof CollateNode) {
-			cur = cur.operand;
-		}
-		if (!(cur instanceof LiteralNode)) return undefined;
-		const v = literalValue(cur.expression);
-		if (v === undefined) return undefined;
-		// Literal NULL ⇒ unbounded (emitter uses Infinity), not a ≤1-row constant.
-		if (v === null) return undefined;
-		const n = Number(v);
-		if (!Number.isFinite(n)) return undefined;
-		return n;
+		return this.limit === undefined ? undefined : constantNumber(this.limit);
 	}
 
 	get estimatedRows(): number | undefined {

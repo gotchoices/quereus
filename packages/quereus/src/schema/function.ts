@@ -268,9 +268,11 @@ export interface ScalarFunctionSchema extends BaseFunctionSchema {
 	 * If provided, this function will be called at planning time to determine
 	 * the return type based on the actual argument types.
 	 * This allows functions like abs() to return INTEGER when given INTEGER,
-	 * and REAL when given REAL.
+	 * and REAL when given REAL. `argNullable[i]` is whether argument `i`'s announced
+	 * type admits NULL (absent when the caller does not know), so e.g. coalesce can
+	 * announce non-null when one of its arguments is.
 	 */
-	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
 	/**
 	 * Optional argument type validation function.
 	 * If provided, this function will be called at planning time to validate

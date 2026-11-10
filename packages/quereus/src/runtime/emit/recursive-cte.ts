@@ -11,6 +11,7 @@ import { ArrayRowIterable } from '../../util/array-row-iterable.js';
 import { DEFAULT_TUNING } from '../../planner/optimizer-tuning.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { toRowCount } from '../../util/row-count.js';
 const log = createLogger('runtime:emit:recursive-cte');
 
 export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): Instruction {
@@ -36,13 +37,8 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 		const limitFn = hasLimit ? rest[argIndex++] : undefined;
 		const offsetFn = hasOffset ? rest[argIndex++] : undefined;
 
-		const limitValue = limitFn ? await limitFn(rctx) : null;
-		const offsetValue = offsetFn ? await offsetFn(rctx) : null;
-
-		let limit = limitValue !== null ? Number(limitValue) : Infinity;
-		let offset = offsetValue !== null ? Number(offsetValue) : 0;
-		if (limit < 0 || !Number.isFinite(limit)) limit = limit < 0 ? 0 : Infinity;
-		if (offset < 0 || !Number.isFinite(offset)) offset = 0;
+		const limit = limitFn ? toRowCount(await limitFn(rctx), 'LIMIT') : Infinity;
+		const offset = offsetFn ? toRowCount(await offsetFn(rctx), 'OFFSET') : 0;
 
 		// Total rows that need to be generated before limit is satisfied
 		const totalNeeded = limit === Infinity ? Infinity : offset + limit;

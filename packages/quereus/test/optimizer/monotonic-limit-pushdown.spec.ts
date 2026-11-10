@@ -186,6 +186,17 @@ describe('Monotonic LIMIT/OFFSET pushdown rule', () => {
 			expect(rows.map(r => Number(r.id))).to.deep.equal([8, 9, 10]);
 		});
 
+		it('a negative bound offset raises instead of clamping to zero', async () => {
+			await createTable();
+			let error: unknown;
+			try {
+				await evalRows(db, 'SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?', [3, -1]);
+			} catch (e) {
+				error = e;
+			}
+			expect((error as Error | undefined)?.message).to.match(/OFFSET must not be negative/);
+		});
+
 		it('produces identical results with the rule disabled', async () => {
 			await createTable();
 			const sql = 'SELECT id FROM t ORDER BY id LIMIT 10 OFFSET 500';

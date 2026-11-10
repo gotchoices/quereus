@@ -5,6 +5,7 @@ import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { type SqlValue, type Row, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
+import { toRowCount } from '../../util/row-count.js';
 
 /** The row window this node applies, after evaluating its LIMIT / OFFSET expressions. */
 interface RowWindow {
@@ -13,12 +14,9 @@ interface RowWindow {
 }
 
 /**
- * Evaluate the LIMIT / OFFSET expressions and clamp them to a usable window.
- *
- * A missing LIMIT, a negative one, and a non-finite one (`null`, `NaN`) all clamp to zero
- * rows, which is what `test/logic/94.1-limit-offset-edge-cases.sqllogic` and
- * `104-emit-mutation-kills.sqllogic` pin today. Whether `limit null` should instead mean
- * "no limit" is open — `backlog/bug-null-limit-returns-no-rows`.
+ * Evaluate the LIMIT / OFFSET expressions into a row window, throwing on a value that is
+ * not a row count (see {@link toRowCount}). An absent clause — `undefined` function, never
+ * a NULL value — is no limit / no offset.
  *
  * Shared with `KeySetSemiJoin`, which weighs the same window, so both agree on what a
  * limit value means.
@@ -28,15 +26,9 @@ export async function resolveWindow(
 	limitFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,
 	offsetFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,
 ): Promise<RowWindow> {
-	const limitValue = limitFn ? await limitFn(ctx) : null;
-	const offsetValue = offsetFn ? await offsetFn(ctx) : null;
-
-	const limit = limitValue !== null ? Number(limitValue) : Infinity;
-	const offset = offsetValue !== null ? Number(offsetValue) : 0;
-
 	return {
-		limit: limit < 0 || !Number.isFinite(limit) ? 0 : limit,
-		offset: offset < 0 || !Number.isFinite(offset) ? 0 : offset,
+		limit: limitFn ? toRowCount(await limitFn(ctx), 'LIMIT') : Infinity,
+		offset: offsetFn ? toRowCount(await offsetFn(ctx), 'OFFSET') : 0,
 	};
 }
 
@@ -58,9 +50,11 @@ export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): In
 		const limitFn = plan.limit ? args[argIndex++] : undefined;
 		const offsetFn = plan.offset ? args[argIndex++] : undefined;
 
+		// Resolved before the source is first pulled, so a rejected row count stops a
+		// writing source before it writes anything.
 		const { limit, offset } = await resolveWindow(ctx, limitFn, offsetFn);
 
-		// A zero (or clamped-to-zero) limit over a pure source must not touch the source at
+		// A zero limit over a pure source must not touch the source at
 		// all, and this return is the ONLY thing that stops it: the loop below breaks only
 		// after a yield, so a zero limit that entered it would fall through to the drain
 		// branch and read the whole source. Pinned by the `LIMIT 0` case in

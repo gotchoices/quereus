@@ -37,9 +37,10 @@ interface ScalarFuncOptions {
 	/**
 	 * Optional type inference function for polymorphic functions.
 	 * If provided, this function will be called at planning time to determine
-	 * the return type based on the actual argument types.
+	 * the return type based on the actual argument types (and, when known, whether
+	 * each argument may be NULL — see `ScalarFunctionSchema.inferReturnType`).
 	 */
-	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
 	/**
 	 * Optional argument type validation function.
 	 * If provided, this function will be called at planning time to validate

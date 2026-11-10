@@ -56,3 +56,5 @@ To re-measure: add to `_iterateWithSignal`'s row loop a check of each null cell 
 `this.columnDefCache.value[i].type.nullable === false` and run
 `QUEREUS_REPR_STRICT=1 … mocha … --no-bail` (exact command in the measurement section
 of `tickets/complete/4-remaining-scalar-result-types-and-repr-net*.md`).
+
+Note (from `bug-null-limit-returns-no-rows`, 2026-11-10): scalar `inferReturnType` now receives a second, optional argument `argNullable` (whether each argument's announced type admits NULL), passed by `planner/building/function-call.ts`. `coalesce` already uses it to announce non-null when any argument is non-null — LIMIT / OFFSET now reject nullable-typed expressions at prepare time and `coalesce(…)` is the documented way out. The builtins in the first class above can use the same argument instead of hard-coding `nullable: false`. Note that LIMIT validation makes nullability over-claims user-visible: an expression announced nullable that never yields NULL is rejected as a LIMIT.

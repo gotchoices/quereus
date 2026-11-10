@@ -45,39 +45,35 @@ select id from bigint_filter where val order by id;
 drop table bigint_filter;
 
 -- =============================================================================
--- limit-offset.ts — negative, null, and boundary limit/offset values
+-- limit-offset.ts — rejected (negative, null) and boundary limit/offset values
 -- =============================================================================
 
 create table lo (id integer primary key);
 insert into lo values (1),(2),(3),(4),(5);
 
--- Negative limit → treated as 0, no rows
+-- Negative and NULL row counts are errors, rejected at prepare
 select id from lo order by id limit -1;
-→ []
+-- error: LIMIT must not be negative
 
--- Negative offset → treated as 0, no skip
 select id from lo order by id limit 5 offset -1;
-→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+-- error: OFFSET must not be negative
+
+select id from lo order by id limit -1 offset 2;
+-- error: LIMIT must not be negative
+
+select id from lo order by id limit null;
+-- error: LIMIT expression may be NULL
+
+select id from lo order by id limit 3 offset null;
+-- error: OFFSET expression may be NULL
 
 -- LIMIT 0 → empty
 select id from lo order by id limit 0;
 → []
 
--- Negative limit with offset → still 0 rows
-select id from lo order by id limit -1 offset 2;
-→ []
-
 -- LIMIT and OFFSET together
 select id from lo order by id limit 2 offset 2;
 → [{"id":3},{"id":4}]
-
--- NULL limit → Infinity → caught by isFinite check → 0 rows
-select id from lo order by id limit null;
-→ []
-
--- NULL offset → treated as 0 offset
-select id from lo order by id limit 3 offset null;
-→ [{"id":1},{"id":2},{"id":3}]
 
 -- OFFSET beyond row count
 select id from lo order by id limit 10 offset 100;

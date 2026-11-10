@@ -8,18 +8,11 @@ import type { EmissionContext } from '../emission-context.js';
 import type { Row, SqlValue, MaybePromise } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { toRowCount } from '../../util/row-count.js';
 
 interface SliceBounds {
 	offset: number;
 	limit: number;
-}
-
-/** Coerce a SqlValue to a non-negative finite integer, clamping invalid input. */
-function coerceCount(value: SqlValue, fallback: number): number {
-	if (value === null || value === undefined) return fallback;
-	const n = Number(value);
-	if (!Number.isFinite(n) || n < 0) return 0;
-	return Math.trunc(n);
 }
 
 /**
@@ -74,12 +67,9 @@ export function emitOrdinalSlice(plan: OrdinalSliceNode, ctx: EmissionContext): 
 		const offsetFn = plan.offsetExpr ? args[argIdx++] : undefined;
 		const limitFn = plan.limitExpr ? args[argIdx++] : undefined;
 
-		const offsetValue = offsetFn ? await offsetFn(runtimeCtx) : 0;
-		const limitValue = limitFn ? await limitFn(runtimeCtx) : null;
-
 		const bounds: SliceBounds = {
-			offset: coerceCount(offsetValue, 0),
-			limit: limitValue === null ? Infinity : coerceCount(limitValue, Infinity),
+			offset: offsetFn ? toRowCount(await offsetFn(runtimeCtx), 'OFFSET') : 0,
+			limit: limitFn ? toRowCount(await limitFn(runtimeCtx), 'LIMIT') : Infinity,
 		};
 		boundsByCtx.set(runtimeCtx, bounds);
 

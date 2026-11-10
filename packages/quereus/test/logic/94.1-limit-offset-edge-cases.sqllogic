@@ -1,5 +1,5 @@
 -- limit-offset-edge-cases.sqllogic - Boundary cases for limit/offset emitter
--- Targets: limit-offset.ts — LIMIT 0, negative, OFFSET beyond count, empty table
+-- Targets: limit-offset.ts — LIMIT 0, rejected row counts, OFFSET beyond count, empty table
 
 CREATE TABLE lo_t (id INTEGER PRIMARY KEY, val TEXT);
 INSERT INTO lo_t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
@@ -32,13 +32,27 @@ SELECT * FROM lo_t ORDER BY id LIMIT 2 OFFSET 2;
 SELECT * FROM lo_t ORDER BY id LIMIT 100 OFFSET 3;
 → [{"id":4,"val":"d"},{"id":5,"val":"e"}]
 
--- Negative LIMIT → treated as 0 (no rows)
+-- Negative LIMIT / OFFSET → rejected at prepare (no "limit -1 = no limit" spelling)
 SELECT * FROM lo_t LIMIT -1;
+-- error: LIMIT must not be negative
+
+SELECT * FROM lo_t ORDER BY id LIMIT 3 OFFSET -1;
+-- error: OFFSET must not be negative
+
+-- Fractional LIMIT truncates toward zero
+SELECT * FROM lo_t ORDER BY id LIMIT 2.5;
+→ [{"id":1,"val":"a"},{"id":2,"val":"b"}]
+
+-- A nullable LIMIT expression is rejected at prepare; coalesce makes it non-null
+SELECT id FROM lo_t ORDER BY id LIMIT (SELECT max(id) FROM lo_t WHERE id > 10);
+-- error: LIMIT expression may be NULL
+
+SELECT id FROM lo_t ORDER BY id LIMIT coalesce((SELECT max(id) FROM lo_t WHERE id > 10), 0);
 → []
 
--- Negative OFFSET → treated as 0 (no offset)
-SELECT * FROM lo_t ORDER BY id LIMIT 3 OFFSET -1;
-→ [{"id":1,"val":"a"},{"id":2,"val":"b"},{"id":3,"val":"c"}]
+-- A non-numeric LIMIT value is an error, not zero rows
+SELECT id FROM lo_t ORDER BY id LIMIT 'abc';
+-- error: LIMIT must be a finite number
 
 -- MySQL-style: LIMIT offset, count
 SELECT * FROM lo_t ORDER BY id LIMIT 2, 3;

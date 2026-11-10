@@ -438,39 +438,35 @@ function fallbackIndexSupports(
 			const v = (lim.limit as unknown as LiteralNode).expression.value;
 			if (typeof v === 'number') limitVal = Math.max(0, Math.floor(v));
 		}
-		if (lim.offset) {
-			if (lim.offset.nodeType === _PlanNodeType.Literal) {
-				const v = (lim.offset as unknown as LiteralNode).expression.value;
-				if (typeof v === 'number') {
-					offsetVal = Math.max(0, Math.floor(v));
-				} else {
-					// Non-numeric literal OFFSET — refuse to push the LIMIT,
-					// because we cannot soundly compute `limit + offset`.
-					// NOTE: a bare `LIMIT n` lands HERE, not in the branch above — the
-					// builder materializes an absent OFFSET as `Literal(null)`, so every
-					// LIMIT without an explicit numeric OFFSET is refused and no module
-					// sees `request.limit` by this route.
-					//
-					// This arm IS reached: `rule-minmax-index-boundary` puts a
-					// `LimitOffset(1, Literal(null))` directly above an ordering-equipped
-					// Retrieve, and this refusal is what keeps it there. Reading a
-					// null/absent OFFSET as 0 would let the grow SWALLOW that node into
-					// `Retrieve.source`, which the index-style branch of
-					// `ruleSelectAccessPath` never executes — the boundary read's early
-					// stop would silently vanish and the scan would drain the table
-					// (answers unchanged, cost restored to a full scan). Widen this only
-					// alongside a guard for that rewrite; the "LIMITOFFSET survives
-					// directly above the access leaf" case in
-					// test/optimizer/minmax-index-boundary.spec.ts is what catches it.
-					limitVal = undefined;
-				}
+		if (lim.offset === undefined) {
+			// NOTE: a bare `LIMIT n` (absent OFFSET) is refused here, so no module sees
+			// `request.limit` by this route unless an explicit numeric OFFSET was written.
+			//
+			// This refusal is load-bearing: `rule-minmax-index-boundary` puts a
+			// `LimitOffset(1)` with an absent OFFSET directly above an ordering-equipped
+			// Retrieve, and refusing is what keeps it there. Reading an absent OFFSET as 0
+			// would let the grow SWALLOW that node into `Retrieve.source`, which the
+			// index-style branch of `ruleSelectAccessPath` never executes — the boundary
+			// read's early stop would silently vanish and the scan would drain the table
+			// (answers unchanged, cost restored to a full scan). Widen this only alongside
+			// a guard for that rewrite; the "LIMITOFFSET survives directly above the access
+			// leaf" case in test/optimizer/minmax-index-boundary.spec.ts is what catches it.
+			limitVal = undefined;
+		} else if (lim.offset.nodeType === _PlanNodeType.Literal) {
+			const v = (lim.offset as unknown as LiteralNode).expression.value;
+			if (typeof v === 'number') {
+				offsetVal = Math.max(0, Math.floor(v));
 			} else {
-				// Non-literal OFFSET (e.g. parameter) — refuse to push the LIMIT.
+				// Non-numeric literal OFFSET — refuse to push the LIMIT, because we cannot
+				// soundly compute `limit + offset`.
 				limitVal = undefined;
 			}
+		} else {
+			// Non-literal OFFSET (e.g. parameter) — refuse to push the LIMIT.
+			limitVal = undefined;
 		}
 		if (limitVal === undefined) {
-			log('No usable constant LIMIT (or non-literal OFFSET present)');
+			log('No usable constant LIMIT (or absent / non-literal OFFSET)');
 			return undefined;
 		}
 		// Reached by an explicit numeric OFFSET only (`limit 5 offset 0` gets here;

@@ -90,7 +90,7 @@ function peelLateral(right: RelationalPlanNode): PeeledLateral | null {
 
 /** Verify that the limit is the literal integer 1 and there's no offset. */
 function isLimitOne(limit: LimitOffsetNode): boolean {
-	if (limit.offset && !isLiteralZeroOrUndefined(limit.offset)) return false;
+	if (limit.offset && !isLiteralZero(limit.offset)) return false;
 	if (!limit.limit) return false;
 	if (!(limit.limit instanceof LiteralNode)) return false;
 	const v = limit.limit.expression.value;
@@ -99,11 +99,10 @@ function isLimitOne(limit: LimitOffsetNode): boolean {
 	return false;
 }
 
-/** A null-or-zero literal for OFFSET. */
-function isLiteralZeroOrUndefined(node: ScalarPlanNode): boolean {
+/** A zero literal for OFFSET. */
+function isLiteralZero(node: ScalarPlanNode): boolean {
 	if (!(node instanceof LiteralNode)) return false;
 	const v = node.expression.value;
-	if (v === null || v === undefined) return true;
 	if (typeof v === 'number') return v === 0;
 	if (typeof v === 'bigint') return v === 0n;
 	return false;

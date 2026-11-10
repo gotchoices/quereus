@@ -110,11 +110,13 @@ export const coalesceFunc = createScalarFunction(
 		name: 'coalesce',
 		numArgs: -1,
 		deterministic: true,
-		// Type inference: find the common type among all arguments
-		inferReturnType: (argTypes) => ({
+		// Type inference: find the common type among all arguments. NULL only when every
+		// argument may be NULL — `coalesce(nullable, 0)` is the documented way to make a
+		// nullable LIMIT / OFFSET acceptable (docs/sql-select.md §3.6).
+		inferReturnType: (argTypes, argNullable) => ({
 			typeClass: 'scalar',
 			logicalType: findCommonType(argTypes),
-			nullable: true, // coalesce can return null if all args are null
+			nullable: argNullable === undefined || argNullable.every(nullable => nullable),
 			isReadOnly: true
 		})
 	},

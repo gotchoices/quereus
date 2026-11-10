@@ -113,20 +113,19 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 		return null;
 	}
 
-	// NOTE: the `Literal(null)` OFFSET is load-bearing, not cosmetic. `ruleGrowRetrieve`'s
+	// NOTE: the absent OFFSET is load-bearing, not cosmetic. `ruleGrowRetrieve`'s
 	// LimitOffset arm (`buildRequest`, rule-grow-retrieve.ts) would otherwise swallow this
 	// node into `Retrieve.source`, where the index-style branch of `ruleSelectAccessPath`
 	// never executes it — the early stop would silently vanish and the scan would run to
-	// completion. That arm refuses every LIMIT whose OFFSET is a non-numeric literal, which
-	// is exactly this shape. Its own comment invites reading a null/absent OFFSET as 0
-	// instead of refusing; if that ever changes, this rewrite needs its own guard, and
-	// test/optimizer/minmax-index-boundary.spec.ts pins the LIMITOFFSET still being present
-	// above the access leaf.
+	// completion. That arm refuses every LIMIT whose OFFSET is absent, which is exactly this
+	// shape. (Writing `literal(scope, 0)` here would be swallowed.) If that refusal is ever
+	// widened, this rewrite needs its own guard, and test/optimizer/minmax-index-boundary.spec.ts
+	// pins the LIMITOFFSET still being present above the access leaf.
 	const limited = new LimitOffsetNode(
 		scope,
 		absorbed as RelationalPlanNode,
 		literal(scope, 1),
-		literal(scope, null),
+		undefined,
 	);
 
 	log('rewrote %s(%s) into an index-boundary read', extremum.name, colRef.toString());
@@ -230,6 +229,6 @@ function buildIsNotNull(scope: Scope, colRef: ColumnReferenceNode): ScalarPlanNo
 	return new UnaryOpNode(scope, ast, colRef);
 }
 
-function literal(scope: Scope, value: number | null): LiteralNode {
+function literal(scope: Scope, value: number): LiteralNode {
 	return new LiteralNode(scope, { type: 'literal', value });
 }

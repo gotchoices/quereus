@@ -82,6 +82,16 @@ with recursive lim_zero(n) as (
 select n from lim_zero;
 → []
 
+-- A negative LIMIT on the recursive compound is rejected at prepare, as anywhere else
+with recursive lim_neg(n) as (
+  select 1
+  union all
+  select n + 1 from lim_neg where n < 1000
+  limit -1
+)
+select n from lim_neg;
+-- error: LIMIT must not be negative
+
 -- =============================================================================
 -- Nested WITH inside the base case of a recursive CTE — accepted by
 -- parseQueryExpr (the inner WITH attaches to the inner SELECT, then the

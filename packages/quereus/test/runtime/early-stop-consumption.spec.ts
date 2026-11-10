@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { CountingMemoryModule } from '../vtab/_counting-memory-module.js';
+import type { SqlValue } from '../../src/common/types.js';
 
 /**
  * One invariant, checked across every consumer that can stop reading its source early:
@@ -116,5 +117,43 @@ describe('early-stop consumption', () => {
 		expect(returned, 'the LIMIT still caps what the query returns').to.have.lengthOf(1);
 		expect(await rows('select count(*) as n from dst'), 'every row was still written')
 			.to.deep.equal([{ n: ROW_COUNT }]);
+	});
+
+	describe('a rejected LIMIT / OFFSET reads nothing (docs/sql-select.md §3.6)', () => {
+		/** Drain `sql` bound to `params`, expecting an error matching `pattern`. */
+		async function rejects(sql: string, params: SqlValue[], pattern: RegExp): Promise<void> {
+			mod.rowCounts.clear();
+			let error: unknown;
+			try {
+				for await (const _ of db.eval(sql, params)) { /* drain */ }
+			} catch (e) {
+				error = e;
+			}
+			expect(error, sql).to.be.instanceOf(Error);
+			expect((error as Error).message, sql).to.match(pattern);
+		}
+
+		it('a negative bound value raises before the first source row is pulled', async () => {
+			// Typed by its bound value, the parameter's sign is known only per execution, so
+			// this is the runtime check, and it must fire before the source is started.
+			await rejects('select k from counting limit ?', [-1], /LIMIT must not be negative/);
+			expect(mod.rowCounts.get('counting') ?? 0).to.equal(0);
+			await rejects('select k from counting limit 2 offset ?', [-1], /OFFSET must not be negative/);
+			expect(mod.rowCounts.get('counting') ?? 0).to.equal(0);
+		});
+
+		it('a NULL bound to the parameter is rejected when the statement is prepared', async () => {
+			await rejects('select k from counting limit ?', [null], /LIMIT expression may be NULL/);
+			expect(mod.rowCounts.get('counting') ?? 0).to.equal(0);
+		});
+
+		it('over a writing source, the write never starts', async () => {
+			// Statement rollback alone would also leave `dst` empty, so the pull count is
+			// what proves the insert never ran.
+			await db.exec('create table dst (k integer primary key)');
+			await rejects('select k from (insert into dst select k from counting returning k) limit ?', [-1], /LIMIT must not be negative/);
+			expect(mod.rowCounts.get('counting') ?? 0, 'no source row read').to.equal(0);
+			expect(await rows('select count(*) as n from dst'), 'nothing written').to.deep.equal([{ n: 0 }]);
+		});
 	});
 });

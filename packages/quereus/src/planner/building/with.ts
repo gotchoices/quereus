@@ -7,7 +7,7 @@ import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
-import { buildExpression } from './expression.js';
+import { buildRowCountExpression } from './row-count-expression.js';
 import { PlanNode, type Attribute, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -288,8 +288,8 @@ function buildRecursiveCTE(
 	// Pass existingCTEs so the base case can reference earlier CTEs
 	const baseCaseQuery = buildSelectStmt(ctx, baseCaseStmt, existingCTEs) as RelationalPlanNode;
 
-	const limitExpr: ScalarPlanNode | undefined = outerLimit ? buildExpression(ctx, outerLimit) : undefined;
-	const offsetExpr: ScalarPlanNode | undefined = outerOffset ? buildExpression(ctx, outerOffset) : undefined;
+	const limitExpr: ScalarPlanNode | undefined = outerLimit ? buildRowCountExpression(ctx, outerLimit, 'LIMIT') : undefined;
+	const offsetExpr: ScalarPlanNode | undefined = outerOffset ? buildRowCountExpression(ctx, outerOffset, 'OFFSET') : undefined;
 
 	// Validate declared column count matches the base case projection arity
 	if (cte.columns && cte.columns.length > 0) {

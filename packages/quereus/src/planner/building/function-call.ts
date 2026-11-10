@@ -152,7 +152,7 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 				);
 			}
 
-			inferredType = functionSchema.inferReturnType(argTypes);
+			inferredType = functionSchema.inferReturnType(argTypes, args.map(arg => arg.getType().nullable));
 		}
 
 		return new ScalarFunctionCallNode(ctx.scope, expr, functionSchema, args, inferredType);

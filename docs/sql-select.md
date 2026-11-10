@@ -56,7 +56,9 @@ whose source subtree carries a write — most visibly a DML FROM-subquery,
 the query RETURNS; it does not cap how many rows the statement WRITES. Once the
 limit is reached the emitter stops yielding but keeps consuming the source, so
 the DML runs to completion — including under `LIMIT 0`, which returns nothing
-and still performs every write. This matches what a data-modifying CTE already
+and still performs every write. A row count that is rejected (NULL, negative —
+[§3.6](#36-limit-and-offset-clauses)) is the opposite case: the error is raised
+before the source is first pulled, so the write never starts. This matches what a data-modifying CTE already
 does (`test/logic/13.6-cte-dml-runs-once.sqllogic`) and what PostgreSQL does for
 data-modifying CTEs. Pinned end-to-end in
 `test/logic/01.9.1-limit-over-dml-subquery.sqllogic`. The gate asks whether the
@@ -808,6 +810,12 @@ limit skip, count
 
 Both are full expressions, and both are evaluated **after** grouping. In an aggregate query they are therefore subject to the post-grouping restriction of [§3.3](#33-group-by-clause) — with or without a `group by` — and may name only grouping keys and aggregates: `select count(*) from t limit b` is rejected, `select count(*) from t limit (select count(*) from u)` is not. A correlated reference to an *enclosing* query is unaffected.
 
+**Valid row counts.** Each value must be a non-null, non-negative number; anything else is an error, never a silent "no rows" or "all rows". To ask for no limit, **omit the clause** — there is no other spelling. This differs from SQLite, where `limit -1` means no limit, and from PostgreSQL, where `limit null` (and `limit all`) does.
+
+- *Rejected when the statement is prepared:* an expression whose type may be NULL — `limit null`, `limit (select max(n) from cfg)`, and arithmetic that can yield NULL such as `limit 10 / 2` (division by zero is NULL) — and a negative constant such as `limit -1` or `offset -2`. Wrap a nullable source in `coalesce(…)` with a fallback: `limit coalesce((select max(n) from cfg), 10)`. A parameter whose type is known when the statement is planned (from a value bound before planning) is judged the same way, so `limit ?` planned with `null` bound is rejected, and rebinding a non-null-typed parameter to `null` already fails at bind time.
+- *Checked on each execution:* a parameter that is still untyped when the plan is built, and any non-constant expression's sign. The check runs when the value is first read, **before any source row is pulled**, so a writing source under a rejected `LIMIT` (`select … from (insert … returning …) limit ?` bound to `-1`) writes nothing. A value that does not convert to a finite number (`limit 'abc'`) is rejected here too.
+- *Fractional values truncate* toward zero: `limit 2.5` returns two rows.
+
 **Examples:**
 ```sql
 -- Simple LIMIT
@@ -1133,6 +1141,8 @@ with recursive counter(n) as (
 )
 select n from counter;  -- 1, 2, 3, 4, 5
 ```
+
+The values obey the same rules as any other `limit` / `offset` ([§3.6](#36-limit-and-offset-clauses)): NULL or negative is an error, checked before the base case runs.
 
 **Performance Characteristics:**
 - **Non-recursive CTEs**: Executed once, results may be cached

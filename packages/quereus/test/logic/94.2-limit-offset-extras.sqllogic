@@ -14,8 +14,9 @@ select * from le order by id limit 1 + 1;
 select * from le order by id limit 10 offset 4 - 2;
 → [{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]
 
--- LIMIT and OFFSET both expression-valued
-select * from le order by id limit 4 / 2 offset 1 + 1;
+-- LIMIT and OFFSET both expression-valued (SQLite's case uses `4 / 2`; division may
+-- yield NULL, so Quereus rejects that LIMIT at prepare — docs/sql-select.md §3.6)
+select * from le order by id limit 4 - 2 offset 1 + 1;
 → [{"id":3,"val":"c"},{"id":4,"val":"d"}]
 
 -- OFFSET without LIMIT — Quereus parser requires explicit LIMIT before OFFSET
