@@ -615,7 +615,9 @@ function fallbackIndexSupports(
 	// which SQL does not guarantee through a join — the LIMIT case that would make one
 	// meaningful is already refused by the peel gate in rules/join/index-nested-loop.ts.
 	// An aliased `join (select * from big b order by b.v) z` takes the absorb path instead,
-	// so it is marked and gets no seek; it got none while its Sort stayed either.
+	// so it is marked and gets no seek; it got none while its Sort stayed either. So does
+	// any Sort under a constant LIMIT (`tryLimitedSortAbsorb` runs first), which the peel
+	// gate refuses anyway.
 	// Revisit if a rewrite ever reorders a leaf whose ordering the query genuinely observes.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
@@ -984,6 +986,12 @@ export function trySortAbsorbViaIndexOrdering(
  * The LimitOffset is never swallowed: it stays above the rebuilt chain and executes
  * there. Only the Sort goes, exactly as on the Sort visit; the bound changes what the
  * module is asked, not what the plan does with the answer.
+ *
+ * NOTE: this asks `getBestAccessPlan` before the Sort visit could offer a Sort sitting
+ * directly on the Retrieve to `supports()`, so a module implementing both now gets the
+ * index-style absorb for `order by … limit n` where it used to be asked to take the Sort
+ * whole (the Project / Filter / Alias chain case already went this way). No in-tree module
+ * implements both; if one does, skip this attempt when the module has `supports()`.
  */
 function tryLimitedSortAbsorb(limitNode: LimitOffsetNode, context: OptContext): PlanNode | null {
 	const rowsWanted = constantRowsWanted(limitNode);

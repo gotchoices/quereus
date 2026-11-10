@@ -42,3 +42,5 @@ A query inside a transaction returns exactly the rows it would return after comm
 ## Wider reach coming (noted by the plan for GitHub #36)
 
 `sort-absorb-sees-constant-limit` and `sort-absorb-runtime-limit-choice` (implement/) send `request.limit` for a user-written `order by … limit n` / `limit ?` above an indexable Sort, not only for the synthesized `min`/`max` boundary read. Once they land, any such query inside a transaction reaches this path, so the likelihood of this bug rises for out-of-tree modules that stop at the limit.
+
+Update from the review of `sort-absorb-sees-constant-limit`: that route has landed. A constant `order by c limit n [offset m]` above an index-servable Sort now sends `limit: n, offset: m` to `getBestAccessPlan` whenever `truncationIsSafe` holds (e.g. `select * from t where b = 1 order by c limit 20` with an index on `(b, c)`), so inside a transaction it reaches the isolation forwarding described above. Not re-run under isolation with a truncating double; read from the code.
