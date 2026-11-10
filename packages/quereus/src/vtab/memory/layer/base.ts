@@ -1,6 +1,6 @@
 import { BTree } from 'inheritree';
 import type { TableSchema } from '../../../schema/table.js';
-import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
+import type { BTreeKeyForPrimary, IndexTreeKey, MemoryIndexEntry } from '../types.js';
 import type { Layer, PkExtractorsAndComparators } from './interface.js';
 import { MemoryIndex } from '../index.js';
 import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
@@ -32,8 +32,8 @@ export function* iteratePrimaryRows(tree: BTree<BTreeKeyForPrimary, Row>): Itera
  * comparator (its BTree keys by `compareKeys`), so a value set unique under BINARY but
  * colliding under e.g. NOCASE surfaces here — a raw value signature would miss it.
  * SQL UNIQUE allows multiple NULLs, so a key with any NULL value never counts as a
- * duplicate. `hasAnyPrimaryKey` is O(1) (Map size) so the build stays O(N) —
- * `getPrimaryKeys` would sort the bucket on every row.
+ * duplicate. `hasAnyPrimaryKey` stops at the first row filed under the key, so the build
+ * stays O(N log N) however many rows share a value.
  *
  * Parameterizing on a row iterable (rather than reading a fixed tree) is what lets
  * `MemoryTableManager` validate a not-yet-built index against the DDL-issuing
@@ -152,7 +152,6 @@ export class BaseLayer implements Layer {
 			this.tableSchema.columns,
 			this.collationResolver,
 			this.primaryKeyFunctions.compare,
-			this.primaryKeyFunctions.encode,
 			this.tableSchema.name,
 		);
 	}
@@ -341,7 +340,7 @@ export class BaseLayer implements Layer {
 	getModificationTree = (indexName: string | 'primary'): BTree<BTreeKeyForPrimary, Row> | null =>
 		indexName === 'primary' ? this.primaryTree : null;
 
-	getSecondaryIndexTree = (indexName: string): BTree<BTreeKeyForIndex, MemoryIndexEntry> | null =>
+	getSecondaryIndexTree = (indexName: string): BTree<IndexTreeKey, MemoryIndexEntry> | null =>
 		this.secondaryIndexes.get(indexName)?.data ?? null;
 
 	getSecondaryIndex = (indexName: string): MemoryIndex | undefined =>

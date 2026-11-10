@@ -397,37 +397,40 @@ describe('Performance sentinels', function () {
 		});
 	});
 
-	// ----------------------------- Secondary index per-entry PK container (O(1) owned add)
-	// Container-level descending-add: every PK lands in ONE low-cardinality bucket in
-	// reverse order. The old sorted-array container splices at the front each time
-	// (O(M²) to build, ~4.4 s at 250k); the Map's set is O(1) so the build is O(N).
-	describe('Secondary index per-entry PK container', function () {
+	// ----------------------------- Secondary index rows under one value
+	// Every PK lands under ONE low-cardinality value, in reverse order. A sorted-array
+	// container per value spliced at the front each time (O(M²) to build, ~4.4 s at 250k);
+	// one tree entry per row makes each add a B-tree insert.
+	describe('Secondary index rows under one value', function () {
 		this.timeout(120_000);
 
+		const columns = [
+			{ ...createDefaultColumnSchema('status'), logicalType: INTEGER_TYPE },
+			{ ...createDefaultColumnSchema('id'), logicalType: INTEGER_TYPE },
+		];
+		const schema: TableSchema = {
+			name: 'orders',
+			schemaName: 'main',
+			columns,
+			columnIndexMap: new Map(columns.map((c, i) => [c.name.toLowerCase(), i])),
+			primaryKeyDefinition: [{ index: 1 }],
+			checkConstraints: [],
+			vtabModuleName: 'memory',
+			isView: false,
+		};
+		const pk = createPrimaryKeyFunctions(schema, testBuiltinCollationResolver);
+		/** An index on `status`; with `base`, its tree inherits base's the way a TransactionLayer's does. */
+		const statusIndex = (base?: MemoryIndex): MemoryIndex => new MemoryIndex(
+			{ name: 'ix_status', columns: [{ index: 0 }] },
+			columns,
+			testBuiltinCollationResolver,
+			pk.compare,
+			schema.name,
+			base?.data,
+		);
+
 		it('builds a single-key bucket of 250k out-of-order PKs under 2 s', () => {
-			const columns = [
-				{ ...createDefaultColumnSchema('status'), logicalType: INTEGER_TYPE },
-				{ ...createDefaultColumnSchema('id'), logicalType: INTEGER_TYPE },
-			];
-			const schema: TableSchema = {
-				name: 'orders',
-				schemaName: 'main',
-				columns,
-				columnIndexMap: new Map(columns.map((c, i) => [c.name.toLowerCase(), i])),
-				primaryKeyDefinition: [{ index: 1 }],
-				checkConstraints: [],
-				vtabModuleName: 'memory',
-				isView: false,
-			};
-			const pk = createPrimaryKeyFunctions(schema, testBuiltinCollationResolver);
-			const index = new MemoryIndex(
-				{ name: 'ix_status', columns: [{ index: 0 }] },
-				columns,
-				testBuiltinCollationResolver,
-				pk.compare,
-				pk.encode,
-				schema.name,
-			);
+			const index = statusIndex();
 
 			const N = 250_000;
 			const start = performance.now();
@@ -436,6 +439,22 @@ describe('Performance sentinels', function () {
 
 			expect(index.getPrimaryKeys(0)).to.have.length(N);
 			expect(elapsed).to.be.below(2000, `250k out-of-order PK adds took ${elapsed.toFixed(1)} ms`);
+		});
+
+		// One layer per write statement inherits its parent's index tree. A layer adding one PK
+		// under a value its parent already holds must not copy that value's whole PK set
+		// (measured 7.3 s here when each entry held a Map of every PK under its value).
+		it('2,000 inheriting layers each adding one PK under a 50k-PK value take under 1 s', () => {
+			const base = statusIndex();
+			const basePks = 50_000;
+			for (let i = 1; i <= basePks; i++) base.addEntry(0, i);
+
+			const layers = 2_000;
+			const start = performance.now();
+			for (let i = 1; i <= layers; i++) statusIndex(base).addEntry(0, basePks + i);
+			const elapsed = performance.now() - start;
+
+			expect(elapsed).to.be.below(1000, `${layers} inheriting single-PK adds took ${elapsed.toFixed(1)} ms`);
 		});
 	});
 

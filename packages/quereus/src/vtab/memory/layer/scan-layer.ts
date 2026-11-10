@@ -1,6 +1,6 @@
 import type { ScanPlan, ScanPlanRangeBound } from './scan-plan.js';
 import type { Layer } from './interface.js';
-import { keyParts, leadingKeyPart, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type MemoryIndexEntry } from '../types.js';
+import { keyParts, leadingKeyPart, PK_HIGH, PK_LOW, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type IndexTreeKey, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
 import type { BTree } from 'inheritree';
@@ -75,8 +75,21 @@ function seekStartKey(
 }
 
 /**
- * The key a walk starts from: {@link seekStartKey}, except that a BACKWARDS walk seeking with a
- * tuple shorter than the tree's keys starts from the last key of the group sharing that tuple.
+ * How a walk moves between the scanned structure's keys (the primary key, or a secondary index's
+ * key columns) and the keys its tree is ordered by. The primary tree is keyed by the primary key
+ * itself; a secondary-index tree by (index key, primary key), so a seek tuple over the index
+ * columns becomes a tree key by adding a sentinel in the primary-key slot.
+ */
+interface WalkKeys<TKey, TEntry> {
+	/** The tree key that positions a walk at a seek tuple over the structure's key columns. */
+	readonly seekKey: (seek: BTreeKey) => TKey;
+	/** An entry's key over the structure's key columns: what plan bounds and seek groups test. */
+	readonly structureKey: (entry: TEntry) => BTreeKey;
+}
+
+/**
+ * The tree key a walk starts from: {@link seekStartKey}, except that a BACKWARDS walk seeking with
+ * a tuple shorter than the structure's keys starts from the last key of the group sharing that tuple.
  *
  * The short tuple sorts just before every key sharing it, so the seek lands at the START of that
  * group. A forward walk then enters the group; a backwards walk would move away from it and skip
@@ -84,19 +97,22 @@ function seekStartKey(
  * key needs no help (an exact hit, or the crack `moveNearest` steps off correctly), and neither
  * does an exclusive seek bound, which excludes the whole group anyway.
  */
-function walkStartKey<TEntry>(
-	tree: BTree<BTreeKey, TEntry>,
+function walkStartKey<TKey, TEntry>(
+	tree: BTree<TKey, TEntry>,
 	plan: ScanPlan,
 	seekBound: ScanPlanRangeBound | undefined,
 	keyArity: number,
-	keyFromEntry: (entry: TEntry) => BTreeKey,
+	keys: WalkKeys<TKey, TEntry>,
 	comparators: ResolvedScanComparators,
-): { value: BTreeKey } | undefined {
+): { value: TKey } | undefined {
 	const startKey = seekStartKey(plan, seekBound, keyArity > 1);
-	if (!startKey || !plan.descending) return startKey;
+	if (!startKey) return undefined;
 	const seekPartCount = (plan.equalityPrefix?.length ?? 0) + (seekBound ? 1 : 0);
-	if (seekPartCount >= keyArity || (seekBound && isExclusiveBound(seekBound))) return startKey;
-	return lastKeyOfSeekGroup(tree, startKey, plan, seekBound, keyFromEntry, comparators);
+	const entersShortGroupBackwards = plan.descending && seekPartCount < keyArity && !(seekBound && isExclusiveBound(seekBound));
+	const from = entersShortGroupBackwards
+		? lastKeyOfSeekGroup(tree, startKey.value, plan, seekBound, keys, comparators)
+		: startKey.value;
+	return { value: keys.seekKey(from) };
 }
 
 function isExclusiveBound(bound: ScanPlanRangeBound): boolean {
@@ -104,32 +120,44 @@ function isExclusiveBound(bound: ScanPlanRangeBound): boolean {
 }
 
 /**
- * The last key at or after `startKey` whose leading columns equal the seek tuple, or `startKey`
- * itself when no key does (the crack is then already the right start for a backwards walk).
- * Equality runs under the walk's own per-column comparators, which mirror the tree's, so the
- * group is contiguous and collation variants of one value count as one group.
+ * The last structure key at or after `startKey` whose leading columns equal the seek tuple, or
+ * `startKey` itself when no key does (the crack is then already the right start for a backwards
+ * walk). Equality runs under the walk's own per-column comparators, which mirror the tree's, so
+ * the group is contiguous and collation variants of one value count as one group.
  *
- * NOTE: costs one extra forward pass over the group's keys (for a secondary index, distinct index
- * keys, not rows). If a large duplicate group at a range boundary ever shows up in a profile, give
- * the key comparator a high sentinel and seek past the group directly.
+ * NOTE: costs one extra forward pass over the group's rows (a secondary index holds one entry per
+ * row). If a large group at a backwards walk's start ever shows up in a profile, give the key
+ * comparator a sentinel that sorts a short tuple after its group and seek past it directly.
  */
-function lastKeyOfSeekGroup<TEntry>(
-	tree: BTree<BTreeKey, TEntry>,
-	startKey: { value: BTreeKey },
+function lastKeyOfSeekGroup<TKey, TEntry>(
+	tree: BTree<TKey, TEntry>,
+	startKey: BTreeKey,
 	plan: ScanPlan,
 	seekBound: ScanPlanRangeBound | undefined,
-	keyFromEntry: (entry: TEntry) => BTreeKey,
+	keys: WalkKeys<TKey, TEntry>,
 	comparators: ResolvedScanComparators,
-): { value: BTreeKey } {
-	const path = tree.find(startKey.value);
+): BTreeKey {
+	const path = tree.find(keys.seekKey(startKey));
 	if (!path.on) tree.moveNext(path);
 	let last: BTreeKey | undefined;
 	for (; path.on; tree.moveNext(path)) {
-		const key = keyFromEntry(tree.at(path)!);
+		const key = keys.structureKey(tree.at(path)!);
 		if (!keyInSeekGroup(key, plan, seekBound, comparators)) break;
 		last = key;
 	}
-	return last === undefined ? startKey : { value: last };
+	return last === undefined ? startKey : last;
+}
+
+/**
+ * The primary-key sentinel a secondary-index seek carries. A seek tuple as long as the index key
+ * names one index value, and every row filed under it shares the tuple, so the sentinel decides
+ * whether the walk starts among those rows or past them: an inclusive seek bound (or a bare
+ * equality prefix) starts on the walk's near side of the group, an exclusive one on its far side.
+ * A shorter tuple sorts before the whole group whatever the sentinel.
+ */
+function seekSentinel(isAscending: boolean, seekBound: ScanPlanRangeBound | undefined): typeof PK_LOW | typeof PK_HIGH {
+	const skipsSeekValue = seekBound !== undefined && isExclusiveBound(seekBound);
+	return isAscending !== skipsSeekValue ? PK_LOW : PK_HIGH;
 }
 
 /** True when `key`'s leading columns equal the equality prefix and then the seek bound's value. */
@@ -323,7 +351,8 @@ function* scanLayerResolved(
 		// the tree end `safeIterate` picks for the direction, or to the prefix's group.
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-		const startKey = walkStartKey(tree, plan, seekBound, keyArity, primaryKeyExtractorFromRow, comparators);
+		const keys: WalkKeys<BTreeKeyForPrimary, Row> = { seekKey: seek => seek, structureKey: primaryKeyExtractorFromRow };
+		const startKey = walkStartKey(tree, plan, seekBound, keyArity, keys, comparators);
 
 		for (const value of safeIterate(tree, isAscending, startKey, primaryKeyExtractorFromRow)) {
 			const row = value as Row;
@@ -336,43 +365,25 @@ function* scanLayerResolved(
 		}
 	} else {
 		// Secondary Index Scan
-		const indexTree = layer.getSecondaryIndexTree(plan.indexName);
-		if (!indexTree) throw new QuereusError(`Secondary index '${plan.indexName}' not found.`, StatusCode.INTERNAL);
-
+		const secondaryIndex = layer.getSecondaryIndex(plan.indexName);
+		if (!secondaryIndex) throw new QuereusError(`Secondary index '${plan.indexName}' not found.`, StatusCode.INTERNAL);
+		const indexTree = secondaryIndex.data;
 		const primaryTree = layer.getModificationTree('primary');
+		if (!primaryTree) return;
 
 		// Emits rows in `(indexKey…, pk…)` order, and on a backwards walk the exact reverse of
 		// it, PK order inside one index value included. That is the composite sort key
 		// `quereus-isolation` sorts its overlay rows by (negated whole for `reverse: true`) and
 		// the order docs/design-isolation-layer.md documents for a secondary-index scan. The
-		// entry's `primaryKeys` Map is in insertion order, so the PK-comparator-sorted view
-		// comes from the MemoryIndex (memoized there); the inline sort is a defensive fallback
-		// for an index name the layer's schema does not know.
-		const secondaryIndex = layer.getSecondaryIndex(plan.indexName);
-		const primaryKeysInWalkOrder = function* (indexEntry: MemoryIndexEntry): Generator<BTreeKeyForPrimary> {
-			const sorted = secondaryIndex
-				? secondaryIndex.getSortedPrimaryKeys(indexEntry)
-				: [...indexEntry.primaryKeys.values()].sort(primaryKeyComparator);
-			// Index backwards rather than `.reverse()`: `getSortedPrimaryKeys` returns its memo,
-			// and reversing that in place would corrupt later forward reads of the entry.
-			if (plan.descending) {
-				for (let i = sorted.length - 1; i >= 0; i--) yield sorted[i];
-			} else {
-				yield* sorted;
-			}
-		};
-
+		// tree holds one entry per row in exactly that order, so the walk yields it directly.
 		if (plan.equalityKey !== undefined) {
 			// NULL equality is UNKNOWN ⇒ no rows (see the primary branch above). Only
 			// `undefined` falls through to the ordered walk.
 			if (seekKeyHasNull(plan.equalityKey, comparators.keyIsTuple)) return;
-			const indexEntry = indexTree.get(plan.equalityKey as BTreeKeyForIndex);
-			if (indexEntry && primaryTree) {
-				for (const pk of primaryKeysInWalkOrder(indexEntry)) {
-					const value = primaryTree.get(pk);
-					if (value) {
-						yield value as Row;
-					}
+			for (const pk of secondaryIndex.primaryKeysOf(plan.equalityKey as BTreeKeyForIndex, plan.descending === true)) {
+				const value = primaryTree.get(pk);
+				if (value) {
+					yield value as Row;
 				}
 			}
 			return;
@@ -388,19 +399,21 @@ function* scanLayerResolved(
 		const keyArity = indexDef?.columns.length ?? 1;
 		const seekFromUpper = isAscending === isDescBoundColumn;
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
-		const startKey = walkStartKey(indexTree, plan, seekBound, keyArity, entry => entry.indexKey, comparators);
+		const sentinel = seekSentinel(isAscending, seekBound);
+		const keys: WalkKeys<IndexTreeKey, MemoryIndexEntry> = {
+			seekKey: seek => ({ indexKey: seek, primaryKey: sentinel }),
+			structureKey: entry => entry.indexKey,
+		};
+		const startKey = walkStartKey(indexTree, plan, seekBound, keyArity, keys, comparators);
 
-		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
+		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
 				if (walkIsExhausted(indexEntry.indexKey, plan, seekFromUpper, comparators)) break;
 				continue;
 			}
-			if (!primaryTree) continue;
-			for (const pk of primaryKeysInWalkOrder(indexEntry)) {
-				const value = primaryTree.get(pk);
-				if (value) {
-					yield value as Row;
-				}
+			const value = primaryTree.get(indexEntry.primaryKey);
+			if (value) {
+				yield value as Row;
 			}
 		}
 	}

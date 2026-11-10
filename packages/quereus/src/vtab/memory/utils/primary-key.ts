@@ -16,9 +16,10 @@ export interface PrimaryKeyFunctions {
 	/**
 	 * Lossless, type-aware PK→string encoding (see {@link encodePrimaryKey}). Two
 	 * PKs the {@link compare} comparator treats as equal encode identically; distinct
-	 * ones encode differently. Used by {@link MemoryIndex} to key each entry's
-	 * `primaryKeys` Map for O(1) value-identity add/remove/dedup. Bound to this
-	 * schema's PK arity — the single piece of schema knowledge the encoder needs.
+	 * ones encode differently. Keys the value-identity sets and maps that need no
+	 * ordering (a multi-seek scan's yielded-row dedup, `TransactionLayer`'s re-key
+	 * bookkeeping). Bound to this schema's PK arity — the single piece of schema
+	 * knowledge the encoder needs.
 	 */
 	encode: (pk: BTreeKeyForPrimary) => string;
 }
@@ -54,7 +55,7 @@ export function createPrimaryKeyFunctions(schema: TableSchema, collationResolver
 
 	const arity = pkDefinition.length;
 	// Single source of truth for the PK arity: bind the lossless encoder here so
-	// MemoryIndex never has to infer it (it lacks the PK definition).
+	// callers never have to infer it.
 	const encode = (pk: BTreeKeyForPrimary): string => encodePrimaryKey(pk, arity);
 
 	let base: ExtractAndCompare;

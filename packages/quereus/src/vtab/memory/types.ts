@@ -41,28 +41,38 @@ export function leadingKeyPart(key: BTreeKey, keyIsTuple: boolean): SqlValue {
 	return keyIsTuple ? (key as SqlValue[])[0] : key as SqlValue;
 }
 
-/** Represents an entry in a MemoryIndex BTree, mapping an IndexKey to its PrimaryKeys.
+/**
+ * One indexed row in a {@link MemoryIndex} tree: the row's index key and its primary key.
  *
- * `primaryKeys` maps a **lossless, type-aware PK encoding** (see
- * `utils/primary-key-encode.ts`, bound to the table's PK arity and threaded into
- * {@link MemoryIndex} as `encode`) to the actual stored PK. The KEY gives O(1)
- * value-identity add/remove/dedup; the VALUE is the real {@link BTreeKeyForPrimary}
- * so scans yield real PKs and the PK comparator can sort them on read.
+ * The tree holds one entry per row, ordered by the index key and then by the table's
+ * primary-key comparator, so identity is that pair under those two comparators: PKs the
+ * PK comparator calls equal (`5n` / `5`, reordered JSON objects, NOCASE `'A'` / `'a'`)
+ * are one entry. Each entry keeps its own row's index-key bytes, so two collation-equal
+ * index values (NOCASE `'B'` / `'b'`) stay as they were written; nothing reads them back
+ * as data, since scans fetch rows from the primary tree.
  *
- * It is a `Map` — NOT a JS `Set`, and NOT a class instance or nested BTree — for two
- * reasons:
- *  - *Value identity.* A `Set` keys members by SameValueZero/reference identity,
- *    wrong here: composite PKs are freshly-allocated arrays (so `Set.delete` of an
- *    equal-by-value key never matches and `Set.add` stores equal-by-value dupes),
- *    and even scalar integer PKs differ by representation (`5n` vs `5`). The encoding
- *    normalizes these so equal-by-comparator PKs share one Map key.
- *  - *Structured-clone safety.* The entry is stored as a value inside the secondary
- *    index `inheritree` BTree, whose node copy-on-write deep-clones stored entries via
- *    `structuredClone(this.entries)`. A `Map` round-trips through `structuredClone` as
- *    a `Map` (pure data); a class instance or nested BTree would not survive intact. */
+ * Immutable once stored. A transaction layer's tree inherits its parent's nodes and
+ * clones only the path it writes; the entry objects in those nodes are shared with the
+ * parent, so changing one in place would change the parent's committed state too.
+ */
 export interface MemoryIndexEntry {
-	indexKey: BTreeKeyForIndex;
-	primaryKeys: Map<string, BTreeKeyForPrimary>;
+	readonly indexKey: BTreeKeyForIndex;
+	readonly primaryKey: BTreeKeyForPrimary;
+}
+
+/** Sorts before every primary key filed under an equal index key. Probe keys only; never stored. */
+export const PK_LOW: unique symbol = Symbol('PK_LOW');
+/** Sorts after every primary key filed under an equal index key. Probe keys only; never stored. */
+export const PK_HIGH: unique symbol = Symbol('PK_HIGH');
+
+/**
+ * A position in a {@link MemoryIndex} tree. A stored entry is one; a probe puts
+ * {@link PK_LOW} or {@link PK_HIGH} in the primary-key slot to land just before or just
+ * after every row filed under `indexKey`.
+ */
+export interface IndexTreeKey {
+	readonly indexKey: BTreeKeyForIndex;
+	readonly primaryKey: BTreeKeyForPrimary | typeof PK_LOW | typeof PK_HIGH;
 }
 
 /**

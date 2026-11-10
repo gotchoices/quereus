@@ -123,7 +123,7 @@ describe('coordinated-commit sibling layer (last-writer-wins loss)', () => {
 		const indexName = head.getSchema().indexes![0].name;
 		const idxTree = head.getSecondaryIndexTree!(indexName);
 		if (!idxTree) throw new Error('secondary index tree missing after rebase');
-		// One entry per distinct v: base, aaa (from P1) and bbb (replayed by rebase).
+		// One entry per indexed row: base, aaa (from P1) and bbb (replayed by rebase).
 		// A rebase that skipped index maintenance would be missing bbb.
 		expect([...idxTree.entries()].length).to.equal(3);
 

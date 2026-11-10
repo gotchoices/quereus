@@ -360,8 +360,8 @@ SELECT id FROM atom_dp ORDER BY id;
 -- Regression (memory module): secondary-index entries are shared across
 -- inherited layer trees, so a rolled-back transaction's index mutations must
 -- be copy-on-written into the transaction's own tree, never applied in place
--- to the shared committed entry (MemoryIndex.ownedEntries). A leaked delete
--- silently un-enforced UNIQUE; a leaked insert left a phantom candidate.
+-- to the shared committed entry. A leaked delete silently un-enforced UNIQUE;
+-- a leaked insert left a phantom candidate.
 
 CREATE TABLE rbk (id INTEGER PRIMARY KEY, v TEXT UNIQUE);
 INSERT INTO rbk VALUES (1, 'x');

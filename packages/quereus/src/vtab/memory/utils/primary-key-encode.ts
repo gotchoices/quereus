@@ -5,8 +5,7 @@ import { canonicalJsonString } from '../../../util/json-canonical.js';
 
 /**
  * Lossless, type-aware encoding of a primary key to a string suitable for keying
- * a `Map<string, BTreeKeyForPrimary>` (the per-entry PK container of a
- * {@link MemoryIndex}). It mirrors {@link compareSqlValuesFast}'s storage-class
+ * a value-identity `Set` or `Map` of primary keys. It mirrors {@link compareSqlValuesFast}'s storage-class
  * EQUALITY — NULL < NUMERIC < TEXT < BLOB < OBJECT(JSON), with booleans/bigints in
  * NUMERIC and JSON reduced to its canonical (recursive object-key-sorted) string via
  * {@link canonicalJsonString} — so two values the PK comparator treats as equal encode
@@ -18,10 +17,8 @@ import { canonicalJsonString } from '../../../util/json-canonical.js';
  * This is NOT a collation transform. Two collation-EQUAL-but-byte-distinct TEXT
  * values (NOCASE `'A'`/`'a'`; a custom collation's `'café'`/`'cafe'`) encode to
  * *different* keys. That is correct: the primary tree enforces PK uniqueness, so
- * such a pair can never both be live PKs in one index entry and therefore never
- * needs to dedup against each other. Removes always carry the actual stored row's
- * PK (exact bytes), so the encoding round-trips. Hence the encoder is
- * collation-INDEPENDENT and value-correct.
+ * such a pair can never both be live PKs and therefore never needs to dedup
+ * against each other. Hence the encoder is collation-INDEPENDENT and value-correct.
  *
  * The only schema knowledge required is the PK ARITY, used to disambiguate a
  * composite PK tuple `[1, 2]` (arity 2, encode element-wise) from a single-column

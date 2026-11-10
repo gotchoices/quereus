@@ -10,18 +10,14 @@ import type { ColumnSchema } from '../../src/schema/column.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../src/schema/table.js';
 
 /**
- * Regression tests for the value-identity (vs JS reference identity) of a
- * MemoryIndex entry's `primaryKeys`. Pre-fix these used a JS `Set`, keyed by
- * SameValueZero/reference identity, which silently broke:
+ * Regression tests for the value identity (vs JS reference identity) of the primary
+ * keys a MemoryIndex files under one index value. An earlier JS `Set` container, keyed
+ * by SameValueZero/reference identity, silently broke:
  *   - composite (array) PKs: a fresh equal-by-value array never matched on
  *     removeEntry and stored a duplicate on addEntry; and
  *   - scalar integer PKs across representations (`5n` vs `5`).
- * The container is now a `Map<string, BTreeKeyForPrimary>` keyed by a lossless,
- * type-aware PK encoding (see `utils/primary-key-encode.ts`): membership/dedup is
- * by *value* (O(1) Map set/delete/has) while PK-sorted scan output is reconstructed
- * by sort-on-read. The Map is pure structured-cloneable data, so the secondary-index
- * inheritree's node copy-on-write (which deep-clones stored entries via
- * `structuredClone`) is safe.
+ * The tree now holds one entry per (index key, primary key) pair, ordered by the
+ * table's PK comparator within an index value, so identity is the comparator's.
  */
 
 /** N INTEGER columns named c0..c(n-1). */
@@ -49,23 +45,21 @@ function makeSchema(columns: ColumnSchema[], primaryKeyDefinition: PrimaryKeyCol
 /** A single-column secondary index (on column 0) whose entries hold PKs compared/encoded for `pkDefinition`. */
 function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[]): MemoryIndex {
 	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, 'test');
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, 'test');
 }
 
 /**
  * A child index whose BTree inherits from `base`'s tree (the same wiring a
- * TransactionLayer uses: `new MemoryIndex(..., parentSecondaryTree)`). Entries
- * reachable only through `base.data` are INHERITED for the child — the child's
- * per-instance `ownedEntries` WeakSet does not contain them — so add/remove must
- * copy-on-write (clone the Map via `new Map(existing)`) rather than mutate the
- * shared entry in place.
+ * TransactionLayer uses: `new MemoryIndex(..., parentSecondaryTree)`). The child
+ * shares base's nodes and entry objects until it writes, so its writes must leave
+ * base's view untouched.
  */
 function makeChildIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[], base: MemoryIndex): MemoryIndex {
 	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, 'test', base.data);
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, 'test', base.data);
 }
 
-describe('MemoryIndex primaryKeys value-identity', () => {
+describe('MemoryIndex primary-key value identity', () => {
 	it('composite-PK removeEntry drops the member by value (count -> 0, entry deleted)', () => {
 		const columns = makeColumns(3);
 		// Composite PK over columns 1 and 2.
@@ -77,7 +71,6 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 		// Fresh array, equal by value to the stored PK — a Set would miss this.
 		index.removeEntry(1, [10, 20]);
 		expect(index.getPrimaryKeys(1)).to.have.length(0);
-		// Emptied entry is removed from the tree, keeping distinct-key stats accurate.
 		expect(index.size).to.equal(0);
 	});
 
@@ -130,9 +123,8 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 	});
 
 	// The copy-on-write discipline that keeps a layer's writes from corrupting the
-	// committed base it inherits from. The container is now a Map cloned via
-	// `new Map(existing)`, so these guard the Map clone path.
-	describe('inherited copy-on-write (Map container) isolates the base', () => {
+	// committed base it inherits from.
+	describe('inherited copy-on-write isolates the base', () => {
 		it('inherited addEntry of a distinct composite PK does not mutate the base entry', () => {
 			const columns = makeColumns(3);
 			const pk = [{ index: 1 }, { index: 2 }];
@@ -140,7 +132,6 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 			base.addEntry(1, [10, 20]);
 
 			const child = makeChildIndex(columns, pk, base);
-			// Inherited entry (owned by `base`, not `child`): must clone before insert.
 			child.addEntry(1, [10, 21]);
 
 			// Child sees both PKs; base is untouched (no write-through to committed state).
@@ -155,7 +146,7 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 			base.addEntry(1, [10, 20]);
 
 			const child = makeChildIndex(columns, pk, base);
-			// Fresh equal-by-value array removes by value through the inherited COW path.
+			// Fresh equal-by-value array removes by value through the inherited path.
 			child.removeEntry(1, [10, 20]);
 
 			// Masked in the child (a rolled-back delete must not strip the live base PK).
@@ -170,7 +161,7 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 			base.addEntry(1, [10, 20]);
 
 			const child = makeChildIndex(columns, pk, base);
-			child.addEntry(1, [10, 20]); // value-equal: COW no-op, still must not dup
+			child.addEntry(1, [10, 20]); // value-equal: replaces, must not dup
 
 			expect(child.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
 			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
@@ -178,11 +169,8 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 	});
 
 	// The corruption class the single-entry COW tests above cannot catch: when an
-	// inheritree LEAF holds ≥2 entries and one is copy-on-written, the node clone
-	// (structuredClone of the leaf's entries) must preserve the SIBLING entries
-	// intact and leave the base's view untouched. A class/BTree container would not
-	// survive structuredClone here — this is the regression guard against
-	// re-introducing one.
+	// inheritree LEAF holds ≥2 entries and the child writes into it, the leaf clone
+	// must preserve the SIBLING entries intact and leave the base's view untouched.
 	describe('multi-entry-leaf copy-on-write', () => {
 		it('a sibling entry is still served on the child AND base after COW of another entry', () => {
 			const columns = makeColumns(3);
@@ -193,7 +181,7 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 			base.addEntry(2, [30, 40]);
 
 			const child = makeChildIndex(columns, pk, base);
-			// COW the entry for index key 1 on the child (inherited → new Map + updateAt).
+			// Write into the shared leaf on the child.
 			child.addEntry(1, [11, 21]);
 
 			// The sibling entry (index key 2) is served correctly through the child...
@@ -207,10 +195,8 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 		});
 	});
 
-	// Numeric-storage-class normalization: the encoder collapses comparator-equal
-	// numerics (NUMERIC class) to one Map key, but only element-wise — a single
-	// JSON-array *value* is encoded whole, so structurally-distinct arrays stay
-	// distinct.
+	// Numeric-storage-class normalization: the PK comparator treats NUMERIC-class
+	// representation variants as one key, element-wise for a composite PK.
 	describe('numeric normalization & arity', () => {
 		it('single-column PK: true / 1 / 1n collapse to one bucket member', () => {
 			const columns = makeColumns(2);
@@ -233,8 +219,7 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 
 		it('single-column JSON PK: reorder-equal objects collapse to one bucket member and remove by value', () => {
 			// A JSON PK column: the PK comparator (JSON_TYPE.compare -> deepCompareJson)
-			// treats {a:1,b:2} and {b:2,a:1} as equal, so the encoder MUST too, or the
-			// primaryKeys Map would hold two members for one logical PK.
+			// treats {a:1,b:2} and {b:2,a:1} as equal, so they are one entry.
 			const columns = [
 				{ ...createDefaultColumnSchema('c0'), logicalType: INTEGER_TYPE },
 				{ ...createDefaultColumnSchema('c1'), logicalType: JSON_TYPE },
@@ -252,19 +237,17 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 		});
 	});
 
-	// An owned (in-place) mutation must invalidate the memoized sorted view so the
-	// next scan reflects the new PK in its sorted position rather than a stale array.
-	describe('sortedCache invalidation', () => {
-		it('an in-place add after a sorted read re-sorts on the next read', () => {
+	// Scans rely on PKs coming back in PK order within one index value, whatever
+	// order they were added in.
+	describe('primary-key order within an index value', () => {
+		it('an add after a read lands in PK order on the next read', () => {
 			const columns = makeColumns(2);
 			const index = makeIndex(columns, [{ index: 1 }]);
 
 			index.addEntry(1, 30);
 			index.addEntry(1, 10);
-			// Prime the cache with a sorted read.
 			expect(index.getPrimaryKeys(1)).to.deep.equal([10, 30]);
 
-			// In-place add of a PK that sorts between the two — must invalidate the cache.
 			index.addEntry(1, 20);
 			expect(index.getPrimaryKeys(1)).to.deep.equal([10, 20, 30]);
 		});

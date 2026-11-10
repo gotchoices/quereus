@@ -3519,7 +3519,6 @@ export class MemoryTableManager {
 			schema.columns,
 			this.collationResolver,
 			this.primaryKeyFunctions.compare,
-			this.primaryKeyFunctions.encode,
 			schema.name,
 		);
 		const rows = source();
@@ -3577,10 +3576,10 @@ export class MemoryTableManager {
 		mapRow?: RowMapper,
 	): Promise<void> {
 		// NOTE: the probe index carries the manager's PRE-change `primaryKeyFunctions` (the new
-		// ones cannot exist before the schema swaps). Only the probe's per-entry PK bookkeeping
-		// uses them, and every effective row already has a distinct PK under the old encoder, so
-		// duplicate detection — which fires on the index key, before any PK is stored — is
-		// unaffected. If a probe ever needs to compare PKs semantically, pass the new functions in.
+		// ones cannot exist before the schema swaps). Only the probe's PK ordering within one
+		// index value uses them, and every effective row already has a distinct PK under the old
+		// comparator, so duplicate detection — which fires on the index key, before any PK is
+		// stored — is unaffected. If a probe ever needs to compare PKs semantically, pass the new functions in.
 		for (const indexSchema of newSchema.indexes ?? []) {
 			if (!indexSchema.columns.some(c => c.index === alteredColumnIndex)) continue;
 			if (!indexEnforcesUnique(newSchema, indexSchema)) continue;

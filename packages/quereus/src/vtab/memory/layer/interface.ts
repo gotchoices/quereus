@@ -1,6 +1,6 @@
 import type { BTree } from 'inheritree';
 import type { TableSchema } from '../../../schema/table.js';
-import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
+import type { BTreeKeyForPrimary, IndexTreeKey, MemoryIndexEntry } from '../types.js';
 import type { Row } from '../../../common/types.js';
 import type { MemoryIndex } from '../index.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
@@ -64,7 +64,7 @@ export interface Layer {
 	isCommitted(): boolean;
 
 	/** Helper to get the specific BTree for a secondary index's underlying data */
-	getSecondaryIndexTree(indexName: string): BTree<BTreeKeyForIndex, MemoryIndexEntry> | null;
+	getSecondaryIndexTree(indexName: string): BTree<IndexTreeKey, MemoryIndexEntry> | null;
 
 	/** Returns the MemoryIndex object for a named secondary index, or undefined if none exists */
 	getSecondaryIndex(indexName: string): MemoryIndex | undefined;

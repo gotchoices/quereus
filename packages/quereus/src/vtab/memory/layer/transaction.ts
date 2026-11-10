@@ -2,7 +2,7 @@ import { BTree } from 'inheritree';
 import type { TableSchema } from '../../../schema/table.js';
 import { MemoryIndex } from '../index.js';
 import type { Row, SqlValue } from '../../../common/types.js';
-import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
+import type { BTreeKeyForPrimary, IndexTreeKey, MemoryIndexEntry } from '../types.js';
 import type { Layer, PkExtractorsAndComparators } from './interface.js';
 import { createLogger } from '../../../common/logger.js';
 import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/primary-key.js';
@@ -194,9 +194,8 @@ export class TransactionLayer implements Layer {
 		const schema = this.tableSchemaAtCreation;
 		if (!schema.indexes) return;
 
-		// All layers of a table derive the PK comparator and encoder from the same PK
-		// definition, so an inherited entry's `primaryKeys` Map keys stay valid for this
-		// layer's value add/remove on each MemoryIndex entry.
+		// Every layer of a table derives the PK comparator from the same PK definition, so the
+		// inherited tree's order is the one this layer's MemoryIndex compares with.
 		const pkFunctions = this.pkFunctions;
 
 		for (const indexSchema of schema.indexes) {
@@ -207,7 +206,6 @@ export class TransactionLayer implements Layer {
 				schema.columns,
 				this.collationResolver,
 				pkFunctions.compare,
-				pkFunctions.encode,
 				schema.name,
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
 			);
@@ -279,7 +277,6 @@ export class TransactionLayer implements Layer {
 				newSchema.columns,
 				this.collationResolver,
 				this.pkFunctions.compare,
-				this.pkFunctions.encode,
 				newSchema.name,
 				parentSecondaryTree || undefined,
 			);
@@ -303,7 +300,7 @@ export class TransactionLayer implements Layer {
 	 * Adopts a schema change that re-keys the PRIMARY KEY — `alter column … set collate` on a
 	 * PK column — applied while THIS layer's transaction is still open. Rebuilds
 	 * {@link pkFunctions}, the primary tree, and every secondary index (each of which derives
-	 * its `primaryKeyComparator` / `encode` from the PK definition), so nothing this layer owns
+	 * its `primaryKeyComparator` from the PK definition), so nothing this layer owns
 	 * survives the ALTER still keyed under the old collation.
 	 *
 	 * Like {@link adoptSchema}, the caller MUST apply this to a whole parent chain oldest-first
@@ -510,7 +507,7 @@ export class TransactionLayer implements Layer {
 	 * and rebuilds every secondary index.
 	 *
 	 * Every index is rebuilt unconditionally, not only those over an altered column: each inherits
-	 * the parent's freshly-rebuilt tree, and each index's key encoding and PK bookkeeping derive
+	 * the parent's freshly-rebuilt tree, and each index's PK order derives
 	 * from `pkFunctions`.
 	 *
 	 * A deletion an upsert has since re-occupied is dropped from the log — keeping it would make
@@ -942,7 +939,7 @@ export class TransactionLayer implements Layer {
 		return null; // Secondary indexes are accessed via getSecondaryIndexTree
 	}
 
-	getSecondaryIndexTree(indexName: string): BTree<BTreeKeyForIndex, MemoryIndexEntry> | null {
+	getSecondaryIndexTree(indexName: string): BTree<IndexTreeKey, MemoryIndexEntry> | null {
 		return this.secondaryIndexes.get(indexName)?.data ?? null;
 	}
 
