@@ -11,8 +11,8 @@ import { ANY_TYPE } from '../types/builtin-types.js';
  *
  * Type inference rules:
  * - null → ANY (nullable) — see {@link getParameterScalarType}
- * - number (integer) → INTEGER
- * - number (float) → REAL
+ * - number (safe integer) → INTEGER
+ * - number (fractional, or whole past 2^53−1) → REAL
  * - bigint → INTEGER
  * - boolean → BOOLEAN
  * - string → TEXT

@@ -31,10 +31,10 @@ export function buildRowCountExpression(
 }
 
 /**
- * A parameter typed ANY when the plan is built is either still unbound (no declared type,
- * no bind-time hint) or was first bound to NULL, which types it ANY rather than NULL (see
- * `getParameterScalarType` in core/param.ts). Either way it is nullable only because
- * nothing is known about its later values. Rejecting it would break `prepare('… limit ?')`
+ * A parameter typed ANY when the plan is built is still unbound (no declared type, no
+ * bind-time hint), was first bound to NULL, which types it ANY rather than NULL (see
+ * `getParameterScalarType` in core/param.ts), or was declared ANY by a hint map. In each
+ * case it is nullable only because nothing is known about its later values. Rejecting it would break `prepare('… limit ?')`
  * before any bind, and would pin a statement first run with NULL to failing forever, so
  * its value is left to the runtime check. A typed parameter carries its own nullability
  * and is judged like any other expression.
