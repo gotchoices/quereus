@@ -193,7 +193,11 @@ you.
 **`limit` is a licence, not a hint.** When it is present the engine has already proven
 that nothing between your scan and the `LIMIT` can discard a row, so you may both price
 against it and truncate to it. When it cannot prove that, the field is *absent* rather
-than advisory — there is no "limit you should ignore". Two rules follow:
+than advisory — there is no "limit you should ignore". It arrives with `requiredOrdering`
+for a LIMIT the user wrote above an `ORDER BY` when the LIMIT and OFFSET are both
+constants (`order by date limit 20 offset 40` sends `limit: 20, offset: 40`), and for
+the one-row boundary read the engine synthesizes for `min` / `max`. A placeholder LIMIT
+(`limit ?`) does not reach you yet. Two rules follow:
 
 - The bound is `limit + offset`, never `limit` alone. The engine's `LimitOffsetNode` still
   discards `offset` rows above whatever you emit, so stopping at `limit` underproduces.

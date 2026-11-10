@@ -122,11 +122,13 @@ table instance `key`?". Both callers that place work on an access path use it:
 looks past a single `Filter`'s own predicate, which is why a bug here needs an `ORDER BY` the
 table's own key walk satisfies.
 
-`trySortAbsorbViaIndexOrdering` is **exported** and has two callers. `ruleGrowRetrieve`
-itself calls it for a `Sort` the user wrote (or an earlier rule left). `rule-minmax-index-boundary`
-(Structural, Aggregate) calls it as a *probe*: it synthesizes a throwaway `SortNode` purely
-to ask whether the access path can serve that ordering, and commits nothing when the answer
-is null. That second caller is why the helper must stay side-effect-free — it probes
+`trySortAbsorbViaIndexOrdering` is **exported** and has three entry points:
+
+- `ruleGrowRetrieve`'s **Sort visit**, for a `Sort` the user wrote (or an earlier rule left). It asks with no row bound.
+- `ruleGrowRetrieve`'s **LimitOffset visit** (`tryLimitedSortAbsorb`), for a `Sort` under a LIMIT whose bound and OFFSET are both plan-time constants. It looks down from the `LimitOffset` through `Project` and `Alias` only (a `Filter` or `Distinct` there discards rows *after* the ordering, so the bound would be wrong to send) and passes `{ limit, offset }` as `rowsWanted`, which reaches the module as `BestAccessPlanRequest.limit` / `.offset` when `truncationIsSafe` holds. The pass is top-down, so this attempt comes before the Sort visit; when it declines, the Sort visit still makes its limit-free attempt. On success the `LimitOffset` is kept above the rebuilt chain and executes there — it is never swallowed. A placeholder LIMIT (`limit ?`) is not a plan-time constant and takes no part (`sort-absorb-runtime-limit-choice`).
+- `rule-minmax-index-boundary` (Structural, Aggregate) calls it as a *probe*: it synthesizes a throwaway `SortNode` purely to ask whether the access path can serve that ordering, passing the `LimitOffset(1)` it is about to wrap on as `rowsWanted`, and commits nothing when the answer is null.
+
+The last two discard a null answer, which is why the helper must stay side-effect-free — it probes
 `getBestAccessPlan` and either returns a new tree or null, never mutating its input and never
 recording anything on the `OptContext`. A caller that gets null must be able to discard its
 probe input and leave the plan byte-identical.

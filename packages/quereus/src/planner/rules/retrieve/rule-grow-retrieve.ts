@@ -34,7 +34,7 @@ import { SortNode } from '../../nodes/sort.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { AliasNode } from '../../nodes/alias-node.js';
 import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
-import { LimitOffsetNode } from '../../nodes/limit-offset.js';
+import { LimitOffsetNode, constantNumber } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
 import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
 import { LiteralNode } from '../../nodes/scalar.js';
@@ -42,6 +42,7 @@ import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineResidualExpressions, orderingClaimSurvivesCollation } from '../access/rule-select-access-path.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
+import { rebuildChain } from '../shared/access-leaf.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
 
@@ -73,6 +74,14 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	// Must be a relational node to be growable
 	if (!isRelationalNode(node)) {
 		return null;
+	}
+
+	// A LIMIT the user wrote sits above the Sort it bounds. Visiting it first (the pass is
+	// top-down) is the only point where both are in hand; a decline falls through and the
+	// Sort's own limit-free attempt below still runs when the pass reaches it.
+	if (node instanceof LimitOffsetNode) {
+		const absorbed = tryLimitedSortAbsorb(node, context);
+		if (absorbed) return absorbed;
 	}
 
 	// Find the RetrieveNode child (if any)
@@ -523,6 +532,13 @@ function fallbackIndexSupports(
 	// so it exercises trySortAbsorbViaIndexOrdering's satisfaction check but not
 	// this clobber. If you refactor this branch, run Lamina's suite too, or add a
 	// Quereus-native repro that re-grows over an already-reverse-equipped Retrieve.
+	// NOTE: a Retrieve equipped under a LIMIT (the min/max boundary read, or a user LIMIT
+	// above an absorbed Sort) re-grows its chain Filter WITHOUT that limit, so a backend
+	// with expensive row reads answers unordered and this declines — the Filter stays as
+	// a re-check of predicates the seek already claimed (`FILTER b = 1` over the `ix_bc`
+	// seek in quereus-store's plan-time-limit.spec.ts). Correct, and it runs only on the
+	// rows the LIMIT pulls; if that re-check ever shows up as cost, drop a chain Filter
+	// whose every constraint the committed plan already handles instead of re-probing.
 	if (equippedOrdering && !planDeliversOrdering(tableSchema, accessPlan, equippedOrdering, plannerConstraints)) {
 		log('Re-probe would clobber equipped ordering; declining grow to preserve absorbed plan');
 		return undefined;
@@ -816,21 +832,24 @@ function baselineScanCost(
  * preserve row order on the way back up. An Alias renames the relation but keeps
  * attribute ids, so sort keys above it still resolve to table columns.
  *
- * Two callers:
- *  - `ruleGrowRetrieve` itself, for a Sort the user wrote (or an earlier rule left);
+ * Three entry points:
+ *  - `ruleGrowRetrieve`'s Sort visit, for a Sort the user wrote (or an earlier rule left);
+ *  - `ruleGrowRetrieve`'s LimitOffset visit ({@link tryLimitedSortAbsorb}), for a Sort
+ *    under a constant LIMIT, asked with that bound before the Sort visit asks without it;
  *  - `rules/aggregate/rule-minmax-index-boundary.ts`, which synthesizes a throwaway
  *    Sort purely to ask this question and commits nothing when the answer is null.
  *
- * Because of that second caller this must stay side-effect-free: it probes
- * `getBestAccessPlan` and either returns a NEW tree or null, never mutating the
- * tree it was handed and never recording anything on `context`. A caller that
- * gets null must be able to discard its probe input and leave the plan untouched.
+ * Because the last two discard a null answer and carry on, this must stay
+ * side-effect-free: it probes `getBestAccessPlan` and either returns a NEW tree or
+ * null, never mutating the tree it was handed and never recording anything on
+ * `context`. A caller that gets null must be able to discard its probe input and
+ * leave the plan untouched.
  *
  * `rowsWanted` is how a caller that already knows the LIMIT tells the module about
- * it. Only `rule-minmax-index-boundary` can: it synthesizes its own
- * `LimitOffset(1)` right after this probe, so it knows the bound before it asks.
- * A LIMIT the user wrote sits ABOVE the Sort, and this rule walks only downward —
- * that case is backlog `feat-sort-absorb-blind-to-limit-general`.
+ * it: `rule-minmax-index-boundary` for the `LimitOffset(1)` it is about to wrap on,
+ * and the LimitOffset visit for a LIMIT and OFFSET the user wrote as plan-time
+ * constants. A placeholder LIMIT (`limit ?`) still reaches no module; that needs a
+ * run-time choice between plans — `sort-absorb-runtime-limit-choice`.
  */
 export function trySortAbsorbViaIndexOrdering(
 	sort: SortNode,
@@ -955,6 +974,58 @@ export function trySortAbsorbViaIndexOrdering(
 
 	log('Absorbed Sort into Retrieve via index ordering for %s', tableSchema.name);
 	return result;
+}
+
+/**
+ * Absorb the Sort under a user-written LIMIT, telling the module how many rows are
+ * wanted, so a backend with expensive row reads can price an ordered seek as the
+ * `limit + offset` rows it reads rather than as every row the predicate matches.
+ *
+ * The LimitOffset is never swallowed: it stays above the rebuilt chain and executes
+ * there. Only the Sort goes, exactly as on the Sort visit; the bound changes what the
+ * module is asked, not what the plan does with the answer.
+ */
+function tryLimitedSortAbsorb(limitNode: LimitOffsetNode, context: OptContext): PlanNode | null {
+	const rowsWanted = constantRowsWanted(limitNode);
+	if (!rowsWanted) return null;
+	const sort = sortUnderLimit(limitNode.source);
+	if (!sort) return null;
+
+	const absorbed = trySortAbsorbViaIndexOrdering(sort, context, rowsWanted);
+	if (!absorbed) return null;
+
+	log('Absorbed Sort under LIMIT %d OFFSET %d', rowsWanted.limit, rowsWanted.offset);
+	const newSource = rebuildChain(limitNode.source, sort, absorbed as RelationalPlanNode);
+	return limitNode.withChildren([newSource, ...limitNode.getChildren().slice(1)]);
+}
+
+/**
+ * The LIMIT and OFFSET as plan-time row counts, or `undefined` when either is not a
+ * constant. Truncated as the runtime's `toRowCount` does; a negative or NULL constant
+ * never gets this far, since `buildRowCountExpression` rejects it at prepare time.
+ */
+function constantRowsWanted(limitNode: LimitOffsetNode): RowsWanted | undefined {
+	if (!limitNode.limit) return undefined;
+	const limit = constantNumber(limitNode.limit);
+	const offset = limitNode.offset ? constantNumber(limitNode.offset) : 0;
+	// A placeholder bound needs a run-time choice between plans, not a plan-time one:
+	// `sort-absorb-runtime-limit-choice`.
+	if (limit === undefined || offset === undefined) return undefined;
+	return { limit: Math.trunc(limit), offset: Math.trunc(offset) };
+}
+
+/**
+ * The Sort a LIMIT bounds, reached only through nodes that pass every row on unchanged
+ * and in order (Project, Alias). A Filter or Distinct between them discards rows AFTER
+ * the ordering, so the ordered read would have to run past the limit to fill it; the
+ * bound would be wrong to send, and the walk stops there.
+ */
+function sortUnderLimit(source: RelationalPlanNode): SortNode | undefined {
+	let current: RelationalPlanNode = source;
+	while (current instanceof ProjectNode || current instanceof AliasNode) {
+		current = current.source;
+	}
+	return current instanceof SortNode ? current : undefined;
 }
 
 /**

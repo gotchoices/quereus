@@ -419,6 +419,33 @@ describe('plan-time LIMIT reaching the store module (feat-sort-absorb-blind-to-l
 				.to.not.match(/ix_bc/i);
 		});
 
+		/**
+		 * GitHub #36: "latest N for one owner" through an `(owner, date)` index, which is
+		 * `ix_bc` with `b` as the owner and `c` as the date. `b = 1` selects 100 of 200 rows,
+		 * so the ordered seek priced for every match (`0.3 + 100 × 3.3`) loses to the
+		 * 200-row scan, and priced for the 20 rows the LIMIT wants (`0.3 + 20 × 3.3`) wins.
+		 * The unlimited plan is asserted too, so a pricing change that let the seek win
+		 * anyway cannot pass this case without the limit doing anything.
+		 */
+		it('a constant LIMIT the user wrote above an order by reaches the module', async () => {
+			const f = await track({ costProfile: INDEXEDDB_PROFILE, rowCount: 200 });
+			const planOf = async (sql: string): Promise<string> =>
+				(await f.rows(`select op, detail from query_plan('${sql}')`)).map(r => JSON.stringify(r)).join('\n');
+
+			expect(await planOf('select * from t where b = 1 order by c'), 'without the limit the seek is vetoed')
+				.to.match(/"op":"SORT"/);
+
+			const query = 'select * from t where b = 1 order by c limit 20';
+			const limited = await planOf(query);
+			expect(limited, 'the limit should let the ordered ix_bc seek replace scan-then-sort').to.match(/ix_bc/i);
+			expect(limited).to.not.match(/"op":"SORT"/);
+
+			const expected = (await f.rows('select * from t where b = 1'))
+				.sort((x, y) => (x.c as number) - (y.c as number))
+				.slice(0, 20);
+			expect(await f.rows(query)).to.deep.equal(expected);
+		});
+
 		it('the ordinary aggregate answers agree with a hand-written order by', async () => {
 			const f = await track({ costProfile: INDEXEDDB_PROFILE });
 			const viaAggregate = await f.rows('select min(c) from t where b = 0');

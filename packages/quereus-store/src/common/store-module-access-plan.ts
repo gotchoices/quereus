@@ -1188,14 +1188,14 @@ function seekRankingCost(
  * {@link rowsToProduce}, which a walk always qualifies for on the ordering test and
  * qualifies for on the residual test only when there are no filters to leave behind.
  *
- * NOTE: only an engine-synthesized limit reaches here today. `ruleMinMaxIndexBoundary`
- * passes the `LimitOffset(1)` it is about to wrap on, so `min(c)` / `max(c)` are priced
- * as the one row they read. A limit the USER wrote still is not: it sits above the Sort,
- * and `trySortAbsorbViaIndexOrdering` walks only downward from the Sort, so it has
- * nothing to pass. `order by n limit 10` is therefore still priced exactly like
- * `order by n`, and a backend declaring an expensive `pointRead` still prefers
- * scan-then-sort under it. The remaining engine change is backlog
- * `feat-sort-absorb-blind-to-limit-general`.
+ * NOTE: a limit reaches here from two engine sites. `ruleMinMaxIndexBoundary` passes the
+ * `LimitOffset(1)` it is about to wrap on, so `min(c)` / `max(c)` are priced as the one
+ * row they read; `ruleGrowRetrieve`'s LimitOffset visit passes a LIMIT / OFFSET the user
+ * wrote as constants above the Sort, so `order by n limit 10` is priced as ten rows. A
+ * placeholder limit (`order by n limit ?`) still is not — the plan is built before the
+ * value is known — so it is priced exactly like `order by n`, and a backend declaring an
+ * expensive `pointRead` still prefers scan-then-sort under it. That engine change is
+ * `sort-absorb-runtime-limit-choice`.
  */
 function chooseOrderingPlan(
 	db: Database,
