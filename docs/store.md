@@ -436,6 +436,8 @@ The module implements `getBestAccessPlan()` to communicate capabilities:
 | Ordering-only index walk (`ORDER BY` matches an index; no filter pushed) | O(n) index entries + n row resolutions (`pointRead` each) | Yes (index order) |
 | Full scan | O(n) | Yes (PK order) |
 
+PK equality and the PK `IN` multi-seek are taken as soon as they apply. Every other pattern competes on its estimated cost: the secondary indexes against each other, the best of them against the full scan, and that winner against a PK range when the predicate also bounds the leading PK column. Between two seeks, one that does not provide a required `ORDER BY` is ranked with the cost of the sort it would force, so `where id > 0 and v = 7 order by id` keeps the PK range's ordering unless the `v` index saves more than the sort costs. Row estimates come from `ANALYZE` statistics where they cover the predicate's columns (the PK range reads the leading PK column's histogram, as a secondary index's range reads its own column's), and from fixed fractions of the table otherwise.
+
 The ordering-only walk is chosen only when it prices below the filter plan plus the external sort that plan would otherwise need (every pushed filter stays residual and is charged per row). The price assumes the **whole table** is wanted, because `LIMIT` is not visible to the module on this path — so a backend declaring an expensive `pointRead` (IndexedDB) prefers scan-then-sort even under `ORDER BY … LIMIT 1`.
 
 Collations and ordering: ordering is advertised under any collation whose registration asserts `orderPreserving` (the built-ins `BINARY`, `NOCASE`, and `RTRIM` do; a custom collation opts in via `db.registerCollation(name, cmp, { normalizer, orderPreserving: true })`). Two shapes never advertise:

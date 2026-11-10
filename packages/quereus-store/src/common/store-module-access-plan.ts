@@ -143,6 +143,10 @@ type IndexArm =
  *    measured prefix factors carry the estimate and only the bound's factor falls back
  *    to this constant.
  *
+ * The leading-primary-key range ({@link leadingPkRangePlan}) is priced through the same
+ * path, as a `range` arm on the leading PK column, so it falls back to the `range` entry
+ * under exactly the conditions a secondary index's leading-column range does.
+ *
  * `prefixRange` sits between the two other factors, as its window does: narrower than a
  * bare leading-column range (the prefix pins every column ahead of the bound) and wider
  * than the pure-equality estimate, which stands for a prefix pinning every column the
@@ -492,7 +496,7 @@ function resolvePrimaryKeyPins(
  * EMISSION ORDER — pushing no filters at all — prices below that plan plus the external
  * sort it would otherwise need. Wrapping the whole filter decision (rather than
  * threading the comparison through its several return points) is what lets the early
- * PK returns compete against an ordering walk too.
+ * PK point / multi-seek returns compete against an ordering walk too.
  *
  * `tableKeyCollation` is the table's resolved key collation K, passed in rather than
  * looked up: the caller (`StoreModule.getBestAccessPlan`) owns the module's table map.
@@ -523,6 +527,18 @@ export function computeBestAccessPlan(
  * advertisements, which is how a plan that already satisfies the required ordering skips
  * the walk comparison entirely); this function just never chooses an access path FOR
  * ordering's sake.
+ *
+ * The order of decisions:
+ *  - A full primary-key equality returns early as a point lookup (the cheapest plan by
+ *    construction), and a full primary-key IN as a `_primary_` multi-seek unless a gate
+ *    declines it. Neither competes with anything below.
+ *  - A bound on the leading PK column becomes a CANDIDATE ({@link leadingPkRangePlan}).
+ *  - The secondary indexes compete among themselves for the best seek, and that seek
+ *    faces the seek-versus-scan veto.
+ *  - With a PK range candidate, the surviving secondary seek displaces it only when it
+ *    RANKS strictly lower ({@link seekRankingCost}: declared cost, plus the sort a plan
+ *    would force when it misses a required ordering). A vetoed seek, or only a cost-only
+ *    advertisement, leaves the PK range. Without one, the veto's verdict stands.
  */
 function computeFilterAccessPlan(
 	db: Database,
@@ -560,11 +576,11 @@ function computeFilterAccessPlan(
 		tableKeyCollation,
 	);
 
-	// Primary-key equality arms. Both live INSIDE this branch — the multi-seek is tried
-	// BEFORE the leading-PK range arm below, which is what keeps a full-primary-key IN
-	// list from being shadowed by a range on the leading column (the general
-	// arm-competition problem is backlog `bug-store-pk-range-preempts-cheaper-index`; do
-	// not fix it here).
+	// Primary-key equality arms. Both return EARLY, before the leading-PK range candidate
+	// below is built: the point lookup because a single-row read is the cheapest plan by
+	// construction, and the multi-seek because returning first is what keeps a
+	// full-primary-key IN list from being shadowed by a range on the leading column. The
+	// leading-PK range, by contrast, is ranked against the secondary-index seeks.
 	//
 	// **No collation gate, and that is not an oversight.** The secondary-index arm gates
 	// its equality window on `indexPrefixSeekIsCollationExact`; the PK arms need no
@@ -621,35 +637,8 @@ function computeFilterAccessPlan(
 		if (plan) return plan;
 	}
 
-	// Check for range constraints on the leading PK column.
-	// The legacy access-path rule (rule-select-access-path.ts) only forwards
-	// range bounds for primaryKeyDefinition[0]; ranges on later PK columns
-	// are silently dropped if marked handled. So only claim handled=true
-	// when the range is on the first PK column.
-	const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
-	const hasLeadingPkRange = firstPkColumn !== undefined
-		&& pkOrderPreservingPrefix >= 1
-		&& request.filters.some(f => f.columnIndex === firstPkColumn && RANGE_OPS.includes(f.op));
-
-	if (hasLeadingPkRange) {
-		// Range scan on first PK column. Iteration is by PK key order (see
-		// StoreTable.scanPKRange), so we can advertise monotonic emission on
-		// the leading PK column. The scan seeks to the window start and
-		// early-terminates (StoreTable.buildPKRangeBounds derives the encoded
-		// bounds), and the leading-PK order guarantee holds throughout.
-		// `buildPKRangeBounds` addresses the window as a direction-agnostic `[gte, lt)` byte
-		// range, so a backwards walk of it (`order by id desc`) is the same window reversed.
-		const rangeRows = Math.max(1, Math.floor(estimatedRows * 0.3));
-		const ordering = buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix);
-		const plan = AccessPlanBuilder
-			.rangeScan(rangeRows, 0.2)
-			.setHandledFilters(claimFirstPerRole(request.filters, rangeRoles(firstPkColumn!)))
-			.setIndexName('_primary_')
-			.setSeekColumns([firstPkColumn!])
-			.setExplanation(`Store primary key range scan${walkExplanationSuffix(ordering.indexDescriptor?.reverse === true)}`)
-			.build();
-		return { ...plan, ...ordering };
-	}
+	// A candidate, not a return: it competes with the best secondary-index seek below.
+	const pkRangePlan = leadingPkRangePlan(tableInfo, request, estimatedRows, pkOrderPreservingPrefix);
 
 	// Check for secondary index usage. `StoreTable.query` now implements the
 	// secondary-index scan arm (leading-prefix EQ point / leading-column range /
@@ -684,6 +673,7 @@ function computeFilterAccessPlan(
 
 	const indexes = tableInfo.indexes || [];
 	let bestSeekPlan: IndexPlanCandidate | null = null;
+	let bestSeekRank = Infinity;
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
@@ -695,7 +685,11 @@ function computeFilterAccessPlan(
 		// indexes doesn't decide the plan. Strict '<' so ties keep the first candidate,
 		// matching MemoryTableModule.findBestAccessPlan's `indexPlan.cost < bestPlan.cost`.
 		if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) {
-			if (!bestSeekPlan || plan.cost < bestSeekPlan.plan.cost) bestSeekPlan = candidate;
+			const rank = seekRankingCost(request, plan, estimatedRows);
+			if (!bestSeekPlan || rank < bestSeekRank) {
+				bestSeekPlan = candidate;
+				bestSeekRank = rank;
+			}
 			continue;
 		}
 		// Otherwise remember the first cost-only advertisement as a fallback.
@@ -743,7 +737,20 @@ function computeFilterAccessPlan(
 		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
 		const exemptFromVeto = requestCarriesRuntimeSet
 			|| (bestSeekPlan.isMultiSeek && !bestSeekPlan.statsBacked);
-		if (exemptFromVeto || bestSeekPlan.vetoCost <= scanPlan.cost) return bestSeekPlan.plan;
+		const seekSurvivesVeto = exemptFromVeto || bestSeekPlan.vetoCost <= scanPlan.cost;
+		if (pkRangePlan) {
+			// The leading-PK range needs no veto of its own (it always prices below the
+			// scan — see {@link leadingPkRangePlan}), so a vetoed secondary seek hands the
+			// plan to it rather than to the scan. Otherwise the two are ranked on the same
+			// footing as the secondary seeks among themselves: declared `plan.cost`, not
+			// `vetoCost` (that parity repricing exists only for judging a shape constant
+			// against the scan), plus the sort each would force. Strict '<', so a tie keeps
+			// the PK range — the first candidate, as in the loop above.
+			const seekWins = seekSurvivesVeto
+				&& bestSeekRank < seekRankingCost(request, pkRangePlan, estimatedRows);
+			return seekWins ? bestSeekPlan.plan : pkRangePlan;
+		}
+		if (seekSurvivesVeto) return bestSeekPlan.plan;
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
@@ -751,6 +758,10 @@ function computeFilterAccessPlan(
 		// index arm's (cheaper) cost, so falling through would undo the comparison.
 		return { ...scanPlan, explains: `${scanPlan.explains} (cheaper than the best index seek)` };
 	}
+	// Ahead of `costOnlyFallback` for the same reason the vetoed seek above returns the
+	// scan rather than falling through: a cost-only plan is a full scan advertising an index
+	// arm's cheaper cost, and the PK range genuinely narrows.
+	if (pkRangePlan) return pkRangePlan;
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'
 	// order by <pk>` picks up a Sort it did not need. Still true, just rarer than it was: an
@@ -772,6 +783,54 @@ function computeFilterAccessPlan(
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
 	return scanPlan;
+}
+
+/**
+ * The `_primary_` range-scan candidate for a bound on the LEADING primary-key column, or
+ * null when the request has none or the leading member's key bytes do not order the way
+ * its comparator does (`orderPreservingPrefix === 0`, where `StoreTable.analyzePKAccess`
+ * declines the byte window, so a claim would drop the residual and return the whole table).
+ *
+ * Leading column only: `rule-select-access-path`'s legacy PK path forwards range bounds
+ * for `primaryKeyDefinition[0]` alone, so a claimed bound on a later member would be
+ * silently dropped.
+ *
+ * Iteration is by PK key order (`StoreTable.scanPKRange`): the scan seeks to the window
+ * start and stops at its end (`StoreTable.buildPKRangeBounds` derives the encoded bounds,
+ * as a direction-agnostic `[gte, lt)` byte range, so `order by id desc` walks the same
+ * window backwards), which is what the PK ordering advertisement rests on.
+ *
+ * Rows come from {@link resolveArmEstimate}'s `range` arm with the leading PK column as
+ * the bound column — the same estimate a secondary index's leading-column range gets, so
+ * the two compete on like numbers, and an un-analyzed table keeps the `range` shape
+ * constant. Cost has no `pointRead` term: the range reads rows straight out of the data
+ * store, with no index entry to resolve. It therefore never prices above the full scan
+ * (`0.2 + 0.5·r ≤ 0.2 + 0.5·N < N` for `N ≥ 1`, and a request with a PK bound always leaves
+ * the scan an unclaimed filter, so a LIMIT never shrinks the scan's `N`), which is why
+ * {@link computeFilterAccessPlan} subjects it to no seek-versus-scan veto.
+ */
+function leadingPkRangePlan(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	estimatedRows: number,
+	pkOrderPreservingPrefix: number,
+): BestAccessPlanResult | null {
+	const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
+	if (firstPkColumn === undefined || pkOrderPreservingPrefix < 1) return null;
+	if (!request.filters.some(f => f.columnIndex === firstPkColumn && RANGE_OPS.includes(f.op))) return null;
+
+	const { selectivity } = resolveArmEstimate(tableInfo, request.filters, 'range', [], firstPkColumn);
+	const rows = Math.max(1, Math.floor(estimatedRows * selectivity));
+	const ordering = buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix);
+	const handledFilters = claimFirstPerRole(request.filters, rangeRoles(firstPkColumn));
+	const plan = AccessPlanBuilder
+		.rangeScan(rowsToProduce(request, rows, ordering.providesOrdering, handledFilters), 0.2)
+		.setHandledFilters(handledFilters)
+		.setIndexName('_primary_')
+		.setSeekColumns([firstPkColumn])
+		.setExplanation(`Store primary key range scan${walkExplanationSuffix(ordering.indexDescriptor?.reverse === true)}`)
+		.build();
+	return { ...plan, ...ordering };
 }
 
 /**
@@ -848,6 +907,29 @@ function rowsToProduce(
 	if (required && required.length > 0 && !orderingAlreadySatisfied(providesOrdering, required)) return rows;
 	if (handledFilters.some(handled => !handled)) return rows;
 	return Math.max(1, Math.min(rows, limit + (request.offset ?? 0)));
+}
+
+/**
+ * The price one seek candidate is RANKED at against another: its advertised `cost`, plus
+ * the external sort it would force when the request requires an ordering the plan does
+ * not provide. Ranking only — the penalty is never added to the advertised cost, since the
+ * engine prices the Sort above the leaf itself.
+ *
+ * Without it, `... where id > 0 and v = 7 order by id` would trade the primary-key walk's
+ * free ordering for an index seek that saves less than the sort it adds. It is the same
+ * comparison {@link chooseOrderingPlan} makes between an ordering walk and the filter
+ * plan plus its sort, applied between seeks.
+ */
+function seekRankingCost(
+	request: BestAccessPlanRequest,
+	plan: BestAccessPlanResult,
+	estimatedRows: number,
+): number {
+	const required = request.requiredOrdering;
+	if (!required || required.length === 0 || orderingAlreadySatisfied(plan.providesOrdering, required)) {
+		return plan.cost;
+	}
+	return plan.cost + estimateSortCost(plan.rows ?? estimatedRows);
 }
 
 /**

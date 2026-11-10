@@ -1476,6 +1476,76 @@ describe('StoreModule predicate pushdown', () => {
 			});
 		});
 
+		// bug-store-pk-range-preempts-cheaper-index: a bound on the leading primary-key column
+		// used to return before any secondary index was considered, and was sized at a fixed
+		// 30% of the table whatever `ANALYZE` had collected. 1000 rows because the arms only
+		// separate at size: on a handful of rows both clamp to one row and the PK range wins on
+		// its smaller fixed cost.
+		describe('primary-key range against a secondary-index seek (cost decides)', () => {
+			/** `t.id` in emission order. */
+			const ids = async (q: string) =>
+				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+			/** The ids `id > 0 and v = 7` matches, ascending. */
+			const vSevenIds = Array.from({ length: 10 }, (_, i) => 7 + 100 * i);
+
+			/** The `est_cost` of the `_primary_` range leaf in the plan for `q`. */
+			async function pkRangeCost(q: string): Promise<number> {
+				const plan = await asyncIterableToArray(db.eval(`select detail, est_cost from query_plan(?)`, [q]));
+				const leaf = plan.find(r => /USING primary\b/.test(String(r.detail)));
+				expect(leaf, `a primary-key range leaf in the plan for ${q}`).to.not.be.undefined;
+				return Number(leaf!.est_cost);
+			}
+
+			beforeEach(async () => {
+				await db.exec(`create table t (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_v on t (v)`);
+				const vals = Array.from({ length: 1000 }, (_, i) => `(${i}, ${i % 100})`).join(', ');
+				await db.exec(`insert into t values ${vals}`);
+			});
+
+			it('un-analyzed: the cheaper index seek displaces the PK range', async () => {
+				// ix_v: 0.3 + 100 × (0.3 + 1.0) = 130.3, against the PK range's 0.2 + 300 × 0.5 = 150.2.
+				const q = `select id from t where id > 0 and v = 7`;
+				expect(await planDetails(q)).to.match(/USING ix_v\b/);
+				expect((await ids(q)).sort((a, b) => a - b)).to.deep.equal(vSevenIds);
+			});
+
+			it('un-analyzed, ordered by id: the PK range keeps its free ordering over a seek plus a sort', async () => {
+				// ix_v ranks 130.3 + sort(100 rows) ≈ 196.7, above the PK range's 150.2.
+				const q = `select id from t where id > 0 and v = 7 order by id`;
+				expect(await planDetails(q)).to.match(/USING primary\b/);
+				expect(await ids(q)).to.deep.equal(vSevenIds);
+			});
+
+			it('analyzed, ordered by id: a selective seek still wins after paying for the sort', async () => {
+				// ix_v ranks 13.3 + sort(10 rows) ≈ 16.6; the histogram sizes `id > 0` at ~999 rows.
+				await db.exec(`analyze t`);
+				const q = `select id from t where id > 0 and v = 7 order by id`;
+				expect(await planDetails(q)).to.match(/USING ix_v\b/);
+				expect(await ids(q)).to.deep.equal(vSevenIds);
+			});
+
+			it('analyzed: a narrow PK range beats the index seek', async () => {
+				// PK range ≈ 0.2 + 10 × 0.5 (ids 0–9), against ix_v's 13.3.
+				await db.exec(`analyze t`);
+				const q = `select id from t where id < 10 and v = 7`;
+				expect(await planDetails(q)).to.match(/USING primary\b/);
+				expect(await ids(q)).to.deep.equal([7]);
+			});
+
+			it('analyzed: the PK range is sized from the histogram, not a fixed fraction', async () => {
+				await db.exec(`analyze t`);
+				const narrow = await pkRangeCost(`select v from t where id < 10`);
+				const wide = await pkRangeCost(`select v from t where id < 900`);
+				// Within ten rows (±5 at 0.5 per row) of the true count: the histogram interpolates
+				// inside a bucket, so the estimate is near the count, not exact. The constant this
+				// replaces put both at 300 rows (150.2).
+				expect(narrow, 'about 10 rows').to.be.closeTo(0.2 + 0.5 * 10, 5);
+				expect(wide, 'about 900 rows').to.be.closeTo(0.2 + 0.5 * 900, 5);
+				expect(narrow).to.be.lessThan(wide);
+			});
+		});
+
 		// Narrowing proof: rows alone cannot distinguish a multi-seek from a full scan
 		// + residual, so count the DATA store's operations. Index entries live in the
 		// (plain) index store; the seek resolves each matched entry with one data-store
