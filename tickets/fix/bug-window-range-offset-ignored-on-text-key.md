@@ -76,3 +76,7 @@ walk, so the error surfaces on `prepare` rather than mid-iteration — but the
 runtime's `getFrameBounds` is where the type is currently observed, so confirm
 the ORDER BY key's logical type is reachable at build time before committing to
 that placement.
+
+## Decision (maintainer, 2026-11-10)
+
+Raise an error, at prepare time, as PostgreSQL and SQLite do. A `range` frame with a numeric `<n> preceding` / `<n> following` bound requires a numeric ORDER BY key; any other logical type (text, blob, boolean, temporal) is rejected when the plan is built. Temporal keys are rejected for now, and the error message says an interval offset is not supported yet. An ANY-typed key gets a runtime check when the frame is first computed. `range` frames bounded only by `unbounded` / `current row`, and all `rows` frames, are unchanged.

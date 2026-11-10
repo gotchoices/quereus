@@ -32,3 +32,7 @@ A self-qualified name in a CHECK reaches the row's column wherever it appears, u
 That reserved qualifier has landed as `OWN_ROW_QUALIFIER`. Its branch in `stripColumnQualifier` deliberately stops at CTE, derived-table and DML bodies (`hasBarrierFrame`), which a wider use has to keep: a materialized CTE holds one buffer per execution, so correlating into it would judge every row on the first row's value.
 
 Also measured here: `check (exists (select 1 from generate_series(1, f.b) g where g.value = 2))` fails every write with `f.b isn't a column`, and works when `b` shares its name with a context variable. The reserved qualifier would close this function-argument shape too.
+
+## Decision (maintainer, 2026-11-10)
+
+Fix it, not just document `new.b`. Use `OWN_ROW_QUALIFIER` for every self-qualified column name in a CHECK, keeping the `hasBarrierFrame` stop at CTE, derived-table and DML bodies. Cover the function-argument shape (`generate_series(1, t.b)`) and check generated columns, which share the strip.

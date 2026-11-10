@@ -105,3 +105,12 @@ it writes nothing. Decide it here rather than leaving it to fall out of the clam
 Also note the code moved: the `Infinity`-destroying guard quoted above now lives in a
 `resolveWindow` helper at the top of `runtime/emit/limit-offset.ts`, not inline in the
 generator. The bug is unchanged — only its address is.
+
+## Decision (maintainer, 2026-11-10)
+
+Raise an error. A null row count is an error, and so is a negative one (`limit -1` is no longer "no limit"); the same goes for `offset`.
+
+- Compile time: the LIMIT / OFFSET expression must have a non-nullable type. `limit null`, `limit (select max(n) from cfg)` and any other nullable expression are rejected when the statement is prepared; a nullable source needs `coalesce`. A negative literal is rejected at prepare time too.
+- A parameter whose type is known when the plan is built carries its nullability from that type, so it is covered at compile time (rebinding it to null already fails at bind time).
+- A parameter still unbound (ANY) when the plan is built gets a runtime check once per execution, when the limit value is read, before any source row is pulled. So under this decision the write-subquery case above (`select k from (insert … returning k) limit -1`) raises the error and writes nothing. Pin that with a test.
+- To ask for no limit, omit the clause. Document this in `docs/sql-select.md` (or wherever LIMIT is described), noting it differs from SQLite (`-1`) and PostgreSQL (`null`).

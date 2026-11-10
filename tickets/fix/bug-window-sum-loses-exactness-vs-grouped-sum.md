@@ -115,3 +115,7 @@ not merely over inputs small enough that the difference is invisible.
 ## Text operands (added from `bug-text-coercion-in-arithmetic-and-aggregates`)
 
 Text past the safe-integer threshold rounds here too, verified: over rows `'9007199254740993'` and `'1'`, `sum(v) over ()` returns 9007199254740992 while grouped `sum(v)` is being fixed to return 9007199254740994. When this ticket gives the window accumulator exact handling, convert text through `parseNumericText` (`util/coercion.ts`) rather than `Number()`, or the two spellings will still disagree on text columns.
+
+## Decision (maintainer, 2026-11-10)
+
+Fix it. The window `sum` (and the other arms here, `avg` included) should reuse the grouped accumulator's exact/approximate split (`addWithPromotion` / `negate` in `func/builtins/aggregate.ts`) instead of keeping its own float-only copy in `runtime/emit/window.ts`, so the two paths cannot drift again. Sliding-frame removal subtracts from the exact part exactly. Values stay plain numbers until a total passes 2^53, so ordinary data should cost about the same; confirm with a quick timing on a large sliding window. Convert text through `parseNumericText`, as noted above.
