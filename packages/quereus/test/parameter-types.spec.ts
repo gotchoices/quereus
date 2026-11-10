@@ -3,7 +3,7 @@ import { Database } from '../src/core/database.js';
 import { getParameterTypes, normalizeParamKey } from '../src/core/param.js';
 import type { ScalarType } from '../src/common/datatype.js';
 import type { SqlValue } from '../src/common/types.js';
-import { ANY_TYPE } from '../src/types/builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE } from '../src/types/builtin-types.js';
 
 type ResultRow = Record<string, SqlValue>;
 
@@ -564,8 +564,6 @@ describe('Parameter Type System', () => {
 		});
 
 		it('should work with explicit type hints', async () => {
-			const { INTEGER_TYPE } = await import('../src/types/builtin-types.js');
-
 			// Prepare with explicit types
 			const types = new Map([
 				[1, { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false } as ScalarType],
