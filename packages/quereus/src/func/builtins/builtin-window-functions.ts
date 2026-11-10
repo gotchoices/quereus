@@ -1,5 +1,7 @@
 import { registerWindowFunction, type WindowFunctionBinding } from '../../schema/window-function.js';
-import { AggValue } from '../registration.js';
+import type { AggregateFunctionSchema } from '../../schema/function.js';
+import { bindAggregateSchema, cloneInitialValue, type AggValue } from '../registration.js';
+import { avgFunc, countXFunc, sumFunc } from './aggregate.js';
 import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL } from './return-types.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { DeepReadonly, SqlValue } from '../../common/types.js';
@@ -52,7 +54,7 @@ const navigationArgType = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>): 
 function extremumWindowParts(
 	direction: 'min' | 'max',
 	compare: (a: SqlValue, b: SqlValue) => number,
-): Required<WindowFunctionBinding> {
+): Required<Pick<WindowFunctionBinding, 'step' | 'final'>> {
 	const wins = direction === 'min'
 		? (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) < 0
 		: (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) > 0;
@@ -89,6 +91,59 @@ function registerExtremumWindowFunction(direction: 'min' | 'max'): void {
 			direction,
 			createSemanticValueComparator(args[0]?.logicalType, args[0]?.collation),
 		),
+	});
+}
+
+/**
+ * The window step / final / inverse of a plain aggregate: its own step and finalize,
+ * so the window cannot sum, count, or coerce differently from the grouped aggregate.
+ * The inverse is the retraction the `AggregateAlgebra` contract defines,
+ * `merge(state, negate(step(identity, value)))`, present only when the algebra
+ * declares both `merge` and `negate`. For sum (and avg, which accumulates as sum)
+ * the exact-integer part retracts exactly.
+ *
+ * NOTE: the floating-point part of sum's accumulator retracts in float. A slid frame
+ * over REAL values can differ in the last digits from a fresh fold, and an inexact
+ * retraction (0.1 + 0.2 − 0.1 − 0.2 ≠ 0) leaves a residue for the rest of the
+ * partition, so a later frame holding only whole numbers past 2^53 finalizes as a
+ * float rather than the exact bigint a fresh fold gives. Closing that means sum's
+ * accumulator counting its approx contributions, so a fully retracted approx part
+ * resets to exactly 0.
+ */
+function aggregateWindowParts(aggSchema: AggregateFunctionSchema): WindowFunctionBinding {
+	const { stepFunction: step, finalizeFunction: finalize, algebra } = aggSchema;
+	const merge = algebra?.merge;
+	const negate = algebra?.negate;
+	return {
+		step,
+		final: (state: AggValue) => finalize(state),
+		inverse: merge && negate
+			? (state: AggValue, value: SqlValue) => merge(state, negate(step(cloneInitialValue(aggSchema.initialValue), value)))
+			: undefined,
+	};
+}
+
+/**
+ * Register a plain aggregate as a window function. Everything that decides a value —
+ * step, finalize, initial accumulator, return type, and any call-site `bindArgs`
+ * specialization — comes from the aggregate's schema, so no window shape (frame walk,
+ * running, sliding) keeps a copy of the aggregate's arithmetic.
+ */
+function registerAggregateAsWindowFunction(aggSchema: AggregateFunctionSchema): void {
+	const parts = aggregateWindowParts(aggSchema);
+	const aggBindArgs = aggSchema.bindArgs;
+	registerWindowFunction({
+		name: aggSchema.name.toUpperCase(),
+		argCount: aggSchema.numArgs < 0 ? 'variadic' : aggSchema.numArgs,
+		returnType: aggSchema.returnType,
+		inferReturnType: aggSchema.inferReturnType,
+		requiresOrderBy: false,
+		kind: 'aggregate',
+		initial: () => cloneInitialValue(aggSchema.initialValue),
+		step: parts.step,
+		final: parts.final,
+		inverse: parts.inverse,
+		bindArgs: aggBindArgs && ((args) => aggregateWindowParts(bindAggregateSchema(aggSchema, args))),
 	});
 }
 
@@ -190,62 +245,11 @@ export function registerBuiltinWindowFunctions(): void {
 		kind: 'ranking'
 	});
 
-	// Aggregate functions as window functions
-	registerWindowFunction({
-		name: 'COUNT',
-		argCount: 1,
-		returnType: INTEGER_RETURN_NOT_NULL,
-		requiresOrderBy: false,
-		kind: 'aggregate',
-		step: (state: AggValue, value: AggValue) => {
-			if (state === null || state === undefined) {
-				state = 0;
-			}
-			return value !== null ? state + 1 : state;
-		},
-		final: (state: AggValue) => state || 0
-	});
-
-	// NOTE: SUM/AVG coerce with `Number(value)` and take no type context — the same
-	// "no comparison/arithmetic context in the step" shape the MIN/MAX bindArgs hook
-	// below removes. Harmless today: over a logical type with no numeric meaning
-	// (TIMESPAN, JSON) both these and the plain aggregates yield NULL, so they agree.
-	// If a future logical type gains a meaningful `Number()` coercion, or the plain
-	// aggregates start summing one, give SUM/AVG a `bindArgs` too — and mirror it in
-	// `slidingStepNum`/`slidingScanSum` (runtime/emit/window.ts), which coerce again.
-	registerWindowFunction({
-		name: 'SUM',
-		argCount: 1,
-		returnType: REAL_RETURN,
-		requiresOrderBy: false,
-		kind: 'aggregate',
-		step: (state: AggValue, value: AggValue) => {
-			if (value === null) return state;
-			if (state === null || state === undefined) {
-				return Number(value);
-			}
-			return state + Number(value);
-		},
-		final: (state: AggValue) => state
-	});
-
-	registerWindowFunction({
-		name: 'AVG',
-		argCount: 1,
-		returnType: REAL_RETURN,
-		requiresOrderBy: false,
-		kind: 'aggregate',
-		step: (state: AggValue, value: AggValue) => {
-			if (value === null) return state;
-			if (!state) {
-				state = { sum: 0, count: 0 };
-			}
-			state.sum += Number(value);
-			state.count += 1;
-			return state;
-		},
-		final: (state: AggValue) => state ? state.sum / state.count : null
-	});
+	// Aggregate functions as window functions — derived from the grouped aggregates so
+	// `f(x) over (…)` and `f(x)` compute identically.
+	registerAggregateAsWindowFunction(countXFunc);
+	registerAggregateAsWindowFunction(sumFunc);
+	registerAggregateAsWindowFunction(avgFunc);
 
 	registerExtremumWindowFunction('min');
 	registerExtremumWindowFunction('max');

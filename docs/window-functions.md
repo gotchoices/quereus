@@ -415,17 +415,22 @@ recognized frame to a `(preceding, following)` offset pair before it gets here,
 so a one-sided frame is simply that pair with a zero on one side — the state
 machine below has no separate case for it.
 
-- **ROWS** — entries finalize when row `j + following` arrives. SUM/COUNT/AVG
-  maintain a `{ sum, count }` accumulator with step+unstep (skipping NULL
-  argVals); MIN/MAX/FIRST_VALUE/LAST_VALUE recompute from the live buffer
-  slice — MIN/MAX by folding the slice through the *bound* schema's own
-  `step`/`final`, so they cannot rank differently from the buffered emitter.
+- **ROWS** — entries finalize when row `j + following` arrives. An aggregate
+  whose schema declares an `inverse` (SUM/COUNT/AVG) keeps one accumulator —
+  the grouped aggregate's own (see *Aggregates as window functions* below) —
+  stepping each arriving row in and inverting each departing row out, so
+  SUM's exact-integer part slides without rounding. MIN/MAX (no inverse) and
+  FIRST_VALUE/LAST_VALUE recompute from the live buffer slice — MIN/MAX by
+  folding the slice through the *bound* schema's own `initial`/`step`/`final`,
+  so they cannot rank differently from the buffered emitter.
   Memory is `O(preceding + following + 1)` per function per partition.
 - **RANGE** — entries finalize when a later arrival's value strictly exceeds
   `v_j + following` (right edge has passed). Frame values are computed by
   scanning the buffer for rows with `v ∈ [v_j - preceding, v_j + following]`
   (finite `v_j`) or the contiguous non-finite peer span (NULL / non-numeric
-  `v_j`). Buffer is trimmed front-of-line as old rows fall out of every
+  `v_j`), and folding every aggregate over that slice through the schema's
+  `initial`/`step`/`final` — an empty slice finalizes the fresh accumulator
+  (`0` for COUNT, NULL otherwise). Buffer is trimmed front-of-line as old rows fall out of every
   remaining pending entry's frame.
 
 At partition close, all remaining pending entries are flushed with their
@@ -471,10 +476,28 @@ registerWindowFunction({
     returnType: { /* ScalarType */ },  // fallback type
     requiresOrderBy: false,
     kind: 'aggregate',       // 'ranking' | 'aggregate' | 'value' | 'navigation'
+    initial: () => null,     // fresh accumulator; absent ⇒ null
     step: (state, value) => { /* update state */ },
-    final: (state, rowCount) => { /* return result */ }
+    final: (state, rowCount) => { /* return result */ },
+    inverse: (state, value) => { /* remove one earlier step(…, value) */ }  // optional
 });
 ```
+
+**Aggregates as window functions.** `COUNT`, `SUM` and `AVG` are not written as
+window functions at all: `registerAggregateAsWindowFunction`
+(`func/builtins/builtin-window-functions.ts`) derives each from its grouped
+aggregate's schema — its `stepFunction`, `finalizeFunction`, `initialValue`,
+`returnType` and any `bindArgs`. So `sum(x) over (…)` returns NUMERIC exactly as
+grouped `sum(x)` does (a `bigint` past 2^53, not a rounded float), coerces text
+the same way, and avg divides the same exact total. The `inverse` is the
+retraction the aggregate algebra defines, `merge(state, negate(step(initial,
+value)))`, present when the aggregate declares both `merge` and `negate`; for
+SUM the exact-integer part retracts exactly and the floating-point part in
+float. `test/window-aggregate-equivalence.spec.ts` checks every such registry
+entry, on every execution shape, against the grouped aggregate over the same
+frame, storage class included. A new aggregate meant to work with `OVER`
+should be registered through the same adapter rather than given its own
+`step`/`final` copy.
 
 **Return-type inference.** Pass-through functions whose result is the argument
 value verbatim (`MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `LAG`, `LEAD`) supply
@@ -485,11 +508,13 @@ result. When no argument types are available the planner falls back to the
 declared `returnType`.
 
 **Comparison context.** A function whose result depends on how values *compare*
-(`MIN`, `MAX`) also supplies `bindArgs(args) => { step?, final? }`. The emitter
-calls it once per call site — never per row — with each argument's declared
-logical type and resolved collation, and runs the returned closures in place of
-the declared ones (`bindWindowSchema`, `schema/window-function.ts`); an omitted
-field keeps the declared default. Route the comparison through
+(`MIN`, `MAX`) also supplies `bindArgs(args) => { step?, final?, inverse? }`. The
+emitter calls it once per call site — never per row — with each argument's
+declared logical type and resolved collation, and runs the returned closures in
+place of the declared ones (`bindWindowSchema`, `schema/window-function.ts`); an
+omitted field keeps the declared default, except that a binding which replaces
+`step` without its own `inverse` drops the declared inverse (the sliding path
+then refolds, which is always correct). Route the comparison through
 `createSemanticValueComparator` (`util/comparison.ts`) so the window ranks
 exactly as the matching aggregate and `order by` do — see `docs/types.md`,
 "Semantic ordering". Resolving a type or a collation inside `step` instead is a

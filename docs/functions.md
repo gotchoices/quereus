@@ -205,13 +205,13 @@ select json_group_object(key, value) from config;
 -- {"theme":"dark","fontSize":12}  (native object)
 ```
 
-**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow. It accumulates exact integers and floating-point values in *separate* running totals and combines them only at the end, so the answer does not depend on the order rows were scanned. A fold that saw only `bigint`s and safe integers returns an exact integer; a fold that saw anything else — a fraction, a whole `number` past 9,007,199,254,740,991, or a non-finite — returns REAL. A REAL total that overflows returns `Infinity` (agreeing with `total()` and `avg()`), unlike binary `+`, which returns `NULL` on a non-finite result.
+**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow. It accumulates exact integers and floating-point values in *separate* running totals and combines them only at the end, so the answer does not depend on the order rows were scanned. A fold that saw only `bigint`s and safe integers returns an exact integer; a fold that saw anything else — a fraction, a whole `number` past 9,007,199,254,740,991, or a non-finite — returns REAL. A REAL total that overflows returns `Infinity` (agreeing with `total()` and `avg()`), unlike binary `+`, which returns `NULL` on a non-finite result. `avg()` accumulates the same way and divides that total only at the end, so the average of whole numbers past 2^53 is not thrown off by a rounded running sum.
 
 ---
 
 ## Window Functions
 
-All aggregate functions above can be used as window functions with an `OVER` clause. Quereus also provides dedicated ranking functions.
+`count`, `sum`, `avg`, `min` and `max` can be used as window functions with an `OVER` clause, and compute exactly what their grouped forms compute over the same rows — `sum(x) over (…)` returns an exact integer past 2^53 just as `sum(x)` does. Quereus also provides dedicated ranking functions.
 
 **Syntax:**
 ```sql

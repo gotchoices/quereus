@@ -12,8 +12,8 @@ import { bindAggregateSchema } from '../../src/func/registration.js';
 import { canonicalizeInteger } from '../../src/util/numeric-canonical.js';
 import { TIMESPAN_TYPE } from '../../src/types/index.js';
 
-/** Integers + NULL — the exact domain for count/avg (avg sums as floats, so
- *  small integers keep every intermediate sum exact). */
+/** Integers + NULL — count's domain (count never looks at the value, so its range is
+ *  immaterial). */
 const intOrNull: fc.Arbitrary<SqlValue> = fc.oneof(
 	fc.constant(null as SqlValue),
 	fc.integer({ min: -1_000, max: 1_000 }).map((v): SqlValue => v),
@@ -81,7 +81,9 @@ describe('Aggregate algebra declarations', () => {
 		});
 
 		it('avg(x) satisfies the algebra laws, including its sum/count decomposition', () => {
-			assertAggregateAlgebraLaws(avgFunc, intOrNull);
+			// sumDomain, not small integers: avg accumulates as sum does, so the
+			// decomposition law must hold over whole numbers past 2^53 too.
+			assertAggregateAlgebraLaws(avgFunc, sumDomain);
 		});
 
 		/* Bound min/max: the emit-time bindArgs specialization replaces step, merge,

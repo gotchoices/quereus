@@ -3,10 +3,13 @@ import type { DeepReadonly, SqlValue } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { AggregateArgBinding } from './function.js';
 
-/** The pieces a window bind may replace. Any field omitted keeps the declared default. */
+/** The pieces a window bind may replace. Any field omitted keeps the declared default,
+ *  except `inverse`: it undoes one `step`, so a binding that replaces `step` without
+ *  supplying an `inverse` drops the declared one (see {@link bindWindowSchema}). */
 export interface WindowFunctionBinding {
 	readonly step?: WindowFunctionSchema['step'];
 	readonly final?: WindowFunctionSchema['final'];
+	readonly inverse?: WindowFunctionSchema['inverse'];
 }
 
 export interface WindowFunctionSchema {
@@ -24,11 +27,26 @@ export interface WindowFunctionSchema {
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
 
+	/**
+	 * A fresh accumulator for an aggregate-style window. Every execution shape starts
+	 * each frame or partition from this; absent ⇒ `null`. `count(x)` is why it exists:
+	 * its accumulator starts at `0`, not `null`.
+	 */
+	initial?: () => unknown;
+
 	// Optional custom step/final hooks for aggregate-style windows
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	step?: (state: any, value: SqlValue) => any;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	final?: (state: any, rowCount: number) => SqlValue;
+
+	/**
+	 * Remove one earlier `step(…, value)` contribution from `state` (SQLite's
+	 * `xInverse`). Lets the streaming ROWS sliding frame drop the row leaving the frame
+	 * instead of refolding the whole frame. Absent ⇒ the sliding path refolds.
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	inverse?: (state: any, value: SqlValue) => any;
 
 	/**
 	 * Specialize step/final to this call site's argument comparison context —
@@ -86,5 +104,8 @@ export function bindWindowSchema(
 		...schema,
 		step: bound.step ?? schema.step,
 		final: bound.final ?? schema.final,
+		// The declared inverse undoes the declared step only; dropping it under a replaced
+		// step costs the sliding path a refold, never a wrong answer.
+		inverse: bound.step ? bound.inverse : (bound.inverse ?? schema.inverse),
 	};
 }

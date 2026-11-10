@@ -84,7 +84,8 @@ describe('Planner: window function types', () => {
 		const sql = 'select sum(id) over () as s, count(v) over () as c from t';
 		const types = getWindowFunctionTypesFromPlan(sql);
 
-		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'REAL')).to.equal(true);
+		// NUMERIC like grouped sum: past 2^53 the value is a bigint, not a REAL.
+		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'NUMERIC'), JSON.stringify(types)).to.equal(true);
 		expect(types.some(t => t.fn.toLowerCase() === 'count' && t.resultType === 'INTEGER')).to.equal(true);
 	});
 
@@ -141,12 +142,12 @@ describe('Planner: window function types', () => {
 	});
 
 	it('leaves non-polymorphic window functions at their declared returnType', async () => {
-		// Regression: only MIN/MAX gained inferReturnType; SUM stays REAL, COUNT
+		// Regression: only MIN/MAX gained inferReturnType; SUM stays NUMERIC, COUNT
 		// stays INTEGER, ROW_NUMBER stays INTEGER even though argTypes now flow in.
 		const sql = 'select sum(id) over () as s, count(id) over () as c, row_number() over (order by id) as rn from t';
 		const types = getWindowFunctionTypesFromPlan(sql);
 
-		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'REAL'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'NUMERIC'), JSON.stringify(types)).to.equal(true);
 		expect(types.some(t => t.fn.toLowerCase() === 'count' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
 		expect(types.some(t => t.fn.toLowerCase() === 'row_number' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
 	});

@@ -545,7 +545,7 @@ async function computeAggregateFunction(
 ): Promise<SqlValue> {
 	const frameBounds = getFrameBounds(frame, sortedRows.length, currentIndex, hasOrderBy, orderByValues, equalityComparators);
 
-	let accumulator: SqlValue = null;
+	let accumulator = initialAccumulator(schema);
 	let rowCount = 0;
 
 	// Process rows within the frame
@@ -567,8 +567,16 @@ async function computeAggregateFunction(
 		}
 	}
 
-	// Apply final function
-	return schema.final ? schema.final(accumulator, rowCount) : accumulator;
+	return finalizeAccumulator(schema, accumulator, rowCount);
+}
+
+/** A fresh accumulator for an aggregate-style window: the schema's `initial`, else NULL. */
+function initialAccumulator(schema: WindowFunctionSchema): unknown {
+	return schema.initial ? schema.initial() : null;
+}
+
+function finalizeAccumulator(schema: WindowFunctionSchema, accumulator: unknown, rowCount: number): SqlValue {
+	return schema.final ? schema.final(accumulator, rowCount) : accumulator as SqlValue;
 }
 
 function getFrameBounds(
@@ -883,8 +891,7 @@ interface StreamingFuncState {
 	/** FIRST_VALUE cache: first row's expr value for this partition. */
 	firstValueCached?: { value: SqlValue; cached: boolean };
 	/** Running-aggregate accumulator + row count. */
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	aggAccumulator?: any;
+	aggAccumulator?: unknown;
 	aggRowCount?: number;
 	/** RANGE mode running aggs: pending peer group entries waiting for fill. */
 	pendingPeerEntries?: StreamingRowEntry[];
@@ -892,8 +899,9 @@ interface StreamingFuncState {
 	slidingBuffer?: SlidingBufEntry[];
 	/** Partition row index of slidingBuffer[0] (ROWS sliding). */
 	slidingHead?: number;
-	/** Running { sum, count } accumulator for SUM/COUNT/AVG sliding (ROWS step+unstep). */
-	slidingAcc?: { sum: number; count: number };
+	/** ROWS sliding, for a schema with an `inverse`: the frame's accumulator, stepped as
+	 *  rows enter and inverted as they leave. */
+	slidingAcc?: unknown;
 	/** Partition row index of next ROWS-sliding entry to finalize. */
 	slidingNextFinalizeIdx?: number;
 	/** ROWS sliding: pending entries awaiting finalization (oldest first). */
@@ -922,6 +930,7 @@ interface SlidingRangePendingEntry {
 
 function makeFuncState(
 	mode: import('../../planner/nodes/window-node.js').StreamingWindowFunctionMode,
+	schema: WindowFunctionSchema,
 ): StreamingFuncState {
 	const s: StreamingFuncState = { mode };
 	switch (mode.kind) {
@@ -935,14 +944,14 @@ function makeFuncState(
 			s.firstValueCached = { value: null, cached: false };
 			break;
 		case 'runningAgg':
-			s.aggAccumulator = null;
+			s.aggAccumulator = initialAccumulator(schema);
 			s.aggRowCount = 0;
 			s.pendingPeerEntries = [];
 			break;
 		case 'slidingAgg':
 			s.slidingBuffer = [];
 			s.slidingHead = 0;
-			s.slidingAcc = { sum: 0, count: 0 };
+			s.slidingAcc = initialAccumulator(schema);
 			s.slidingNextFinalizeIdx = 0;
 			if (mode.frameMode === 'rows') {
 				s.slidingPending = [];
@@ -958,6 +967,7 @@ function makeFuncState(
 
 function freshPartitionState(
 	streamingModes: ReadonlyArray<import('../../planner/nodes/window-node.js').StreamingWindowFunctionMode>,
+	functionSchemas: ReadonlyArray<WindowFunctionSchema>,
 ): StreamingPartitionState {
 	return {
 		rowCount: 0,
@@ -965,7 +975,7 @@ function freshPartitionState(
 		currentRank: 0,
 		lastOrderByValues: null,
 		queue: [],
-		funcStates: streamingModes.map(makeFuncState),
+		funcStates: streamingModes.map((mode, fi) => makeFuncState(mode, functionSchemas[fi])),
 		pendingPeers: [],
 	};
 }
@@ -1101,7 +1111,7 @@ async function* runStreaming(
 		}
 
 		if (state === null) {
-			state = freshPartitionState(streaming.modes);
+			state = freshPartitionState(streaming.modes, functionSchemas);
 			curPartitionKey = partitionKey;
 		}
 
@@ -1308,10 +1318,7 @@ function stepRunningAgg(
 	if (!isRangeMode) {
 		// ROWS UNBOUNDED PRECEDING TO CURRENT ROW: each row gets its post-step
 		// final value immediately.
-		const finalValue = schema.final
-			? schema.final(fs.aggAccumulator, fs.aggRowCount ?? 0)
-			: (fs.aggAccumulator as SqlValue);
-		fillSlot(entry, fi, finalValue);
+		fillSlot(entry, fi, finalizeAccumulator(schema, fs.aggAccumulator, fs.aggRowCount ?? 0));
 		return;
 	}
 
@@ -1329,10 +1336,7 @@ function closePeerGroup(
 	for (let fi = 0; fi < funcContexts.length; fi++) {
 		const fs = state.funcStates[fi];
 		if (fs.mode.kind !== 'runningAgg') continue;
-		const schema = funcContexts[fi].schema;
-		const value = schema.final
-			? schema.final(fs.aggAccumulator, fs.aggRowCount ?? 0)
-			: (fs.aggAccumulator as SqlValue);
+		const value = finalizeAccumulator(funcContexts[fi].schema, fs.aggAccumulator, fs.aggRowCount ?? 0);
 		const pending = fs.pendingPeerEntries!;
 		for (const entry of pending) {
 			fillSlot(entry, fi, value);
@@ -1395,10 +1399,12 @@ async function* finalizePartition(
 //   - `slidingBuffer` holds {argVal, orderByVal0} for rows with index in
 //     [slidingHead, currentRow]; entries fall off the front as they age out
 //     of the leftmost-pending entry's frame.
-//   - SUM/COUNT/AVG: maintain a `{ sum, count }` accumulator with step+unstep;
-//     skip null argVals (matches the schema's null-skipping semantics).
-//   - MIN/MAX/FIRST_VALUE/LAST_VALUE: recompute from the buffer slice on each
-//     finalize (acceptable for v1 — windows are typically small).
+//   - An aggregate whose schema has an `inverse` (SUM/COUNT/AVG): keep the
+//     frame's accumulator in `slidingAcc` — `step` as a row enters, `inverse`
+//     as it leaves, `final` per finalized entry.
+//   - Any other aggregate (MIN/MAX) and FIRST_VALUE/LAST_VALUE: recompute from
+//     the buffer slice on each finalize (acceptable for v1 — windows are
+//     typically small).
 //   - Each pending entry is finalized when row `j + following` arrives
 //     (mid-partition) or at partition close (right edge clamps to last row).
 //
@@ -1408,76 +1414,62 @@ async function* finalizePartition(
 //     by a later arrival whose value strictly exceeds `v_j + following`.
 //   - On finalize: scan the buffer for rows in [v_j - preceding, v_j +
 //     following] (finite v_j) or for the contiguous non-finite peer span
-//     (non-finite v_j); compute the aggregate by direct scan in v1 (no
+//     (non-finite v_j); compute the value by direct scan in v1 (no
 //     incremental acc — keeps the code simple and handles non-finite v
 //     entries cleanly).
-
-function slidingStepNum(acc: { sum: number; count: number }, argVal: SqlValue): void {
-	if (argVal === null) return;
-	acc.sum += Number(argVal);
-	acc.count += 1;
-}
-
-function slidingUnstepNum(acc: { sum: number; count: number }, argVal: SqlValue): void {
-	if (argVal === null) return;
-	acc.sum -= Number(argVal);
-	acc.count -= 1;
-}
-
-function slidingFinalAcc(name: string, acc: { sum: number; count: number }): SqlValue {
-	switch (name) {
-		case 'sum': return acc.count === 0 ? null : acc.sum;
-		case 'count': return acc.count;
-		case 'avg': return acc.count === 0 ? null : acc.sum / acc.count;
-		default: return null;
-	}
-}
+//
+// Every aggregate value here comes from the BOUND schema's own initial/step/
+// inverse/final — the same hooks the buffered frame walk folds through — so the
+// sliding shapes cannot compute differently from it (no arithmetic or coercion of
+// argument values lives in this file).
 
 /**
- * MIN/MAX over a sliding-frame buffer slice, folded through the BOUND schema's own
- * step/final rather than a local `<`. Reusing the schema is what keeps the sliding
- * fast path ranking identically to the buffered frame walk — both consume the
- * comparator `bindWindowSchema` installed at emit (semantic ordering for
- * TIMESPAN/JSON arguments, the declared collation for text, storage-class order
- * otherwise). `lo > hi` (empty slice) folds to the empty accumulator ⇒ NULL.
+ * An aggregate over a sliding-frame buffer slice, folded through the bound schema.
+ * For MIN/MAX that means the comparator `bindWindowSchema` installed at emit
+ * (semantic ordering for TIMESPAN/JSON arguments, the declared collation for text,
+ * storage-class order otherwise). `lo > hi` (empty slice) finalizes the fresh
+ * accumulator: 0 for COUNT, NULL for the rest.
+ *
+ * NOTE: sum's step is immutable, so a RANGE frame refold allocates one accumulator
+ * per row in the frame — measured ~30% slower end to end than the float loop it
+ * replaced (`range between 100 preceding and current row`, 200k rows). If RANGE
+ * sliding shows up in profiles, slide it through `inverse` as ROWS does, or give sum
+ * a mutable fold inside aggregate.ts — not a numeric copy here.
  */
-function slidingScanExtremum(
+function slidingScanFold(
 	schema: WindowFunctionSchema,
 	buf: SlidingBufEntry[],
 	lo: number,
 	hi: number,
 ): SqlValue {
 	if (!schema.step) return null;
-	let acc: unknown = null;
-	let rowCount = 0;
+	let acc = initialAccumulator(schema);
 	for (let k = lo; k <= hi; k++) {
 		acc = schema.step(acc, buf[k].argVal);
-		rowCount++;
 	}
-	return schema.final ? schema.final(acc, rowCount) : acc as SqlValue;
+	return finalizeAccumulator(schema, acc, Math.max(0, hi - lo + 1));
 }
 
-function slidingScanCountNonNull(buf: SlidingBufEntry[], lo: number, hi: number): number {
-	let n = 0;
-	for (let k = lo; k <= hi; k++) {
-		if (buf[k].argVal !== null) n++;
+/** A sliding-frame function's value over buf[lo..hi] by direct scan; `lo > hi` is an empty frame. */
+function slidingScanValue(
+	fc: StreamingFunctionContext,
+	name: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>['name'],
+	buf: SlidingBufEntry[],
+	lo: number,
+	hi: number,
+): SqlValue {
+	switch (name) {
+		case 'first_value':
+			return lo > hi ? null : buf[lo].argVal;
+		case 'last_value':
+			return lo > hi ? null : buf[hi].argVal;
+		default:
+			return slidingScanFold(fc.schema, buf, lo, hi);
 	}
-	return n;
-}
-
-function slidingScanSum(buf: SlidingBufEntry[], lo: number, hi: number): { sum: number; count: number } {
-	let sum = 0, count = 0;
-	for (let k = lo; k <= hi; k++) {
-		const v = buf[k].argVal;
-		if (v === null) continue;
-		sum += Number(v);
-		count += 1;
-	}
-	return { sum, count };
 }
 
 /** Per-row dispatch for slidingAgg functions. `fc` carries the emit-time-bound
- *  registry schema, consulted by the MIN/MAX scans. */
+ *  registry schema every aggregate value is computed through. */
 function handleSlidingArrival(
 	entry: StreamingRowEntry,
 	fc: StreamingFunctionContext,
@@ -1503,8 +1495,9 @@ function handleSlidingRowsArrival(
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	argVal: SqlValue,
 ): void {
-	if (m.name === 'sum' || m.name === 'count' || m.name === 'avg') {
-		slidingStepNum(fs.slidingAcc!, argVal);
+	const schema = fc.schema;
+	if (schema.inverse && schema.step) {
+		fs.slidingAcc = schema.step(fs.slidingAcc, argVal);
 	}
 	fs.slidingPending!.push(entry);
 	while (fs.slidingPending!.length > m.following) {
@@ -1519,37 +1512,19 @@ function finalizeSlidingRowsEntry(
 ): void {
 	const j = fs.slidingNextFinalizeIdx!;
 	const targetLeft = Math.max(0, j - m.preceding);
+	const schema = fc.schema;
 	// Trim left: rows that have aged out of the next-pending entry's frame.
 	while (fs.slidingHead! < targetLeft) {
-		if (m.name === 'sum' || m.name === 'count' || m.name === 'avg') {
-			slidingUnstepNum(fs.slidingAcc!, fs.slidingBuffer![0].argVal);
+		if (schema.inverse) {
+			fs.slidingAcc = schema.inverse(fs.slidingAcc, fs.slidingBuffer![0].argVal);
 		}
 		fs.slidingBuffer!.shift();
 		fs.slidingHead!++;
 	}
 	const buf = fs.slidingBuffer!;
-	const lo = 0;
-	const hi = buf.length - 1;
-	let value: SqlValue;
-	switch (m.name) {
-		case 'sum':
-		case 'count':
-		case 'avg':
-			value = slidingFinalAcc(m.name, fs.slidingAcc!);
-			break;
-		case 'min':
-		case 'max':
-			value = slidingScanExtremum(fc.schema, buf, lo, hi);
-			break;
-		case 'first_value':
-			value = lo > hi ? null : buf[lo].argVal;
-			break;
-		case 'last_value':
-			value = lo > hi ? null : buf[hi].argVal;
-			break;
-		default:
-			value = null;
-	}
+	const value = schema.inverse
+		? finalizeAccumulator(schema, fs.slidingAcc, buf.length)
+		: slidingScanValue(fc, m.name, buf, 0, buf.length - 1);
 	const targetEntry = fs.slidingPending!.shift()!;
 	fillSlot(targetEntry, fc.fi, value);
 	fs.slidingNextFinalizeIdx!++;
@@ -1592,6 +1567,9 @@ function handleSlidingRangeArrival(
 	}
 }
 
+/** The empty buffer slice, in the `lo > hi` form the slice scans expect. */
+const EMPTY_SLICE = { lo: 0, hi: -1 } as const;
+
 /**
  * Find the buffer index range that constitutes the finite-v window
  * [v_j - preceding, v_j + following]. Returns lo > hi for an empty range
@@ -1614,7 +1592,7 @@ function findRangeWindow(
 		if (lo < 0) lo = k;
 		hi = k;
 	}
-	return { lo, hi };
+	return lo < 0 ? EMPTY_SLICE : { lo, hi };
 }
 
 /**
@@ -1633,7 +1611,7 @@ function findNonFinitePeerSpan(buf: SlidingBufEntry[]): { lo: number; hi: number
 			hi = k;
 		}
 	}
-	return { lo, hi };
+	return lo < 0 ? EMPTY_SLICE : { lo, hi };
 }
 
 function finalizeSlidingRangeEntry(
@@ -1644,47 +1622,10 @@ function finalizeSlidingRangeEntry(
 	const pending = fs.slidingRangePending!;
 	const head = pending[0];
 	const buf = fs.slidingBuffer!;
-	let lo: number, hi: number;
-	if (head.isFinite) {
-		({ lo, hi } = findRangeWindow(buf, head.v_j, m.preceding, m.following));
-	} else {
-		({ lo, hi } = findNonFinitePeerSpan(buf));
-	}
-
-	let value: SqlValue;
-	if (lo < 0 || hi < 0 || lo > hi) {
-		// Empty frame: SUM/MIN/MAX/FIRST/LAST return NULL, COUNT returns 0.
-		value = m.name === 'count' ? 0 : null;
-	} else {
-		switch (m.name) {
-			case 'sum': {
-				const r = slidingScanSum(buf, lo, hi);
-				value = r.count === 0 ? null : r.sum;
-				break;
-			}
-			case 'count':
-				value = slidingScanCountNonNull(buf, lo, hi);
-				break;
-			case 'avg': {
-				const r = slidingScanSum(buf, lo, hi);
-				value = r.count === 0 ? null : r.sum / r.count;
-				break;
-			}
-			case 'min':
-			case 'max':
-				value = slidingScanExtremum(fc.schema, buf, lo, hi);
-				break;
-			case 'first_value':
-				value = buf[lo].argVal;
-				break;
-			case 'last_value':
-				value = buf[hi].argVal;
-				break;
-			default:
-				value = null;
-		}
-	}
-	fillSlot(head.entry, fc.fi, value);
+	const { lo, hi } = head.isFinite
+		? findRangeWindow(buf, head.v_j, m.preceding, m.following)
+		: findNonFinitePeerSpan(buf);
+	fillSlot(head.entry, fc.fi, slidingScanValue(fc, m.name, buf, lo, hi));
 	pending.shift();
 
 	// Trim buffer rows that no remaining pending entry needs.

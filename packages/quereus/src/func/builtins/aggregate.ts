@@ -101,6 +101,60 @@ function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAcc
 		: { exact: base.exact, approx: base.approx + (value as number), count: base.count + 1 };
 }
 
+/** SUM's step. Also AVG's: avg accumulates exactly as sum does (see avgFunc). */
+function stepSum(acc: SumAccumulator, value: SqlValue): SumAccumulator {
+	if (value === null) return acc; // Ignore NULLs
+
+	if (typeof value === 'bigint' || typeof value === 'number') {
+		return addSumContribution(acc, value);
+	}
+	if (typeof value === 'boolean') {
+		return addSumContribution(acc, value ? 1 : 0);
+	}
+	if (typeof value === 'string') {
+		const parsed = parseNumericText(value);
+		// Documented skip, not a failure: text that names no number contributes nothing.
+		// (How text becomes a number at all is the coercion layer's rule, not sum's.)
+		if (typeof parsed === 'number' && isNaN(parsed)) return acc;
+		return addSumContribution(acc, parsed);
+	}
+	// Documented skip, not a failure: a non-numeric storage class (Uint8Array, JSON
+	// object) contributes nothing. Every remaining branch routes into the split
+	// accumulator, whose adder cannot throw, so there is nothing left to catch.
+	return acc;
+}
+
+function mergeSum(a: SumAccumulator, b: SumAccumulator): SumAccumulator {
+	if (a === null) return b;
+	if (b === null) return a;
+	// Each part combines within its own domain — the exact parts exactly, the
+	// approx parts in float. Mixing them here is what made the fold order-dependent.
+	return {
+		exact: addWithPromotion(a.exact, b.exact),
+		approx: a.approx + b.approx,
+		count: a.count + b.count,
+	};
+}
+
+function negateSum(a: SumAccumulator): SumAccumulator {
+	return a === null ? null : { exact: -a.exact, approx: -a.approx, count: -a.count };
+}
+
+function finalizeSum(acc: SumAccumulator): number | bigint | null {
+	// SQLite returns NULL for SUM of empty set, INTEGER or REAL result.
+	// count === 0 (all contributions retracted) is observationally the empty group.
+	if (acc === null || acc.count === 0) return null;
+	// An all-integer fold finalizes to its exact part untouched (still R1-canonical);
+	// only a fold that saw a non-exact contribution combines, and it lands in float.
+	// NOTE: a non-finite total propagates (±Infinity, and NaN for Infinity + -Infinity)
+	// rather than becoming NULL. Deliberate: sum matches the other float-summing
+	// aggregates, `total()` and `avg()`, over identical rows. Binary `+` is the
+	// outlier — `runtime/emit/binary.ts` nulls a non-finite result — so a caller
+	// comparing `sum(v)` against a hand-written `a + b` sees them diverge at overflow.
+	if (acc.approx === 0) return acc.exact;
+	return Number(acc.exact) + acc.approx;
+}
+
 export const sumFunc = createAggregateFunction(
 	{
 		name: 'sum', numArgs: 1, initialValue: null,
@@ -114,19 +168,8 @@ export const sumFunc = createAggregateFunction(
 		// property (floats drift) the function cannot see, so the write-side delta arm
 		// gates on the argument's static type before exploiting negate.
 		algebra: {
-			merge: (a: SumAccumulator, b: SumAccumulator): SumAccumulator => {
-				if (a === null) return b;
-				if (b === null) return a;
-				// Each part combines within its own domain — the exact parts exactly, the
-				// approx parts in float. Mixing them here is what made the fold order-dependent.
-				return {
-					exact: addWithPromotion(a.exact, b.exact),
-					approx: a.approx + b.approx,
-					count: a.count + b.count,
-				};
-			},
-			negate: (a: SumAccumulator): SumAccumulator =>
-				a === null ? null : { exact: -a.exact, approx: -a.approx, count: -a.count },
+			merge: mergeSum,
+			negate: negateSum,
 			// Stored NULL (empty group) decodes to the empty accumulator, never a
 			// wrapped NULL. A stored value decodes with an ABSORBING count witness
 			// (Infinity): the stored sum cannot recover the true non-NULL contribution
@@ -158,89 +201,49 @@ export const sumFunc = createAggregateFunction(
 			},
 		},
 	},
-	(acc: SumAccumulator, value: SqlValue): SumAccumulator => {
-		if (value === null) return acc; // Ignore NULLs
-
-		if (typeof value === 'bigint' || typeof value === 'number') {
-			return addSumContribution(acc, value);
-		}
-		if (typeof value === 'boolean') {
-			return addSumContribution(acc, value ? 1 : 0);
-		}
-		if (typeof value === 'string') {
-			const parsed = parseNumericText(value);
-			// Documented skip, not a failure: text that names no number contributes nothing.
-			// (How text becomes a number at all is the coercion layer's rule, not sum's.)
-			if (typeof parsed === 'number' && isNaN(parsed)) return acc;
-			return addSumContribution(acc, parsed);
-		}
-		// Documented skip, not a failure: a non-numeric storage class (Uint8Array, JSON
-		// object) contributes nothing. Every remaining branch routes into the split
-		// accumulator, whose adder cannot throw, so there is nothing left to catch.
-		return acc;
-	},
-	(acc: SumAccumulator): number | bigint | null => {
-		// SQLite returns NULL for SUM of empty set, INTEGER or REAL result.
-		// count === 0 (all contributions retracted) is observationally the empty group.
-		if (acc === null || acc.count === 0) return null;
-		// An all-integer fold finalizes to its exact part untouched (still R1-canonical);
-		// only a fold that saw a non-exact contribution combines, and it lands in float.
-		// NOTE: a non-finite total propagates (±Infinity, and NaN for Infinity + -Infinity)
-		// rather than becoming NULL. Deliberate: sum matches the other float-summing
-		// aggregates, `total()` and `avg()`, over identical rows. Binary `+` is the
-		// outlier — `runtime/emit/binary.ts` nulls a non-finite result — so a caller
-		// comparing `sum(v)` against a hand-written `a + b` sees them diverge at overflow.
-		if (acc.approx === 0) return acc.exact;
-		return Number(acc.exact) + acc.approx;
-	}
+	stepSum,
+	finalizeSum,
 );
 
 // --- AVG(X) ---
-interface AvgAccumulator { sum: number; count: number }
+// Accumulates exactly as SUM does — the same accumulator, step, merge, and negate —
+// and divides only at finalize. The numerator is therefore sum's exact total (a float
+// running sum loses whole numbers past 2^53), and the divisor is sum's count of
+// numeric contributions. Direct evaluation and the sum/count decomposition share one
+// quotient (`avgQuotient`), so the two cannot drift apart.
+
+/** avg's value from a sum total and a contribution count; an empty group (count 0 /
+ *  NULL) ⇒ NULL. Real division, so the result is always a float. */
+function avgQuotient(sumTotal: SqlValue, count: SqlValue): number | null {
+	if (count === null || count === undefined || Number(count) === 0) return null;
+	return Number(sumTotal) / Number(count);
+}
+
 export const avgFunc = createAggregateFunction(
 	{
-		name: 'avg', numArgs: 1, initialValue: { sum: 0, count: 0 },
+		name: 'avg', numArgs: 1, initialValue: null,
 		returnType: REAL_RETURN,
 		// No decode — the stored quotient forgets the count and cannot reconstruct
 		// an accumulator. Maintained/rolled up via its decomposition instead.
 		algebra: {
-			merge: (a: AvgAccumulator, b: AvgAccumulator): AvgAccumulator => ({ sum: a.sum + b.sum, count: a.count + b.count }),
-			negate: (a: AvgAccumulator): AvgAccumulator => ({ sum: -a.sum, count: -a.count }),
+			merge: mergeSum,
+			negate: negateSum,
 			decompose: {
 				partials: [
 					{ func: 'sum', arg: 'same-arg' },
 					{ func: 'count', arg: 'same-arg' },
 				],
-				// Real division, matching native avg; empty group (count 0 / NULL) ⇒ NULL.
-				combine: (partialValues: readonly SqlValue[]): SqlValue => {
-					const [sumV, countV] = partialValues;
-					if (countV === null || countV === undefined || Number(countV) === 0) return null;
-					return Number(sumV) / Number(countV);
-				},
+				// NOTE: count(x) counts every non-NULL value, but sum (and so direct avg) skips
+				// non-numeric text, blobs, and JSON — over such a value the decomposed divisor
+				// is larger than the direct one. Equal over every numeric domain; if avg ever
+				// needs to agree over mixed-class columns, the count partial must skip what
+				// sum skips.
+				combine: (partialValues: readonly SqlValue[]): SqlValue => avgQuotient(partialValues[0], partialValues[1]),
 			},
 		},
 	},
-	(acc: AvgAccumulator, value: SqlValue): AvgAccumulator => {
-		if (value === null) return acc; // Ignore NULLs
-		let numValue = value;
-		try {
-			if (typeof value !== 'bigint') {
-				numValue = Number(value);
-				if (isNaN(numValue as number)) return acc; // Ignore non-numeric
-			}
-
-			// Use floating point for sum in AVG to avoid potential BigInt division issues
-			const newSum = acc.sum + Number(numValue);
-			return { sum: newSum, count: acc.count + 1 };
-		} catch (e) {
-			warnLog("Error during AVG step coercion: %O", e);
-			return acc;
-		}
-	},
-	(acc: AvgAccumulator): number | null => {
-		if (acc.count === 0) return null; // NULL for empty set
-		return acc.sum / acc.count;
-	}
+	stepSum,
+	(acc: SumAccumulator): number | null => avgQuotient(finalizeSum(acc), acc?.count ?? 0),
 );
 
 // --- MIN(X) / MAX(X) ---
