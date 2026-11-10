@@ -564,3 +564,49 @@ select id, g from t_sp_coll order by id;
 
 drop table t_sp_coll;
 -- run
+
+-- ============================================================
+-- 17. The added column stays computed through every later ALTER
+--
+-- Section 13 checks the graph right after the ADD COLUMN. Every later ALTER that
+-- stores a new table schema must keep it too: a write after the ALTER computes the
+-- added column exactly as it would a CREATE TABLE-declared one. One insert per ALTER,
+-- so a failure names the ALTER that dropped it.
+-- ============================================================
+
+create table t_keep (id integer primary key, a integer, b integer null, constraint cb check (b is null or b >= 0));
+insert into t_keep (id, a) values (1, 5);
+-- run
+
+alter table t_keep add column g integer null generated always as (a + 100);
+-- run
+
+alter table t_keep rename column a to aa;
+insert into t_keep (id, aa) values (2, 2);
+-- run
+
+alter table t_keep alter column b set default 7;
+insert into t_keep (id, aa) values (3, 3);
+-- run
+
+alter table t_keep add constraint ck check (aa > -1000);
+insert into t_keep (id, aa) values (4, 4);
+-- run
+
+alter table t_keep rename constraint cb to cb2;
+insert into t_keep (id, aa) values (5, 5);
+-- run
+
+alter table t_keep drop constraint cb2;
+insert into t_keep (id, aa) values (6, 6);
+-- run
+
+alter table t_keep alter primary key (id, aa);
+insert into t_keep (id, aa) values (7, 7);
+-- run
+
+select id, g from t_keep order by id;
+→ [{"id":1,"g":105},{"id":2,"g":102},{"id":3,"g":103},{"id":4,"g":104},{"id":5,"g":105},{"id":6,"g":106},{"id":7,"g":107}]
+
+drop table t_keep;
+-- run
