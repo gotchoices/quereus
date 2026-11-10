@@ -11,6 +11,7 @@ import {
 	CachingAnalysis
 } from '../../src/planner/framework/characteristics.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { DEFAULT_TUNING } from '../../src/planner/optimizer-tuning.js';
 import type { Scope } from '../../src/planner/scopes/scope.js';
 import { AggregateNode } from '../../src/planner/nodes/aggregate-node.js';
 import { StreamAggregateNode } from '../../src/planner/nodes/stream-aggregate.js';
@@ -98,7 +99,7 @@ describe('CachingAnalysis', () => {
 			physical: { estimatedRows: 5000 }
 		} as PlanNode;
 
-		const threshold = CachingAnalysis.getCacheThreshold(node);
+		const threshold = CachingAnalysis.getCacheThreshold(node, DEFAULT_TUNING);
 		expect(threshold).to.be.a('number');
 		expect(threshold).to.be.greaterThan(0);
 	});

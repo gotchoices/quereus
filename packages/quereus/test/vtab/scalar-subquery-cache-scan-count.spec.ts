@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { Statement } from '../../src/core/statement.js';
 import { CountingMemoryModule } from './_counting-memory-module.js';
-import type { OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 
 /**
  * Runtime execution-count checks for the uncorrelated scalar-subquery cache.
@@ -106,29 +105,6 @@ describe('scalar-subquery cache: scan count', () => {
 		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
 		expect(module.scanCounts.get('counting'),
 			'a correlated scalar subquery is not cached; each of the 3 outer rows re-scans'
-		).to.equal(3);
-	});
-
-	it('re-scans per outer row when the inner exceeds the cache threshold', async () => {
-		// A valid scalar subquery yields <=1 row, so force the threshold to 0: the
-		// non-eager cache abandons the buffer on the first row and streams the
-		// remainder through. An abandoned cache re-scans fresh on every subsequent
-		// eval → one scan per outer row. Documents that the memory bound wins.
-		const base = db.optimizer.tuning;
-		db.optimizer.updateTuning({
-			...base,
-			cte: { ...base.cte, maxCacheThreshold: 0 },
-		} as OptimizerTuning);
-
-		await db.exec("INSERT INTO probe VALUES (1, 10), (2, 20), (3, 30)");
-
-		module.scanCounts.clear();
-		const rows = await allRows<{ id: number }>(
-			'select id from probe where x > (select max(k) from counting) order by id'
-		);
-		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
-		expect(module.scanCounts.get('counting'),
-			'threshold 0 abandons the cache; each of the 3 outer rows re-scans'
 		).to.equal(3);
 	});
 

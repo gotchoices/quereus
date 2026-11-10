@@ -68,10 +68,7 @@ export function ruleScalarSubqueryCache(node: PlanNode, context: OptContext): Pl
 
 	log('Wrapping uncorrelated scalar-subquery inner in CacheNode');
 
-	const cacheThreshold = Math.min(
-		CachingAnalysis.getCacheThreshold(inner),
-		context.tuning.cte.maxCacheThreshold
-	);
+	const cacheThreshold = CachingAnalysis.getCacheThreshold(inner, context.tuning);
 
 	// Non-eager (streaming): the scalar consumer drains the whole input on the
 	// first evaluation, committing the buffer, so later evaluations replay. See

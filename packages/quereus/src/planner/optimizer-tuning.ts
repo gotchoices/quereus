@@ -34,20 +34,13 @@ export interface OptimizerTuning {
 		readonly minLeftRowsForCaching: number;
 		/** Maximum right side rows to cache */
 		readonly maxRightRowsForCaching: number;
-		/** Cache threshold multiplier (rightSize * multiplier) */
+		/**
+		 * CacheNode threshold multiplier: a cache warns of a misestimate once its
+		 * buffer passes `estimatedRows * multiplier` (floored at 1000). Every
+		 * CacheNode-injecting rule and the materialization advisory share it via
+		 * `CachingAnalysis.getCacheThreshold`; the cache never stops buffering.
+		 */
 		readonly cacheThresholdMultiplier: number;
-		/** Maximum cache threshold */
-		readonly maxCacheThreshold: number;
-	};
-
-	/**
-	 * Shared by `rule-scalar-subquery-cache` for its cache threshold. Named `cte`
-	 * for historical reasons (it also fed the now-removed CTE-source cache wrap);
-	 * kept rather than renamed to avoid rippling into unrelated test overrides.
-	 */
-	readonly cte: {
-		/** Maximum cache threshold */
-		readonly maxCacheThreshold: number;
 	};
 
 	/** Recursive CTE configuration */
@@ -298,11 +291,7 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 	join: {
 		minLeftRowsForCaching: 1,
 		maxRightRowsForCaching: 50000,
-		cacheThresholdMultiplier: 2,
-		maxCacheThreshold: 10000
-	},
-	cte: {
-		maxCacheThreshold: 20000
+		cacheThresholdMultiplier: 2
 	},
 	recursiveCte: {
 		maxIterations: 10000,

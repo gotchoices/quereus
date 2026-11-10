@@ -7,9 +7,12 @@ import type { Row } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('runtime:cache:shared');
+const warnLog = log.extend('warn');
 
 /**
- * Cache strategy for handling overflow
+ * Cache strategy selected by the planner. Only `'memory'` is implemented:
+ * `'spill'` is accepted but not yet acted on (no spill-to-disk exists), so it
+ * buffers in memory exactly like `'memory'`.
  */
 export type CacheStrategy = 'memory' | 'spill';
 
@@ -17,9 +20,13 @@ export type CacheStrategy = 'memory' | 'spill';
  * Configuration for shared cache behavior
  */
 export interface SharedCacheConfig {
-	/** Maximum rows before abandoning cache */
+	/**
+	 * Row count past which the build logs a misestimate warning. A soft guard,
+	 * not a cap: the buffer keeps growing past it, so a cached source still runs
+	 * at most once per execution whatever its size.
+	 */
 	threshold: number;
-	/** Strategy when threshold exceeded */
+	/** Planner-selected strategy; `'spill'` is not yet acted on (see {@link CacheStrategy}) */
 	strategy: CacheStrategy;
 	/** Optional identifier for logging */
 	name?: string;
@@ -37,10 +44,8 @@ export interface SharedCacheConfig {
  * Based on the proven closure pattern from the existing cache emitter
  */
 export interface CacheState {
-	/** Cached result rows (undefined if not cached or abandoned) */
+	/** Cached result rows (undefined until a build pass drains the source to completion) */
 	cachedResult?: Row[];
-	/** Whether caching was abandoned due to threshold */
-	cacheAbandoned: boolean;
 	/** Number of times cache has been consumed */
 	consumeCount: number;
 }
@@ -51,9 +56,27 @@ export interface CacheState {
 export function createCacheState(): CacheState {
 	return {
 		cachedResult: undefined,
-		cacheAbandoned: false,
 		consumeCount: 0
 	};
+}
+
+/**
+ * Append a copy of `row` to the build buffer, warning once when the buffer
+ * first grows past the configured threshold.
+ *
+ * NOTE: buffers are unbounded, like hash-join build sides and shared-CTE
+ * materialization. If memory pressure from large buffers ever shows up, the
+ * answer is a shared memory budget or spill for all of them, not a cap on this
+ * one — a cap re-runs the source once per pass (quadratic re-reads, repeated
+ * writes for a DML-bearing source).
+ */
+function bufferRow(buffer: Row[], row: Row, config: SharedCacheConfig, name: string): void {
+	if (buffer.length === config.threshold) {
+		warnLog('%s cache exceeded its threshold of %d rows (estimate was low); still buffering',
+			name, config.threshold);
+	}
+	// Copy so a consumer mutating a yielded row cannot corrupt the buffer
+	buffer.push([...row] as Row);
 }
 
 /**
@@ -72,16 +95,12 @@ export async function* streamWithCache(
 		state.consumeCount++;
 		log('Serving %s from cache (access #%d, %d rows)',
 			name, state.consumeCount, state.cachedResult.length);
+		// NOTE: copies each row per replay; if replay allocation shows up in
+		// profiles, audit consumers for in-place row mutation and switch to frozen
+		// shared rows.
 		for (const row of state.cachedResult) {
 			yield [...row] as Row;
 		}
-		return;
-	}
-
-	// If we previously abandoned caching, just stream through
-	if (state.cacheAbandoned) {
-		log('%s cache abandoned due to previous threshold exceed, streaming directly', name);
-		yield* sourceIterable;
 		return;
 	}
 
@@ -90,27 +109,14 @@ export async function* streamWithCache(
 	// the whole drain + commit here, so every later evaluation replays from cache
 	// instead of re-opening the source. The build cannot be short-circuited.
 	if (config.eager) {
-		log('Building %s cache eagerly (full drain before yield) with threshold %d', name, threshold);
+		log('Building %s cache eagerly (full drain before yield), warning past %d rows', name, threshold);
 		const buffer: Row[] = [];
 		for await (const row of sourceIterable) {
-			if (buffer.length < threshold) {
-				// Deep copy to avoid reference issues (same as streaming path)
-				buffer.push([...row] as Row);
-			} else {
-				// Over threshold - abandon caching and stream the remainder straight
-				// through. The memory bound wins; later evals stream fresh.
-				log('%s eager cache threshold %d exceeded, abandoning cache and streaming through',
-					name, threshold);
-				state.cacheAbandoned = true;
-				for (const buffered of buffer) yield buffered;
-				yield row;
-				yield* sourceIterable;
-				return;
-			}
+			bufferRow(buffer, row, config, name);
 		}
-		// Drained fully within threshold - commit before yielding any row.
-		// (If the source threw mid-drain we never reach here: nothing is committed
-		//  and cacheAbandoned stays false, so the next eval retries fresh.)
+		// Drained fully - commit before yielding any row.
+		// (If the source threw mid-drain we never reach here: nothing is committed,
+		//  so the next eval retries fresh.)
 		log('%s eager cache built successfully with %d rows', name, buffer.length);
 		state.cachedResult = buffer;
 		for (const row of buffer) yield [...row] as Row;
@@ -118,35 +124,17 @@ export async function* streamWithCache(
 	}
 
 	// First time (streaming-first) - pipeline results while building cache
-	log('Building %s cache with threshold %d while pipelining', name, threshold);
-	let cache: Row[] | undefined = [];
-
-	// Pipeline while caching (proven pattern from existing emitter)
+	log('Building %s cache while pipelining, warning past %d rows', name, threshold);
+	const buffer: Row[] = [];
 	for await (const row of sourceIterable) {
-		// Always yield immediately (streaming-first)
 		yield row;
-
-		// Try to cache if we haven't exceeded threshold
-		if (cache) {
-			if (cache.length < threshold) {
-				// Cache the row (deep copy to avoid reference issues)
-				cache.push([...row] as Row);
-			} else {
-				// Hit threshold - dump cache and abandon caching
-				log('%s cache threshold %d exceeded at row %d, dumping cache and continuing to pipeline',
-					name, threshold, cache.length);
-				cache = undefined;
-			}
-		}
+		bufferRow(buffer, row, config, name);
 	}
 
-	// If we finished without exceeding threshold, cache is ready
-	if (cache) {
-		log('%s cache built successfully with %d rows', name, cache.length);
-		state.cachedResult = cache;
-	} else {
-		state.cacheAbandoned = true;
-	}
+	// Commit only once the source drains: a consumer that stops early leaves
+	// nothing committed, and the next pass re-runs the source.
+	log('%s cache built successfully with %d rows', name, buffer.length);
+	state.cachedResult = buffer;
 }
 
 /**
@@ -188,13 +176,11 @@ export function withSharedCache(
  */
 export function getCacheMetrics(state: CacheState): {
 	isCached: boolean;
-	isAbandoned: boolean;
 	consumeCount: number;
 	cachedRows?: number;
 } {
 	return {
 		isCached: !!state.cachedResult,
-		isAbandoned: state.cacheAbandoned,
 		consumeCount: state.consumeCount,
 		cachedRows: state.cachedResult?.length
 	};
@@ -205,6 +191,5 @@ export function getCacheMetrics(state: CacheState): {
  */
 export function clearCache(state: CacheState): void {
 	state.cachedResult = undefined;
-	state.cacheAbandoned = false;
 	state.consumeCount = 0;
 }

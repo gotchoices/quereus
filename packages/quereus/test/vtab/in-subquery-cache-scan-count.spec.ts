@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { Statement } from '../../src/core/statement.js';
 import { CountingMemoryModule } from './_counting-memory-module.js';
-import type { OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 
 /**
  * Runtime execution-count checks for uncorrelated `x IN (subquery)`.
@@ -100,31 +99,6 @@ describe('Uncorrelated IN subquery (semi join / set probe): scan count', () => {
 		expect(rows).to.deep.equal([{ id: 2 }, { id: 3 }]);
 		expect(module.scanCounts.get('counting'),
 			'a null-condition leading row drives no scan; the set still builds exactly once'
-		).to.equal(1);
-	});
-
-	it('scans once regardless of the (now-irrelevant) cache threshold', async () => {
-		// Regression for the O(N×K) cliff: the old eager CacheNode abandoned its
-		// buffer once the source exceeded `cte.maxCacheThreshold`, then re-drove the
-		// subquery per outer row (one scan per outer row). Neither the hash semi
-		// join's build nor the set probe has a size threshold, so forcing the tuning
-		// knob low must NOT reintroduce re-scans — the source is still drained
-		// exactly once.
-		const base = db.optimizer.tuning;
-		db.optimizer.updateTuning({
-			...base,
-			cte: { ...base.cte, maxCacheThreshold: 2 },
-		} as OptimizerTuning);
-
-		await db.exec("INSERT INTO probe VALUES (1, 1), (2, 2), (3, 3)");
-
-		module.scanCounts.clear();
-		const rows = await allRows<{ id: number }>(
-			'select id from probe where x in (select k from counting) order by id'
-		);
-		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
-		expect(module.scanCounts.get('counting'),
-			'the set probe has no threshold; a small maxCacheThreshold must not cause per-row re-scans'
 		).to.equal(1);
 	});
 

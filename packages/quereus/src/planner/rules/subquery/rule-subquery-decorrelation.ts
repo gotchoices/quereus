@@ -417,10 +417,8 @@ function extractUncorrelatedIn(
 	// handles it).
 	// NOTE: nested loop can still win the cost comparison when the OUTER is
 	// tiny (L ≤ ~2 under current COST_CONSTANTS); rule-nested-loop-right-cache
-	// then wraps the uncorrelated right in a CacheNode whose abandon threshold
-	// is the subject of backlog/bug-cache-threshold-abandon-cliff. A one-row
-	// outer scanning the inner once is not a cliff, so that interaction is
-	// confined to the harmless quadrant.
+	// then wraps the uncorrelated right in a CacheNode, which runs it once and
+	// replays the buffer for every outer row, so the inner is still scanned once.
 	const rightAttrIds = new Set(right.getAttributes().map(a => a.id));
 	const extraction = extractEquiPairs(condition, outerAttrIds, rightAttrIds);
 	if (!extraction || extraction.equiPairs.length !== 1 || extraction.residual) return null;

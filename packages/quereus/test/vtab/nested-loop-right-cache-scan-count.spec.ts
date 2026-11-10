@@ -55,6 +55,17 @@ describe('nested-loop right-side cache: scan count', () => {
 		expect(module.scanCounts.get('r'), 'right table scanned').to.equal(1);
 	});
 
+	it('scans an un-analyzed right table of over 1,000 rows once', async () => {
+		// Past the default-estimate cache threshold: the cache must keep its
+		// buffer rather than fall back to re-scanning per outer row.
+		await db.exec("INSERT INTO r SELECT value, value FROM generate_series(4, 1500)");
+		module.scanCounts.clear();
+		await drain("SELECT l.v, r.v FROM l JOIN r ON l.v + r.v > 0");
+
+		expect(module.scanCounts.get('l'), 'left table scanned').to.equal(1);
+		expect(module.scanCounts.get('r'), 'right table scanned').to.equal(1);
+	});
+
 	it('produces correct rows under the theta join', async () => {
 		const rows: { lv: number; rv: number }[] = [];
 		for await (const row of db.eval(

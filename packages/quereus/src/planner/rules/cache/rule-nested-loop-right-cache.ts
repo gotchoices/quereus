@@ -233,11 +233,13 @@ export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): P
 
 	log('Caching pure nested-loop right side (%s)', node.joinType);
 
-	// Memory strategy + a CacheNode threshold (which degrades to pass-through
-	// past its limit) mirrors the sibling mutating-subquery-cache rule. Spill is
-	// unreachable under `canCacheNestedLoopRight`'s size gate (maxRightRowsForCaching <
-	// cache.spillThreshold), so 'memory' is the only live choice here.
-	const threshold = CachingAnalysis.getCacheThreshold(right);
+	// Memory strategy mirrors the sibling mutating-subquery-cache rule. The
+	// CacheNode keeps buffering past its threshold (which only triggers a
+	// misestimate warning), so the right side is scanned once whatever its size.
+	// Spill is unreachable under `canCacheNestedLoopRight`'s size gate
+	// (maxRightRowsForCaching < cache.spillThreshold), so 'memory' is the only
+	// live choice here.
+	const threshold = CachingAnalysis.getCacheThreshold(right, context.tuning);
 	const cached = new CacheNode(right.scope, right, 'memory', threshold);
 
 	// Reconstruct via withChildren, NOT the raw JoinNode constructor: withChildren

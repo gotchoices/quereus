@@ -60,7 +60,9 @@ export function emitCache(plan: CacheNode, ctx: EmissionContext): Instruction {
 
 		let sourceIterable = sourceCallback(rctx);
 
-		// Optional: Add buffering for large threshold caches to improve performance
+		// Read-ahead for large expected sources: the threshold tracks a multiple of
+		// the row estimate (CachingAnalysis.getCacheThreshold), so this fires on
+		// big estimates, never on a misestimate discovered at runtime.
 		if (plan.threshold > 50000) {
 			sourceIterable = buffered(sourceIterable, Math.min(plan.threshold / 10, 5000));
 		}

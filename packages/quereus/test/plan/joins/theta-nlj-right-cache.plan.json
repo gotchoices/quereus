@@ -487,12 +487,12 @@
                   }
                 }
               ],
-              "detail": "CACHE (memory, threshold=1000)",
+              "detail": "CACHE (memory, threshold=2000)",
               "logical": {
                 "eager": false,
                 "sourceNodeType": "Alias",
                 "strategy": "memory",
-                "threshold": 1000
+                "threshold": 2000
               },
               "nodeType": "Cache",
               "op": "CACHE",

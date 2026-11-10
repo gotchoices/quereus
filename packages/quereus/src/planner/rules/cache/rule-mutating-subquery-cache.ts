@@ -21,7 +21,7 @@ import { PlanNodeCharacteristics, CapabilityDetectors, CachingAnalysis, type Joi
 
 const log = createLogger('optimizer:rule:mutating-subquery-cache');
 
-export function ruleMutatingSubqueryCache(node: PlanNode, _context: OptContext): PlanNode | null {
+export function ruleMutatingSubqueryCache(node: PlanNode, context: OptContext): PlanNode | null {
 	// Guard: node must support join operations
 	if (!CapabilityDetectors.isJoin(node)) {
 		return null;
@@ -54,8 +54,9 @@ export function ruleMutatingSubqueryCache(node: PlanNode, _context: OptContext):
 
 	log('Detected operations with side effects on right side of join, injecting cache');
 
-	// Calculate appropriate cache threshold using characteristics
-	const threshold = CachingAnalysis.getCacheThreshold(rightSide);
+	// The CacheNode runs the writing source once and replays its rows; the
+	// threshold only sets when an oversized result logs a misestimate warning.
+	const threshold = CachingAnalysis.getCacheThreshold(rightSide, context.tuning);
 
 	// Wrap the right side with a cache node
 	const cachedRightSide = new CacheNode(

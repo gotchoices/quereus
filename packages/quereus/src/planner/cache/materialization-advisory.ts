@@ -6,7 +6,7 @@
 import { createLogger } from '../../common/logger.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { PlanNodeCharacteristics } from '../framework/characteristics.js';
+import { CachingAnalysis, PlanNodeCharacteristics } from '../framework/characteristics.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode, type TableDescriptor } from '../nodes/plan-node.js';
 import { CacheNode, type CacheStrategy } from '../nodes/cache-node.js';
 import { CTENode } from '../nodes/cte-node.js';
@@ -343,7 +343,7 @@ export class MaterializationAdvisory {
 		// Rule 5: Multi-parent nodes benefit from caching
 		if (stats.parentCount > 1) {
 			const strategy = this.selectStrategy(stats.estimatedRows);
-			const threshold = this.calculateThreshold(stats.estimatedRows, strategy);
+			const threshold = CachingAnalysis.thresholdForEstimate(stats.estimatedRows, this.tuning);
 
 			return {
 				shouldCache: true,
@@ -372,21 +372,6 @@ export class MaterializationAdvisory {
 		}
 
 		return 'memory';
-	}
-
-	/**
-	 * Calculate appropriate cache threshold
-	 */
-	private calculateThreshold(estimatedRows: number, strategy: CacheStrategy): number {
-		const multiplier = this.tuning.join.cacheThresholdMultiplier;
-		const maxThreshold = strategy === 'spill' ?
-			this.tuning.join.maxCacheThreshold * 2 : // Allow larger thresholds for spill
-			this.tuning.join.maxCacheThreshold;
-
-		return Math.min(
-			Math.max(estimatedRows * multiplier, 1000), // Minimum threshold
-			maxThreshold
-		);
 	}
 
 	/**

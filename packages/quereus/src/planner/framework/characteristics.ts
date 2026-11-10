@@ -18,10 +18,14 @@ import type { PlanNode, RelationalPlanNode, ScalarPlanNode, ConstantNode, TableD
 import { isRelationalNode } from '../nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
 import type { TableSchema } from '../../schema/table.js';
+import type { OptimizerTuning } from '../optimizer-tuning.js';
 import { hasAnyKey, hasSingletonFd } from '../util/fd-utils.js';
 
 // Default row estimate when not available
 const DEFAULT_ROW_ESTIMATE = 1000;
+
+/** Floor for a CacheNode's misestimate-warning threshold, so small estimates do not warn on noise. */
+const MIN_CACHE_WARN_ROWS = 1000;
 
 /**
  * Core physical property-based characteristics
@@ -488,9 +492,19 @@ export class CachingAnalysis {
 			PlanNodeCharacteristics.isLikelyRepeated(node);
 	}
 
-	static getCacheThreshold(node: PlanNode): number {
-		const estimatedRows = PlanNodeCharacteristics.estimatesRows(node);
-		return Math.min(Math.max(estimatedRows * 0.1, 1000), 100000);
+	/**
+	 * CacheNode threshold for `node`: the row count past which its build warns
+	 * that the estimate was low. The cache never drops its buffer at the
+	 * threshold (see runtime/cache/shared-cache.ts), so this is a guard multiple
+	 * of the estimate with a floor, and no upper cap — a cap would only make the
+	 * warning fire on correctly estimated large results.
+	 */
+	static getCacheThreshold(node: PlanNode, tuning: OptimizerTuning): number {
+		return this.thresholdForEstimate(PlanNodeCharacteristics.estimatesRows(node), tuning);
+	}
+
+	static thresholdForEstimate(estimatedRows: number, tuning: OptimizerTuning): number {
+		return Math.max(Math.ceil(estimatedRows * tuning.join.cacheThresholdMultiplier), MIN_CACHE_WARN_ROWS);
 	}
 }
 

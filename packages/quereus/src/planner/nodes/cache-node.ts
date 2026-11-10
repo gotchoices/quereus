@@ -13,8 +13,9 @@ export type CacheStrategy = 'memory' | 'spill'; // Future: spill-to-disk
  * CacheNode provides smart caching for any relational input.
  *
  * This node materializes its input on first iteration and serves
- * subsequent iterations from the cached result. It implements
- * smart threshold-based policies to avoid excessive memory usage.
+ * subsequent iterations from the cached result, so its source runs at most
+ * once per execution. `threshold` is a soft guard: a build that grows past it
+ * logs a misestimate warning and keeps buffering (see runtime/cache/shared-cache.ts).
  */
 export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCapable {
 	readonly nodeType = PlanNodeType.Cache;
@@ -24,7 +25,7 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 		scope: Scope,
 		public readonly source: RelationalPlanNode,
 		public readonly strategy: CacheStrategy = 'memory',
-		public readonly threshold: number = 10000,  // Rows before switching to pass-through
+		public readonly threshold: number = 10000,  // Rows past which the build warns of a misestimate
 		/**
 		 * Eager build mode: fully drain + commit the buffer on the first evaluation
 		 * before yielding any row, so a short-circuiting consumer above the cache

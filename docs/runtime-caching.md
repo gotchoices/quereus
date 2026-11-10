@@ -66,6 +66,8 @@ statement's executions, tying the cache to the context rather than the
 closure resets it between runs: a re-executed statement re-drives its cached
 source and observes current data instead of replaying the first run's rows.
 
+**Run once, at any size.** Once a build pass drains a `CacheNode` source, every later pass in that execution replays the buffer, whatever its size, so a source its consumers drain runs at most once per execution (a streaming-first build its consumer stops early still re-runs — see the next paragraph). `CacheNode.threshold` is a soft guard, not a cap — a build that grows past it logs one warning on the `quereus:runtime:cache:shared:warn` logger (the estimate was low) and keeps buffering. The threshold is `max(ceil(estimatedRows × join.cacheThresholdMultiplier), 1000)` (`CachingAnalysis.getCacheThreshold`, shared by every CacheNode-injecting rule and the materialization advisory), with no upper cap. The cache once dropped its buffer at the threshold and re-ran the source on every later pass; that made large nested-loop joins quadratic, and re-ran the writes of an `insert … returning` used as a join input. Buffers are unbounded, like hash-join build sides and shared-CTE materialization — if memory pressure from large buffers ever shows up, the answer is a shared memory budget or spill for all of them, not a cap on this one. The `'spill'` strategy is selected by the advisory for large estimates but is not yet acted on; it buffers in memory like `'memory'`.
+
 **Eager vs. streaming-first build.** `streamWithCache` has two build modes,
 selected by `CacheNode.eager`. The default *streaming-first* mode yields each
 source row as it arrives and only commits `cachedResult` after the source drains
@@ -73,8 +75,8 @@ to completion — great first-row latency, but a consumer that short-circuits
 (breaks on an early row) aborts the generator before the drain finishes, so the
 buffer is never committed and the next evaluation re-opens the source. The
 *eager* mode drains the source fully and commits the buffer **before** yielding
-any row, so a first-match short-circuit can't abort the build; if the eager drain
-exceeds the cache threshold it abandons and streams the remainder through.
+any row, so a first-match short-circuit can't abort the build. Neither mode stops
+buffering at the threshold.
 
 > **NOTE:** eager mode currently has **no caller** — the only rule that set
 > `eager: true` was `rule-in-subquery-cache`, retired in favor of the emit-level
@@ -95,8 +97,9 @@ membership conversion coerces to NULL short-circuits the same way, so the key is
 computed before the build, not after; see `inMembershipKeys` and `docs/types.md`
 § JSON). This is O(K + N·log K) with
 **zero statistics** — it replaced the retired eager-CacheNode mechanism, whose
-threshold could abandon the buffer and re-drive the subquery per outer row
-(O(N×K); see quereus-in-subquery-set-probe). The probe set lives on the
+threshold could then abandon the buffer and re-drive the subquery per outer row
+(O(N×K); see quereus-in-subquery-set-probe; the CacheNode no longer abandons —
+see § CacheNode row-cache lifetime). The probe set lives on the
 per-execution `RuntimeContext` (`ctx.inSetProbes`, `Map<symbol, {tree, hasNull}>`)
 keyed by a symbol minted in the `emitIn` closure — same reset-per-execution
 pattern as `cacheStates` / `executionMemo`, so a re-run re-drains with current

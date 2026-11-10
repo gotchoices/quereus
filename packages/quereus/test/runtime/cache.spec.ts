@@ -95,27 +95,17 @@ describe('Runtime Shared Cache', () => {
 			expect(cached2[0][1]).to.equal('original');
 		});
 
-		it('threshold exceeded — cache abandoned', async () => {
+		it('past the threshold — keeps buffering, and a second pass replays without the source', async () => {
 			const config: SharedCacheConfig = { threshold: 2, strategy: 'memory', name: 'test' };
 			const sourceRows: Row[] = [[1], [2], [3]];
 			const state = createCacheState();
 
 			const result = await collect(streamWithCache(fromRows(sourceRows), config, state));
-
 			expect(result).to.deep.equal(sourceRows);
-			expect(state.cacheAbandoned).to.be.true;
-			expect(state.cachedResult).to.be.undefined;
-		});
 
-		it('threshold boundary — exactly threshold rows keeps cache', async () => {
-			const config: SharedCacheConfig = { threshold: 3, strategy: 'memory', name: 'test' };
-			const sourceRows: Row[] = [[1], [2], [3]];
-			const state = createCacheState();
-
-			await collect(streamWithCache(fromRows(sourceRows), config, state));
-
-			expect(state.cacheAbandoned).to.be.false;
-			expect(state.cachedResult).to.deep.equal(sourceRows);
+			// Empty source proves the replay comes from the buffer, not a re-run.
+			const replay = await collect(streamWithCache(fromRows([]), config, state));
+			expect(replay).to.deep.equal(sourceRows);
 		});
 
 		it('zero rows — cache populated as empty array', async () => {
@@ -124,7 +114,6 @@ describe('Runtime Shared Cache', () => {
 			await collect(streamWithCache(fromRows([]), defaultConfig, state));
 
 			expect(state.cachedResult).to.deep.equal([]);
-			expect(state.cacheAbandoned).to.be.false;
 		});
 
 		it('single row — cache populated correctly', async () => {
@@ -148,7 +137,6 @@ describe('Runtime Shared Cache', () => {
 
 			clearCache(state);
 			expect(state.cachedResult).to.be.undefined;
-			expect(state.cacheAbandoned).to.be.false;
 			expect(state.consumeCount).to.equal(0);
 
 			// After clear, next consumer should rebuild the cache from source
@@ -209,23 +197,6 @@ describe('Runtime Shared Cache', () => {
 		});
 	});
 
-	describe('cache abandoned path', () => {
-		it('after threshold exceeded, subsequent consumers stream directly from source', async () => {
-			const config: SharedCacheConfig = { threshold: 2, strategy: 'memory', name: 'test' };
-			const state = createCacheState();
-
-			// First consumer exceeds threshold
-			await collect(streamWithCache(fromRows([[1], [2], [3]]), config, state));
-			expect(state.cacheAbandoned).to.be.true;
-
-			// Second consumer should stream directly (no caching)
-			const newSource: Row[] = [[10], [20]];
-			const result = await collect(streamWithCache(fromRows(newSource), config, state));
-			expect(result).to.deep.equal(newSource);
-			expect(state.cachedResult).to.be.undefined;
-		});
-	});
-
 	describe('edge cases', () => {
 		it('source throws mid-stream — cache not committed, next consumer gets clean error', async () => {
 			const config: SharedCacheConfig = { threshold: 10, strategy: 'memory', name: 'test' };
@@ -242,8 +213,6 @@ describe('Runtime Shared Cache', () => {
 
 			// Cache should not have been committed (iteration didn't finish)
 			expect(state.cachedResult).to.be.undefined;
-			// cacheAbandoned should still be false — it wasn't a threshold issue
-			expect(state.cacheAbandoned).to.be.false;
 
 			// Next consumer with a working source should be able to build cache fresh
 			const goodSource: Row[] = [[10], [20]];
@@ -289,7 +258,6 @@ describe('Runtime Shared Cache', () => {
 			const state = createCacheState();
 			const metrics = getCacheMetrics(state);
 			expect(metrics.isCached).to.be.false;
-			expect(metrics.isAbandoned).to.be.false;
 			expect(metrics.consumeCount).to.equal(0);
 			expect(metrics.cachedRows).to.be.undefined;
 		});
@@ -300,18 +268,7 @@ describe('Runtime Shared Cache', () => {
 
 			const metrics = getCacheMetrics(state);
 			expect(metrics.isCached).to.be.true;
-			expect(metrics.isAbandoned).to.be.false;
 			expect(metrics.cachedRows).to.equal(2);
-		});
-
-		it('reports abandoned state', async () => {
-			const config: SharedCacheConfig = { threshold: 1, strategy: 'memory', name: 'test' };
-			const state = createCacheState();
-			await collect(streamWithCache(fromRows([[1], [2]]), config, state));
-
-			const metrics = getCacheMetrics(state);
-			expect(metrics.isCached).to.be.false;
-			expect(metrics.isAbandoned).to.be.true;
 		});
 	});
 
@@ -389,19 +346,18 @@ describe('Runtime Shared Cache', () => {
 			const result = await collect(streamWithCache(fromRows([]), eagerConfig, state));
 			expect(result).to.deep.equal([]);
 			expect(state.cachedResult).to.deep.equal([]);
-			expect(state.cacheAbandoned).to.be.false;
 		});
 
-		it('over-threshold eager source abandons cache but still delivers all rows', async () => {
+		it('over-threshold eager source keeps buffering, and a second pass replays without the source', async () => {
 			const config: SharedCacheConfig = { threshold: 2, strategy: 'memory', name: 'test-eager', eager: true };
 			const sourceRows: Row[] = [[1], [2], [3]];
 			const state = createCacheState();
 
 			const result = await collect(streamWithCache(fromRows(sourceRows), config, state));
-
 			expect(result).to.deep.equal(sourceRows);
-			expect(state.cacheAbandoned).to.be.true;
-			expect(state.cachedResult).to.be.undefined;
+
+			const replay = await collect(streamWithCache(fromRows([]), config, state));
+			expect(replay).to.deep.equal(sourceRows);
 		});
 
 		it('deep-copy — mutating a yielded row does not corrupt the eager cache (build pass)', async () => {
@@ -441,9 +397,8 @@ describe('Runtime Shared Cache', () => {
 				expect((err as Error).message).to.equal('source error');
 			}
 
-			// Not committed, and not a threshold abandon — next eval must retry fresh.
+			// Not committed — next eval must retry fresh.
 			expect(state.cachedResult).to.be.undefined;
-			expect(state.cacheAbandoned).to.be.false;
 
 			const goodSource: Row[] = [[10], [20]];
 			const result = await collect(streamWithCache(fromRows(goodSource), config, state));
