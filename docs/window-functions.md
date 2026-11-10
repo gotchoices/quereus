@@ -209,7 +209,9 @@ Frame offsets must be non-negative **integer** literals, in `RANGE` as well as
 `ROWS`; anything else (a fraction, a parameter, an expression) raises
 `Invalid window frame offset`.
 
-A `RANGE` offset is arithmetic on the ORDER BY value (`[v - n, v + m]`), so the
+A `RANGE` offset is arithmetic on the ORDER BY value: `n PRECEDING AND m
+FOLLOWING` covers `[v - n, v + m]` under an ascending key and the mirror image
+`[v - m, v + n]` under `DESC`, since "preceding" means earlier in the sort. The
 frame is checked against its ORDER BY when the statement is prepared, as in
 PostgreSQL and SQLite:
 

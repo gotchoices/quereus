@@ -52,6 +52,10 @@ describe('Window one-sided sliding frames', () => {
 		await db.exec('create table rnull (id integer primary key, k integer null, v integer)');
 		await db.exec('create index rnull_k on rnull (k)');
 		await db.exec('insert into rnull values (1,null,1),(2,null,2),(3,10,4),(4,20,8),(5,20,16),(6,30,32)');
+		// A descending primary key, which advertises a DESC monotonic order, so
+		// `order by id desc` streams. Under DESC, `n preceding` means n *larger*.
+		await db.exec('create table d (id integer, v integer, primary key (id desc))');
+		await db.exec('insert into d values (1,1),(2,2),(3,4),(5,8),(8,16)');
 		// Partitioned fixture.
 		await db.exec('create table p (id integer primary key, g text, v integer)');
 		await db.exec("insert into p values (1,'A',10),(2,'A',20),(3,'A',30),(4,'B',40),(5,'B',50)");
@@ -324,6 +328,31 @@ describe('Window one-sided sliding frames', () => {
 				{ k: 20, c: 2 },
 				{ k: 20, c: 2 },
 				{ k: 30, c: 1 },
+			]);
+		});
+
+		it('a DESC ORDER BY mirrors the offsets: n PRECEDING reaches larger keys', async () => {
+			// Regression: both paths did the offset arithmetic as if the sort
+			// ascended — streaming answered NULL frames, buffered the whole partition.
+			const twoSided = 'select id, sum(v) over (order by id desc range between 2 preceding and 1 following) as s'
+				+ ' from d order by id desc';
+			await expectStreamingModes(twoSided, [['slidingAgg']]);
+			expect(await bothShapes(twoSided)).to.deep.equal([
+				{ id: 8, s: 16 },  // [7,10] → 16
+				{ id: 5, s: 8 },   // [4,7] → 8
+				{ id: 3, s: 14 },  // [2,5] → 2+4+8
+				{ id: 2, s: 7 },   // [1,4] → 1+2+4
+				{ id: 1, s: 7 },   // [0,3] → 1+2+4
+			]);
+			const trailing = 'select id, sum(v) over (order by id desc range between 2 preceding and current row) as s'
+				+ ' from d order by id desc';
+			await expectStreamingModes(trailing, [['slidingAgg']]);
+			expect(await bothShapes(trailing)).to.deep.equal([
+				{ id: 8, s: 16 },  // [8,10] → 16
+				{ id: 5, s: 8 },   // [5,7] → 8
+				{ id: 3, s: 12 },  // [3,5] → 4+8
+				{ id: 2, s: 6 },   // [2,4] → 2+4
+				{ id: 1, s: 7 },   // [1,3] → 1+2+4
 			]);
 		});
 

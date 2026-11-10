@@ -237,6 +237,7 @@ async function* processPartition(
 	const orderByValues = sorted.orderByValues;
 
 	const partitionSize = sortedRows.length;
+	const sign = rangeSign(plan.windowSpec.orderBy);
 
 	// Pre-compute ranking values in a single O(n) pass using cached orderByValues
 	const rankings = precomputeRankings(partitionSize, orderByValues, preResolvedEqualityComparators);
@@ -267,7 +268,7 @@ async function* processPartition(
 				value = await computeAggregateFunction(
 					schema, argCallbacks[0] ?? null, sortedRows, currentIndex,
 					plan.windowSpec.frame, plan.windowSpec.orderBy.length > 0,
-					orderByValues, preResolvedEqualityComparators,
+					orderByValues, preResolvedEqualityComparators, sign,
 					rctx, sourceSlot
 				);
 			} else if (schema.kind === 'navigation') {
@@ -280,7 +281,7 @@ async function* processPartition(
 					func.functionName, sortedRows, currentIndex,
 					argCallbacks, plan.windowSpec.frame,
 					plan.windowSpec.orderBy.length > 0,
-					orderByValues, preResolvedEqualityComparators,
+					orderByValues, preResolvedEqualityComparators, sign,
 					rctx, sourceSlot
 				);
 			} else {
@@ -503,6 +504,7 @@ async function computeValueFunction(
 	hasOrderBy: boolean,
 	orderByValues: SqlValue[][],
 	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
+	sign: RangeSign,
 	rctx: RuntimeContext,
 	sourceSlot: RowSlot
 ): Promise<SqlValue> {
@@ -511,7 +513,7 @@ async function computeValueFunction(
 		throw new QuereusError(`${functionName} requires one argument`, StatusCode.ERROR);
 	}
 
-	const frameBounds = getFrameBounds(frame, sortedRows.length, currentIndex, hasOrderBy, orderByValues, equalityComparators);
+	const frameBounds = getFrameBounds(frame, sortedRows.length, currentIndex, hasOrderBy, orderByValues, equalityComparators, sign);
 	const name = functionName.toLowerCase();
 
 	let targetIndex: number;
@@ -540,10 +542,11 @@ async function computeAggregateFunction(
 	hasOrderBy: boolean,
 	orderByValues: SqlValue[][],
 	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
+	sign: RangeSign,
 	rctx: RuntimeContext,
 	sourceSlot: RowSlot
 ): Promise<SqlValue> {
-	const frameBounds = getFrameBounds(frame, sortedRows.length, currentIndex, hasOrderBy, orderByValues, equalityComparators);
+	const frameBounds = getFrameBounds(frame, sortedRows.length, currentIndex, hasOrderBy, orderByValues, equalityComparators, sign);
 
 	let accumulator = initialAccumulator(schema);
 	let rowCount = 0;
@@ -583,9 +586,10 @@ function getFrameBounds(
 	frame: AST.WindowFrame | undefined,
 	totalRows: number,
 	currentIndex: number,
-	hasOrderBy: boolean = true,
-	orderByValues: SqlValue[][] = [],
-	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number> = []
+	hasOrderBy: boolean,
+	orderByValues: SqlValue[][],
+	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
+	sign: RangeSign
 ): { start: number; end: number } {
 	if (!frame) {
 		if (!hasOrderBy) {
@@ -614,14 +618,14 @@ function getFrameBounds(
 	} else if (frame.start.type === 'preceding') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, sign, -offset);
 		} else {
 			start = currentIndex - offset;
 		}
 	} else if (frame.start.type === 'following') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, sign, offset);
 		} else {
 			start = currentIndex + offset;
 		}
@@ -644,14 +648,14 @@ function getFrameBounds(
 	} else if (frame.end.type === 'preceding') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, sign, -offset);
 		} else {
 			end = currentIndex - offset;
 		}
 	} else if (frame.end.type === 'following') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, sign, offset);
 		} else {
 			end = currentIndex + offset;
 		}
@@ -717,12 +721,27 @@ function arePeerRows(
 	return true;
 }
 
+/** +1 when the leading ORDER BY key ascends, -1 when it descends. */
+type RangeSign = 1 | -1;
+
 /**
- * Numeric form of an ORDER BY value for RANGE offset arithmetic. SQL NULL must
- * become NaN, not `Number(null) === 0` — a NULL-keyed row is outside every
- * finite-valued row's `[v - n, v + m]` interval, and coercing it to zero would
- * silently pull the NULL rows into any frame whose interval happens to span
- * zero. Mirrors the streaming emitter's `orderByVal0Num`, so both paths agree.
+ * The sign that makes a RANGE ordering key increase along the sort order: under
+ * `order by k desc`, "n preceding" means n *larger*, so the frame over key `v` is
+ * `[v - m, v + n]`. Multiplying every key by -1 turns that into the ascending
+ * `[u - n, u + m]` over `u = -v`, so both emit paths write the offset arithmetic
+ * once, ascending. NaN stays NaN, so the non-finite peer-group handling is unchanged.
+ */
+function rangeSign(orderBy: readonly AST.OrderByClause[]): RangeSign {
+	return orderBy[0]?.direction === 'desc' ? -1 : 1;
+}
+
+/**
+ * Numeric form of an ORDER BY value for RANGE offset arithmetic, multiplied by the
+ * {@link rangeSign} so it increases along the sort order. SQL NULL must become NaN,
+ * not `Number(null) === 0` — a NULL-keyed row is outside every finite-valued row's
+ * `[v - n, v + m]` interval, and coercing it to zero would silently pull the NULL
+ * rows into any frame whose interval happens to span zero. Mirrors the streaming
+ * emitter's `orderByVal0Num` (same NaN rule, same sign), so both paths agree.
  *
  * Any other non-numeric value is an error, not a peer group: the builder rejects
  * a non-numeric key type at prepare time (`validateRangeOffsetFrame`,
@@ -731,10 +750,10 @@ function arePeerRows(
  * frame, so that row still raises once it is current; the query fails either way.
  * Ranking functions compute no frame and so never reach this.
  */
-function rangeOrdinal(value: SqlValue): number {
+function rangeOrdinal(value: SqlValue, sign: RangeSign): number {
 	if (value === null) return NaN;
-	if (typeof value === 'number') return value;
-	if (typeof value === 'bigint') return Number(value);
+	if (typeof value === 'number') return sign * value;
+	if (typeof value === 'bigint') return sign * Number(value);
 	const valueType = typeof value === 'boolean' ? 'boolean' : getSqlDataTypeName(value);
 	throw new QuereusError(
 		`RANGE with offset PRECEDING/FOLLOWING requires a numeric ORDER BY key; got a ${valueType} value`,
@@ -754,18 +773,19 @@ function rangeOffsetStart(
 	totalRows: number,
 	orderByValues: SqlValue[][],
 	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
+	sign: RangeSign,
 	offset: number // negative for PRECEDING, positive for FOLLOWING
 ): number {
-	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0], sign);
 	if (!Number.isFinite(currentVal)) {
 		return findFirstPeer(currentIndex, totalRows, orderByValues, equalityComparators);
 	}
 
-	// First row whose ordering value is >= the target. Reads key 0 only: the
+	// First row whose signed ordering value is >= the target. Reads key 0 only: the
 	// builder rejects a numeric RANGE offset over any other key count.
 	const targetVal = currentVal + offset;
 	for (let i = 0; i < totalRows; i++) {
-		const rowVal = rangeOrdinal(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0], sign);
 		if (Number.isFinite(rowVal) && rowVal >= targetVal) {
 			return i;
 		}
@@ -773,24 +793,25 @@ function rangeOffsetStart(
 	return totalRows; // No matching row (empty frame start)
 }
 
-/** End-bound counterpart of {@link rangeOffsetStart}: last row whose ordering
- *  value is <= (currentValue + offset), or the peer group's last row when the
- *  current row's key is non-finite. */
+/** End-bound counterpart of {@link rangeOffsetStart}: last row whose signed
+ *  ordering value is <= (currentValue + offset), or the peer group's last row when
+ *  the current row's key is non-finite. */
 function rangeOffsetEnd(
 	currentIndex: number,
 	totalRows: number,
 	orderByValues: SqlValue[][],
 	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
+	sign: RangeSign,
 	offset: number
 ): number {
-	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0], sign);
 	if (!Number.isFinite(currentVal)) {
 		return findLastPeer(currentIndex, totalRows, orderByValues, equalityComparators);
 	}
 
 	const targetVal = currentVal + offset;
 	for (let i = totalRows - 1; i >= 0; i--) {
-		const rowVal = rangeOrdinal(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0], sign);
 		if (Number.isFinite(rowVal) && rowVal <= targetVal) {
 			return i;
 		}
@@ -913,14 +934,14 @@ interface StreamingFuncState {
 /** Per-row entry in a sliding-frame buffer (ROWS or RANGE). */
 interface SlidingBufEntry {
 	argVal: SqlValue;
-	/** Number(orderByValues[0]) — NaN for null/non-numeric. Used by RANGE only. */
+	/** rangeSign * Number(orderByValues[0]) — NaN for null/non-numeric. Used by RANGE only. */
 	orderByVal0: number;
 }
 
 /** Pending entry for a RANGE-sliding function. */
 interface SlidingRangePendingEntry {
 	entry: StreamingRowEntry;
-	/** Numeric ORDER BY value at this entry's row (NaN if non-finite). */
+	/** Signed numeric ORDER BY value at this entry's row (NaN if non-finite). */
 	v_j: number;
 	/** Pre-computed `Number.isFinite(v_j)`. */
 	isFinite: boolean;
@@ -1020,6 +1041,7 @@ async function* runStreaming(
 	// suppresses peer-buffering.
 	const frame = plan.windowSpec.frame;
 	const isRangeMode = frame === undefined || frame.type === 'range';
+	const sign = rangeSign(plan.windowSpec.orderBy);
 
 	let curPartitionKey: string | null = null;
 	let state: StreamingPartitionState | null = null;
@@ -1143,11 +1165,12 @@ async function* runStreaming(
 			}
 		}
 
-		// Numeric form of the leading ORDER BY value, used by RANGE-sliding.
+		// Numeric form of the leading ORDER BY value, used by RANGE-sliding,
+		// signed so it increases along the sort order (see rangeSign).
 		// SQL NULL must coerce to NaN (not `Number(null) === 0`) so the
 		// non-finite-peer-span branch handles it correctly.
 		const orderByLead = orderByValues.length > 0 ? orderByValues[0] : null;
-		const orderByVal0Num = orderByLead === null ? NaN : Number(orderByLead);
+		const orderByVal0Num = orderByLead === null ? NaN : sign * Number(orderByLead);
 
 		// Allocate a new queue entry for this row.
 		const sourceColCount = (row as SqlValue[]).length;
@@ -1409,7 +1432,9 @@ async function* finalizePartition(
 //     (mid-partition) or at partition close (right edge clamps to last row).
 //
 // RANGE strategy (per function):
-//   - Bounds advance by ORDER BY value, not by row offset.
+//   - Bounds advance by ORDER BY value, not by row offset. Every `v` below is
+//     the key times `rangeSign`, so it ascends along the sort for ASC and DESC
+//     alike and the arithmetic is written once, ascending.
 //   - Each pending entry tracks its `v_j` and a `rightClosed` flag flipped on
 //     by a later arrival whose value strictly exceeds `v_j + following`.
 //   - On finalize: scan the buffer for rows in [v_j - preceding, v_j +
