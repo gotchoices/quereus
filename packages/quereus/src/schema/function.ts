@@ -18,6 +18,14 @@ import type {
 import { planTimeLiteralValue } from '../planner/analysis/predicate-shape.js';
 
 /**
+ * A function's plan-time argument type check, called at build time with the call's
+ * argument logical types — for scalar, aggregate and (aggregate-derived) window calls
+ * alike. Return `true` to accept. Return `false` to reject, or a string to reject with
+ * that string as the reason, appended to the error message (e.g. to suggest a `cast`).
+ */
+export type ArgTypeValidator = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean | string;
+
+/**
  * Type for a scalar function implementation.
  */
 export type ScalarFunc = (...args: SqlValue[]) => MaybePromise<SqlValue>;
@@ -273,13 +281,8 @@ export interface ScalarFunctionSchema extends BaseFunctionSchema {
 	 * announce non-null when one of its arguments is.
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
-	/**
-	 * Optional argument type validation function.
-	 * If provided, this function will be called at planning time to validate
-	 * that the argument types are acceptable for this function.
-	 * Should return true if types are valid, false otherwise.
-	 */
-	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Optional plan-time argument type check — see {@link ArgTypeValidator}. */
+	validateArgTypes?: ArgTypeValidator;
 }
 
 /**
@@ -419,12 +422,8 @@ export interface AggregateFunctionSchema extends BaseFunctionSchema {
 	 * the return type based on the actual argument types.
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
-	/**
-	 * Optional argument type validation function.
-	 * If provided, this function will be called at planning time to validate
-	 * that the argument types are acceptable for this function.
-	 */
-	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Optional plan-time argument type check — see {@link ArgTypeValidator}. */
+	validateArgTypes?: ArgTypeValidator;
 }
 
 /**

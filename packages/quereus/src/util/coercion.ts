@@ -8,7 +8,7 @@ import { integerFromDigits } from './numeric-canonical.js';
 
 /**
  * What a piece of text means as a number: the single text-to-number rule behind arithmetic,
- * unary operators, `sum` and aggregate-argument conversion. A whole-number digit string
+ * unary operators and aggregate-argument conversion. A whole-number digit string
  * past the safe-integer range is an exact `bigint`, agreeing with `cast(... as integer)`;
  * everything else keeps `Number()`'s reading. NaN means "names no number" — each caller
  * maps that to its own rule.
@@ -101,13 +101,16 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
 	return [v1, v2];
 }
 
-/** Aggregates that never want their argument read as a number. MIN and MAX rank values in
- *  the argument's own order, so `min(text_col)` agrees with `order by text_col limit 1`. */
-const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT', 'MIN', 'MAX']);
+/** Aggregates whose arguments are never pre-converted from text. MIN and MAX rank values
+ *  in the argument's own order, so `min(text_col)` agrees with `order by text_col limit 1`.
+ *  SUM, AVG and TOTAL refuse text outright (func/builtins/aggregate.ts, `toSummand`), so a
+ *  numeric string arriving through an untyped argument must reach them as text to raise. */
+const UNCOERCED_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT', 'MIN', 'MAX', 'SUM', 'AVG', 'TOTAL']);
 
 /**
- * Does this aggregate read its arguments numerically? False for COUNT, GROUP_CONCAT,
- * MIN, MAX and the `JSON_*` family, which take their arguments as-is.
+ * Does this aggregate read numeric-looking text arguments as numbers? False for COUNT,
+ * GROUP_CONCAT, MIN, MAX, SUM, AVG, TOTAL and the `JSON_*` family, which take their
+ * arguments as-is. True for the rest — the var/stddev family and user aggregates.
  *
  * Split out so the routing decision has one home: the aggregate emitters resolve it once
  * per call site at emit time (`computeAggregateValueTransforms`,
@@ -116,7 +119,7 @@ const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT', 'MIN', 'MAX']);
  */
 export function aggregateCoercesArguments(functionName: string): boolean {
 	const upperName = functionName.toUpperCase();
-	return !NON_NUMERIC_AGGREGATES.has(upperName) && !upperName.startsWith('JSON_');
+	return !UNCOERCED_AGGREGATES.has(upperName) && !upperName.startsWith('JSON_');
 }
 
 /**
@@ -129,9 +132,10 @@ export function coerceAggregateValue(value: SqlValue): SqlValue {
 }
 
 /**
- * Coerces a value for aggregate function arguments.
- * Most aggregate functions should accept numeric strings as numbers.
- * For COUNT and MIN/MAX, no coercion needed. For SUM/AVG, numeric strings should be converted.
+ * Coerces a value for aggregate function arguments: a numeric-looking string becomes a
+ * number for the aggregates {@link aggregateCoercesArguments} says coerce (var/stddev,
+ * user aggregates). COUNT, MIN/MAX, GROUP_CONCAT, JSON_* and SUM/AVG/TOTAL see the value
+ * unchanged — SUM/AVG/TOTAL reject text rather than read it as a number.
  */
 export function coerceForAggregate(value: SqlValue, functionName: string): SqlValue {
 	return aggregateCoercesArguments(functionName) ? coerceAggregateValue(value) : value;

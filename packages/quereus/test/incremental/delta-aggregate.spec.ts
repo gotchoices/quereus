@@ -196,8 +196,8 @@ describe('Delta-aggregate fast path (arithmetic maintenance inside residual-reco
 			expect(plan.delta!.retractionSafe, 'nullable sum arg: retraction falls back to residual').to.equal(false);
 		});
 
-		it('sum over a TEXT argument fails the exact-domain gate (residual)', async () => {
-			await db.exec('create table srct (id integer primary key, t text, k integer)');
+		it('sum over a REAL argument fails the exact-domain gate (residual)', async () => {
+			await db.exec('create table srct (id integer primary key, t real, k integer)');
 			await db.exec('create materialized view mv as select k, count(*) as c, sum(t) as s from srct group by k');
 			const plan = deltaPlan(db, 'mv')!;
 			expect(plan.chosenStrategy).to.equal('residual-recompute');

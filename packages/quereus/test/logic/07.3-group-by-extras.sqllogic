@@ -271,7 +271,7 @@ select a, count(distinct b) as cd from wg group by a having count(distinct b) > 
 
 -- Control: a SELECT-list alias reference resolves through the aggregate output
 -- scope, not through this matching at all.
-select a, sum(b) as s from wg group by a having s > 3;
+select a, sum(b+0) as s from wg group by a having s > 3;
 → [{"a":"x","s":4}]
 
 -- Control: whitespace and redundant parentheses don't defeat the match — the
@@ -279,17 +279,17 @@ select a, sum(b) as s from wg group by a having s > 3;
 select a, sum(b+0) as s from wg group by a having sum(b + 0) > 3;
 → [{"a":"x","s":4}]
 
-select a, sum(b) as s from wg group by a having sum((b)) > 3;
+select a, sum(b+0) as s from wg group by a having sum((b+0)) > 3;
 → [{"a":"x","s":4}]
 
 -- Control: identifier case doesn't defeat the match.
-select a, sum(B) as s from wg group by a having sum(b) > 3;
+select a, sum(B+0) as s from wg group by a having sum(b+0) > 3;
 → [{"a":"x","s":4}]
 
 -- Narrowing (documented, not fixed): a qualifier divergence (`w.b` vs bare `b`)
 -- no longer matches, so HAVING computes a second, redundant aggregate over the
 -- same column instead of reusing the SELECT list's — the answer is unaffected.
-select a, sum(w.b) as s from wg w group by a having sum(b) > 3;
+select a, sum(w.b+0) as s from wg w group by a having sum(b+0) > 3;
 → [{"a":"x","s":4}]
 
 -- ---------------------------------------------------------------------------
@@ -314,7 +314,7 @@ select a as k, count(*) as c from wg group by a having (select count(*) from wg 
 → [{"k":"x","c":2}]
 
 -- Beside an aggregate alias, both resolving through the same scope.
-select a as k, sum(b) as s from wg group by a having k = 'x' and s > 3;
+select a as k, sum(b+0) as s from wg group by a having k = 'x' and s > 3;
 → [{"k":"x","s":4}]
 
 -- DELIBERATE: the alias SHADOWS a same-named base-table column. `b` is a real

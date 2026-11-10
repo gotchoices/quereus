@@ -331,16 +331,6 @@ select sum(v) from bigint_sum;
 drop table bigint_sum;
 
 -- ============================================================
--- AGGREGATE: SUM with string coercion
--- ============================================================
-
-create table str_sum (id integer primary key, v text null);
-insert into str_sum values (1, '10'), (2, '20'), (3, 'abc'), (4, null);
-select sum(v) from str_sum;
-→ [{"sum(v)":30}]
-drop table str_sum;
-
--- ============================================================
 -- AGGREGATE: SUM with boolean values
 -- ============================================================
 
@@ -435,16 +425,6 @@ insert into allnull values (1, null), (2, null);
 select min(v), max(v), sum(v), avg(v) from allnull;
 → [{"min(v)":null,"max(v)":null,"sum(v)":null,"avg(v)":null}]
 drop table allnull;
-
--- ============================================================
--- AGGREGATE: TOTAL with non-numeric
--- ============================================================
-
-create table total_t (id integer primary key, v text null);
-insert into total_t values (1, 'abc'), (2, null), (3, 'def');
-select total(v) from total_t;
-→ [{"total(v)":0}]
-drop table total_t;
 
 -- ============================================================
 -- SCALAR: coalesce

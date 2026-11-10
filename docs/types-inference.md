@@ -27,8 +27,9 @@ export interface ScalarFunctionSchema {
   // absent when the caller does not know.
   inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
 
-  // Optional: Validate argument types at planning time
-  validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+  // Optional: Validate argument types at planning time (ArgTypeValidator).
+  // true accepts; false rejects; a string rejects with that string as the reason.
+  validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean | string;
 
   implementation: ScalarFunc;
 }
@@ -115,6 +116,15 @@ any user-defined function's result. Use the shared
 `isNumeric` check: it accepts a numeric type, `ANY`, or `NULL`, and defers the decision to
 the implementation, which returns null for input it cannot use. (Accepting `NULL` is also
 what makes `abs(null)` return null instead of raising `Invalid argument types`.)
+
+`validateArgTypes` runs at build time whether or not the function also declares
+`inferReturnType`, for scalar and aggregate functions alike, and an aggregate registered as
+a window function carries its aggregate's check (`sum(x) over (…)` rejects what `sum(x)`
+rejects). Return a string instead of `false` to say why — it is appended to the
+`Invalid argument types for …` error. `sum`, `avg` and `total` use this to reject TEXT,
+JSON, BLOB and temporal arguments with a `cast` hint (`isSummableType`, which is
+`isNumericOrUnknownType` plus BOOLEAN); an ANY argument passes, and the aggregate's step
+raises on a non-number at run time instead.
 
 ### Built-in Polymorphic Functions
 

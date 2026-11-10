@@ -576,7 +576,7 @@ select '100000000000000000000000000000000000000000000000000000000000000000000000
 create table text_big (id integer primary key, v text);
 insert into text_big values (1, '9007199254740993'), (2, '1');
 
-select sum(v) as s from text_big;
+select sum(cast(v as integer)) as s from text_big;
 → [{"s":9007199254740994}]
 
 drop table text_big;

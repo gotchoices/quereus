@@ -145,14 +145,10 @@ select case when 'nonempty' then 'yes' else 'no' end as r;
 select case when null then 'yes' else 'no' end as r;
 → [{"r":"no"}]
 
--- === Aggregate coercion ===
+-- === Aggregates over text ===
 
--- SUM with numeric strings (coerced to numbers)
 CREATE TABLE agg_t (id INTEGER PRIMARY KEY, amount TEXT);
 INSERT INTO agg_t VALUES (1, '10'), (2, '20'), (3, '30');
-
-select sum(amount) from agg_t;
-→ [{"sum(amount)":60}]
 
 -- MIN/MAX over a TEXT column compare as text and return text, matching ORDER BY
 INSERT INTO agg_t VALUES (4, 'z'), (5, 'a');

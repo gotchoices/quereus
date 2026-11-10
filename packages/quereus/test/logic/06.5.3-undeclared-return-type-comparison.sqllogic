@@ -215,9 +215,9 @@ select abs(strftime('%Y', d)) as r from urt where id = 1;
 select abs(integer(strftime('%Y', d))) as r from urt where id = 1;
 → [{"r":2024}]
 
--- Aggregates: an ANY-typed argument no longer skips coerceForAggregate
--- (`computeAggregateValueTransforms`, runtime/emit/aggregate-setup.ts).
-select sum(strftime('%Y', d)) as s, avg(strftime('%Y', d)) as a from urt;
+-- Aggregates: sum/avg reject strftime's TEXT at prepare time for the same reason abs
+-- does; convert first.
+select sum(integer(strftime('%Y', d))) as s, avg(integer(strftime('%Y', d))) as a from urt;
 → [{"s":4047,"a":2023.5}]
 
 -- ===================================

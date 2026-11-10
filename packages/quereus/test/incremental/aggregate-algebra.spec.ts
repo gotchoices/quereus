@@ -43,6 +43,14 @@ const sumDomain: fc.Arbitrary<SqlValue> = fc.oneof(
 	fc.integer({ min: -4_000, max: 4_000 }).map((v): SqlValue => v / 4),
 );
 
+/** sumDomain plus every non-number class an untyped (ANY) column can carry into avg:
+ *  text (including numeric text), blobs, and booleans. */
+const mixedClassDomain: fc.Arbitrary<SqlValue> = fc.oneof(
+	sumDomain,
+	fc.constantFrom<SqlValue>('abc', '4', '', true, false),
+	fc.uint8Array({ maxLength: 4 }).map((v): SqlValue => v),
+);
+
 /** Mixed comparable values + NULL for min/max (cross-type BINARY ordering:
  *  numeric < text). NaN excluded — it is not a legal comparison-domain value. */
 const comparableOrNull: fc.Arbitrary<SqlValue> = fc.oneof(
@@ -82,8 +90,11 @@ describe('Aggregate algebra declarations', () => {
 
 		it('avg(x) satisfies the algebra laws, including its sum/count decomposition', () => {
 			// sumDomain, not small integers: avg accumulates as sum does, so the
-			// decomposition law must hold over whole numbers past 2^53 too.
-			assertAggregateAlgebraLaws(avgFunc, sumDomain);
+			// decomposition law must hold over whole numbers past 2^53 too. The
+			// decomposition also runs over values avg refuses (text, numeric text, blobs)
+			// and booleans: count(x) counts every one of them, so sum/count agrees with a
+			// direct avg only because both sides raise on the refused ones.
+			assertAggregateAlgebraLaws(avgFunc, sumDomain, { decomposeValueArb: mixedClassDomain });
 		});
 
 		/* Bound min/max: the emit-time bindArgs specialization replaces step, merge,
@@ -176,25 +187,17 @@ describe('Aggregate algebra declarations', () => {
 				.to.deep.equal({ exact: 0, approx: 0.5, count: Number.POSITIVE_INFINITY });
 		});
 
-		it("sum's non-numeric contributions are SKIPPED, not counted and not thrown", () => {
-			// The step used to wrap its coercion in a try/catch that swallowed a real
-			// RangeError from BigInt(); the catch is gone, so these skips are now the only
-			// way a value contributes nothing, and each has to be reached deliberately.
+		it("sum's step skips only NULL: booleans add as 1 / 0, every other non-number raises", () => {
+			// Nothing but NULL may contribute nothing: count(x) counts every non-NULL value,
+			// so a skip is what made avg's sum/count decomposition disagree with direct avg.
 			const step = (acc: AggValue, v: SqlValue): AggValue => sumFunc.stepFunction(acc, v);
-			expect(step(null, 'abc'), 'text naming no number').to.equal(null);
-			expect(step(null, ''), 'empty text coerces to 0, which DOES count')
-				.to.deep.equal({ exact: 0, approx: 0, count: 1 });
-			expect(step(null, new Uint8Array([1, 2])), 'blob').to.equal(null);
-			expect(step(null, { a: 1 }), 'json object').to.equal(null);
-			// Coerced contributions route by the same rule as native numbers.
-			expect(step(null, '7'), 'integral text').to.deep.equal({ exact: 7, approx: 0, count: 1 });
-			expect(step(null, '2.5'), 'fractional text').to.deep.equal({ exact: 0, approx: 2.5, count: 1 });
+			const counted = step(null, 5);
+			expect(step(counted, null), 'NULL leaves the accumulator untouched').to.equal(counted);
 			expect(step(null, true), 'true').to.deep.equal({ exact: 1, approx: 0, count: 1 });
 			expect(step(null, false), 'false').to.deep.equal({ exact: 0, approx: 0, count: 1 });
-			// A skipped value leaves an existing accumulator untouched — identically, not
-			// merely equally, so a skip can never bump the count that decides NULL-on-empty.
-			const counted = step(null, 5);
-			expect(step(counted, 'abc'), 'skip after a real contribution').to.equal(counted);
+			for (const v of ['abc', '7', '', new Uint8Array([1, 2]), { a: 1 }] as SqlValue[]) {
+				expect(() => step(counted, v), `refuses ${String(v)}`).to.throw(/cannot add/);
+			}
 		});
 
 		it('sum propagates a non-finite total instead of nulling it, matching total()/avg()', () => {

@@ -15,7 +15,7 @@ import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
-import { buildFunctionCall } from './function-call.js';
+import { assertArgTypesAccepted, buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
 import { classifyBinaryOperator } from '../analysis/binary-operator-class.js';
 
@@ -222,10 +222,12 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        // authoritative argument plan nodes are (re)built in select-window.ts for
        // the WindowNode; these exist only so this node's getType() can consult
        // inferReturnType (e.g. min(text_col) over (...) must type as TEXT so a
-       // surrounding `|| 'x'` types correctly).
+       // surrounding `|| 'x'` types correctly) and so the argument type check
+       // runs at prepare time (e.g. sum(text_col) over (...) is rejected).
        const windowArgTypes = expr.function.args.map(arg =>
          buildExpression(ctx, arg, false).getType().logicalType
        );
+       assertArgTypesAccepted(windowSchema.validateArgTypes, windowArgTypes, `window function ${expr.function.name}`, expr);
 
        return new WindowFunctionCallNode(
          ctx.scope,

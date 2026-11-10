@@ -183,9 +183,9 @@ Aggregate functions compute a single result from multiple rows within a `GROUP B
 |---|---|---|---|
 | `count(*)` | 0 | INTEGER | Total row count (including NULLs) |
 | `count(X)` | 1 | INTEGER | Count of non-NULL values |
-| `sum(X)` | 1 | INTEGER/BIGINT/REAL | Sum. `NULL` for empty set |
-| `total(X)` | 1 | REAL | Sum, always REAL. `0.0` for empty set |
-| `avg(X)` | 1 | REAL | Average. `NULL` for empty set |
+| `sum(X)` | 1 | INTEGER/BIGINT/REAL | Sum. `NULL` for empty set. Numeric or boolean argument only (see below) |
+| `total(X)` | 1 | REAL | Sum, always REAL. `0.0` for empty set. Same argument rule as `sum` |
+| `avg(X)` | 1 | REAL | Average. `NULL` for empty set. Same argument rule as `sum` |
 | `min(X)` | 1 | any | Minimum non-NULL value, in `order by` order. Text compares as text: over `'5'`, `'10'` it returns `'10'`. Use `min(cast(X as integer))` for numeric order |
 | `max(X)` | 1 | any | Maximum non-NULL value, in `order by` order. Text compares as text, as for `min` |
 | `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`). Skips NULLs. Non-text values render through the one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)) — a BLOB is UTF-8-decoded, a JSON document keeps its own text |
@@ -204,6 +204,8 @@ select json_group_array(score) from results;
 select json_group_object(key, value) from config;
 -- {"theme":"dark","fontSize":12}  (native object)
 ```
+
+**Arguments to `sum`, `avg` and `total`.** The argument must be numeric, BOOLEAN (adds as 1 / 0), or untyped (ANY). A TEXT, JSON, BLOB or temporal (DATE, TIME, DATETIME, TIMESTAMP, TIMESPAN) argument is rejected when the statement is prepared, with a hint to `cast` it — `sum(cast(price_text as real))`. A column declared with no type is BLOB, so it is rejected too. In an untyped column, a value that is not a number or boolean — text of any kind, including numeric text such as `'4'`, a blob, a JSON object — raises an error when the aggregate reaches it; NULL is skipped as usual. **Difference from SQLite**, which reads numeric text as a number and skips everything else. Refusing instead of skipping is what keeps an `avg` answered from a materialized view's stored `sum` and `count` equal to a direct `avg`: `count(x)` counts every non-NULL value, so `sum` must never pass over one silently. One consequence: with a materialized view that sums an untyped column, inserting a non-number into the base table fails during view maintenance and the insert is rolled back. `var_pop`, `var_samp`, `stddev_pop` and `stddev_samp` still skip non-numbers and read numeric text as numbers.
 
 **Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow. It accumulates exact integers and floating-point values in *separate* running totals and combines them only at the end, so the answer does not depend on the order rows were scanned. A fold that saw only `bigint`s and safe integers returns an exact integer; a fold that saw anything else — a fraction, a whole `number` past 9,007,199,254,740,991, or a non-finite — returns REAL. A REAL total that overflows returns `Infinity` (agreeing with `total()` and `avg()`), unlike binary `+`, which returns `NULL` on a non-finite result. `avg()` accumulates the same way and divides that total only at the end, so the average of whole numbers past 2^53 is not thrown off by a rounded running sum.
 

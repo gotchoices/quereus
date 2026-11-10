@@ -20,7 +20,8 @@ import { countStarFunc, countXFunc, sumFunc, minFunc, maxFunc, avgFunc } from '.
  *    finalize(merge(a, b))` — a stored value round-trips to an accumulator that
  *    behaves identically under further merges. Not bijectivity.
  * 5. Decompose: `finalize(a) ≡ combine([finalize(p) …])` over the partial
- *    accumulators the same input rows induce.
+ *    accumulators the same input rows induce — or both sides throw. Comparing
+ *    outcomes lets this law run over values the aggregate refuses.
  *
  * Accumulator equivalence throughout is finalize-then-byte-compare
  * (`sqlValueIdentical`, storage-class tolerant: bigint 5n ≡ number 5) — two
@@ -36,7 +37,7 @@ export interface AggregateAlgebraLawOptions {
 	/** fast-check run count per law (default 100). */
 	numRuns?: number;
 	/**
-	 * Narrower domain for the DECODE laws (4 and 4b) only; laws 1–3 and 5 keep using
+	 * Narrower domain for the DECODE laws (4 and 4b) only; laws 1–3 keep using
 	 * `valueArb`. Defaults to `valueArb`.
 	 *
 	 * `decode` reconstructs an accumulator from ONE finalized value per group, so an
@@ -48,6 +49,16 @@ export interface AggregateAlgebraLawOptions {
 	 * domain the write side's delta arm gates on.
 	 */
 	decodeValueArb?: fc.Arbitrary<SqlValue>;
+	/**
+	 * Wider domain for the DECOMPOSE law (5) only; defaults to `valueArb`.
+	 *
+	 * Law 5 compares outcomes — both sides return identical values, or both throw — so
+	 * it can run over values the aggregate refuses, which laws 1–3 cannot (they would
+	 * throw on the first such row). That is where a decomposition can silently disagree:
+	 * a partial that counts a value the direct evaluation skipped. avg over text and
+	 * blob rows is the case this exists for.
+	 */
+	decomposeValueArb?: fc.Arbitrary<SqlValue>;
 }
 
 const BUILTIN_PARTIALS: ReadonlyArray<AggregateFunctionSchema> =
@@ -100,6 +111,23 @@ function fold(schema: AggregateFunctionSchema, values: readonly SqlValue[]): Agg
 		acc = schema.numArgs === 0 ? schema.stepFunction(acc) : schema.stepFunction(acc, v);
 	}
 	return acc;
+}
+
+/** What evaluating one side of a law produced: a value, or that it threw. */
+type Outcome = { readonly threw: true; readonly error: unknown } | { readonly threw: false; readonly value: SqlValue };
+
+function outcomeOf(evaluate: () => SqlValue): Outcome {
+	try {
+		return { threw: false, value: evaluate() };
+	} catch (error) {
+		return { threw: true, error };
+	}
+}
+
+/** Same kind of outcome, and identical values when both returned. */
+function sameOutcome(a: Outcome, b: Outcome): boolean {
+	if (a.threw || b.threw) return a.threw && b.threw;
+	return sqlValueIdentical(a.value, b.value);
 }
 
 /** Finalize-then-byte-compare accumulator equivalence (law 4's notion of equality). */
@@ -211,7 +239,8 @@ export function assertAggregateAlgebraLaws(
 	}
 
 	// Law 5: decompose — combining the partials' finalized values reproduces this
-	// aggregate's finalize over the same input rows.
+	// aggregate's finalize over the same input rows, or both sides throw. Runs over
+	// `decomposeValueArb` (defaults to `valueArb`) — see the option's doc.
 	const decompose = algebra.decompose;
 	if (decompose) {
 		const resolvePartial = options.resolvePartial ?? defaultResolvePartial;
@@ -222,8 +251,9 @@ export function assertAggregateAlgebraLaws(
 			}
 			return { spec: p, schema: resolved };
 		});
-		check('decompose-combine', () => assertLawProperty(fc.property(valuesArb, (xs) => {
-			const partialValues = partials.map(({ spec, schema: pSchema }) => {
+		const decomposeValuesArb = fc.array(options.decomposeValueArb ?? valueArb, { maxLength: 12 });
+		check('decompose-combine', () => assertLawProperty(fc.property(decomposeValuesArb, (xs) => {
+			const combined = outcomeOf(() => decompose.combine(partials.map(({ spec, schema: pSchema }) => {
 				let acc: AggValue = cloneInitialValue(pSchema.initialValue);
 				for (const v of xs) {
 					// 'star' partials step once per row with no argument; 'same-arg'
@@ -231,8 +261,9 @@ export function assertAggregateAlgebraLaws(
 					acc = spec.arg === 'star' ? pSchema.stepFunction(acc) : pSchema.stepFunction(acc, v);
 				}
 				return pSchema.finalizeFunction(acc);
-			});
-			return sqlValueIdentical(decompose.combine(partialValues), schema.finalizeFunction(fold(schema, xs)));
+			})));
+			const direct = outcomeOf(() => schema.finalizeFunction(fold(schema, xs)));
+			return sameOutcome(combined, direct);
 		}), numRuns));
 	}
 }

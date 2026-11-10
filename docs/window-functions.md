@@ -489,9 +489,10 @@ registerWindowFunction({
 window functions at all: `registerAggregateAsWindowFunction`
 (`func/builtins/builtin-window-functions.ts`) derives each from its grouped
 aggregate's schema — its `stepFunction`, `finalizeFunction`, `initialValue`,
-`returnType` and any `bindArgs`. So `sum(x) over (…)` returns NUMERIC exactly as
-grouped `sum(x)` does (a `bigint` past 2^53, not a rounded float), coerces text
-the same way, and avg divides the same exact total. The `inverse` is the
+`returnType`, `validateArgTypes` and any `bindArgs`. So `sum(x) over (…)` returns
+NUMERIC exactly as grouped `sum(x)` does (a `bigint` past 2^53, not a rounded
+float), rejects the same argument types at prepare time and the same values at run
+time, and avg divides the same exact total. The `inverse` is the
 retraction the aggregate algebra defines, `merge(state, negate(step(initial,
 value)))`, present when the aggregate declares both `merge` and `negate`; for
 SUM the exact-integer part retracts exactly and the floating-point part in

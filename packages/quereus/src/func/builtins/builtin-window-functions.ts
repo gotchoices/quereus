@@ -125,8 +125,8 @@ function aggregateWindowParts(aggSchema: AggregateFunctionSchema): WindowFunctio
 
 /**
  * Register a plain aggregate as a window function. Everything that decides a value —
- * step, finalize, initial accumulator, return type, and any call-site `bindArgs`
- * specialization — comes from the aggregate's schema, so no window shape (frame walk,
+ * step, finalize, initial accumulator, return type, argument type check, and any
+ * call-site `bindArgs` specialization — comes from the aggregate's schema, so no window shape (frame walk,
  * running, sliding) keeps a copy of the aggregate's arithmetic.
  */
 function registerAggregateAsWindowFunction(aggSchema: AggregateFunctionSchema): void {
@@ -137,6 +137,7 @@ function registerAggregateAsWindowFunction(aggSchema: AggregateFunctionSchema): 
 		argCount: aggSchema.numArgs < 0 ? 'variadic' : aggSchema.numArgs,
 		returnType: aggSchema.returnType,
 		inferReturnType: aggSchema.inferReturnType,
+		validateArgTypes: aggSchema.validateArgTypes,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		initial: () => cloneInitialValue(aggSchema.initialValue),

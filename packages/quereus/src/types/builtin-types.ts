@@ -342,6 +342,17 @@ export function isNumericOrUnknownType(type: DeepReadonly<LogicalType>): boolean
 }
 
 /**
+ * Plan-time argument gate for `sum`, `avg` and `total`: {@link isNumericOrUnknownType}
+ * plus BOOLEAN, which adds as 1 / 0. Every other type (TEXT, JSON, BLOB, the temporal
+ * types) is rejected — those arguments need an explicit `cast`. Values arriving through
+ * an ANY argument are checked per row by the aggregate's step instead.
+ */
+export function isSummableType(type: DeepReadonly<LogicalType>): boolean {
+	// NOTE: identity against the singleton, same caveat as isNumericOrUnknownType.
+	return isNumericOrUnknownType(type) || type === BOOLEAN_TYPE;
+}
+
+/**
  * The three builtin types whose values share one numeric seek key space. Tested by
  * IDENTITY against the registry singletons, deliberately not by `type.isNumeric`:
  * a plugin-registered numeric type supplies its own `compare`, which is what a

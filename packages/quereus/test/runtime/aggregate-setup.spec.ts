@@ -107,14 +107,15 @@ describe('evalArgsSync', () => {
 });
 
 describe('aggregate argument coercion', () => {
-	it('routes the non-numeric aggregates away from coercion', () => {
-		for (const name of ['count', 'COUNT', 'group_concat', 'GROUP_CONCAT', 'min', 'MIN', 'max', 'MAX', 'json_group_array', 'JSON_OBJECT']) {
+	it('routes the uncoerced aggregates away from coercion', () => {
+		// sum/avg/total refuse text, so a numeric string must reach their step unconverted.
+		for (const name of ['count', 'COUNT', 'group_concat', 'GROUP_CONCAT', 'min', 'MIN', 'max', 'MAX', 'sum', 'SUM', 'avg', 'total', 'json_group_array', 'JSON_OBJECT']) {
 			expect(aggregateCoercesArguments(name), name).to.equal(false);
 		}
 	});
 
 	it('routes every other aggregate into coercion', () => {
-		for (const name of ['sum', 'SUM', 'avg', 'total', 'my_custom_agg', '']) {
+		for (const name of ['var_pop', 'STDDEV_SAMP', 'my_custom_agg', '']) {
 			expect(aggregateCoercesArguments(name), name).to.equal(true);
 		}
 	});
@@ -130,7 +131,7 @@ describe('aggregate argument coercion', () => {
 	});
 
 	it('composes back into coerceForAggregate, the definition the emitters must match', () => {
-		for (const name of ['sum', 'count', 'json_object', 'max']) {
+		for (const name of ['var_pop', 'sum', 'count', 'json_object', 'max']) {
 			for (const value of ['42', 'abc', '', null, 7] as const) {
 				const expected = aggregateCoercesArguments(name) ? coerceAggregateValue(value) : value;
 				expect(coerceForAggregate(value, name), `${name}(${String(value)})`).to.equal(expected);

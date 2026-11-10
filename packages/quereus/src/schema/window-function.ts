@@ -1,7 +1,7 @@
 import type { ScalarType } from '../common/datatype.js';
 import type { DeepReadonly, SqlValue } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
-import type { AggregateArgBinding } from './function.js';
+import type { AggregateArgBinding, ArgTypeValidator } from './function.js';
 
 /** The pieces a window bind may replace. Any field omitted keeps the declared default,
  *  except `inverse`: it undoes one `step`, so a binding that replaces `step` without
@@ -26,6 +26,13 @@ export interface WindowFunctionSchema {
 	 * return their argument's type rather than the fixed `returnType`).
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
+
+	/**
+	 * Optional plan-time argument type check, mirroring the aggregate schema's. A window
+	 * derived from an aggregate carries the aggregate's own, so `sum(x) over (…)` rejects
+	 * exactly what `sum(x)` rejects.
+	 */
+	validateArgTypes?: ArgTypeValidator;
 
 	/**
 	 * A fresh accumulator for an aggregate-style window. Every execution shape starts

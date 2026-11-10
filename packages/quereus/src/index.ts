@@ -328,6 +328,7 @@ export type {
 	TableValuedFunc,
 	AggregateReducer,
 	AggregateFinalizer,
+	ArgTypeValidator,
 	FunctionSchema
 } from './schema/function.js';
 

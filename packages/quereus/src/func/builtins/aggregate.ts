@@ -1,10 +1,11 @@
 import { createLogger } from '../../common/logger.js';
-import type { SqlValue } from '../../common/types.js';
-import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer } from '../../schema/function.js';
+import { StatusCode, type SqlValue } from '../../common/types.js';
+import { QuereusError } from '../../common/errors.js';
+import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer, ArgTypeValidator } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
-import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import { compareSqlValuesFast, createSemanticValueComparator, getSqlDataTypeName, BINARY_COLLATION } from '../../util/comparison.js';
 import { canonicalizeInteger } from '../../util/numeric-canonical.js';
-import { parseNumericText } from '../../util/coercion.js';
+import { isSummableType } from '../../types/builtin-types.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
@@ -65,6 +66,33 @@ export const countStarFunc = createAggregateFunction(
 	(acc: number): number => acc
 );
 
+// --- What sum, avg and total accept ---
+// Numbers add, booleans add as 1 / 0, NULL is skipped, and anything else is an error —
+// never skipped. Skipping is what let avg's sum/count decomposition disagree with a
+// direct avg: count(x) counts every non-NULL value, so every value it counts must be one
+// sum either added or refused. A TEXT, JSON, BLOB or temporal argument is refused at
+// prepare time; a value of those kinds can still arrive through an untyped (ANY)
+// argument, and the step refuses it then. Departs from SQLite, which reads numeric text
+// as a number and skips the rest.
+
+const CAST_HINT = 'use cast(x as integer) or cast(x as real)';
+
+/** Prepare-time gate shared by sum, avg and total — see {@link isSummableType}. */
+const validateSummableArg: ArgTypeValidator = (argTypes) =>
+	isSummableType(argTypes[0]) || `requires a numeric or boolean argument, got ${argTypes[0].name}; ${CAST_HINT}`;
+
+/** One value as sum/avg/total add it: the number, 1 / 0 for a boolean, or null (skip)
+ *  for NULL. Throws for every other value. `label` names the aggregate for the error. */
+function toSummand(label: string, value: SqlValue): number | bigint | null {
+	if (value === null) return null;
+	if (typeof value === 'number' || typeof value === 'bigint') return value;
+	if (typeof value === 'boolean') return value ? 1 : 0;
+	throw new QuereusError(
+		`${label}: cannot add a ${getSqlDataTypeName(value)} value; ${CAST_HINT}`,
+		StatusCode.MISMATCH,
+	);
+}
+
 // --- SUM(X) ---
 // The accumulator SPLITS the two number domains and never mixes them until finalize.
 // One slot cannot decide per addition whether the running total is an exact integer
@@ -74,7 +102,7 @@ export const countStarFunc = createAggregateFunction(
 // on the order rows happened to arrive, which breaks merge-associativity and so
 // materialized-view maintenance.
 //
-// The count of counted (non-NULL numeric) contributions rides alongside so retraction
+// The count of counted (non-NULL) contributions rides alongside so retraction
 // stays observational: merge(a, negate(a)) must finalize to NULL (the empty-group
 // value), which a bare running sum cannot distinguish from contributions cancelling
 // to 0. A fold that counted nothing still finalizes to NULL.
@@ -101,27 +129,12 @@ function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAcc
 		: { exact: base.exact, approx: base.approx + (value as number), count: base.count + 1 };
 }
 
-/** SUM's step. Also AVG's: avg accumulates exactly as sum does (see avgFunc). */
+/** SUM's step. Also AVG's: avg accumulates exactly as sum does (see avgFunc), so the
+ *  two share this one step and its error. NULL is skipped; a value that is not a number
+ *  or boolean throws (see toSummand). */
 function stepSum(acc: SumAccumulator, value: SqlValue): SumAccumulator {
-	if (value === null) return acc; // Ignore NULLs
-
-	if (typeof value === 'bigint' || typeof value === 'number') {
-		return addSumContribution(acc, value);
-	}
-	if (typeof value === 'boolean') {
-		return addSumContribution(acc, value ? 1 : 0);
-	}
-	if (typeof value === 'string') {
-		const parsed = parseNumericText(value);
-		// Documented skip, not a failure: text that names no number contributes nothing.
-		// (How text becomes a number at all is the coercion layer's rule, not sum's.)
-		if (typeof parsed === 'number' && isNaN(parsed)) return acc;
-		return addSumContribution(acc, parsed);
-	}
-	// Documented skip, not a failure: a non-numeric storage class (Uint8Array, JSON
-	// object) contributes nothing. Every remaining branch routes into the split
-	// accumulator, whose adder cannot throw, so there is nothing left to catch.
-	return acc;
+	const summand = toSummand('sum/avg', value);
+	return summand === null ? acc : addSumContribution(acc, summand);
 }
 
 function mergeSum(a: SumAccumulator, b: SumAccumulator): SumAccumulator {
@@ -164,6 +177,7 @@ export const sumFunc = createAggregateFunction(
 		// hold safe integers accumulates in the exact part and can finalize a `bigint`
 		// past 2^53 (`addWithPromotion`). No static argument type promises `number`.
 		returnType: NUMERIC_RETURN,
+		validateArgTypes: validateSummableArg,
 		// NOTE: declared unconditionally; exactness under retraction is a value-domain
 		// property (floats drift) the function cannot see, so the write-side delta arm
 		// gates on the argument's static type before exploiting negate.
@@ -209,8 +223,10 @@ export const sumFunc = createAggregateFunction(
 // Accumulates exactly as SUM does — the same accumulator, step, merge, and negate —
 // and divides only at finalize. The numerator is therefore sum's exact total (a float
 // running sum loses whole numbers past 2^53), and the divisor is sum's count of
-// numeric contributions. Direct evaluation and the sum/count decomposition share one
-// quotient (`avgQuotient`), so the two cannot drift apart.
+// contributions: every non-NULL value, because a value sum cannot add raises instead of
+// being skipped. That is what lets the decomposition use count(x) as its divisor.
+// Direct evaluation and the sum/count decomposition share one quotient
+// (`avgQuotient`), so the two cannot drift apart.
 
 /** avg's value from a sum total and a contribution count; an empty group (count 0 /
  *  NULL) ⇒ NULL. Real division, so the result is always a float. */
@@ -223,6 +239,7 @@ export const avgFunc = createAggregateFunction(
 	{
 		name: 'avg', numArgs: 1, initialValue: null,
 		returnType: REAL_RETURN,
+		validateArgTypes: validateSummableArg,
 		// No decode — the stored quotient forgets the count and cannot reconstruct
 		// an accumulator. Maintained/rolled up via its decomposition instead.
 		algebra: {
@@ -233,11 +250,6 @@ export const avgFunc = createAggregateFunction(
 					{ func: 'sum', arg: 'same-arg' },
 					{ func: 'count', arg: 'same-arg' },
 				],
-				// NOTE: count(x) counts every non-NULL value, but sum (and so direct avg) skips
-				// non-numeric text, blobs, and JSON — over such a value the decomposed divisor
-				// is larger than the direct one. Equal over every numeric domain; if avg ever
-				// needs to agree over mixed-class columns, the count partial must skip what
-				// sum skips.
 				combine: (partialValues: readonly SqlValue[]): SqlValue => avgQuotient(partialValues[0], partialValues[1]),
 			},
 		},
@@ -367,27 +379,17 @@ export const groupConcatFuncRev = createAggregateFunction(
 );
 
 // --- TOTAL(X) ---
+// Accepts what sum accepts (toSummand), but always adds in floating point and returns
+// 0.0 rather than NULL for an empty set.
 // NOTE: deliberately declares no algebra — a float running sum drifts under
 // retraction and would diverge byte-exactly from a fresh live re-sum, which the
 // maintenance-equivalence oracle compares byte-exactly. Residual-only is correct,
 // just not incremental. Same for group_concat / var_* / stddev_* below.
 export const totalFunc = createAggregateFunction(
-	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: REAL_RETURN_NOT_NULL },
+	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: REAL_RETURN_NOT_NULL, validateArgTypes: validateSummableArg },
 	(acc: number, value: SqlValue): number => {
-		let numValue = 0.0;
-		if (value !== null) {
-			try {
-				// Attempt numeric conversion, default to 0.0 if not possible
-				numValue = Number(value);
-				if (isNaN(numValue)) {
-					numValue = 0.0;
-				}
-			} catch {
-				numValue = 0.0;
-			}
-		}
-		// Always use floating-point arithmetic
-		return acc + numValue;
+		const summand = toSummand('total', value);
+		return summand === null ? acc : acc + Number(summand);
 	},
 	(acc: number): number => acc // Returns 0.0 for empty set or only NULL inputs
 );
@@ -399,6 +401,9 @@ interface StatAccumulator {
 	sumSq: number;
 }
 
+// NOTE: still skips non-numbers (and reads numeric text as a number), unlike
+// sum/avg/total, which raise. Safe because these declare no algebra, so no materialized
+// view can disagree with them; aligning them with sum is a separate decision.
 const statReducer = (acc: StatAccumulator, value: SqlValue): StatAccumulator => {
 	if (value === null) {
 		return acc; // Ignore NULLs

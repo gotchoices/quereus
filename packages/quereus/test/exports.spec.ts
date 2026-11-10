@@ -177,7 +177,7 @@ describe('Public API Exports', () => {
 
 		it('should export coerceForAggregate', () => {
 			expect(coerceForAggregate).to.be.a('function');
-			expect(coerceForAggregate('123', 'SUM')).to.equal(123);
+			expect(coerceForAggregate('123', 'VAR_POP')).to.equal(123);
 		});
 
 		it('should export isNumericValue', () => {

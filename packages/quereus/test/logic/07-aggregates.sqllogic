@@ -37,7 +37,7 @@ SELECT sum(val) FROM agg_t HAVING sum(val) > 100;
 → [{"sum(val)":150}]
 
 -- Aggregate with empty input
-CREATE TABLE empty_agg(x NULL);
+CREATE TABLE empty_agg(x INTEGER NULL);
 SELECT count(*), sum(x) FROM empty_agg;
 → [{"count(*)":0,"sum(x)":null}]
 DROP TABLE empty_agg;

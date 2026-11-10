@@ -18,8 +18,8 @@ import { sqlValueIdentical } from '../src/util/comparison.js';
  * running aggregate, and the streaming ROWS and RANGE sliding frames.
  *
  * The value domain mixes the exact-integer part of sum's accumulator (bigints past
- * 2^53, safe integers near the boundary, numeric text) with its floating-point part
- * (fractions). Fractions are dyadic and bounded, so float addition over them is
+ * 2^53, safe integers near the boundary, booleans) with its floating-point part
+ * (fractions). No text: sum and avg refuse it, numeric text included. Fractions are dyadic and bounded, so float addition over them is
  * exact: a slide-and-retract and a fresh fold then agree bit for bit, and a
  * divergence means a real difference in the computation, not IEEE rounding order.
  */
@@ -41,7 +41,7 @@ const valueArb: fc.Arbitrary<SqlValue> = fc.oneof(
 	bigWhole.map((v): SqlValue => v),
 	nearBoundary.map((v): SqlValue => v),
 	dyadic.map((v): SqlValue => v),
-	fc.oneof(bigWhole, nearBoundary, dyadic).map((v): SqlValue => String(v)),
+	fc.boolean().map((v): SqlValue => v),
 );
 
 interface Shape {

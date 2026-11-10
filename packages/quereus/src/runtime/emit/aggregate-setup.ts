@@ -156,11 +156,11 @@ export function buildDistinctComparators(
  * Per-aggregate value transform, replacing a per-row `coerceForAggregate(value,
  * functionName)` call with a decision made once at emit time. `undefined` means the call
  * site never coerces — the aggregate ignores coercion (COUNT, GROUP_CONCAT, MIN, MAX,
- * JSON_*, per {@link aggregateCoercesArguments}), every argument is already numeric, or
- * every argument type carries semantic ordering (TIMESPAN/JSON), whose text is not a
- * number to read: `sum`/`avg` over such an argument see the value as stored. Otherwise the
- * transform is {@link coerceAggregateValue} — the same function `coerceForAggregate`
- * calls once its own routing agrees, so the two paths cannot drift.
+ * SUM, AVG, TOTAL, JSON_*, per {@link aggregateCoercesArguments}), every argument is
+ * already numeric, or every argument type carries semantic ordering (TIMESPAN/JSON),
+ * whose text is not a number to read: e.g. `var_pop` over such an argument sees the value
+ * as stored. Otherwise the transform is {@link coerceAggregateValue} — the same function
+ * `coerceForAggregate` calls once its own routing agrees, so the two paths cannot drift.
  */
 export function computeAggregateValueTransforms(
 	aggregates: readonly AggregateExpr[],

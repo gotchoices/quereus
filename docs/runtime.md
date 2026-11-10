@@ -1153,14 +1153,15 @@ SQL requires different coercion strategies for different contexts. Quereus coerc
 **Arithmetic Context** (`coerceToNumberForArithmetic`):
 - Converts all values to numbers for arithmetic operations
 - Non-numeric strings become 0 (SQL standard behavior)
-- Text holding a whole number past the safe-integer range stays exact as a `bigint`, through `parseNumericText`, the one text-to-number rule that unary operators and `sum` share
+- Text holding a whole number past the safe-integer range stays exact as a `bigint`, through `parseNumericText`, the one text-to-number rule that unary operators and aggregate-argument coercion share
 - Example: `'abc' + 0` → 0, `'123' + 0` → 123, `'9007199254740993' + 0` → 9007199254740993n
 - Such a `bigint` follows the integer rules, including truncating division with a whole-number divisor: `'9007199254740993' / 1000000000000000` → 9, as `9007199254740993 / 1000000000000000` does, while safe-range text divides as a double
 - Used in: +, -, *, /, % operators
 
 **Aggregate Context** (`coerceForAggregate`):
 - Function-specific coercion for aggregate arguments
-- COUNT/GROUP_CONCAT/MIN/MAX/`JSON_*` skip coercion, numeric aggregates (SUM/AVG) coerce strings
+- COUNT/GROUP_CONCAT/MIN/MAX/SUM/AVG/TOTAL/`JSON_*` skip coercion; the variance family (`var_*`, `stddev_*`) and user aggregates coerce numeric strings
+- SUM/AVG/TOTAL skip it because they refuse text outright: a TEXT/JSON/BLOB/temporal argument is rejected at prepare time, and a non-number arriving through an ANY argument raises in the step (`toSummand`, `func/builtins/aggregate.ts`) — so numeric text must reach the step unconverted. See [functions.md § Aggregate Functions](functions.md#aggregate-functions)
 - `min`/`max` over text therefore compare as text and return text, matching `order by`: `min` over `'5'`, `'10'` returns `'10'`. Convert explicitly for numeric order: `min(cast(v as integer))`
 - The aggregate emitters do not call it per row: the routing decision is constant for a
   call site, so `computeAggregateValueTransforms` (`runtime/emit/aggregate-setup.ts`)

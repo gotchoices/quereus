@@ -262,13 +262,18 @@ describe('Utility Edge Cases', () => {
 			expect(coerceForAggregate('42', 'GROUP_CONCAT')).to.equal('42');
 		});
 
-		it('should coerce numeric strings for SUM and AVG', () => {
-			expect(coerceForAggregate('42', 'SUM')).to.equal(42);
-			expect(coerceForAggregate('42', 'AVG')).to.equal(42);
+		it('should leave SUM, AVG and TOTAL arguments unconverted (they refuse text)', () => {
+			expect(coerceForAggregate('42', 'SUM')).to.equal('42');
+			expect(coerceForAggregate('42', 'AVG')).to.equal('42');
+			expect(coerceForAggregate('42', 'TOTAL')).to.equal('42');
 		});
 
-		it('should leave non-numeric strings for SUM', () => {
-			expect(coerceForAggregate('hello', 'SUM')).to.equal('hello');
+		it('should coerce numeric strings for the variance family', () => {
+			expect(coerceForAggregate('42', 'VAR_POP')).to.equal(42);
+		});
+
+		it('should leave non-numeric strings for the variance family', () => {
+			expect(coerceForAggregate('hello', 'VAR_POP')).to.equal('hello');
 		});
 
 		it('should skip coercion for MIN and MAX', () => {

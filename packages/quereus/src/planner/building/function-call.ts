@@ -5,7 +5,7 @@ import { QuereusError } from "../../common/errors.js";
 import { StatusCode } from "../../common/types.js";
 import * as AST from "../../parser/ast.js";
 import { ScalarPlanNode } from "../nodes/plan-node.js";
-import { isAggregateFunctionSchema, isScalarFunctionSchema } from '../../schema/function.js';
+import { isAggregateFunctionSchema, isScalarFunctionSchema, type ArgTypeValidator } from '../../schema/function.js';
 import { buildExpression } from "./expression.js";
 import { coerceComparisonGroup } from "./coercion.js";
 import { ScalarFunctionCallNode } from "../nodes/function.js";
@@ -13,6 +13,8 @@ import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
 import { expressionToIdentityString } from "../../emit/ast-stringify.js";
+import type { LogicalType } from "../../types/logical-type.js";
+import type { DeepReadonly } from "../../common/types.js";
 
 /** One entry of {@link PlanningContext.aggregates} — an aggregate already computed by the AggregateNode. */
 export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[number];
@@ -61,6 +63,31 @@ export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionEx
 	return undefined;
 }
 
+/**
+ * Apply a function schema's plan-time argument type check, throwing MISMATCH when it
+ * rejects. Runs whether or not the schema also infers its return type — a fixed-return
+ * function (`sum`) validates as well as a polymorphic one (`abs`). `what` names the
+ * call for the message, e.g. `aggregate function sum`.
+ */
+export function assertArgTypesAccepted(
+	validate: ArgTypeValidator | undefined,
+	argTypes: ReadonlyArray<DeepReadonly<LogicalType>>,
+	what: string,
+	expr: AST.Expression,
+): void {
+	if (!validate) return;
+	const verdict = validate(argTypes);
+	if (verdict === true) return;
+	const reason = typeof verdict === 'string' ? `: ${verdict}` : '';
+	throw new QuereusError(
+		`Invalid argument types for ${what}${reason}`,
+		StatusCode.MISMATCH,
+		undefined,
+		expr.loc?.start.line,
+		expr.loc?.start.column
+	);
+}
+
 export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, allowAggregates: boolean): ScalarPlanNode {
 	// In HAVING context, check if this function matches an existing aggregate
 	const matchingAggregate = findMatchingAggregate(ctx, expr);
@@ -89,24 +116,9 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 		// Build arguments for aggregate function
 		const args = expr.args.map(arg => buildExpression(ctx, arg, false)); // Aggregates can't contain other aggregates
 
-		// Perform type inference if available
-		let inferredType: ScalarType | undefined;
-		if (functionSchema.inferReturnType) {
-			const argTypes = args.map(arg => arg.getType().logicalType);
-
-			// Validate argument types if validator is provided
-			if (functionSchema.validateArgTypes && !functionSchema.validateArgTypes(argTypes)) {
-				throw new QuereusError(
-					`Invalid argument types for aggregate function ${expr.name}`,
-					StatusCode.MISMATCH,
-					undefined,
-					expr.loc?.start.line,
-					expr.loc?.start.column
-				);
-			}
-
-			inferredType = functionSchema.inferReturnType(argTypes);
-		}
+		const argTypes = args.map(arg => arg.getType().logicalType);
+		assertArgTypesAccepted(functionSchema.validateArgTypes, argTypes, `aggregate function ${expr.name}`, expr);
+		const inferredType = functionSchema.inferReturnType?.(argTypes);
 
 		return new AggregateFunctionCallNode(
 			ctx.scope,
@@ -136,23 +148,11 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 			coerceComparisonGroup(ctx.scope, functionSchema.comparesArgs, args);
 		}
 
-		// Perform type inference if available
 		let inferredType: ScalarType | undefined;
-		if (isScalarFunctionSchema(functionSchema) && functionSchema.inferReturnType) {
+		if (isScalarFunctionSchema(functionSchema)) {
 			const argTypes = args.map(arg => arg.getType().logicalType);
-
-			// Validate argument types if validator is provided
-			if (functionSchema.validateArgTypes && !functionSchema.validateArgTypes(argTypes)) {
-				throw new QuereusError(
-					`Invalid argument types for function ${expr.name}`,
-					StatusCode.MISMATCH,
-					undefined,
-					expr.loc?.start.line,
-					expr.loc?.start.column
-				);
-			}
-
-			inferredType = functionSchema.inferReturnType(argTypes, args.map(arg => arg.getType().nullable));
+			assertArgTypesAccepted(functionSchema.validateArgTypes, argTypes, `function ${expr.name}`, expr);
+			inferredType = functionSchema.inferReturnType?.(argTypes, args.map(arg => arg.getType().nullable));
 		}
 
 		return new ScalarFunctionCallNode(ctx.scope, expr, functionSchema, args, inferredType);

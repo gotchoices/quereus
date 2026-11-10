@@ -33,30 +33,33 @@ SELECT grp FROM aec GROUP BY grp HAVING sum(val) * 2 + count(*) < 0;
 DROP TABLE aec;
 
 -- ============================================================
--- Type coercion in aggregates: string values that look numeric
+-- sum/avg/total refuse non-numbers (departs from SQLite, which coerces/skips)
 -- ============================================================
 
 CREATE TABLE aec_coerce (id INTEGER PRIMARY KEY, val TEXT NULL);
 INSERT INTO aec_coerce VALUES (1, '10'), (2, '20'), (3, '30.5');
 
--- sum() should coerce numeric-looking strings
+-- A TEXT argument is rejected at prepare time, numeric-looking or not
 SELECT sum(val) AS s FROM aec_coerce;
-→ [{"s":60.5}]
+-- error: requires a numeric or boolean argument, got TEXT; use cast
 
--- avg() should coerce numeric-looking strings
 SELECT avg(val) AS a FROM aec_coerce;
-→ [{"a":20.166666666666668}]
+-- error: requires a numeric or boolean argument, got TEXT
 
--- Non-numeric strings should be ignored by sum/avg (treated as 0 or skipped)
+SELECT total(val) AS t FROM aec_coerce;
+-- error: requires a numeric or boolean argument, got TEXT
+
+-- ...including as a window function
+SELECT sum(val) OVER () AS s FROM aec_coerce;
+-- error: Invalid argument types for window function sum
+
+-- An explicit cast is the workaround
+SELECT sum(cast(val AS real)) AS s, avg(cast(val AS real)) AS a, total(cast(val AS real)) AS t FROM aec_coerce;
+→ [{"s":60.5,"a":20.166666666666668,"t":60.5}]
+
 INSERT INTO aec_coerce VALUES (4, 'hello'), (5, 'world');
 
-SELECT sum(val) AS s FROM aec_coerce;
-→ [{"s":60.5}]
-
-SELECT avg(val) AS a FROM aec_coerce;
-→ [{"a":20.166666666666668}]
-
--- count(val) counts all non-null values regardless of coercion
+-- count(val) counts all non-null values; it takes any type
 SELECT count(val) AS c FROM aec_coerce;
 → [{"c":5}]
 
@@ -65,6 +68,49 @@ SELECT min(val) AS mn, max(val) AS mx FROM aec_coerce;
 → [{"mn":"10","mx":"world"}]
 
 DROP TABLE aec_coerce;
+
+-- In an untyped (ANY) column a non-number raises at run time — numeric text too.
+-- Booleans add as 1 / 0; NULL is skipped.
+CREATE TABLE aec_any (id INTEGER PRIMARY KEY, v ANY NULL);
+INSERT INTO aec_any VALUES (1, 4), (2, true), (3, false), (4, null);
+
+SELECT sum(v) AS s, avg(v) AS a, total(v) AS t FROM aec_any;
+→ [{"s":5,"a":1.6666666666666667,"t":5}]
+
+INSERT INTO aec_any VALUES (5, 'abc');
+
+SELECT sum(v) AS s FROM aec_any;
+-- error: cannot add a text value; use cast
+
+DELETE FROM aec_any WHERE id = 5;
+INSERT INTO aec_any VALUES (6, '4');
+
+SELECT avg(v) AS a FROM aec_any;
+-- error: cannot add a text value
+
+DROP TABLE aec_any;
+
+-- A materialized view summing an ANY column: a non-number fails the insert during view
+-- maintenance, and neither the base table nor the view changes. avg rolled up from the
+-- view's sum/count then agrees with a direct avg.
+CREATE TABLE aec_mv (id INTEGER PRIMARY KEY, g INTEGER, v ANY NULL);
+INSERT INTO aec_mv VALUES (1, 1, 2), (2, 1, 4), (3, 2, 6);
+CREATE MATERIALIZED VIEW aec_mv_sums AS SELECT g, sum(v) AS sv, count(v) AS cv, count(*) AS c FROM aec_mv GROUP BY g;
+
+INSERT INTO aec_mv VALUES (4, 1, 'abc');
+-- error: cannot add a text value
+
+SELECT count(*) AS n FROM aec_mv;
+→ [{"n":3}]
+
+SELECT g, sv, cv, c FROM aec_mv_sums ORDER BY g;
+→ [{"g":1,"sv":6,"cv":2,"c":2},{"g":2,"sv":6,"cv":1,"c":1}]
+
+SELECT avg(v) AS a FROM aec_mv;
+→ [{"a":4}]
+
+DROP MATERIALIZED VIEW aec_mv_sums;
+DROP TABLE aec_mv;
 
 -- ============================================================
 -- Aggregate over empty GROUP BY with no matching rows
@@ -307,10 +353,6 @@ select min(v) as mn, max(v) as mx from aec_minmax group by 1 = 1;
 
 select min(distinct v) as mn from aec_minmax;
 → [{"mn":"10"}]
-
--- sum/avg over the same column still read the text as numbers
-select sum(v) as s, avg(v) as a from aec_minmax;
-→ [{"s":15,"a":7.5}]
 
 drop table aec_minmax;
 

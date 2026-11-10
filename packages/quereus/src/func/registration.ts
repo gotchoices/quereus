@@ -1,5 +1,5 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
-	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement, FunctionSchema } from '../schema/function.js';
+	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, ArgTypeValidator, TVFAdvertisement, FunctionSchema } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
 import type { ScalarType, RelationType, BaseType, ColumnDef, ColRef } from '../common/datatype.js';
 import type { LogicalType } from '../types/logical-type.js';
@@ -41,12 +41,8 @@ interface ScalarFuncOptions {
 	 * each argument may be NULL — see `ScalarFunctionSchema.inferReturnType`).
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>, argNullable?: ReadonlyArray<boolean>) => ScalarType;
-	/**
-	 * Optional argument type validation function.
-	 * If provided, this function will be called at planning time to validate
-	 * that the argument types are acceptable for this function.
-	 */
-	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Optional plan-time argument type check — see {@link ArgTypeValidator}. */
+	validateArgTypes?: ArgTypeValidator;
 	/** Argument indices on which this function is injective when all other arguments are held constant. */
 	injectiveOnArgs?: readonly number[];
 	/** Per-argument monotonicity when all other arguments are held constant. */
@@ -140,12 +136,8 @@ interface AggregateFuncOptions {
 	 * the return type based on the actual argument types.
 	 */
 	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
-	/**
-	 * Optional argument type validation function.
-	 * If provided, this function will be called at planning time to validate
-	 * that the argument types are acceptable for this function.
-	 */
-	validateArgTypes?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => boolean;
+	/** Optional plan-time argument type check — see {@link ArgTypeValidator}. */
+	validateArgTypes?: ArgTypeValidator;
 }
 
 /**

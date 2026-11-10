@@ -782,28 +782,28 @@ select stddev_samp(val) as r from mk_agg_two;
 drop table mk_agg_two;
 
 -- ============================================================
--- aggregate.ts: total always returns 0 for non-numeric
+-- aggregate.ts: total refuses a non-number arriving through an untyped column
 -- ============================================================
 
-create table mk_total_text (id integer primary key, val text);
+create table mk_total_text (id integer primary key, val any);
 insert into mk_total_text values (1, 'hello'), (2, 'world');
 
--- Kill: total of non-numeric text → 0 (NaN treated as 0)
+-- Kill: total of text raises rather than reading it as 0
 select total(val) as r from mk_total_text;
-→ [{"r":0}]
+-- error: total: cannot add a text value
 
 drop table mk_total_text;
 
 -- ============================================================
--- aggregate.ts: total with mixed numeric strings
+-- aggregate.ts: total over numbers, booleans and null
 -- ============================================================
 
-create table mk_total_mixed (id integer primary key, val text null);
-insert into mk_total_mixed values (1, '10'), (2, 'abc'), (3, '20'), (4, null);
+create table mk_total_mixed (id integer primary key, val any null);
+insert into mk_total_mixed values (1, 10), (2, true), (3, 20.5), (4, null);
 
--- Kill: total coerces numeric strings, treats non-numeric as 0, skips null
+-- Kill: total adds numbers, adds true as 1, skips null
 select total(val) as r from mk_total_mixed;
-→ [{"r":30}]
+→ [{"r":31.5}]
 
 drop table mk_total_mixed;
 

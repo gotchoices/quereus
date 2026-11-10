@@ -905,7 +905,7 @@ select a, count(*) over (partition by b) as c from wg group by a;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
 -- Same rule for a window function's arguments.
-select a, sum(b) over () as s from wg group by a;
+select a, count(b) over () as s from wg group by a;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
 -- A window function above an UNGROUPED aggregate: the aggregation yields exactly
@@ -925,7 +925,7 @@ select count(*) as c, row_number() over (order by count(*)) as rn from wg;
 select count(*) as c, row_number() over (order by a) as rn from wg;
 -- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
 
-select count(*) as c, sum(b) over () as s from wg;
+select count(*) as c, count(b) over () as s from wg;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
 -- A window function whose ARGUMENTS are column-free runs over that same single
@@ -953,10 +953,10 @@ select a, sum(b+0) as s, row_number() over (order by sum(a+0)) as rn from wg gro
 -- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
 -- The match is textual, so a *qualifier* divergence lands in that same
--- limitation even though both spellings name the same column: `sum(w.b)` in the
--- select list is not the fingerprint `sum(b)` the window spec asks for. Writing
+-- limitation even though both spellings name the same column: `sum(w.b+0)` in the
+-- select list is not the fingerprint `sum(b+0)` the window spec asks for. Writing
 -- both the same way, or referencing the select-list alias, both work.
-select a, sum(w.b) as s, row_number() over (order by sum(b)) as rn from wg w group by a;
+select a, sum(w.b+0) as s, row_number() over (order by sum(b+0)) as rn from wg w group by a;
 -- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
 -- Same limitation for a literal-case divergence
@@ -1183,7 +1183,7 @@ from wg group by a order by rn;
 
 -- In a window function's ARGUMENT rather than its specification: the per-group
 -- values '3' and '2' summed over the whole (unpartitioned) window.
-select a, sum((select max(t.b) from wg t where t.a = wg.a)) over () as s
+select a, sum((select max(t.b) from wg t where t.a = wg.a) + 0) over () as s
 from wg group by a order by a;
 → [{"a":"x","s":5},{"a":"y","s":5}]
 
