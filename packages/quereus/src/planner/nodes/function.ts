@@ -55,7 +55,10 @@ export class ScalarFunctionCallNode extends PlanNode implements NaryScalarNode {
 			return this;
 		}
 
-		// Create new instance
+		// NOTE: keeps the type inferred from the ORIGINAL arguments. `inferReturnType` now
+		// reads argument nullability (coalesce is non-null when any argument is), so a rewrite
+		// that swaps a non-null argument for a nullable one would leave a stale non-null claim;
+		// if a rule ever does that, re-run inference here.
 		return new ScalarFunctionCallNode(
 			this.scope,
 			this.expression,

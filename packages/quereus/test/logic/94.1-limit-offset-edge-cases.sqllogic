@@ -54,6 +54,13 @@ SELECT id FROM lo_t ORDER BY id LIMIT coalesce((SELECT max(id) FROM lo_t WHERE i
 SELECT id FROM lo_t ORDER BY id LIMIT 'abc';
 -- error: LIMIT must be a finite number
 
+-- …nor is a blank string or a blob (plain JS Number() reads '' as 0 and x'05' as 5)
+SELECT id FROM lo_t ORDER BY id LIMIT '';
+-- error: LIMIT must be a finite number
+
+SELECT id FROM lo_t ORDER BY id LIMIT x'05';
+-- error: LIMIT must be a finite number
+
 -- MySQL-style: LIMIT offset, count
 SELECT * FROM lo_t ORDER BY id LIMIT 2, 3;
 → [{"id":3,"val":"c"},{"id":4,"val":"d"},{"id":5,"val":"e"}]

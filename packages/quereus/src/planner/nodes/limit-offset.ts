@@ -10,13 +10,14 @@ import { CastNode, CollateNode, LiteralNode } from './scalar.js';
 import { addSingletonFd } from '../util/fd-utils.js';
 import { literalValue } from '../analysis/predicate-shape.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
+import { rowCountNumber } from '../../util/row-count.js';
 
 /**
  * Resolve a LIMIT / OFFSET expression to a compile-time-constant finite number, or
  * `undefined` when it is not one (a parameter, a subquery, any other expression, or a
  * literal that does not coerce to a finite number). Peels `CastNode`/`CollateNode` to find
- * a `LiteralNode`, mirroring `literalSqlValueOf` in `fd-utils.ts`; `Number(value)`
- * coercion matches the runtime's `toRowCount`.
+ * a `LiteralNode`, mirroring `literalSqlValueOf` in `fd-utils.ts`; reads the literal with
+ * the runtime's own `rowCountNumber`, so plan and runtime agree on what it means.
  *
  * NOTE: peeling a cast reads the literal under it, not the cast's result, so a cast that
  * changes the number (`cast(-0.5 as integer)` is 0) is judged by its operand. Only a
@@ -30,7 +31,7 @@ export function constantNumber(node: ScalarPlanNode): number | undefined {
 	if (!(cur instanceof LiteralNode)) return undefined;
 	const v = literalValue(cur.expression);
 	if (v === undefined || v === null) return undefined;
-	const n = Number(v);
+	const n = rowCountNumber(v);
 	return Number.isFinite(n) ? n : undefined;
 }
 

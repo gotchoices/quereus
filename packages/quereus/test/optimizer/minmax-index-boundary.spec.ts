@@ -235,8 +235,8 @@ describe('minmax-index-boundary', () => {
 			// `ruleGrowRetrieve`'s LimitOffset arm would swallow this node into
 			// `Retrieve.source`, where the index-style branch of `ruleSelectAccessPath`
 			// never executes it — the early stop would silently vanish. Today that arm
-			// refuses a LIMIT whose OFFSET is a non-numeric literal, which is exactly the
-			// `Literal(null)` OFFSET the rewrite constructs. This pins that it stays.
+			// refuses a LIMIT whose OFFSET is absent, which is exactly the shape the
+			// rewrite constructs. This pins that it stays.
 			await createTable();
 			await db.exec('create index t_c on t(c)');
 
