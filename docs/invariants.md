@@ -1271,6 +1271,19 @@ collation rewrites the definition in the same schema. A disagreement makes one r
 different keys — a staged row a seek cannot find, a case-only update reported as a delete
 plus an insert.
 
+### SCH-007 — Every generated column is in the table's evaluation order
+
+- code: `packages/quereus/src/schema/table.ts` — `withGeneratedColumnGraph`
+- code: `packages/quereus/src/runtime/emit/alter-table.ts` — `withEngineGeneratedColumnGraph`
+- guard: `packages/quereus/src/schema/table.ts` — `assertGeneratedColumnGraphMatchesColumns` (called by `Schema.addTable` on every registration)
+- doc: [Schema § TableSchema](schema.md#tableschema)
+
+In every registered table schema, the set of indices in `generatedColumnTopoOrder` equals
+the set of indices of columns marked `generated` (both empty when there are none). INSERT
+and UPDATE compute generated columns by walking that order, so a missing index is a column
+silently written as NULL. The order is engine bookkeeping a module's `alterTable` /
+`alterTags` answer does not carry, so every ALTER arm re-derives it before registering.
+
 ## SYNC — Sync
 
 ### SYNC-001 — All DDL in a sync batch applies before any DML

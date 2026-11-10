@@ -1,4 +1,4 @@
-import { assertPrimaryKeyCollationsMatchColumns, pruneStaleColumnStatistics, type TableSchema } from './table.js';
+import { assertGeneratedColumnGraphMatchesColumns, assertPrimaryKeyCollationsMatchColumns, pruneStaleColumnStatistics, type TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import { getFunctionKey } from './function.js';
 import type { ViewSchema } from './view.js';
@@ -64,7 +64,8 @@ export class Schema {
 	 * @param table The table schema object
 	 * @returns The schema actually registered — `table` itself unless it needed correcting
 	 * @throws QuereusError if a view with the same name exists, or (`INTERNAL`) if a
-	 *   primary-key member's definition collation disagrees with its column's
+	 *   primary-key member's definition collation disagrees with its column's, or if
+	 *   `generatedColumnTopoOrder` does not cover exactly the table's generated columns
 	 */
 	addTable(table: TableSchema): TableSchema {
 		// Ensure no view conflict (maintained tables — materialized views — live
@@ -80,6 +81,9 @@ export class Schema {
 		// Same seam, same reason: a key member's definition collation must equal its
 		// column's — see {@link assertPrimaryKeyCollationsMatchColumns}.
 		assertPrimaryKeyCollationsMatchColumns(registered);
+		// Same seam: every generated column must be in the evaluation order INSERT / UPDATE
+		// walk — see {@link assertGeneratedColumnGraphMatchesColumns}.
+		assertGeneratedColumnGraphMatchesColumns(registered);
 		this.tables.set(table.name.toLowerCase(), registered);
 		return registered;
 	}

@@ -448,6 +448,27 @@ export function assertPrimaryKeyCollationsMatchColumns(table: TableSchema): void
 }
 
 /**
+ * Assert that `generatedColumnTopoOrder` covers exactly the table's generated columns.
+ *
+ * INSERT and UPDATE compute generated columns by walking that order, so a generated column
+ * missing from it is silently written as NULL. The order is engine bookkeeping that module
+ * answers do not carry (see `withEngineGeneratedColumnGraph`); checked at registration
+ * (`Schema.addTable`) so a producer that forgets to re-derive it with
+ * {@link withGeneratedColumnGraph} fails at its own DDL statement rather than at a later
+ * write. A mismatch is a producer bug, hence `INTERNAL`.
+ */
+export function assertGeneratedColumnGraphMatchesColumns(table: TableSchema): void {
+	const ordered = new Set(table.generatedColumnTopoOrder ?? []);
+	const generated = table.columns.flatMap((col, i) => col.generated ? [i] : []);
+	if (ordered.size === generated.length && generated.every(i => ordered.has(i))) return;
+	quereusError(
+		`Table '${table.schemaName}.${table.name}': generated-column evaluation order [${[...ordered].join(', ')}] `
+			+ `does not match its generated columns [${generated.join(', ')}]`,
+		StatusCode.INTERNAL,
+	);
+}
+
+/**
  * Builds a map from column names to their indices in the columns array
  *
  * @param columns Array of column schemas

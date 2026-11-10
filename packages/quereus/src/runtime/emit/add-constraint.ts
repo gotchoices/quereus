@@ -15,6 +15,7 @@ import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { describeAddCheck } from '../../vtab/rollback-states.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
 import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
+import { withEngineGeneratedColumnGraph } from './alter-table.js';
 
 const log = createLogger('runtime:emit:add-constraint');
 
@@ -264,14 +265,14 @@ async function runAddConstraintViaModule(
 		{ type: 'addConstraint', constraint, ddl: sql, ...(rctx.db._isSchemaUnwinding() ? { restoring: true as const } : {}) },
 	);
 
-	schema.addTable(updatedTableSchema);
+	const registeredSchema = schema.addTable(withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema));
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: registeredSchema,
 	});
 
 	emitAlterSchemaEvent(rctx, tableSchema, {

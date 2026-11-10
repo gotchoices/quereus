@@ -61,6 +61,20 @@ function qualifyTableName(schemaName: string | undefined, tableName: string): st
 	return `${prefix}${quoteIdentifier(tableName)}`;
 }
 
+/**
+ * Re-derives the generated-column graph (`generatedColumnDependencies` /
+ * `generatedColumnTopoOrder`) on a schema a module handed back from `alterTable` or
+ * `alterTags`, before the ALTER arm registers it. The graph is engine bookkeeping that a
+ * module's answer does not carry: the memory module builds its answer from its own cached
+ * schema, which never received the graph ADD COLUMN computed, so registering that answer
+ * as-is leaves INSERT / UPDATE with no generated column to compute. `Schema.addTable`
+ * refuses a schema whose graph misses a generated column, so an arm that skips this fails
+ * at the ALTER rather than writing NULLs later.
+ */
+export function withEngineGeneratedColumnGraph(db: Database, returned: TableSchema): TableSchema {
+	return withGeneratedColumnGraph(returned, buildColumnSourceResolver(db));
+}
+
 export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
 	const action = plan.action;
@@ -455,8 +469,17 @@ async function runRenameColumn(
 	// `addTable`, whose prune would otherwise drop the entry being moved.
 	updatedTableSchema = carryStatisticsAcrossColumnRename(tableSchema, updatedTableSchema, oldName, newName);
 
-	// Update the schema catalog
-	schema.addTable(updatedTableSchema);
+	// The table's own definition (CHECKs, DEFAULT and generated bodies, a self-referencing
+	// FK, index predicates) still names `oldName`; rewrite it BEFORE re-deriving the
+	// generated-column graph, which reads each generated body against the renamed column
+	// list and would reject a body still naming `oldName` as an unknown column. Mirrors the
+	// table-rename arm's pre-swap `rewriteTableForTableRename`: `propagateColumnRename`
+	// below runs the same in-place, idempotent rewrite over every table, and so finds
+	// nothing left to do on this one.
+	updatedTableSchema = withEngineGeneratedColumnGraph(rctx.db, rewriteTableForColumnRename(
+		updatedTableSchema, tableSchema.name, oldName, newName, objectResolvers, renamedTableKey, resolveColumnInSource));
+
+	const registeredSchema = schema.addTable(updatedTableSchema);
 
 	// Snapshot pre-statement MV staleness BEFORE the notify below: the notify's
 	// listener marks every dependent MV stale, and the propagation must be able to
@@ -469,7 +492,7 @@ async function runRenameColumn(
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: registeredSchema,
 	});
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
@@ -915,15 +938,11 @@ async function runAddColumn(
 	// `dropConstraint` before the column itself goes (see {@link revertAddColumn}).
 	const installedConstraintNames: string[] = [];
 	let finalTableSchema: TableSchema;
-	// One resolver for every re-analysis this ALTER runs, so no two of them can disagree
-	// about what an inner FROM source exposes. It reads the LIVE catalog per call, so
-	// sharing it across the rounds below does not freeze the answers between them.
-	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
 	try {
 		// Recompute the generated-column dependency graph. If the added column is generated
 		// and its expression references an unknown column, or any new generated-column edges
 		// form a cycle, this throws — and the revert below undoes the materialization.
-		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema, resolveColumnInSource);
+		const columnOnlySchema = withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema);
 
 		// Register the COLUMN-ONLY schema before installing any inline constraint. Two
 		// properties depend on this ordering, and both are easy to break:
@@ -1005,7 +1024,7 @@ async function runAddColumn(
 				type: 'addConstraint',
 				constraint,
 			});
-			current = withGeneratedColumnGraph(withConstraint, resolveColumnInSource);
+			current = withEngineGeneratedColumnGraph(rctx.db, withConstraint);
 			if (installedName !== undefined) installedConstraintNames.push(installedName);
 		}
 
@@ -1332,7 +1351,7 @@ async function runDropColumn(
 	// column array — old indices in the previous map are invalid. Questions about
 	// this table resolve against the post-drop `columns`, not the stale catalog
 	// entry (the catalog is only updated below).
-	const finalSchema = withGeneratedColumnGraph(updatedTableSchema, buildColumnSourceResolver(rctx.db));
+	const finalSchema = withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema);
 
 	// Update the schema catalog. The REGISTERED schema is what the notify carries: the drop
 	// frees a column name, so `addTable` prunes that column's statistics entry — and a
@@ -1398,14 +1417,14 @@ async function runDropConstraint(
 		ddl: sql,
 	});
 
-	schema.addTable(updatedTableSchema);
+	const registeredSchema = schema.addTable(withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema));
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: registeredSchema,
 	});
 
 	emitAlterSchemaEvent(rctx, tableSchema, {
@@ -1480,14 +1499,14 @@ async function runRenameConstraint(
 		ddl: sql,
 	});
 
-	schema.addTable(updatedTableSchema);
+	const registeredSchema = schema.addTable(withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema));
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: registeredSchema,
 	});
 
 	// A named constraint is not an `objectType` of its own, so the arm reports the TABLE it
@@ -1641,14 +1660,14 @@ async function runAlterColumn(
 		);
 	}
 
-	schema.addTable(updatedTableSchema);
+	const registeredSchema = schema.addTable(withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema));
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: registeredSchema,
 	});
 
 	// All four attribute forms (SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT,
@@ -1740,11 +1759,10 @@ async function runTagEdit(
 	const change: TagChangeInfo = { target: storedTarget, ...edit, ddl: sql };
 	const returned = await module.alterTags(rctx.db, live.schemaName, live.name, change);
 
-	// A module's answer carries no generated-column bookkeeping (same as the ADD COLUMN arm).
 	// A tag edit moves no value, so `ANALYZE`'s numbers stay correct, and a module that builds
 	// its return from its own stored view must not discard them and change query plans.
 	const registered = schema.addTable({
-		...withGeneratedColumnGraph(returned, buildColumnSourceResolver(rctx.db)),
+		...withEngineGeneratedColumnGraph(rctx.db, returned),
 		statistics: returned.statistics ?? live.statistics,
 	});
 
@@ -1988,13 +2006,13 @@ async function runAlterPrimaryKey(
 			rctx.db._getEventEmitter().rekeyBatchedDataEvents(
 				tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
 
-			schema.addTable(updatedTableSchema);
+			const registeredSchema = schema.addTable(withEngineGeneratedColumnGraph(rctx.db, updatedTableSchema));
 			rctx.db.schemaManager.getChangeNotifier().notifyChange({
 				type: 'table_modified',
 				schemaName: tableSchema.schemaName,
 				objectName: tableSchema.name,
 				oldObject: tableSchema,
-				newObject: updatedTableSchema,
+				newObject: registeredSchema,
 			});
 
 			// NOTE: inside the try whose catch falls through to the rebuild — same caveat as
