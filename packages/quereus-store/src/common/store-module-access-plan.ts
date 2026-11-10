@@ -355,7 +355,7 @@ interface IndexPlanCandidate {
 	vetoCost: number;
 	/**
 	 * True for the `plan=5` multi-seek arm. Together with {@link statsBacked} it decides
-	 * the veto exemption at the comparison site: a multi-seek whose row estimate is still
+	 * the veto exemption in {@link seekSurvivesVeto}: a multi-seek whose row estimate is still
 	 * the clamped shape-constant union (`min(N, inCount × 0.1N)`) must not be judged by
 	 * the veto — the figure is an artifact, not an estimate.
 	 */
@@ -525,20 +525,21 @@ export function computeBestAccessPlan(
  * former body, extracted verbatim so {@link chooseOrderingPlan} can wrap every one of its
  * return points. Ordering is not ignored here (the seek arms still attach their
  * advertisements, which is how a plan that already satisfies the required ordering skips
- * the walk comparison entirely); this function just never chooses an access path FOR
- * ordering's sake.
+ * the walk comparison entirely, and seeks are ranked with the sort they would force); this
+ * function just never chooses an ordering-only access path that pushes no filter.
  *
  * The order of decisions:
  *  - A full primary-key equality returns early as a point lookup (the cheapest plan by
  *    construction), and a full primary-key IN as a `_primary_` multi-seek unless a gate
  *    declines it. Neither competes with anything below.
  *  - A bound on the leading PK column becomes a CANDIDATE ({@link leadingPkRangePlan}).
- *  - The secondary indexes compete among themselves for the best seek, and that seek
- *    faces the seek-versus-scan veto.
- *  - With a PK range candidate, the surviving secondary seek displaces it only when it
- *    RANKS strictly lower ({@link seekRankingCost}: declared cost, plus the sort a plan
- *    would force when it misses a required ordering). A vetoed seek, or only a cost-only
- *    advertisement, leaves the PK range. Without one, the veto's verdict stands.
+ *  - Each secondary-index seek faces the seek-versus-scan veto ({@link seekSurvivesVeto});
+ *    the survivors compete for the lowest RANK ({@link seekRankingCost}: declared cost,
+ *    plus the sort a plan would force when it misses a required ordering).
+ *  - With a PK range candidate, the best surviving seek displaces it only when it ranks
+ *    strictly lower; with no survivor, or only a cost-only advertisement, the PK range
+ *    stands. Without a PK range, the best survivor wins, else the scan when every seek was
+ *    vetoed, else the first cost-only advertisement, else the scan.
  */
 function computeFilterAccessPlan(
 	db: Database,
@@ -557,7 +558,7 @@ function computeFilterAccessPlan(
 	// Whether ANY pushed filter is a runtime-valued set. Detected once, on the REQUEST:
 	// such a request is engine-synthesized (`rule-key-set-seek`'s probes, or the key-set
 	// semi join itself) and must never be answered with this module's own scan verdict,
-	// whichever arm ends up serving it — see the exemption at the seek-vs-scan comparison.
+	// whichever arm ends up serving it — see {@link seekSurvivesVeto}.
 	const requestCarriesRuntimeSet = request.filters.some(f => f.runtimeSet !== undefined);
 
 	const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
@@ -674,6 +675,7 @@ function computeFilterAccessPlan(
 	const indexes = tableInfo.indexes || [];
 	let bestSeekPlan: IndexPlanCandidate | null = null;
 	let bestSeekRank = Infinity;
+	let anySeekVetoed = false;
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
@@ -681,10 +683,18 @@ function computeFilterAccessPlan(
 		if (!candidate) continue;
 		const { plan } = candidate;
 		// A fully-handled seek (indexName + seekColumns set) is a candidate: keep the
-		// cheapest one seen so far rather than the first, so declaration order of the
+		// lowest-RANKED one seen so far rather than the first, so declaration order of the
 		// indexes doesn't decide the plan. Strict '<' so ties keep the first candidate,
 		// matching MemoryTableModule.findBestAccessPlan's `indexPlan.cost < bestPlan.cost`.
+		// The veto runs per candidate, BEFORE ranking: ranking adds a sort penalty the veto
+		// does not, so a seek that provides the ordering can out-rank a cheaper one and
+		// still lose to the scan — which, judged after the loop, would discard the cheaper
+		// seek that beat the scan.
 		if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) {
+			if (!seekSurvivesVeto(candidate, scanPlan.cost, requestCarriesRuntimeSet)) {
+				anySeekVetoed = true;
+				continue;
+			}
 			const rank = seekRankingCost(request, plan, estimatedRows);
 			if (!bestSeekPlan || rank < bestSeekRank) {
 				bestSeekPlan = candidate;
@@ -696,61 +706,21 @@ function computeFilterAccessPlan(
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
 	if (bestSeekPlan) {
-		// Two narrow exemptions skip the seek-vs-scan comparison outright:
-		//
-		//  - **A request carrying a runtime-valued set** (`filter.runtimeSet`). Such a
-		//    request is only ever built by the engine — `rule-key-set-seek`'s synthesized
-		//    probes and the key-set semi join itself — and the engine reads a probe answer
-		//    that names no index as "the module declined", abandoning the whole rewrite.
-		//    So this module must NEVER substitute its own scan verdict there: the engine
-		//    makes the scan comparison itself, interpolating a break-even from the module's
-		//    costs at 2 and 1000 keys. Detected on the REQUEST rather than on the winning
-		//    arm, because the probe must survive whichever arm this module happens to pick
-		//    for it. (Substituting a scan verdict at 1000 keys was MEASURED to fail 11
-		//    tests in `key-set-seek-store.spec.ts` on 200-and-300-row tables where the seek
-		//    is unambiguously right at the key counts actually used.)
-		//  - **A multi-seek whose row estimate is not statistics-backed.** Its
-		//    `min(N, inCount × 0.1N)` union reaches the whole table at ten seek keys, so
-		//    beyond that the figure is a CLAMP rather than an estimate — vetoing on it
-		//    would judge the estimator's artifact. A statistics-backed multi-seek clamps
-		//    only at `inCount ≈ distinctCount`, which is the honest saturation point, so it
-		//    faces the comparison like every other arm — a literal `col in (…900 values…)`
-		//    over an analyzed 100-row table now correctly loses to the scan.
-		//
-		// **The comparison judges the candidate at `vetoCost`, which is `plan.cost` itself
-		// exactly when the arm's row estimate is statistics-backed.** A per-query estimate
-		// lets the backend's declared profile decide the arm's fate per query: on
-		// IndexedDB (`pointRead: 3.0`) the `range` arm's break-even is
-		// 1/(0.5 + 3.0) ≈ 0.286 of the table, so a range the histogram puts at 25% seeks
-		// and one it puts at 35% scans — the discrimination the declared profile exists to
-		// buy. An arm still priced by an {@link ARM_SELECTIVITY} shape constant is instead
-		// judged at PARITY `pointRead`, settled when the IndexedDB profile was measured:
-		// a fixed fraction makes the veto arm-DISABLING rather than arm-tuning (the
-		// flip-point arithmetic is at the top of this file, where the profile's terms are
-		// introduced), IndexedDB's measured band straddles the `range` arm's flip point
-		// exactly, and the error is wildly asymmetric — disabling the arm costs up to 25×
-		// when the real predicate is selective, keeping it costs ~10% in the case the
-		// constant describes. So the declared profile decides per QUERY once the estimate
-		// is real, and falls back to the parity price where the estimate is still a shape
-		// constant. `cost-profile.spec.ts` pins both halves of that policy.
-		//
-		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
-		const exemptFromVeto = requestCarriesRuntimeSet
-			|| (bestSeekPlan.isMultiSeek && !bestSeekPlan.statsBacked);
-		const seekSurvivesVeto = exemptFromVeto || bestSeekPlan.vetoCost <= scanPlan.cost;
-		if (pkRangePlan) {
-			// The leading-PK range needs no veto of its own (it always prices below the
-			// scan — see {@link leadingPkRangePlan}), so a vetoed secondary seek hands the
-			// plan to it rather than to the scan. Otherwise the two are ranked on the same
-			// footing as the secondary seeks among themselves: declared `plan.cost`, not
-			// `vetoCost` (that parity repricing exists only for judging a shape constant
-			// against the scan), plus the sort each would force. Strict '<', so a tie keeps
-			// the PK range — the first candidate, as in the loop above.
-			const seekWins = seekSurvivesVeto
-				&& bestSeekRank < seekRankingCost(request, pkRangePlan, estimatedRows);
-			return seekWins ? bestSeekPlan.plan : pkRangePlan;
-		}
-		if (seekSurvivesVeto) return bestSeekPlan.plan;
+		if (!pkRangePlan) return bestSeekPlan.plan;
+		// Ranked on the same footing as the secondary seeks among themselves: declared
+		// `plan.cost`, not `vetoCost` (that parity repricing exists only for judging a shape
+		// constant against the scan), plus the sort each would force. Strict '<', so a tie
+		// keeps the PK range — the first candidate, as in the loop above.
+		return bestSeekRank < seekRankingCost(request, pkRangePlan, estimatedRows)
+			? bestSeekPlan.plan
+			: pkRangePlan;
+	}
+	// The leading-PK range needs no veto of its own (it always prices below the scan — see
+	// {@link leadingPkRangePlan}), so a vetoed secondary seek hands the plan to it rather
+	// than to the scan. It also goes ahead of `costOnlyFallback`: a cost-only plan is a full
+	// scan advertising an index arm's cheaper cost, and the PK range genuinely narrows.
+	if (pkRangePlan) return pkRangePlan;
+	if (anySeekVetoed) {
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
@@ -758,10 +728,6 @@ function computeFilterAccessPlan(
 		// index arm's (cheaper) cost, so falling through would undo the comparison.
 		return { ...scanPlan, explains: `${scanPlan.explains} (cheaper than the best index seek)` };
 	}
-	// Ahead of `costOnlyFallback` for the same reason the vetoed seek above returns the
-	// scan rather than falling through: a cost-only plan is a full scan advertising an index
-	// arm's cheaper cost, and the PK range genuinely narrows.
-	if (pkRangePlan) return pkRangePlan;
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'
 	// order by <pk>` picks up a Sort it did not need. Still true, just rarer than it was: an
@@ -783,6 +749,60 @@ function computeFilterAccessPlan(
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
 	return scanPlan;
+}
+
+/**
+ * The seek-versus-scan veto for one secondary-index candidate: true when the seek is kept
+ * (its `vetoCost` at or below the scan's cost — ties keep the seek, since it returns fewer
+ * rows for the rest of the plan to carry), false when the scan beats it.
+ *
+ * `rule-select-access-path` takes whatever single plan {@link computeFilterAccessPlan}
+ * returns and never compares it with an alternative, so a seek that costs more than reading
+ * the table start to finish is only rejected if the module rejects it here.
+ *
+ * Two narrow exemptions skip the comparison outright:
+ *
+ *  - **A request carrying a runtime-valued set** (`filter.runtimeSet`). Such a request is
+ *    only ever built by the engine — `rule-key-set-seek`'s synthesized probes and the
+ *    key-set semi join itself — and the engine reads a probe answer that names no index as
+ *    "the module declined", abandoning the whole rewrite. So this module must NEVER
+ *    substitute its own scan verdict there: the engine makes the scan comparison itself,
+ *    interpolating a break-even from the module's costs at 2 and 1000 keys. Detected on the
+ *    REQUEST rather than on the winning arm, because the probe must survive whichever arm
+ *    this module happens to pick for it. (Substituting a scan verdict at 1000 keys was
+ *    MEASURED to fail 11 tests in `key-set-seek-store.spec.ts` on 200-and-300-row tables
+ *    where the seek is unambiguously right at the key counts actually used.)
+ *  - **A multi-seek whose row estimate is not statistics-backed.** Its
+ *    `min(N, inCount × 0.1N)` union reaches the whole table at ten seek keys, so beyond
+ *    that the figure is a CLAMP rather than an estimate — vetoing on it would judge the
+ *    estimator's artifact. A statistics-backed multi-seek clamps only at
+ *    `inCount ≈ distinctCount`, which is the honest saturation point, so it faces the
+ *    comparison like every other arm — a literal `col in (…900 values…)` over an analyzed
+ *    100-row table correctly loses to the scan.
+ *
+ * **The comparison judges the candidate at `vetoCost`, which is `plan.cost` itself exactly
+ * when the arm's row estimate is statistics-backed.** A per-query estimate lets the
+ * backend's declared profile decide the arm's fate per query: on IndexedDB
+ * (`pointRead: 3.0`) the `range` arm's break-even is 1/(0.5 + 3.0) ≈ 0.286 of the table, so
+ * a range the histogram puts at 25% seeks and one it puts at 35% scans — the discrimination
+ * the declared profile exists to buy. An arm still priced by an {@link ARM_SELECTIVITY}
+ * shape constant is instead judged at PARITY `pointRead`, settled when the IndexedDB
+ * profile was measured: a fixed fraction makes the veto arm-DISABLING rather than
+ * arm-tuning (the flip-point arithmetic is at the top of this file, where the profile's
+ * terms are introduced), IndexedDB's measured band straddles the `range` arm's flip point
+ * exactly, and the error is wildly asymmetric — disabling the arm costs up to 25× when the
+ * real predicate is selective, keeping it costs ~10% in the case the constant describes.
+ * So the declared profile decides per QUERY once the estimate is real, and falls back to
+ * the parity price where the estimate is still a shape constant. `cost-profile.spec.ts`
+ * pins both halves of that policy.
+ */
+function seekSurvivesVeto(
+	candidate: IndexPlanCandidate,
+	scanCost: number,
+	requestCarriesRuntimeSet: boolean,
+): boolean {
+	if (requestCarriesRuntimeSet || (candidate.isMultiSeek && !candidate.statsBacked)) return true;
+	return candidate.vetoCost <= scanCost;
 }
 
 /**
@@ -1217,8 +1237,8 @@ function primaryKeyMultiSeekPlan(
  * names out of the data store. A cost-only decline deliberately does not pay it (it
  * resolves nothing; the scan reads rows directly), and the multi-seek pays it exactly when
  * its row estimate is statistics-backed — the reason is recorded at that arm below. Every
- * candidate also carries a `vetoCost`, the price the seek-vs-scan comparison in
- * {@link computeBestAccessPlan} judges it at: the declared cost itself for a
+ * candidate also carries a `vetoCost`, the price the seek-vs-scan veto in
+ * {@link seekSurvivesVeto} judges it at: the declared cost itself for a
  * statistics-backed arm, the arm repriced at PARITY `pointRead` otherwise (reasoning at
  * that site).
  */

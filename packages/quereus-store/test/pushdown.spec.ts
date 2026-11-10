@@ -1544,6 +1544,21 @@ describe('StoreModule predicate pushdown', () => {
 				expect(wide, 'about 900 rows').to.be.closeTo(0.2 + 0.5 * 900, 5);
 				expect(narrow).to.be.lessThan(wide);
 			});
+
+			it('a seek that out-ranks a cheaper one but loses to the scan does not discard the cheaper one', async () => {
+				// ix_b (`b >= 300`, ~700 rows) provides `order by b` and ranks ≈ 1050, below ix_a
+				// (`a = 0`, 500 rows) at ≈ 650 + sort(500) ≈ 1100 — but 1050 is above the 1000-row
+				// scan, so ix_b is vetoed. ix_a beat the scan and must still be chosen.
+				await db.exec(`create table u (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_a on u (a)`);
+				await db.exec(`create index ix_b on u (b)`);
+				const vals = Array.from({ length: 1000 }, (_, i) => `(${i}, ${i % 2}, ${i})`).join(', ');
+				await db.exec(`insert into u values ${vals}`);
+				await db.exec(`analyze u`);
+				const q = `select id from u where a = 0 and b >= 300 order by b`;
+				expect(await planDetails(q)).to.match(/USING ix_a\b/);
+				expect(await ids(q)).to.deep.equal(Array.from({ length: 350 }, (_, i) => 300 + 2 * i));
+			});
 		});
 
 		// Narrowing proof: rows alone cannot distinguish a multi-seek from a full scan
