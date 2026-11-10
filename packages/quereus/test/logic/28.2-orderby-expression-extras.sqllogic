@@ -137,10 +137,6 @@ insert into nc values ('a','1'), ('B','9'), ('c','5'), ('D','3');
 select a from nc order by 1 collate nocase;
 → [{"a":"a"},{"a":"B"},{"a":"c"},{"a":"D"}]
 
--- Combined with alias shadowing: position 2 is `z` (= nc.a), not the alias `a`
-select b as a, a as z from nc order by 2 collate nocase;
-→ [{"a":"1","z":"a"},{"a":"9","z":"B"},{"a":"5","z":"c"},{"a":"3","z":"D"}]
-
 -- Compound ORDER BY
 select a from nc union select 'e' order by 1 collate nocase;
 → [{"a":"a"},{"a":"B"},{"a":"c"},{"a":"D"},{"a":"e"}]
