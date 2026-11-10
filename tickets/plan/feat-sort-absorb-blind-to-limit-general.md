@@ -68,3 +68,7 @@ cost-profile-parameterized cases added for the parent rather than writing plain 
 ## Evidence from GitHub issue #36 (reported on 4.24.0, IndexedDB)
 
 An ordered `limit` through an `(owner, date)` index is priced as walking and fetching every row, so it loses to a full scan and sort: about 200 ms for 20 rows that a bounded walk would return in a few milliseconds. The reporter calls "latest N through an owner and timestamp index" the canonical paginated-list query.
+
+## Decision (maintainer, 2026-11-10)
+
+Take route 1: teach the rule to look upward through the Sort for a `LimitOffsetNode` and pass its limit/offset as `rowsWanted`. No fused sort-and-limit node. It must cover a parameter limit (`limit ?`), the paginated-list shape from #36: follow `bug-parameterized-limit-reads-every-key`, which decides seek versus walk at run time from the actual limit value, rather than giving up when the limit is not a literal. Note that LIMIT / OFFSET are now required to be non-nullable (`bug-null-limit-returns-no-rows`). Test through the cost-profile-parameterized harness with an expensive `pointRead`, including the `(owner, date)` "latest N" query from #36. In this release.
