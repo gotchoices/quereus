@@ -164,6 +164,33 @@ describe('early-stop consumption', () => {
 			await stmt.finalize();
 		});
 
+		it('an expression nullable only through its parameters prepares, and a NULL raises at execution', async () => {
+			// Inferred parameter types are nullable, so judging these at prepare would reject
+			// every one. Unbound, `?` is ANY; the check assumes it a non-null integer.
+			const cases: [string, SqlValue[] | undefined][] = [
+				['select k from counting limit ?', [2]],
+				['select k from counting limit ? + 1', [1]],
+				['select k from counting limit ? + 1', undefined],
+				['select k from counting limit coalesce(?, 10) - ?', undefined],
+			];
+			for (const [sql, first] of cases) {
+				const stmt = db.prepare(sql, first);
+				stmt.getColumnDefs(); // plans now, with only `first` typing the parameters
+				mod.rowCounts.clear();
+				let error: unknown;
+				try {
+					for await (const _ of stmt.all(sql.includes('coalesce') ? [null, null] : [null])) { /* drain */ }
+				} catch (e) {
+					error = e;
+				}
+				expect((error as Error | undefined)?.message, sql).to.match(/LIMIT must not be NULL/);
+				expect(mod.rowCounts.get('counting') ?? 0, sql).to.equal(0);
+				await stmt.finalize();
+			}
+			// Still nullable with its parameter non-null (division by zero is NULL).
+			await rejects('select k from counting limit ? / 2', [4], /LIMIT expression may be NULL/);
+		});
+
 		it('over a writing source, the write never starts', async () => {
 			// Statement rollback alone would also leave `dst` empty, so the pull count is
 			// what proves the insert never ran.

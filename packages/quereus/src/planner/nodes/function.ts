@@ -4,10 +4,23 @@ import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type NaryScalarNode, type ScalarPlanNode, type PhysicalProperties, type InjectivityResult, type MonotonicityResult, type Monotonicity, type RangeRewrite, addMonotonicity } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { formatExpressionList, formatScalarType } from '../../util/plan-formatter.js';
-import type { FunctionSchema } from '../../schema/function.js';
+import { isScalarFunctionSchema, type FunctionSchema } from '../../schema/function.js';
 import { FunctionFlags } from '../../common/constants.js';
 import type { SqlValue } from '../../common/types.js';
 import { ColumnReferenceNode } from './reference.js';
+
+/**
+ * The return type a scalar function schema infers for these operands, or undefined when
+ * it declares no `inferReturnType`. Reads the operands as built — after any
+ * comparison-group coercion has wrapped them in casts.
+ */
+export function inferScalarCallType(schema: FunctionSchema, operands: readonly ScalarPlanNode[]): ScalarType | undefined {
+	if (!isScalarFunctionSchema(schema)) return undefined;
+	return schema.inferReturnType?.(
+		operands.map(arg => arg.getType().logicalType),
+		operands.map(arg => arg.getType().nullable),
+	);
+}
 
 export class ScalarFunctionCallNode extends PlanNode implements NaryScalarNode {
 	override readonly nodeType = PlanNodeType.ScalarFunctionCall;
@@ -55,16 +68,19 @@ export class ScalarFunctionCallNode extends PlanNode implements NaryScalarNode {
 			return this;
 		}
 
-		// NOTE: keeps the type inferred from the ORIGINAL arguments. `inferReturnType` now
-		// reads argument nullability (coalesce is non-null when any argument is), so a rewrite
-		// that swaps a non-null argument for a nullable one would leave a stale non-null claim;
-		// if a rule ever does that, re-run inference here.
+		// Re-infer from the NEW operands: `inferReturnType` reads their types and
+		// nullability (coalesce is non-null when any argument is), so the original
+		// arguments' answer goes stale once they change — the LIMIT / OFFSET check
+		// (building/row-count-expression.ts) relies on this when it judges an expression
+		// with its parameters made non-null. A schema without `inferReturnType` keeps the
+		// type the node was built with (a synthetic call may carry one explicitly).
+		const operands = newChildren as ScalarPlanNode[];
 		return new ScalarFunctionCallNode(
 			this.scope,
 			this.expression,
 			this.functionSchema,
-			newChildren as ScalarPlanNode[],
-			this._inferredType
+			operands,
+			inferScalarCallType(this.functionSchema, operands) ?? this._inferredType
 		);
 	}
 

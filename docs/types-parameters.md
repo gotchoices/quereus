@@ -17,11 +17,12 @@ Quereus offers two approaches for specifying parameter types:
 
 ## Type Inference Rules
 
-When you pass parameter values, Quereus automatically infers the logical type based on the JavaScript type:
+When you pass parameter values, Quereus automatically infers the logical type based on the JavaScript type. Every inferred type is **nullable**: the value fixes the storage class the parameter accepts, never whether it may be NULL, because one execution's value says nothing about the next one's. A statement prepared with `[5]` can later run with `[null]`. To have NULL refused, declare `nullable: false` in an [explicit hint map](#examples).
+
 
 | JavaScript Type | Logical Type | Example |
 |----------------|--------------|---------|
-| `null` | ANY (nullable) | `null` |
+| `null` | ANY | `null` |
 | `number` (safe integer) | INTEGER | `42`, `0`, `-100` |
 | `number` (fractional, or whole past 2^53−1) | REAL | `3.14`, `-0.5`, `1e308` |
 | `bigint` | INTEGER | `9007199254740991n` |
@@ -113,7 +114,11 @@ consequences:
   with its real type, or declare the type with a hint map, when that conversion matters.
 - **LIMIT / OFFSET are checked on each execution.** `limit ?` first bound to `null` is not
   rejected when prepared; the execution with `null` fails with "LIMIT must not be NULL", and a
-  later execution with `2` returns two rows (see [SQL SELECT §3.6](sql-select.md)).
+  later execution with `2` returns two rows (see [SQL SELECT §3.6](sql-select.md)). This holds
+  for every inferred parameter, not only one first bound to `null`: an inferred type is always
+  nullable, so `limit ?` first bound to `5` also takes `null` later and fails at execution.
+
+Declaring `nullable: false` in a hint map is how a caller keeps the non-null facts: NULL is then refused at bind, and the planner treats the parameter as non-null — a LIMIT / OFFSET expression over it is judged at prepare like any non-null expression.
 
 ## Examples
 
@@ -197,7 +202,7 @@ Parameter type validation ensures type safety across executions:
 - **Physical type validation**: Validates that JavaScript values are compatible with the **physical type** of the declared logical type
 - **Type preservation**: Once established, parameter types are preserved across all executions of a prepared statement
 - **Validation on execution**: Each execution validates that parameter values match the established physical types
-- **NULL compatibility**: NULL values are compatible with any nullable parameter type. A type inferred from a non-null value is not nullable, so binding `null` to a parameter first bound to `5` is a mismatch; a parameter first bound to `null` is ANY (nullable) and accepts both (see [A first binding of `null`](#a-first-binding-of-null))
+- **NULL compatibility**: NULL values are compatible with any nullable parameter type, and every type inferred from a value is nullable, so binding `null` to a parameter first bound to `5` is accepted (a parameter first bound to `null` is ANY and accepts both — see [A first binding of `null`](#a-first-binding-of-null)). Only a hint declared `nullable: false` rejects `null`, at bind time
 - **Flexible logical types**: Different logical types with the same physical type are compatible (e.g., `number` and `bigint` both work for INTEGER physical type)
 - **Canonical form at bind**: A bound value is canonicalized as it is stored (see [Physical representation](types.md#physical-representation)) — a `bigint` inside the safe-integer range narrows to `number`, so `stmt.bind(1, 5n)` is used, stored, and returned as `5`
 - **No implicit conversion**: Physical type mismatches are rejected with clear error messages

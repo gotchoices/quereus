@@ -9,8 +9,8 @@ import { ANY_TYPE } from '../types/builtin-types.js';
  * Generate type hints for parameters based on their JavaScript values.
  * This is used during planning to assign strong types to parameters.
  *
- * Type inference rules:
- * - null → ANY (nullable) — see {@link getParameterScalarType}
+ * Type inference rules (every inferred type is nullable — see {@link getParameterScalarType}):
+ * - null → ANY
  * - number (safe integer) → INTEGER
  * - number (fractional, or whole past 2^53−1) → REAL
  * - bigint → INTEGER
@@ -148,9 +148,14 @@ export function normalizeParamKey(name: string): string | number {
 /**
  * Infer the ScalarType for a parameter value based on its JavaScript type.
  *
- * A null value says nothing about what the parameter will hold next, so it types the
- * parameter ANY (nullable) rather than NULL: a NULL-typed parameter would reject every
- * later non-null binding, and the type is frozen for the statement's life. Literal
+ * The type is frozen for the statement's life, and one execution's value says nothing
+ * about the next one's. So the value fixes only the storage class the parameter
+ * accepts, never whether it may be NULL: the type is always nullable, and a statement
+ * first run with `5` can later be run with `null`. A caller who wants NULL refused
+ * declares `nullable: false` in the type map handed to `prepare()`.
+ *
+ * A null value fixes no storage class either, so it types the parameter ANY rather than
+ * NULL: a NULL-typed parameter would reject every later non-null binding. Literal
  * typing keeps `null → NULL`, which is why this is not done in
  * `inferLogicalTypeFromValue`. See docs/types-parameters.md.
  *
@@ -158,11 +163,10 @@ export function normalizeParamKey(name: string): string | number {
  * @returns The inferred ScalarType
  */
 function getParameterScalarType(value: SqlValue): ScalarType {
-	const isNull = value === null;
 	return {
 		typeClass: 'scalar',
-		logicalType: isNull ? ANY_TYPE : inferLogicalTypeFromValue(value),
-		nullable: isNull,
+		logicalType: value === null ? ANY_TYPE : inferLogicalTypeFromValue(value),
+		nullable: true,
 		isReadOnly: true,
 	};
 }

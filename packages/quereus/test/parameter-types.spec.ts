@@ -574,6 +574,21 @@ describe('Parameter Type System', () => {
 			await stmt.finalize();
 		});
 
+		it('accepts NULL on a later run for a parameter typed by a non-null first value', async () => {
+			// A value fixes the storage class, never nullability: one execution's value says
+			// nothing about the next one's (docs/types-parameters.md).
+			await db.exec('INSERT INTO mixed_test (id, value_col) VALUES (1, 0), (2, 0)');
+			const stmt = db.prepare('update mixed_test set value_col = ? where id = ?', [5, 1]);
+			await stmt.run();
+			await stmt.run([null, 2]);
+			const rows: ResultRow[] = [];
+			for await (const row of db.eval('select value_col from mixed_test order by id')) {
+				rows.push(row);
+			}
+			expect(rows).to.deep.equal([{ value_col: 5 }, { value_col: null }]);
+			await stmt.finalize();
+		});
+
 		it('should work with explicit type hints', async () => {
 			// Prepare with explicit types
 			const types = new Map([
@@ -586,13 +601,23 @@ describe('Parameter Type System', () => {
 			// Execute with matching types
 			await stmt.run([1, 42]);
 			await stmt.run([2, 100]);
+			await stmt.run([3, null]);
+
+			// A declared `nullable: false` is the one way to have NULL refused at bind.
+			let error: Error | undefined;
+			try {
+				await stmt.run([null, 1]);
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error?.message).to.include('expected non-nullable INTEGER, got NULL');
 
 			// Verify rows were inserted
 			const rows: ResultRow[] = [];
 			for await (const row of db.eval('SELECT * FROM mixed_test ORDER BY id')) {
 				rows.push(row);
 			}
-			expect(rows).to.have.length(2);
+			expect(rows).to.have.length(3);
 
 			await stmt.finalize();
 		});

@@ -8,7 +8,7 @@ import { ScalarPlanNode } from "../nodes/plan-node.js";
 import { isAggregateFunctionSchema, isScalarFunctionSchema, type ArgTypeValidator } from '../../schema/function.js';
 import { buildExpression } from "./expression.js";
 import { coerceComparisonGroup } from "./coercion.js";
-import { ScalarFunctionCallNode } from "../nodes/function.js";
+import { ScalarFunctionCallNode, inferScalarCallType } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
@@ -152,7 +152,7 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 		if (isScalarFunctionSchema(functionSchema)) {
 			const argTypes = args.map(arg => arg.getType().logicalType);
 			assertArgTypesAccepted(functionSchema.validateArgTypes, argTypes, `function ${expr.name}`, expr);
-			inferredType = functionSchema.inferReturnType?.(argTypes, args.map(arg => arg.getType().nullable));
+			inferredType = inferScalarCallType(functionSchema, args);
 		}
 
 		return new ScalarFunctionCallNode(ctx.scope, expr, functionSchema, args, inferredType);
