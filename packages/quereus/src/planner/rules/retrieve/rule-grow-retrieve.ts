@@ -1109,6 +1109,11 @@ function constantRowsWanted(limitExpr: ScalarPlanNode, offsetExpr: ScalarPlanNod
  * Both branches hold the Sort's subtree (one rebuilt over the equipped Retrieve, one
  * verbatim), so a subtree that is unsafe to hold twice declines ({@link branchesCanShare}).
  * Declining costs only reads: today's scan-then-sort plan stays.
+ *
+ * NOTE: this file is ~1250 lines. If it grows further, move the sort-absorb group
+ * (`trySortAbsorbViaIndexOrdering` through `bisectOrderedBound`) into its own module,
+ * taking the probe helpers it shares with the Retrieve growth path (`probeAccessPlan`,
+ * `planDeliversOrdering`) into a shared one.
  */
 function tryRuntimeLimitChoice(
 	sort: SortNode,

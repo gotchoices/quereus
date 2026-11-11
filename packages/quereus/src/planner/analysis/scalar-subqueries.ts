@@ -23,8 +23,10 @@ import { ScalarSubqueryNode } from '../nodes/subquery.js';
  * (bug-deferred-subquery-check-reads-stale-state).
  *
  * Callers: CHECK auto-deferral (`planner/building/constraint-builder.ts`), the
- * MV-rewrite residual gate (`query-rewrite-matcher.ts`), and AND/OR
- * short-circuit deferral (`runtime/emit/binary.ts`).
+ * MV-rewrite residual gate (`query-rewrite-matcher.ts`), AND/OR
+ * short-circuit deferral (`runtime/emit/binary.ts`), `safeToEvaluateTwice`
+ * (`rules/shared/evaluate-twice.ts`) and the run-time limit choice's subtree
+ * check in `rule-grow-retrieve`.
  */
 export function hasRelationalDescendant(expr: ScalarPlanNode): boolean {
 	const stack: PlanNode[] = [expr];
