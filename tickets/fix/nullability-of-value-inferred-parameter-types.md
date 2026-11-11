@@ -5,7 +5,7 @@ repro: verified
 ----
 # Should a parameter type inferred from a non-null value be nullable?
 
-**Blocked: specification silent until just now.** Unblocks when the maintainer accepts or edits the proposed rule below.
+**Unblocked 2026-11-10:** maintainer accepted the proposed rule; see Decision at the end.
 
 ## What happens
 
@@ -43,3 +43,9 @@ The rejection stays, as now documented. Callers that reuse a prepared statement 
 ## Reversibility
 
 Easy: the rule lives in one function (`getParameterScalarType`) plus the LIMIT/OFFSET helper; no stored data depends on it.
+
+## Decision (maintainer, 2026-11-10)
+
+Accept the proposed rule: a type inferred from a bound value is nullable; a declared type (the `db.prepare` type map's `ScalarType`, `nullable: true | false`) keeps full control.
+
+Widen the LIMIT / OFFSET part: not only a bare inferred parameter but any LIMIT / OFFSET expression whose possible nullness comes only from parameters (value-inferred, ANY, or declared `nullable: true`) goes to the runtime check in `util/row-count.ts`, so `limit ? + 1` and `limit coalesce(?, 10) - ?` keep working. Today `query_plan('… limit ? + 1')` with an unbound parameter fails at prepare ("LIMIT expression may be NULL") while running the statement works; after this change both work, and a NULL limit is still an error, at run time. A LIMIT that is nullable for any other reason (a nullable column, a scalar subquery, `null` itself) is still rejected at prepare. Document in `docs/types-parameters.md` and `docs/sql-select.md` §3.6 that declaring `nullable: false` is how to keep prepare-time rejection and the planner's non-null facts.
