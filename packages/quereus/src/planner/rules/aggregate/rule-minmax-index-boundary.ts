@@ -106,8 +106,7 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	// by a run-time choice between plans). Telling the module lets it price a boundary
 	// read as the one row it is, instead of as an ordered read of the whole table; the
 	// absorb declines the bound on its own if anything below the Sort could still filter
-	// a row out. See
-	// `feat-sort-absorb-blind-to-limit`.
+	// a row out. See `feat-sort-absorb-blind-to-limit`.
 	const absorbed = trySortAbsorbViaIndexOrdering(probe, context, { limit: 1, offset: 0 });
 	if (!absorbed) {
 		log('access path cannot serve %s ordering for %s; leaving the aggregate alone',

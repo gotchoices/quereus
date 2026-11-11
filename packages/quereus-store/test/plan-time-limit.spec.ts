@@ -456,6 +456,9 @@ describe('plan-time LIMIT reaching the store module (feat-sort-absorb-blind-to-l
 		it('a placeholder LIMIT picks the ordered read or the sort when it runs', async () => {
 			const f = await track({ costProfile: INDEXEDDB_PROFILE, rowCount: 200, descC: true });
 			f.db.setOption('runtime_metrics', true);
+			// The branches share the Sort's subtree; the validator's attribute-origin check is
+			// what catches a branch that originates an attribute id the other already does.
+			f.db.setOption('validate_plan', true);
 			const query = 'select * from t where b = 1 order by c desc limit ?';
 
 			const plan = (await f.rows(`select op, detail from query_plan('${query}')`))
