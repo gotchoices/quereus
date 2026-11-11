@@ -19,7 +19,6 @@ Quereus offers two approaches for specifying parameter types:
 
 When you pass parameter values, Quereus automatically infers the logical type based on the JavaScript type. Every inferred type is **nullable**: the value fixes the storage class the parameter accepts, never whether it may be NULL, because one execution's value says nothing about the next one's. A statement prepared with `[5]` can later run with `[null]`. To have NULL refused, declare `nullable: false` in an [explicit hint map](#examples).
 
-
 | JavaScript Type | Logical Type | Example |
 |----------------|--------------|---------|
 | `null` | ANY | `null` |
