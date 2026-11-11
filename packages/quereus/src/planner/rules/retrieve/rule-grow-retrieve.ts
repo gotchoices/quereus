@@ -43,6 +43,10 @@ import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineResidualExpressions, orderingClaimSurvivesCollation } from '../access/rule-select-access-path.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 import { rebuildChain } from '../shared/access-leaf.js';
+import { safeToEvaluateTwice } from '../shared/evaluate-twice.js';
+import { LimitChoiceNode } from '../../nodes/limit-choice-node.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { hasRelationalDescendant } from '../../analysis/scalar-subqueries.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
 
@@ -837,7 +841,9 @@ function baselineScanCost(
  * Three entry points:
  *  - `ruleGrowRetrieve`'s Sort visit, for a Sort the user wrote (or an earlier rule left);
  *  - `ruleGrowRetrieve`'s LimitOffset visit ({@link tryLimitedSortAbsorb}), for a Sort
- *    under a constant LIMIT, asked with that bound before the Sort visit asks without it;
+ *    under a constant LIMIT, asked with that bound before the Sort visit asks without it
+ *    (a placeholder LIMIT goes through the same prepare / build steps instead, via
+ *    {@link tryRuntimeLimitChoice});
  *  - `rules/aggregate/rule-minmax-index-boundary.ts`, which synthesizes a throwaway
  *    Sort purely to ask this question and commits nothing when the answer is null.
  *
@@ -850,14 +856,51 @@ function baselineScanCost(
  * `rowsWanted` is how a caller that already knows the LIMIT tells the module about
  * it: `rule-minmax-index-boundary` for the `LimitOffset(1)` it is about to wrap on,
  * and the LimitOffset visit for a LIMIT and OFFSET the user wrote as plan-time
- * constants. A placeholder LIMIT (`limit ?`) still reaches no module; that needs a
- * run-time choice between plans — `sort-absorb-runtime-limit-choice`.
+ * constants. A placeholder LIMIT (`limit ?`) reaches the module as the series of bounds
+ * {@link largestOrderedBound} probes, and the plan is chosen at run time.
  */
 export function trySortAbsorbViaIndexOrdering(
 	sort: SortNode,
 	context: OptContext,
 	rowsWanted?: RowsWanted,
 ): PlanNode | null {
+	const prepared = prepareSortAbsorb(sort, context);
+	if (!prepared) return null;
+
+	const accessPlan = orderedPlanFor(prepared, rowsWanted);
+	if (!accessPlan) {
+		log('Access plan does not satisfy required ordering; leaving Sort in place');
+		return null;
+	}
+	return buildAbsorbed(prepared, accessPlan);
+}
+
+/**
+ * Everything a Sort absorb asks the module and rebuilds the tree from, gathered once so
+ * the module can be asked repeatedly, with different row bounds, without re-walking the
+ * subtree.
+ */
+interface PreparedSortAbsorb {
+	/** Project / Filter / Alias nodes between the Sort and the Retrieve, top first. */
+	readonly chain: readonly (ProjectNode | FilterNode | AliasNode)[];
+	readonly retrieveNode: RetrieveNode;
+	/** The Sort's source: the region between the module's scan and the Sort. */
+	readonly subtree: RelationalPlanNode;
+	readonly tableSchema: TableSchema;
+	/** The limit-free request; a row bound is spread onto it per probe. */
+	readonly request: BestAccessPlanRequest;
+	/** `request.filters` in planner-side form (see {@link probeAccessPlan}). */
+	readonly constraints: readonly PredicateConstraint[];
+	readonly requiredOrdering: readonly OrderingSpec[];
+	readonly ask: (request: BestAccessPlanRequest) => BestAccessPlanResult;
+}
+
+/**
+ * Walk down from the Sort to its Retrieve and build the limit-free request, or null when
+ * the Sort cannot be absorbed at all: the chain holds a node other than Project / Filter /
+ * Alias, the module has no `getBestAccessPlan`, or a sort key is not a plain table column.
+ */
+function prepareSortAbsorb(sort: SortNode, context: OptContext): PreparedSortAbsorb | null {
 	// Walk down through commuting unary operators to find the RetrieveNode.
 	const chain: (ProjectNode | FilterNode | AliasNode)[] = [];
 	let current: PlanNode = sort.source;
@@ -877,28 +920,8 @@ export function trySortAbsorbViaIndexOrdering(
 	const vtabModule = tableRef.vtabModule;
 	if (!vtabModule?.getBestAccessPlan) return null;
 
-	// Translate sort keys to table-column ordering using attribute IDs.
-	const tableAttrIndex = tableRef.getAttributeIndex();
-	const requiredOrdering: OrderingSpec[] = [];
-	for (const key of sort.getSortKeys()) {
-		// Explicit NULLS FIRST/LAST is not currently propagated to the access
-		// plan — refuse to absorb so the Sort runtime can honor the request.
-		if (key.nulls) {
-			log('Sort key has explicit NULLS %s; cannot absorb', key.nulls);
-			return null;
-		}
-		if (key.expression.nodeType !== PlanNodeType.ColumnReference) {
-			log('Non-trivial sort expression; cannot absorb');
-			return null;
-		}
-		const colRef = key.expression as ColumnReferenceNode;
-		const tableColIdx = tableAttrIndex.get(colRef.attributeId) ?? -1;
-		if (tableColIdx < 0) {
-			log('Sort key not directly mappable to table column; cannot absorb');
-			return null;
-		}
-		requiredOrdering.push({ columnIndex: tableColIdx, desc: key.direction === 'desc' });
-	}
+	const requiredOrdering = sortKeysAsTableOrdering(sort, tableRef);
+	if (!requiredOrdering) return null;
 
 	// Collect filters anywhere in the subtree below Sort (chain Filters or
 	// Filters already pushed into Retrieve.source). The second argument is a display
@@ -925,25 +948,72 @@ export function trySortAbsorbViaIndexOrdering(
 		estimatedRows: measuredRows(tableRef),
 	};
 
-	// `probeAccessPlan` sends the bound and re-asks without it if the plan that comes back
-	// is not truncation-safe; the region it validates is everything below the Sort, which
-	// is exactly what sits between the module's scan and the LimitOffset this caller is
-	// about to wrap on.
-	const accessPlan = probeAccessPlan(
-		req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
-		rowsWanted ? { ...request, limit: rowsWanted.limit, offset: rowsWanted.offset } : request,
+	return {
+		chain,
+		retrieveNode,
+		subtree: sort.source,
+		tableSchema,
+		request,
 		constraints,
-		sort.source,
-	);
+		requiredOrdering,
+		ask: req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
+	};
+}
 
-	// Only proceed if the plan actually satisfies the ordering — every requested
-	// position must be provided by the SAME column and direction, not merely
-	// matched on length. A length-only check would let an ascending
-	// providesOrdering of equal length wrongly drop a DESC Sort.
-	if (!planDeliversOrdering(tableSchema, accessPlan, requiredOrdering, constraints)) {
-		log('Access plan does not satisfy required ordering; leaving Sort in place');
-		return null;
+/** The sort keys as table-column ordering, matched by attribute id, or null when one is not a plain table column. */
+function sortKeysAsTableOrdering(sort: SortNode, tableRef: TableReferenceNode): OrderingSpec[] | null {
+	const tableAttrIndex = tableRef.getAttributeIndex();
+	const requiredOrdering: OrderingSpec[] = [];
+	for (const key of sort.getSortKeys()) {
+		// Explicit NULLS FIRST/LAST is not currently propagated to the access
+		// plan — refuse to absorb so the Sort runtime can honor the request.
+		if (key.nulls) {
+			log('Sort key has explicit NULLS %s; cannot absorb', key.nulls);
+			return null;
+		}
+		if (key.expression.nodeType !== PlanNodeType.ColumnReference) {
+			log('Non-trivial sort expression; cannot absorb');
+			return null;
+		}
+		const colRef = key.expression as ColumnReferenceNode;
+		const tableColIdx = tableAttrIndex.get(colRef.attributeId) ?? -1;
+		if (tableColIdx < 0) {
+			log('Sort key not directly mappable to table column; cannot absorb');
+			return null;
+		}
+		requiredOrdering.push({ columnIndex: tableColIdx, desc: key.direction === 'desc' });
 	}
+	return requiredOrdering;
+}
+
+/**
+ * Ask the module for the prepared request under `rowsWanted` (absent: limit-free), and
+ * return the plan only when it can stand in for the Sort.
+ *
+ * `probeAccessPlan` sends the bound and re-asks without it if the plan that comes back
+ * is not truncation-safe; the region it validates is everything below the Sort, which
+ * is exactly what sits between the module's scan and the LimitOffset the caller wraps on.
+ *
+ * Every requested ordering position must be provided by the SAME column and direction,
+ * not merely matched on length: a length-only check would let an ascending
+ * providesOrdering of equal length wrongly drop a DESC Sort.
+ */
+function orderedPlanFor(prepared: PreparedSortAbsorb, rowsWanted?: RowsWanted): BestAccessPlanResult | undefined {
+	const request = rowsWanted
+		? { ...prepared.request, limit: rowsWanted.limit, offset: rowsWanted.offset }
+		: prepared.request;
+	const plan = probeAccessPlan(prepared.ask, request, prepared.constraints, prepared.subtree);
+	return planDeliversOrdering(prepared.tableSchema, plan, prepared.requiredOrdering, prepared.constraints)
+		? plan
+		: undefined;
+}
+
+/**
+ * The Sort's subtree with the Sort dropped and the Retrieve equipped with `accessPlan`,
+ * which must be a plan {@link orderedPlanFor} returned for `prepared`.
+ */
+function buildAbsorbed(prepared: PreparedSortAbsorb, accessPlan: BestAccessPlanResult): RelationalPlanNode {
+	const { chain, retrieveNode, constraints } = prepared;
 
 	// Build residual predicate from any constraints the access plan didn't handle.
 	// rule-select-access-path's index-style branch trusts moduleCtx.residualPredicate
@@ -974,7 +1044,7 @@ export function trySortAbsorbViaIndexOrdering(
 		result = chainNode.withChildren(newChildren) as RelationalPlanNode;
 	}
 
-	log('Absorbed Sort into Retrieve via index ordering for %s', tableSchema.name);
+	log('Absorbed Sort into Retrieve via index ordering for %s', prepared.tableSchema.name);
 	return result;
 }
 
@@ -982,6 +1052,10 @@ export function trySortAbsorbViaIndexOrdering(
  * Absorb the Sort under a user-written LIMIT, telling the module how many rows are
  * wanted, so a backend with expensive row reads can price an ordered seek as the
  * `limit + offset` rows it reads rather than as every row the predicate matches.
+ *
+ * A LIMIT and OFFSET that are both constants are sent as they are. When either is a
+ * placeholder (or any other expression), {@link tryRuntimeLimitChoice} plans both the
+ * ordered read and the scan-then-sort and the runtime picks between them.
  *
  * The LimitOffset is never swallowed: it stays above the rebuilt chain and executes
  * there. Only the Sort goes, exactly as on the Sort visit; the bound changes what the
@@ -994,16 +1068,18 @@ export function trySortAbsorbViaIndexOrdering(
  * implements both; if one does, skip this attempt when the module has `supports()`.
  */
 function tryLimitedSortAbsorb(limitNode: LimitOffsetNode, context: OptContext): PlanNode | null {
-	const rowsWanted = constantRowsWanted(limitNode);
-	if (!rowsWanted) return null;
+	if (!limitNode.limit) return null;
 	const sort = sortUnderLimit(limitNode.source);
 	if (!sort) return null;
 
-	const absorbed = trySortAbsorbViaIndexOrdering(sort, context, rowsWanted);
-	if (!absorbed) return null;
+	const rowsWanted = constantRowsWanted(limitNode.limit, limitNode.offset);
+	const replacement = rowsWanted
+		? trySortAbsorbViaIndexOrdering(sort, context, rowsWanted)
+		: tryRuntimeLimitChoice(sort, limitNode.limit, limitNode.offset, context);
+	if (!replacement) return null;
 
-	log('Absorbed Sort under LIMIT %d OFFSET %d', rowsWanted.limit, rowsWanted.offset);
-	const newSource = rebuildChain(limitNode.source, sort, absorbed as RelationalPlanNode);
+	log('Absorbed Sort under %s', limitNode.toString());
+	const newSource = rebuildChain(limitNode.source, sort, replacement as RelationalPlanNode);
 	return limitNode.withChildren([newSource, ...limitNode.getChildren().slice(1)]);
 }
 
@@ -1012,14 +1088,133 @@ function tryLimitedSortAbsorb(limitNode: LimitOffsetNode, context: OptContext): 
  * constant. Truncated as the runtime's `toRowCount` does; a negative or NULL constant
  * never gets this far, since `buildRowCountExpression` rejects it at prepare time.
  */
-function constantRowsWanted(limitNode: LimitOffsetNode): RowsWanted | undefined {
-	if (!limitNode.limit) return undefined;
-	const limit = constantNumber(limitNode.limit);
-	const offset = limitNode.offset ? constantNumber(limitNode.offset) : 0;
-	// A placeholder bound needs a run-time choice between plans, not a plan-time one:
-	// `sort-absorb-runtime-limit-choice`.
+function constantRowsWanted(limitExpr: ScalarPlanNode, offsetExpr: ScalarPlanNode | undefined): RowsWanted | undefined {
+	const limit = constantNumber(limitExpr);
+	const offset = offsetExpr ? constantNumber(offsetExpr) : 0;
 	if (limit === undefined || offset === undefined) return undefined;
 	return { limit: Math.trunc(limit), offset: Math.trunc(offset) };
+}
+
+/**
+ * For a LIMIT whose value is known only at run time: plan both the ordered read and the
+ * original Sort, under a {@link LimitChoiceNode} that runs the ordered one when the
+ * actual `limit + offset` is at most the largest bound the module still prices it as the
+ * cheaper plan for ({@link largestOrderedBound}). Null when there is nothing to choose:
+ *
+ *  - the limit-free plan already delivers the ordering, so the Sort visit absorbs it
+ *    unconditionally (every parity backend lands here, and its plan is unchanged);
+ *  - the module prefers scan-then-sort even for one row, e.g. under a filter it cannot
+ *    claim, where the ordered read could not stop early anyway.
+ *
+ * Both branches hold the Sort's subtree (one rebuilt over the equipped Retrieve, one
+ * verbatim), so a subtree that is unsafe to hold twice declines ({@link branchesCanShare}).
+ * Declining costs only reads: today's scan-then-sort plan stays.
+ */
+function tryRuntimeLimitChoice(
+	sort: SortNode,
+	limit: ScalarPlanNode,
+	offset: ScalarPlanNode | undefined,
+	context: OptContext,
+): RelationalPlanNode | null {
+	if (!safeToEvaluateTwice(limit) || (offset && !safeToEvaluateTwice(offset))) return null;
+	const prepared = prepareSortAbsorb(sort, context);
+	if (!prepared || !branchesCanShare(prepared)) return null;
+
+	if (orderedPlanFor(prepared)) return null;
+	const bound = largestOrderedBound(prepared);
+	if (!bound) {
+		log('No row bound makes the ordered read cheaper; keeping scan-then-sort');
+		return null;
+	}
+
+	log('Planning both branches; ordered when limit + offset <= %d', bound.rows);
+	return new LimitChoiceNode(sort.scope, buildAbsorbed(prepared, bound.plan), sort, limit, offset, bound.rows);
+}
+
+/**
+ * Whether the Sort's subtree may appear in both branches of a {@link LimitChoiceNode}.
+ * The branches share its nodes (the verbatim one entirely, the rebuilt one everything but
+ * the chain and the Retrieve), so:
+ *  - nothing in it may write;
+ *  - no scalar in it may hold a subquery, whose body would then hang off a predicate both
+ *    branches share;
+ *  - no chain node may mint an attribute id (a computed projection): the rebuilt copy
+ *    would originate the same id a second time, which the plan validator rejects.
+ */
+function branchesCanShare(prepared: PreparedSortAbsorb): boolean {
+	if (PlanNodeCharacteristics.subtreeHasSideEffects(prepared.subtree)) return false;
+	if (subtreeHoldsSubquery(prepared.subtree)) return false;
+	return prepared.chain.every(node => {
+		const sourceIds = new Set(node.source.getAttributes().map(attr => attr.id));
+		return node.getAttributes().every(attr => sourceIds.has(attr.id));
+	});
+}
+
+/** True when some scalar below `root` has a relational descendant, i.e. holds a subquery. */
+function subtreeHoldsSubquery(root: RelationalPlanNode): boolean {
+	const stack: PlanNode[] = [root];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		for (const child of node.getChildren()) {
+			if (isRelationalNode(child)) stack.push(child);
+			else if (hasRelationalDescendant(child as ScalarPlanNode)) return true;
+		}
+	}
+	return false;
+}
+
+/** Highest bound {@link largestOrderedBound} probes; past it the ordered plan is assumed to hold. */
+const ORDERED_BOUND_CAP = 2 ** 30;
+
+/** A row bound and the ordered plan the module returned for it. */
+interface OrderedBound {
+	readonly rows: number;
+	readonly plan: BestAccessPlanResult;
+}
+
+/**
+ * The largest `limit` (at offset 0) for which the module still answers with a plan that
+ * delivers the ordering, with that plan; undefined when even one row does not.
+ *
+ * Doubles the bound until the ordered plan is lost or {@link ORDERED_BOUND_CAP} is
+ * reached, then bisects between the last bound that kept it and the first that lost it.
+ * Under the store's pricing the ordered cost rises with the bound and the scan's does
+ * not, so the answer is monotone; a module whose answer is not only gets a worse
+ * threshold, never a wrong result, because both branches return the same rows.
+ *
+ * The plan kept is the one at the boundary: below it every ordered plan is cheap, and at
+ * it picking the wrong one would cost the most. It is also the licence the emitter keeps:
+ * that plan may stop after `rows` rows, so the ordered branch runs only when
+ * `limit + offset <= rows`.
+ *
+ * NOTE: about `2 * log2(rows) + 2` probes — around 40 for a million-row table. If a
+ * module's `getBestAccessPlan` is expensive enough to show up at prepare time, memoize
+ * per table per pass or stop the bisection early.
+ */
+function largestOrderedBound(prepared: PreparedSortAbsorb): OrderedBound | undefined {
+	const atOne = orderedPlanFor(prepared, { limit: 1, offset: 0 });
+	if (!atOne) return undefined;
+
+	let kept: OrderedBound = { rows: 1, plan: atOne };
+	let lost: number | undefined;
+	while (lost === undefined && kept.rows < ORDERED_BOUND_CAP) {
+		const rows = kept.rows * 2;
+		const plan = orderedPlanFor(prepared, { limit: rows, offset: 0 });
+		if (plan) kept = { rows, plan };
+		else lost = rows;
+	}
+	return lost === undefined ? kept : bisectOrderedBound(prepared, kept, lost);
+}
+
+/** Narrow `kept` (delivers the ordering) toward `lost` (does not) until they are adjacent. */
+function bisectOrderedBound(prepared: PreparedSortAbsorb, kept: OrderedBound, lost: number): OrderedBound {
+	while (lost - kept.rows > 1) {
+		const rows = Math.floor((kept.rows + lost) / 2);
+		const plan = orderedPlanFor(prepared, { limit: rows, offset: 0 });
+		if (plan) kept = { rows, plan };
+		else lost = rows;
+	}
+	return kept;
 }
 
 /**

@@ -18,6 +18,13 @@ files:
   - docs/optimizer-retrieve.md
   - docs/module-authoring.md  # ~:185 probe list, ~:193 the limit licence
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-11-11T00:12:16.878Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\sort-absorb-runtime-limit-choice.implement.2026-11-11T00-12-16-878Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # A placeholder LIMIT above a Sort: decide at run time
 
 ## Background

@@ -35,24 +35,17 @@
  */
 
 import { createLogger } from '../../../common/logger.js';
-import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
-import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { LimitOffsetNode } from '../../nodes/limit-offset.js';
 import { AliasNode } from '../../nodes/alias-node.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { KeySetSemiJoinNode, seekRestoresTargetOrder } from '../../nodes/key-set-semi-join-node.js';
-import { hasRelationalDescendant } from '../../analysis/scalar-subqueries.js';
 import { rebuildChain } from '../shared/access-leaf.js';
+import { safeToEvaluateTwice } from '../shared/evaluate-twice.js';
 
 const log = createLogger('optimizer:rule:key-set-seek-row-bound');
-
-function safeToEvaluateTwice(expr: ScalarPlanNode): boolean {
-	return PlanNodeCharacteristics.isDeterministic(expr)
-		&& !PlanNodeCharacteristics.subtreeHasSideEffects(expr)
-		&& !hasRelationalDescendant(expr);
-}
 
 /** Each wrapper here passes rows on in order, one row out per row in at most. */
 function peelToKeySetJoin(chainRoot: RelationalPlanNode): KeySetSemiJoinNode | null {

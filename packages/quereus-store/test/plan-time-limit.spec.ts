@@ -446,6 +446,44 @@ describe('plan-time LIMIT reaching the store module (feat-sort-absorb-blind-to-l
 			expect(await f.rows(query)).to.deep.equal(expected);
 		});
 
+		/**
+		 * The same #36 query with the LIMIT as a placeholder, the paginated-list spelling, as
+		 * "latest N" (`ix_bc` declares `c` descending). One prepared plan holds both the
+		 * ordered `ix_bc` read and scan-then-sort, and each execution picks by the bound's
+		 * value: 20 reads 20 index entries, and a bound above all 100 rows `b = 1` matches
+		 * takes the sorted branch. Both must return the reference rows.
+		 */
+		it('a placeholder LIMIT picks the ordered read or the sort when it runs', async () => {
+			const f = await track({ costProfile: INDEXEDDB_PROFILE, rowCount: 200, descC: true });
+			f.db.setOption('runtime_metrics', true);
+			const query = 'select * from t where b = 1 order by c desc limit ?';
+
+			const plan = (await f.rows(`select op, detail from query_plan('${query}')`))
+				.map(r => JSON.stringify(r)).join('\n');
+			expect(plan, 'both branches should be planned under one run-time choice').to.match(/LIMITCHOICE/i);
+
+			const reference = (await f.rows('select * from t where b = 1'))
+				.sort((x, y) => (y.c as number) - (x.c as number));
+			const stmt = f.db.prepare(query);
+			try {
+				const run = async (limit: number): Promise<{ rows: Record<string, unknown>[]; scanned: number }> => {
+					const rows: Record<string, unknown>[] = [];
+					for await (const row of stmt.all([limit])) rows.push(row);
+					return { rows, scanned: stmt.getWorkCounters()!.tables['main.t'].rowsScanned };
+				};
+
+				const short = await run(20);
+				expect(short.rows).to.deep.equal(reference.slice(0, 20));
+				expect(short.scanned, 'the ordered branch stops at the limit').to.equal(20);
+
+				const long = await run(150);
+				expect(long.rows).to.deep.equal(reference);
+				expect(long.scanned, 'the sorted branch reads every matching row').to.be.at.least(reference.length);
+			} finally {
+				await stmt.finalize();
+			}
+		});
+
 		it('the ordinary aggregate answers agree with a hand-written order by', async () => {
 			const f = await track({ costProfile: INDEXEDDB_PROFILE });
 			const viaAggregate = await f.rows('select min(c) from t where b = 0');

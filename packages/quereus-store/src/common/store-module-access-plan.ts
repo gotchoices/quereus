@@ -1191,11 +1191,11 @@ function seekRankingCost(
  * NOTE: a limit reaches here from two engine sites. `ruleMinMaxIndexBoundary` passes the
  * `LimitOffset(1)` it is about to wrap on, so `min(c)` / `max(c)` are priced as the one
  * row they read; `ruleGrowRetrieve`'s LimitOffset visit passes a LIMIT / OFFSET the user
- * wrote as constants above the Sort, so `order by n limit 10` is priced as ten rows. A
- * placeholder limit (`order by n limit ?`) still is not — the plan is built before the
- * value is known — so it is priced exactly like `order by n`, and a backend declaring an
- * expensive `pointRead` still prefers scan-then-sort under it. That engine change is
- * `sort-absorb-runtime-limit-choice`.
+ * wrote as constants above the Sort, so `order by n limit 10` is priced as ten rows. For
+ * a placeholder limit (`order by n limit ?`) the same visit probes here with a series of
+ * bounds to find the largest one this walk still wins at, and the engine keeps both this
+ * walk and scan-then-sort, choosing per execution once the value is known. So this
+ * function is asked about one statement some dozens of times; it must stay pure.
  */
 function chooseOrderingPlan(
 	db: Database,

@@ -33,6 +33,7 @@ import { TableAccessNode, EmptyResultNode } from '../nodes/table-access-nodes.js
 import { FilterNode } from '../nodes/filter.js';
 import { SortNode } from '../nodes/sort.js';
 import { LimitOffsetNode } from '../nodes/limit-offset.js';
+import { LimitChoiceNode } from '../nodes/limit-choice-node.js';
 import { AliasNode } from '../nodes/alias-node.js';
 import { CacheNode } from '../nodes/cache-node.js';
 import { ProjectNode } from '../nodes/project-node.js';
@@ -184,9 +185,10 @@ function walkPlan(root: PlanNode): { referencedAttrIds: Set<number>; scans: Map<
 
 	function childDemands(node: PlanNode, wholeRow: boolean): ChildDemand[] {
 		// Operators that emit their input rows unchanged: their inputs are read whole
-		// exactly when they are.
+		// exactly when they are. A LimitChoice emits the rows of whichever branch it runs,
+		// so both branches are read as it is.
 		if (node instanceof FilterNode || node instanceof SortNode || node instanceof LimitOffsetNode
-			|| node instanceof AliasNode || node instanceof CacheNode) {
+			|| node instanceof LimitChoiceNode || node instanceof AliasNode || node instanceof CacheNode) {
 			return scalarsAndRelations(node, () => wholeRow);
 		}
 		// Operators that read their input only through expressions — all of which are

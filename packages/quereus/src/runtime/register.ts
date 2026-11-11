@@ -38,6 +38,7 @@ import { emitFilter } from './emit/filter.js';
 import { emitDistinct } from './emit/distinct.js';
 import { emitScalarFunctionCall } from './emit/scalar-function.js';
 import { emitLimitOffset } from './emit/limit-offset.js';
+import { emitLimitChoice } from './emit/limit-choice.js';
 import { emitOrdinalSlice } from './emit/ordinal-slice.js';
 import { emitStreamAggregate } from './emit/aggregate.js';
 import { emitHashAggregate } from './emit/hash-aggregate.js';
@@ -127,6 +128,7 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.Distinct, emitDistinct as EmitterFunc);
 	registerEmitter(PlanNodeType.Sort, emitSort as EmitterFunc);
 	registerEmitter(PlanNodeType.LimitOffset, emitLimitOffset as EmitterFunc);
+	registerEmitter(PlanNodeType.LimitChoice, emitLimitChoice as EmitterFunc);
 	registerEmitter(PlanNodeType.OrdinalSlice, emitOrdinalSlice as EmitterFunc);
 	registerEmitter(PlanNodeType.TableFunctionCall, emitTableValuedFunctionCall as EmitterFunc);
 	registerEmitter(PlanNodeType.In, emitIn as EmitterFunc);

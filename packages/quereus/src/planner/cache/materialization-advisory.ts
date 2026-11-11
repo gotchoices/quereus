@@ -302,6 +302,19 @@ export class MaterializationAdvisory {
 			};
 		}
 
+		// Rule 2b: a table reference is the descriptor its access nodes read, not a row
+		// stream, and those nodes accept only a TableReferenceNode child — a wrap could
+		// never land. Two access nodes share one when a LimitChoice holds the same table
+		// in both branches.
+		if (node.nodeType === PlanNodeType.TableReference) {
+			return {
+				shouldCache: false,
+				strategy: 'memory',
+				threshold: 0,
+				reason: 'Table reference — read by its access nodes, never iterated'
+			};
+		}
+
 		// Rule 3: Correlated subqueries should not be cached
 		// Check if this node is part of a subquery context and if it's correlated
 		if (isRelationalNode(node) && this.isCorrelatedNode(node)) {

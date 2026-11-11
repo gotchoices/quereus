@@ -60,6 +60,7 @@ export enum PlanNodeType {
 
   AsofScan = 'AsofScan',            // Streaming asof join: per left row, latest right with key ≤ left's
   OrdinalSlice = 'OrdinalSlice',    // O(log N) seek to kth row over a monotonic, ordinal-seek-capable leaf
+  LimitChoice = 'LimitChoice',      // Ordered read or scan-then-sort under a run-time LIMIT, picked per execution
   Materialize = 'Materialize',      // Materialize intermediate results
 
   // Scalar expression nodes

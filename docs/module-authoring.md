@@ -185,6 +185,10 @@ retrieve-growth rule asks once for the plan it is considering, re-asks without `
 limit turns out not to be truncation-safe, and asks a third time with `filters`, `requiredOrdering`,
 `limit` and `offset` all stripped to get the whole-table baseline it compares that plan against
 (`baselineScanCost`, see [Optimizer costing § Where a module's own size fits](optimizer-costing.md)).
+An `order by … limit ?` with a placeholder bound probes many more times: the engine searches for the
+largest `limit` at which you still answer with a plan that provides the ordering (doubling, then
+bisecting — about `2·log2(rows)` requests on one table, see
+[Optimizer Retrieve § A placeholder LIMIT](optimizer-retrieve.md#a-placeholder-limit-choosing-at-run-time)).
 A discarded probe must leave nothing behind — no cursor opened, no cache mutated, no counter
 advanced — and asking about a filter-free request must be as cheap as asking about a filtered one.
 A module that cannot answer cheaply should memoize its own answer; the engine does not memoize for
@@ -197,7 +201,10 @@ than advisory — there is no "limit you should ignore". It arrives with `requir
 for a LIMIT the user wrote above an `ORDER BY` when the LIMIT and OFFSET are both
 constants (`order by date limit 20 offset 40` sends `limit: 20, offset: 40`), and for
 the one-row boundary read the engine synthesizes for `min` / `max`. A placeholder LIMIT
-(`limit ?`) does not reach you yet. Two rules follow:
+(`limit ?`) reaches you as the **largest bound the engine will ever run that plan under**: it
+keeps the ordered plan you returned for `limit: N, offset: 0` and runs it only on executions
+whose actual `limit + offset` is at most `N`, falling back to scan-then-sort above that, so
+truncating to `N` never underproduces. Two rules follow:
 
 - The bound is `limit + offset`, never `limit` alone. The engine's `LimitOffsetNode` still
   discards `offset` rows above whatever you emit, so stopping at `limit` underproduces.

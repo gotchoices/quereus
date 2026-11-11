@@ -102,10 +102,11 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	]);
 	// The `LimitOffset(1)` wrapped on below is synthesized HERE, so the bound is known
 	// before the probe — the same way `ruleGrowRetrieve`'s LimitOffset visit knows a
-	// constant limit the user wrote above a Sort (a placeholder `limit ?` still reaches no
-	// module). Telling the module lets it price a boundary read as the one row it is,
-	// instead of as an ordered read of the whole table; the absorb declines the bound on
-	// its own if anything below the Sort could still filter a row out. See
+	// constant limit the user wrote above a Sort (a placeholder `limit ?` is handled there
+	// by a run-time choice between plans). Telling the module lets it price a boundary
+	// read as the one row it is, instead of as an ordered read of the whole table; the
+	// absorb declines the bound on its own if anything below the Sort could still filter
+	// a row out. See
 	// `feat-sort-absorb-blind-to-limit`.
 	const absorbed = trySortAbsorbViaIndexOrdering(probe, context, { limit: 1, offset: 0 });
 	if (!absorbed) {

@@ -125,7 +125,7 @@ table's own key walk satisfies.
 `trySortAbsorbViaIndexOrdering` is **exported** and has three entry points:
 
 - `ruleGrowRetrieve`'s **Sort visit**, for a `Sort` the user wrote (or an earlier rule left). It asks with no row bound.
-- `ruleGrowRetrieve`'s **LimitOffset visit** (`tryLimitedSortAbsorb`), for a `Sort` under a LIMIT whose bound and OFFSET are both plan-time constants. It looks down from the `LimitOffset` through `Project` and `Alias` only (a `Filter` or `Distinct` there discards rows *after* the ordering, so the bound would be wrong to send) and passes `{ limit, offset }` as `rowsWanted`, which reaches the module as `BestAccessPlanRequest.limit` / `.offset` when `truncationIsSafe` holds. The pass is top-down, so this attempt comes before the Sort visit; when it declines, the Sort visit still makes its limit-free attempt. On success the `LimitOffset` is kept above the rebuilt chain and executes there — it is never swallowed. A placeholder LIMIT (`limit ?`) is not a plan-time constant and takes no part (`sort-absorb-runtime-limit-choice`).
+- `ruleGrowRetrieve`'s **LimitOffset visit** (`tryLimitedSortAbsorb`), for a `Sort` under a LIMIT whose bound and OFFSET are both plan-time constants. It looks down from the `LimitOffset` through `Project` and `Alias` only (a `Filter` or `Distinct` there discards rows *after* the ordering, so the bound would be wrong to send) and passes `{ limit, offset }` as `rowsWanted`, which reaches the module as `BestAccessPlanRequest.limit` / `.offset` when `truncationIsSafe` holds. The pass is top-down, so this attempt comes before the Sort visit; when it declines, the Sort visit still makes its limit-free attempt. On success the `LimitOffset` is kept above the rebuilt chain and executes there — it is never swallowed. A LIMIT or OFFSET that is not a plan-time constant (`limit ?`) takes the run-time choice described [below](#a-placeholder-limit-choosing-at-run-time) instead; it reuses the helper's two halves (`prepareSortAbsorb`, `buildAbsorbed`) rather than calling it.
 - `rule-minmax-index-boundary` (Structural, Aggregate) calls it as a *probe*: it synthesizes a throwaway `SortNode` purely to ask whether the access path can serve that ordering, passing the `LimitOffset(1)` it is about to wrap on as `rowsWanted`, and commits nothing when the answer is null.
 
 The last two discard a null answer, which is why the helper must stay side-effect-free — it probes
@@ -165,6 +165,25 @@ letting `extractCoveredKeysForTable` claim ≤1 row for a relation with many, an
 over the same *table* is not this shape: the inner scan is a distinct
 `TableReferenceNode` with its own attribute ids, so `exists (select 1 from a a2 where
 a2.id = 2)` never matched the outer instance's attributes in the first place.
+
+#### A placeholder LIMIT: choosing at run time
+
+`select * from t where owner = ? order by date desc limit ?` (the paginated list) has no row bound at plan time, yet on a backend with expensive row reads (IndexedDB) the ordered index read is far cheaper than scan-then-sort for small bounds and far dearer for large ones. When the LimitOffset visit finds a LIMIT or OFFSET that is not a constant, `tryRuntimeLimitChoice` plans both and leaves the choice to each execution:
+
+```
+LimitOffset(limit ?, offset)
+└─ LimitChoice(orderedUpTo = N, limit ?, offset)     ← same expression instances as above
+   ├─ ordered: chain → Retrieve(index plan priced at limit N, provides the ordering)
+   └─ sorted:  the original Sort → chain → Retrieve
+```
+
+**Threshold.** The module decides which plan is cheaper; the rule only finds the largest bound at which it still answers with an ordered plan. Each probe is `orderedPlanFor(prepared, { limit: L, offset: 0 })` — the request `trySortAbsorbViaIndexOrdering` would send with that bound, kept only when `planDeliversOrdering` holds (`probeAccessPlan` already strips an unsafe bound, so an unsafe subtree is unordered at every `L`). The rule returns null, leaving the Sort visit to do what it does today, when the limit-free probe is already ordered (every parity backend) or the probe at `L = 1` is not (for example under a filter the module cannot claim). Otherwise `largestOrderedBound` doubles `L` from 2 until the ordered plan is lost or `L` reaches `2 ** 30`, then bisects. `orderedUpTo` is the largest delivering `L`, and the plan returned there becomes the `ordered` branch's access plan: at the boundary, choosing the wrong ordered plan would cost the most. Under the store's pricing the ordered cost rises with `L` and the scan's does not, so the answer is monotone; a module whose answer is not gets a worse threshold, never wrong rows, because both branches return the same rows. The search costs about `2·log2(rows) + 2` probes.
+
+**Licence invariant.** The `ordered` plan was requested with `limit: orderedUpTo, offset: 0`, so the module may truncate to `orderedUpTo` rows. The emitter (`runtime/emit/limit-choice.ts`) evaluates the LIMIT and OFFSET through the same `resolveWindow` as the `LimitOffset` above and runs `ordered` only when `limit + offset <= orderedUpTo` (so `limit 0` is ordered), `sorted` otherwise. Both branches are emitted as on-demand sub-programs, so the one not taken opens no cursor.
+
+**Declines.** The LIMIT and OFFSET must pass `safeToEvaluateTwice` (`rules/shared/evaluate-twice.ts`, shared with `rule-key-set-seek-row-bound`), since both nodes evaluate them. A correlated limit is admitted: both evaluations read the same outer row. The branches share the subtree's nodes, so the rule also declines when the subtree writes, when any scalar in it holds a subquery, or when a chain node mints an attribute id (a computed projection, which the rebuilt copy would originate a second time).
+
+**Node contract.** `LimitChoiceNode` reports the attributes, ordering and estimates of `sorted`, and throws `INTERNAL` if the branches' attribute ids ever disagree (a rewrite that touched one branch only). `required-columns` passes the demand from above to both branches. Cost additivity counts both branches, about twice either plan; this is accepted because the node normally sits under a top-level `LimitOffset` where nothing compares its cost (`NOTE:` on the node). The materialization advisory never wraps a `TableReference`, which the two branches' access nodes share. Rules that look below a `LimitOffset` (`rule-monotonic-limit-pushdown`, `rule-key-set-seek-row-bound`, …) do not see through the node; its doc comment says why they lose nothing.
 
 ### Set operations and growth boundaries
 
