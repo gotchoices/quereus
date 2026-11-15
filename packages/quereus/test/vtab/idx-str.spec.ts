@@ -162,7 +162,7 @@ describe('idxStr codec', () => {
 
 	describe('plan code mapping', () => {
 		it('is a bijection over the kinds the engine emits', () => {
-			const kinds = ['scan', 'eqSeek', 'rangeSeek', 'multiSeek', 'multiRangeSeek', 'prefixRangeSeek'] as const;
+			const kinds = ['scan', 'eqSeek', 'rangeSeek', 'multiSeek', 'multiRangeSeek', 'prefixRangeSeek', 'moduleSeek'] as const;
 			for (const kind of kinds) {
 				expect(planKindFromCode(planCodeFromKind(kind))).to.equal(kind);
 			}

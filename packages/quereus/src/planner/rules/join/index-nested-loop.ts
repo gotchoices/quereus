@@ -427,6 +427,8 @@ function probeModule(
 		return null;
 	}
 
+	// Also declines every module-listed seek (`moduleSeekFilters`), which never carries seek
+	// columns: this rule emits its own per-column join-key constraints and needs that shape.
 	if (!seekPlan.indexName || !seekPlan.seekColumnIndexes || seekPlan.seekColumnIndexes.length === 0) {
 		log('decline: module did not claim an index seek');
 		return null;

@@ -210,7 +210,7 @@ export function makeIndexEqSeekFilterInfo(
 
 /**
  * Rewrite the index name across `idxStr`, `indexInfoOutput.idxStr`, and
- * `accessPath.index.name` (or `accessPath.indexName` when unresolved).
+ * `accessPath.index.name` (or `accessPath.indexName` when unresolved or unordered).
  *
  * A module may advertise a per-plan alias for an index (`_primary_1`) that a wrapping
  * table's delegate does not know. Retargeting rewrites only the name; `plan`, `nameArg`,
@@ -241,6 +241,7 @@ function retargetAccessPath(accessPath: AccessPath | undefined, newIndexName: st
 			if (accessPath.index.name === newIndexName) return accessPath;
 			return { ...accessPath, index: { ...accessPath.index, name: newIndexName } };
 		case 'unresolvedIndex':
+		case 'unorderedIndex':
 			if (accessPath.indexName === newIndexName) return accessPath;
 			return { ...accessPath, indexName: newIndexName };
 		default:

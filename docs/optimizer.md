@@ -471,8 +471,9 @@ it does not apply and also stops at `limit + offset` returns too few rows.
 
 Alongside the free-text `idxStr`, `rule-select-access-path` records its choice on the
 physical leaf as a typed `FilterInfo.accessPath` (`vtab/index-descriptor.ts`): one of
-`{ kind: 'fullScan' }`, `{ kind: 'empty' }`, `{ kind: 'index', index, plan }`, or
-`{ kind: 'unresolvedIndex', indexName, plan }`. `idxStr` is the text *projection* of the
+`{ kind: 'fullScan' }`, `{ kind: 'empty' }`, `{ kind: 'index', index, plan }`,
+`{ kind: 'unresolvedIndex', indexName, plan }`, or `{ kind: 'unorderedIndex', indexName, plan }`.
+`idxStr` is the text *projection* of the
 same choice — both are emitted from one `(indexName, plan, params)` triple through
 `encodeIdxStr`, so they cannot drift, and every module runtime still parses `idxStr` via
 the shared `decodeIdxStr`. Consumers that need to know *what the index is* — above all the
@@ -486,6 +487,8 @@ descriptor — becomes `unresolvedIndex`, logged at warn level; an order-sensiti
 must refuse such a plan rather than guess it is the primary key. See
 [module authoring](module-authoring.md#2-index-based-access-standard) for the module-side
 contract.
+
+A plan carrying `moduleSeekFilters` takes its own arm (`selectPhysicalNodeFromModuleSeek`), checked before the index-aware and legacy arms: the module listed the filters it enforces inside `indexName`, so the rule consumes exactly those, in list order, as one `IndexSeekNode` of plan kind `moduleSeek` (`plan=8`) whose `FilterInfo.constraints` are one (column, operator, value) triple per listed filter, AND-ed together. Every listed filter takes the range collation rule against the index's key column (BINARY when the index does not describe it); a mismatch declines to a scan with the listed filters as residual. When such a plan claims no order and names an index the engine cannot resolve, it is recorded as `unorderedIndex` instead of `unresolvedIndex`, without a warning — nothing above relies on its emission order. The seek never claims the single-row FD, since its keys are not one per primary-key column.
 
 Which seek-family filters the rule *can* consume is further shaped by the seek encodings.
 Seek keys are positional, so a standalone range bound is only ever seeked on the

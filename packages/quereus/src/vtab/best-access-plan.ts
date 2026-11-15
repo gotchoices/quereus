@@ -397,6 +397,20 @@ export interface BestAccessPlanResult {
 	indexDescriptor?: IndexDescriptor;
 	/** Column indexes that form the seek/range key, in order */
 	seekColumnIndexes?: readonly number[];
+	/**
+	 * Module-enforced seek. Indexes into `request.filters` of the filters the module enforces
+	 * itself, inside the index named by `indexName`, and whose comparison values it needs at
+	 * run time. At query() time `FilterInfo.constraints[k]` names the column and operator of
+	 * `request.filters[moduleSeekFilters[k]]` and `FilterInfo.args[k]` carries its value
+	 * (argvIndex k + 1). An empty list asks for the module's own scan of `indexName` with no
+	 * arguments.
+	 *
+	 * The engine consumes exactly these filters, in this order — it picks nothing per column —
+	 * and reattaches every other handled filter above the scan. The rules
+	 * {@link moduleSeekFiltersProblem} states are enforced by {@link validateAccessPlan} and by
+	 * the planner. See docs/module-authoring.md § "Module-listed seek arguments".
+	 */
+	moduleSeekFilters?: readonly number[];
 	/** Whether this plan guarantees unique rows (helps DISTINCT optimization) */
 	isSet?: boolean;
 	/** Free-text explanation for debugging */
@@ -705,6 +719,59 @@ export function validateAccessPlanRequest(request: BestAccessPlanRequest): void 
 	}
 }
 
+/** The range operators a module may list in {@link BestAccessPlanResult.moduleSeekFilters}. */
+const MODULE_SEEK_RANGE_OPS: ReadonlySet<ConstraintOp> = new Set<ConstraintOp>(['<', '<=', '>', '>=']);
+
+/**
+ * Whether filter `f` may be listed in {@link BestAccessPlanResult.moduleSeekFilters}: a
+ * comparison carrying one value — `=`, a range operator, or an `IN` whose literal list holds
+ * exactly one element (delivered as `=`). A multi-value or runtime-set `IN`, an `OR_RANGE`,
+ * and the operators that carry no single comparison value are not.
+ */
+function isModuleSeekFilterOp(f: PredicateConstraint): boolean {
+	if (f.op === '=' || MODULE_SEEK_RANGE_OPS.has(f.op)) return true;
+	return f.op === 'IN' && !f.runtimeSet && Array.isArray(f.value) && (f.value as unknown[]).length === 1;
+}
+
+/**
+ * Why `result.moduleSeekFilters` breaks its contract against `filters`, or undefined when it
+ * is absent or well formed. One check shared by {@link validateAccessPlan} (which throws
+ * FORMAT) and the planner (which throws INTERNAL — not every module validates its own plan):
+ *
+ *  - it requires `indexName`, and excludes a non-empty `seekColumnIndexes`;
+ *  - each entry is an integer index into `filters`, listed once, whose filter
+ *    `handledFilters` claims;
+ *  - each listed filter is one {@link isModuleSeekFilterOp} accepts.
+ */
+export function moduleSeekFiltersProblem(
+	filters: readonly PredicateConstraint[],
+	result: BestAccessPlanResult,
+): string | undefined {
+	const listed = result.moduleSeekFilters;
+	if (listed === undefined) return undefined;
+	if (result.indexName === undefined) return 'moduleSeekFilters requires indexName';
+	if ((result.seekColumnIndexes?.length ?? 0) > 0) {
+		return 'moduleSeekFilters and a non-empty seekColumnIndexes are mutually exclusive';
+	}
+	const seen = new Set<number>();
+	for (const entry of listed) {
+		if (!Number.isInteger(entry) || entry < 0 || entry >= filters.length) {
+			return `moduleSeekFilters entry ${entry} is not an index into request.filters (0-${filters.length - 1})`;
+		}
+		if (seen.has(entry)) return `moduleSeekFilters lists filter ${entry} more than once`;
+		seen.add(entry);
+		if (result.handledFilters[entry] !== true) {
+			return `moduleSeekFilters lists filter ${entry}, which handledFilters does not claim`;
+		}
+		const f = filters[entry];
+		if (!isModuleSeekFilterOp(f)) {
+			return `moduleSeekFilters lists filter ${entry} ('${f.op}' on column ${f.columnIndex}); `
+				+ 'only =, <, <=, >, >= and a single-value IN may be listed';
+		}
+	}
+	return undefined;
+}
+
 /**
  * Validation function for access plan results
  * Throws if the plan violates basic contracts
@@ -792,6 +859,11 @@ export function validateAccessPlan(
 				StatusCode.FORMAT
 			);
 		}
+	}
+
+	const moduleSeekProblem = moduleSeekFiltersProblem(request.filters, result);
+	if (moduleSeekProblem !== undefined) {
+		quereusError(`Access plan${by}: ${moduleSeekProblem}`, StatusCode.FORMAT);
 	}
 
 	// Validate seek column indexes

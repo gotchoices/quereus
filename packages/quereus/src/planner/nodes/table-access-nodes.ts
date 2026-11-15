@@ -653,8 +653,13 @@ export class IndexSeekNode extends TableAccessNode {
 			// optimization in a rare shape rather than risking a false claim.
 			// `estimatedRows` needs no override either way — the module's own estimate,
 			// read above, already says 1 for a whole-PK point seek and 3 for the IN.
-			const isMultiSeek = accessPathPlan(this.filterInfo.accessPath) === 'multiSeek';
-			if (pk.length > 0 && this.seekKeys.length === pk.length && !isMultiSeek) {
+			//
+			// A module-listed seek (`moduleSeek`) is excluded for the same reason: its keys
+			// are the filters the module listed, not one per key column, so `a = 1 and a = 1`
+			// over a two-column key matches the count without pinning the key.
+			const plan = accessPathPlan(this.filterInfo.accessPath);
+			const keysMayRepeatAColumn = plan === 'multiSeek' || plan === 'moduleSeek';
+			if (pk.length > 0 && this.seekKeys.length === pk.length && !keysMayRepeatAColumn) {
 				// Full PK equality seek — at most one row per evaluation of its keys. A
 				// correlated seek (the inner side of a nested-loop join, keyed on the outer
 				// row) is at most one row per OUTER row, so it must not stamp the singleton:

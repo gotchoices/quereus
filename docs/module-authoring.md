@@ -363,6 +363,35 @@ Three corollaries worth spelling out:
   when you answer a seek with the whole table. Do not treat a direct `query()` call as
   permission to skip the negotiation: your module remains free to decline.
 
+**Module-listed seek arguments — `moduleSeekFilters`**:
+
+The seek shapes above (all equalities; equalities plus one trailing range; a range on the leading seek column; one `OR_RANGE`) are the only ways `seekColumnIndexes` gets run-time values to your module. An index that answers a different lookup in one pass — a multi-dimensional index answering `x >= ? and x <= ? and y >= ? and y <= ?`, say — instead lists the filters it enforces:
+
+```typescript
+interface BestAccessPlanResult {
+  // …
+  indexName?: string;                      // required with moduleSeekFilters
+  moduleSeekFilters?: readonly number[];   // indexes into request.filters, in the order you want their values
+}
+```
+
+The engine consumes **exactly** the listed filters, in list order, and picks nothing per column, so you never have to mirror the positional picker above. At `query()` time `FilterInfo.constraints[k]` names the column and operator of `request.filters[moduleSeekFilters[k]]`, and `FilterInfo.args[k]` carries its value (`argvIndex` is `k + 1`). The constraints are a **conjunction**: two listed filters on one column (`x >= ? and x <= ?`) arrive as two constraints with the same `iColumn`, both of which must hold. `idxStr` is `idx=<indexName>(0);plan=8` (plan kind `moduleSeek`), plus `reverse=1` when your `indexDescriptor` says the walk runs backwards; there are no other parameters. Every handled filter you did not list is re-checked by the engine above your scan, exactly as an unconsumed claim is today. An empty list asks for your own scan of `indexName` with no arguments.
+
+The rules, which `validateAccessPlan` rejects with `FORMAT` (and the planner with `INTERNAL`, since not every module validates its own plan):
+
+- `indexName` is required, and a non-empty `seekColumnIndexes` is not allowed alongside.
+- Each entry is an integer index into `request.filters`, listed once, whose filter you claim in `handledFilters`.
+- Each listed filter's op is `=`, `<`, `<=`, `>` or `>=`, or an `IN` whose literal `value` list has exactly one element (delivered as `=`). A multi-value `IN`, a `runtimeSet`, `OR_RANGE`, `IS NULL`, `LIKE` and the rest cannot be listed.
+- A `providesOrdering` claim still needs `orderingIndexName === indexName`.
+
+**Nulls.** A listed filter that compares with a literal NULL folds the whole access to an empty result and `query()` is never called. A run-time value that turns out NULL (a parameter bound to null) reaches you as a `null` in `args`; treat that comparison as false, which matches no row. (`col > null` and its siblings never reach you as filters at all: the engine keeps them as a residual.)
+
+**Collation.** You get no collation with the constraints, so every listed filter — equalities included — must compare under the collation of the index key column it constrains, read from your `indexDescriptor` (or the schema, for `_primary_` and schema indexes). A column the descriptor does not hold, or an index the engine cannot resolve, counts as BINARY. A non-BINARY match also needs `honorsCollatedRangeBounds`. Any mismatch makes the engine decline your plan to a full scan with the listed filters as a residual; the answer is still correct, only the lookup is lost. So a NOCASE predicate over an index you do not describe always declines — describe the index, or use `seekColumnIndexes`, if that matters.
+
+**Order.** A plan that claims an order (`providesOrdering` or `monotonicOn`) over an index the engine cannot resolve is recorded as `unresolvedIndex` with a warning, as for any other plan; give it a descriptor. A plan that claims no order over such an index is recorded as `unorderedIndex` (see Naming the chosen index, below).
+
+Index-nested-loop joins and the key-set seek (`where k in (select …)`) synthesize their own per-column seek constraints, so they need `seekColumnIndexes` and never use a module-listed seek. A BETWEEN reaches you as its two bounds only when both bounds are literals; `x between ? and ?` is kept by the engine as a residual today, so spell placeholder bounds with comparisons.
+
 **Runtime-valued `IN` sets**:
 
 `where col in (select …)` has no plan-time values. It arrives with `op: 'IN'`, **no
@@ -478,6 +507,8 @@ access path recorded as `{ kind: 'unresolvedIndex' }` (and the engine logs a war
 sensitive consumers refuse an unresolved plan rather than guess — so the alias-without-
 descriptor path is a correctness bug in the module, not a slow path. Name the primary key
 `_primary_` or supply the descriptor.
+
+The one exception is a module-listed seek (`moduleSeekFilters`, plan kind `moduleSeek`) that claims no order — no `providesOrdering`, no `monotonicOn` — over an index the engine cannot resolve. That plan is recorded as `{ kind: 'unorderedIndex', indexName, plan }`, without a warning: nothing above relies on its emission order, which for a multi-dimensional index no `IndexDescriptor` can state anyway. A consumer that merges by sort key must merge such a stream as a set. (The isolation layer does not yet; a merged read over an `unorderedIndex` fails loudly until it does.)
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 

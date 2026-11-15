@@ -660,6 +660,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					`A module that names an index anything other than '_primary_' or a schema index ` +
 					`must return an 'indexDescriptor' from getBestAccessPlan (see docs/module-authoring.md).`,
 					StatusCode.INTERNAL);
+			case 'unorderedIndex':
+				// Dormant: no in-repo module emits this kind. The merge for a stream with no
+				// describable order lands with `module-listed-seek-arguments-isolation-overlay`.
+				throw new QuereusError(
+					`IsolatedTable '${this.tableName}': the underlying module chose index ` +
+					`'${path.indexName}', whose row order cannot be described; a merged read over ` +
+					`an index with no describable order is not supported yet.`,
+					StatusCode.INTERNAL);
 			default: {
 				// A new AccessPath kind must extend this switch; never-assignment makes that a
 				// compile error rather than a silent `undefined` return that would crash at the

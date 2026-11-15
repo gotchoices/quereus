@@ -19,7 +19,7 @@ import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { RemoteQueryNode } from '../../nodes/remote-query-node.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode, EmptyResultNode, type AccessPathAdvertisement } from '../../nodes/table-access-nodes.js';
 import { seqScanCost } from '../../cost/index.js';
-import { provesEmpty, type ColumnMeta, type BestAccessPlanRequest, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
+import { moduleSeekFiltersProblem, provesEmpty, type ColumnMeta, type BestAccessPlanRequest, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import { makeEmptyFilterInfo, makeFullScanFilterInfo, type FilterInfo } from '../../../vtab/filter-info.js';
 import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexDescriptor, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
 import { encodeIdxStr, makeIdxStrSpec, withWalkDirection } from '../../../vtab/idx-str.js';
@@ -50,6 +50,10 @@ const warnLog = createLogger('optimizer:rule:select-access-path').extend('warn')
  * arms. When the engine cannot resolve it (a per-plan alias the module minted without
  * supplying an `indexDescriptor`) we record `unresolvedIndex` and warn, rather than
  * guessing: an order-sensitive consumer must be able to refuse the plan.
+ *
+ * The one exception is a `moduleSeek` plan that claims no order: nothing above relies on
+ * its emission order, so it is recorded as `unorderedIndex` without a warning. That is the
+ * multi-dimensional-index case, whose order no `IndexDescriptor` can state.
  */
 function buildIndexAccessPath(
 	tableSchema: TableSchema,
@@ -59,11 +63,19 @@ function buildIndexAccessPath(
 ): AccessPath {
 	const index = resolveIndexDescriptor(tableSchema, accessPlan, indexName);
 	if (index) return { kind: 'index', index, plan };
+	if (plan === 'moduleSeek' && !claimsEmissionOrder(accessPlan)) {
+		return { kind: 'unorderedIndex', indexName, plan };
+	}
 	warnLog(
 		'access plan for table %s named index %s which the engine cannot resolve; module should return indexDescriptor',
 		tableSchema.name, indexName,
 	);
 	return { kind: 'unresolvedIndex', indexName, plan };
+}
+
+/** Whether the plan says anything about the order it emits rows in. */
+function claimsEmissionOrder(accessPlan: BestAccessPlanResult): boolean {
+	return (accessPlan.providesOrdering?.length ?? 0) > 0 || accessPlan.monotonicOn !== undefined;
 }
 
 /** The descriptor an index `accessPath` walks, whose `reverse` flag the `idxStr` must restate. */
@@ -457,12 +469,7 @@ export function selectPhysicalNode(
 	}));
 
 	const consumed: ConsumedSet = new Set();
-
-	// --- Index-aware path: use module-provided index identity ---
-	// --- Legacy fallback: infer access method from constraints and PK definition ---
-	const leaf = usesIndexAwarePath(accessPlan)
-		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing)
-		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
+	const leaf = selectLeaf(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
 
 	// Record on a seek leaf what its FilterInfo is now the sole enforcer of. Iterate
 	// `constraints` (not the Set) so the recorded order is deterministic and identical
@@ -502,6 +509,143 @@ function stampSeekProvenance(
 		return node.withChildren([inner, node.predicate]) as RelationalPlanNode;
 	}
 	return node;
+}
+
+/**
+ * Pick the physical-selection arm for `accessPlan`:
+ *  - module-listed seek arguments (`moduleSeekFilters`) — the module named every filter
+ *    it enforces, so the engine picks nothing;
+ *  - index-aware — the module named an index and its seek columns;
+ *  - legacy — infer the access from the constraints and the primary key.
+ */
+function selectLeaf(
+	tableRef: TableReferenceNode,
+	accessPlan: BestAccessPlanResult,
+	constraints: PlannerPredicateConstraint[],
+	filterInfo: FilterInfo,
+	providesOrdering: { column: number; desc: boolean }[] | undefined,
+	consumed: ConsumedSet,
+	orderingLoadBearing: boolean,
+): RelationalPlanNode {
+	if (accessPlan.moduleSeekFilters !== undefined) {
+		return selectPhysicalNodeFromModuleSeek(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed);
+	}
+	return usesIndexAwarePath(accessPlan)
+		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing)
+		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
+}
+
+/**
+ * Physical node selection for a plan carrying `moduleSeekFilters`: the module enforces the
+ * listed filters inside `indexName` and receives their values, in list order, as
+ * `FilterInfo.args`. The engine consumes exactly the listed filters — never a filter the
+ * module did not handle — and `reattachUnconsumedConstraints` re-checks every other handled
+ * one above the seek.
+ *
+ * The leaf is always an `IndexSeekNode` (zero seek keys for an empty list), unless a listed
+ * filter compares with a literal NULL (no row can match) or the collation cover declines
+ * (a scan with the listed filters as residual).
+ */
+function selectPhysicalNodeFromModuleSeek(
+	tableRef: TableReferenceNode,
+	accessPlan: BestAccessPlanResult,
+	constraints: PlannerPredicateConstraint[],
+	filterInfo: FilterInfo,
+	providesOrdering: { column: number; desc: boolean }[] | undefined,
+	consumed: ConsumedSet,
+): RelationalPlanNode {
+	const tableSchema = tableRef.tableSchema;
+	// Loud, not a silent scan: a malformed list is a module bug, and not every module runs
+	// `validateAccessPlan` (the store module does not).
+	const problem = moduleSeekFiltersProblem(constraints, accessPlan);
+	if (problem !== undefined) {
+		quereusError(`Access plan for table '${tableSchema.name}': ${problem}`, StatusCode.INTERNAL);
+	}
+	const indexName = accessPlan.indexName!;
+	const listed = accessPlan.moduleSeekFilters!.map(i => constraints[i]);
+	// Every return below consumes the listed filters — as seek keys, as the collation
+	// residual, or by folding to an empty result.
+	for (const c of listed) consumed.add(c);
+
+	if (listed.some(isLiteralNullComparison)) {
+		log('Module seek on %s compares with a literal NULL — using empty result', indexName);
+		return createEmptyResultNode(tableRef);
+	}
+
+	const cover = moduleSeekCover(tableSchema, accessPlan, listed);
+	if (!cover.useIndex) {
+		log('Declining module seek on %s (collation mismatch) — sequential scan + residual', indexName);
+		const scan = createSeqScan(tableRef);
+		return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
+	}
+
+	const seekKeys = listed.map(c => moduleSeekKey(tableRef, c));
+	const seekConstraints: { constraint: IndexConstraint; argvIndex: number }[] = listed.map((c, k) => ({
+		constraint: { iColumn: c.columnIndex, op: moduleSeekIndexOp(c), usable: true },
+		argvIndex: k + 1,
+	}));
+	const fi = makeIndexFilterInfo(filterInfo, tableSchema, accessPlan, indexName, 'moduleSeek', seekConstraints);
+	const physicalIndexName = indexName === PRIMARY_INDEX_NAME ? PRIMARY_PHYSICAL_INDEX_NAME : indexName;
+
+	log('Using module seek on %s (%d listed filter(s))', physicalIndexName, listed.length);
+	return makeIndexSeek(
+		tableRef,
+		fi,
+		physicalIndexName,
+		seekKeys,
+		listed.some(isRangeComparison),
+		providesOrdering,
+		accessPlan.cost,
+		extractAdvertisement(accessPlan),
+	);
+}
+
+/** True for a listed `<`, `<=`, `>` or `>=`; the other listable ops are equalities. */
+function isRangeComparison(c: PlannerPredicateConstraint): c is PlannerPredicateConstraint & { op: RangeOp } {
+	return c.op === '>' || c.op === '>=' || c.op === '<' || c.op === '<=';
+}
+
+/** The `FilterInfo` operator a listed filter is delivered as: a single-value `IN` is an `=`. */
+function moduleSeekIndexOp(c: PlannerPredicateConstraint): IndexConstraintOp {
+	return isRangeComparison(c) ? opToIndexOp(c.op) : IndexConstraintOp.EQ;
+}
+
+/** The seek key (the run-time value) a listed filter delivers. */
+function moduleSeekKey(tableRef: TableReferenceNode, c: PlannerPredicateConstraint): ScalarPlanNode {
+	const columnType = columnScalarType(tableRef, c.columnIndex);
+	return isRangeComparison(c)
+		? rangeSeekKey(tableRef.scope, c, columnType)
+		: equalitySeekKey(tableRef.scope, c, columnType);
+}
+
+/**
+ * The collation cover for a module seek's listed filters. Every listed filter, equalities
+ * included, takes the RANGE rule: the module compares each one inside its own index, which
+ * may order by that column, so any collation mismatch declines. The index's key collation
+ * is read through {@link resolveIndexKeyCollations}; a column the index does not describe,
+ * or an index that does not resolve at all, is taken as BINARY — the module gets no
+ * collation with its constraints, so BINARY is what it compares under.
+ *
+ * Shared with {@link orderingClaimSurvivesCollation} so the arm and the ordering check
+ * cannot disagree about whether the seek survives.
+ *
+ * NOTE: accepted tradeoff — a NOCASE equality on a NOCASE index column needs
+ * `honorsCollatedRangeBounds` here (the equality lattice would not), and a non-BINARY
+ * predicate on an undescribed index always declines; a module that wants either describes
+ * its index or uses `seekColumnIndexes`.
+ */
+function moduleSeekCover(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	listed: readonly PlannerPredicateConstraint[],
+): CollationCoverDecision {
+	const collations = resolveIndexKeyCollations(tableSchema, accessPlan, accessPlan.indexName!);
+	return classifyCollationCover(
+		listed.map(c => ({ colIdx: c.columnIndex, constraint: c })),
+		false,
+		colIdx => collations?.get(colIdx) ?? 'BINARY',
+		accessPlan.honorsCollatedRangeBounds === true,
+	);
 }
 
 /**
@@ -774,7 +918,7 @@ function selectPhysicalNodeFromPlan(
 		// no row can match. Emit an empty result rather than a doomed point-seek so
 		// EXPLAIN stays honest (EmptyResult, not a degraded IndexSeek/SeqScan). A
 		// dynamic `valueExpr` is left to the scan-layer runtime guard (Part A).
-		if ([...eqBySeekCol.values()].some(isLiteralNullEquality)) {
+		if ([...eqBySeekCol.values()].some(isLiteralNullComparison)) {
 			log('Equality seek on %s has a literal NULL key — using empty result', physicalIndexName);
 			return createEmptyResultNode(tableRef);
 		}
@@ -836,7 +980,7 @@ function selectPhysicalNodeFromPlan(
 			// on the runtime prefix walk breaking on the first row. Part A does not
 			// cover this path (it walks via `equalityPrefix`, not `equalityKey`), so
 			// the plan-time check is the robustness guarantee here.
-			if (prefixConstraints.some(({ constraint }) => isLiteralNullEquality(constraint))) {
+			if (prefixConstraints.some(({ constraint }) => isLiteralNullComparison(constraint))) {
 				log('Prefix-range seek on %s has a literal NULL prefix key — using empty result', physicalIndexName);
 				return createEmptyResultNode(tableRef);
 			}
@@ -871,12 +1015,12 @@ function selectPhysicalNodeFromPlan(
 			const trailingRangeType = columnScalarType(tableRef, trailingRangeCol);
 			if (lower) {
 				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, trailingRangeType));
+				seekKeys.push(rangeSeekKey(tableRef.scope, lower, trailingRangeType));
 				argv++;
 			}
 			if (upper) {
 				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-				seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, trailingRangeType));
+				seekKeys.push(rangeSeekKey(tableRef.scope, upper, trailingRangeType));
 				argv++;
 			}
 
@@ -944,12 +1088,12 @@ function selectPhysicalNodeFromPlan(
 		const rangeColType = columnScalarType(tableRef, rangeCol);
 		if (lower) {
 			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, rangeColType));
+			seekKeys.push(rangeSeekKey(tableRef.scope, lower, rangeColType));
 			argv++;
 		}
 		if (upper) {
 			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, rangeColType));
+			seekKeys.push(rangeSeekKey(tableRef.scope, upper, rangeColType));
 			argv++;
 		}
 
@@ -1119,7 +1263,7 @@ function selectPhysicalNodeLegacy(
 		// index-aware path; the scan-layer runtime guard covers the dynamic case).
 		if (pkCols.some(pk => {
 			const c = eqByCol.get(pk.index);
-			return c !== undefined && isLiteralNullEquality(c);
+			return c !== undefined && isLiteralNullComparison(c);
 		})) {
 			log('PK equality seek has a literal NULL key — using empty result (legacy)');
 			return createEmptyResultNode(tableRef);
@@ -1205,12 +1349,12 @@ function selectPhysicalNodeLegacy(
 		const primaryFirstColType = columnScalarType(tableRef, primaryFirstCol);
 		if (lower) {
 			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, primaryFirstColType));
+			seekKeys.push(rangeSeekKey(tableRef.scope, lower, primaryFirstColType));
 			argv++;
 		}
 		if (upper) {
 			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, primaryFirstColType));
+			seekKeys.push(rangeSeekKey(tableRef.scope, upper, primaryFirstColType));
 			argv++;
 		}
 
@@ -1378,6 +1522,16 @@ function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint, columnType
 }
 
 /**
+ * Seek key for a range bound (`<`, `<=`, `>`, `>=`): its dynamic value expression when it
+ * has a single one (parameter or correlated binding), else a literal of its plan-time value.
+ */
+function rangeSeekKey(scope: Scope, c: PlannerPredicateConstraint, columnType?: ScalarType): ScalarPlanNode {
+	return c.valueExpr && !Array.isArray(c.valueExpr)
+		? c.valueExpr
+		: literalFromValue(scope, c.value as SqlValue, columnType);
+}
+
+/**
  * Build an {@link IndexSeekNode} for `tableRef`, deriving the scope every call
  * site passed identically. The seek-key row-context invariant (OPT-061) is
  * enforced by the node's own constructor.
@@ -1416,11 +1570,11 @@ function createEmptyResultNode(tableRef: TableReferenceNode): EmptyResultNode {
 }
 
 /**
- * True when an equality constraint resolves to a *literal* SQL NULL — `col = null`
- * or single-value `col IN (null)` carrying no dynamic value expression. SQL NULL
- * equality is UNKNOWN under three-valued logic, so such a point-seek matches no
+ * True when a comparison constraint resolves to a *literal* SQL NULL — `col = null`,
+ * `col > null`, or single-value `col IN (null)` carrying no dynamic value expression. A
+ * comparison with NULL is UNKNOWN under three-valued logic, so such a seek matches no
  * row; the planner emits an {@link createEmptyResultNode} instead of a doomed
- * point-seek (mirrors the all-NULL IN-list reduction in {@link reduceLiteralSeekValues}).
+ * seek (mirrors the all-NULL IN-list reduction in {@link reduceLiteralSeekValues}).
  *
  * A dynamic single `valueExpr` (parameter/correlated binding) is deliberately NOT
  * treated as literal: its NULL-ness is unknown at plan time and is handled by the
@@ -1430,7 +1584,7 @@ function createEmptyResultNode(tableRef: TableReferenceNode): EmptyResultNode {
  * `IN (?)` carries an *array* `valueExpr` and an `undefined` placeholder value, so
  * the effective-value check below also rejects it.
  */
-function isLiteralNullEquality(c: PlannerPredicateConstraint): boolean {
+function isLiteralNullComparison(c: PlannerPredicateConstraint): boolean {
 	if (c.valueExpr && !Array.isArray(c.valueExpr)) return false;
 	const val = c.op === 'IN' && Array.isArray(c.value)
 		? (c.value as unknown as SqlValue[])[0]
@@ -1575,6 +1729,10 @@ function indexColumnCollationLookup(
  * bearing constraint is classified against an unknown collation, as the seek arms do.
  * `constraints` must be the array `handledFilters` is positional against.
  *
+ * A module-listed seek (`moduleSeekFilters`) must also keep its seek: its listed filters
+ * take a stricter collation rule than the equality lattice below ({@link moduleSeekCover}),
+ * and a decline there builds a scan that emits no claimed order.
+ *
  * Whether the ordered columns themselves sort as the index does is the module's to answer,
  * since it can see both collations: see `providesOrdering` in docs/module-authoring.md.
  */
@@ -1583,6 +1741,9 @@ export function orderingClaimSurvivesCollation(
 	accessPlan: BestAccessPlanResult,
 	constraints: readonly PlannerPredicateConstraint[],
 ): boolean {
+	if (accessPlan.moduleSeekFilters !== undefined && !moduleSeekKeepsItsSeek(tableSchema, accessPlan, constraints)) {
+		return false;
+	}
 	const keyCollations = resolveIndexKeyCollations(tableSchema, accessPlan, orderingClaimIndexName(accessPlan));
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	return constraints.every((c, i) => {
@@ -1593,6 +1754,21 @@ export function orderingClaimSurvivesCollation(
 		const indexColl = keyCollations?.get(c.columnIndex);
 		return classifyConstraintCover(c.collation, indexColl, isEquality, honorsCollatedRangeBounds) !== 'MISMATCH_UNSAFE';
 	});
+}
+
+/**
+ * Whether {@link selectPhysicalNodeFromModuleSeek} would build its seek for `accessPlan`
+ * rather than decline to a scan on collation. A malformed list answers false; the arm
+ * throws on it.
+ */
+function moduleSeekKeepsItsSeek(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	constraints: readonly PlannerPredicateConstraint[],
+): boolean {
+	if (moduleSeekFiltersProblem(constraints, accessPlan) !== undefined) return false;
+	const listed = accessPlan.moduleSeekFilters!.map(i => constraints[i]);
+	return moduleSeekCover(tableSchema, accessPlan, listed).useIndex;
 }
 
 /**
@@ -1607,10 +1783,12 @@ function usesIndexAwarePath(accessPlan: BestAccessPlanResult): boolean {
 /**
  * The index whose collations decide {@link orderingClaimSurvivesCollation}: the one the
  * ordering arm of whichever physical-selection path builds the leaf would walk. The legacy
- * path walks the primary key unless the module named an ordering index.
+ * path walks the primary key unless the module named an ordering index; a module-listed
+ * seek walks its `indexName`.
  */
 function orderingClaimIndexName(accessPlan: BestAccessPlanResult): string {
 	if (accessPlan.orderingIndexName !== undefined) return accessPlan.orderingIndexName;
+	if (accessPlan.moduleSeekFilters !== undefined && accessPlan.indexName !== undefined) return accessPlan.indexName;
 	return usesIndexAwarePath(accessPlan) ? accessPlan.indexName! : PRIMARY_INDEX_NAME;
 }
 

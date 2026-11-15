@@ -343,6 +343,9 @@ function enumeratesWholeTable(plan: SeqScanNode | IndexScanNode | IndexSeekNode)
 // NOTE: assumes an index holds each row at most once, true of both shipped modules; if a
 // module ever exposes a multi-valued index (one entry per array element, say), a walk of
 // it can yield a row twice and overstate the floor — exclude such indexes here.
+// NOTE: `moduleSeek` is left out. It is a conjunction, so over either shipped index shape it
+// visits a row at most once and could qualify; add it if the cardinality floor this feeds
+// ever matters for a module that lists its seek arguments.
 function walksOneWindow(plan: SeqScanNode | IndexScanNode | IndexSeekNode): boolean {
 	const { accessPath } = plan.filterInfo;
 	if (accessPath?.kind === 'fullScan') return true;

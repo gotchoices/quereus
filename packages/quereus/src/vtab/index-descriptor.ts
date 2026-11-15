@@ -68,7 +68,8 @@ export type IndexPlanKind =
 	| 'rangeSeek'        // plan=3
 	| 'multiSeek'        // plan=5 (IN list)
 	| 'multiRangeSeek'   // plan=6 (OR_RANGE)
-	| 'prefixRangeSeek'; // plan=7
+	| 'prefixRangeSeek'  // plan=7
+	| 'moduleSeek';      // plan=8 (BestAccessPlanResult.moduleSeekFilters: a conjunction the module enforces)
 
 /** Structured description of the access path chosen for one table reference. */
 export type AccessPath =
@@ -81,21 +82,35 @@ export type AccessPath =
 	 * order, say) MUST fail loudly rather than guess — an unresolved secondary index
 	 * merged as if it were the primary key silently reorders rows.
 	 */
-	| { readonly kind: 'unresolvedIndex'; readonly indexName: string; readonly plan: IndexPlanKind };
+	| { readonly kind: 'unresolvedIndex'; readonly indexName: string; readonly plan: IndexPlanKind }
+	/**
+	 * The plan walks a module-named index the engine cannot describe, and claims no order
+	 * (no `providesOrdering`, no `monotonicOn`), so nothing above relies on its emission
+	 * order — the planner kept any `Sort` it needed. Only a `moduleSeek` plan is recorded this
+	 * way: a multi-dimensional index answering a box query emits in an order no
+	 * {@link IndexDescriptor} can state. A consumer that merges by sort key must merge it as a
+	 * set rather than refuse it.
+	 */
+	| { readonly kind: 'unorderedIndex'; readonly indexName: string; readonly plan: IndexPlanKind };
 
 /**
  * The index plan an access path walks, or undefined when the path names no index
  * (`fullScan` / `empty`) or no path was recorded at all.
  *
- * Answers both index kinds: a consumer asking "is this a multi-seek?" cares about the
- * access SHAPE, which an `unresolvedIndex` describes just as faithfully as a resolved
- * one — only the index identity is missing there.
+ * Answers every index kind: a consumer asking "is this a multi-seek?" cares about the
+ * access SHAPE, which an `unresolvedIndex` or `unorderedIndex` describes just as faithfully
+ * as a resolved one — only the index identity is missing there.
  */
 export function accessPathPlan(accessPath: AccessPath | undefined): IndexPlanKind | undefined {
 	if (!accessPath) return undefined;
-	return accessPath.kind === 'index' || accessPath.kind === 'unresolvedIndex'
-		? accessPath.plan
-		: undefined;
+	switch (accessPath.kind) {
+		case 'index':
+		case 'unresolvedIndex':
+		case 'unorderedIndex':
+			return accessPath.plan;
+		default:
+			return undefined;
+	}
 }
 
 /** The canonical name the engine uses for a table's primary-key index in `idxStr`. */

@@ -59,6 +59,7 @@ const PLAN_CODE_BY_KIND: ReadonlyMap<IndexPlanKind, number> = new Map<IndexPlanK
 	['multiSeek', 5],
 	['multiRangeSeek', 6],
 	['prefixRangeSeek', 7],
+	['moduleSeek', 8],
 ]);
 
 const PLAN_KIND_BY_CODE: ReadonlyMap<number, IndexPlanKind> = new Map<number, IndexPlanKind>(

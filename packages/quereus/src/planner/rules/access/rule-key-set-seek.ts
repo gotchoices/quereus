@@ -358,6 +358,8 @@ function resolveSeekColumns(
 function claimedIndex(plan: BestAccessPlanResult, seekCol: number): string | null {
 	if (plan.handledFilters[0] !== true) return null;
 	if (!plan.indexName) return null;
+	// Also declines every module-listed seek (`moduleSeekFilters`), which never carries seek
+	// columns: this rule stamps its own multi-seek keys and needs the per-column shape.
 	if (!plan.seekColumnIndexes || plan.seekColumnIndexes.length !== 1 || plan.seekColumnIndexes[0] !== seekCol) {
 		// A composite claim is declined too: sorting by single-column SQL value
 		// order equals index-key order only for a single key column.
