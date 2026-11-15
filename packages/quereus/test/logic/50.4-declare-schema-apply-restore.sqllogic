@@ -764,12 +764,12 @@ insert into r_p values (3, 12);
 select id from r_p order by id;
 → [{"id": 1}, {"id": 2}]
 
--- The table can be altered in the same plan, in the stretch where the view is gone.
+-- The table can be altered in the same plan, in the stretch where the view is gone. (A new
+-- index built in that stretch is 50.4.1-declare-schema-apply-restore-index.)
 declare schema main {
 	table r_t { id integer primary key, n integer }
 	view r_v as select sum(n) + 2 as s from r_t
 	table r_p { id integer primary key, u integer, w integer default 3, check (u <= (select s from r_v)) }
-	index r_p_u on r_p (u)
 }
 
 -- run

@@ -1,0 +1,46 @@
+-- 50.4.1-declare-schema-apply-restore-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 50.4-declare-schema-apply-restore § 12: an `index` member of a `declare
+-- schema` block lowers to a standalone `create index`, which not every backend implements,
+-- and the `-- requires-capability:` directive is whole-file. 50.4 § 12 keeps the `add
+-- column` proof of the same point.
+--
+-- Subject: when a view a CHECK reads is redefined, the plan drops and recreates the view,
+-- and a new index on the CHECK's table can be built in the stretch where the view is gone.
+
+create table r_t (id integer primary key, n integer);
+insert into r_t values (1, 10);
+create view r_v as select sum(n) as s from r_t;
+create table r_p (id integer primary key, u integer, check (u <= (select s from r_v)));
+insert into r_p values (1, 5);
+
+declare schema main {
+	table r_t { id integer primary key, n integer }
+	view r_v as select sum(n) + 2 as s from r_t
+	table r_p { id integer primary key, u integer, check (u <= (select s from r_v)) }
+	index r_p_u on r_p (u)
+}
+
+-- run
+
+apply schema main;
+
+diff schema main;
+→ []
+
+select name from schema() where type = 'index' and name = 'r_p_u';
+→ [{"name":"r_p_u"}]
+
+-- The CHECK reads the new view: 12 fits only under its new sum.
+insert into r_p values (2, 12);
+insert into r_p values (3, 13);
+-- error: CHECK constraint failed
+
+select id from r_p order by id;
+→ [{"id": 1}, {"id": 2}]
+
+drop table r_p;
+drop view r_v;
+drop table r_t;

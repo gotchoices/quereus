@@ -5,13 +5,15 @@
 -- Carved out of 15.1-semantic-ordering: that file proves the semantic-ordering rule
 -- (docs/types.md "Semantic ordering") across ORDER BY, comparisons, BETWEEN, PK
 -- order and range scans, DISTINCT/GROUP BY/set-operation identity, windows and
--- joins — none of which needs index DDL. Two scenarios reached the same rule via a
+-- joins — none of which needs index DDL. Three scenarios reached the same rule via a
 -- standalone index (one a secondary-index access path, one a `create unique index`
 -- restatement of a UNIQUE identity check the file already makes via a table-level
--- constraint), so they move here.
+-- constraint, one a partial `create unique index` under a mixed-type CHECK equality),
+-- so they move here.
 --
--- Subject: the typed compare governs a secondary index's seek/range/ordering, and
--- an index-derived UNIQUE enforces the same identity at write time.
+-- Subject: the typed compare governs a secondary index's seek/range/ordering, an
+-- index-derived UNIQUE enforces the same identity at write time, and a mixed-type
+-- CHECK equality does not license inference through a partial index's `where` clause.
 
 -- Secondary index: seek, range and ordering all run under the tree's typed order.
 create table si (id integer primary key, d timespan);
@@ -39,3 +41,27 @@ insert into ui values (2, 'PT60M');
 -- error: UNIQUE constraint failed
 
 drop table ui;
+
+-- CHECK-derived equality meets a partial UNIQUE index (moved from 15.1's "CHECK-derived
+-- cross-column equality facts" section). A `check (d = s)` between a TIMESPAN column and
+-- a TEXT column compares by elapsed time, so a row may store 'PT1H' in `d` and 'PT60M'
+-- in `s`; it used to put `d` and `s` in one equivalence class anyway. Regression for
+-- `check-derived-equivalence-ignores-semantic-ordering`.
+--
+-- Row 2 is outside the index's `where` scope, so both rows may carry v = 7. The false
+-- {d, s} class dropped row 2 by inferring `s = 'PT60M'` from the pin on `d`. (It also
+-- fed the guard-discharge route, where an equivalence peer pinned to a literal
+-- discharges the partial index's `where` clause and activates a uniqueness FD that does
+-- not hold; the two could not be isolated from each other and close together.)
+create table ckp (id integer primary key, d timespan, s text, v integer, check (d = s));
+create unique index ckp_v on ckp (v) where s = 'PT60M';
+insert into ckp values (1, 'PT60M', 'PT60M', 7);
+insert into ckp values (2, 'PT1H', 'PT1H', 7);
+
+-- No `order by` here on purpose: adding one changes the plan enough to hide the
+-- defect (it returned both rows even ungated), so the bare form is the case that
+-- discriminates.
+select id from ckp where d = 'PT60M' and v = 7;
+→ [{"id":1},{"id":2}]
+
+drop table ckp;

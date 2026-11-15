@@ -404,24 +404,8 @@ select id, d, e from ckt where e = 'PT60M';
 
 drop table ckt;
 
--- A partial UNIQUE index in play. Row 2 is outside the index's `where` scope, so
--- both rows may carry v = 7. The false {d, s} class dropped row 2 by inferring
--- `s = 'PT60M'` from the pin on `d`. (It also fed the guard-discharge route,
--- where an equivalence peer pinned to a literal discharges the partial index's
--- `where` clause and activates a uniqueness FD that does not hold; the two could
--- not be isolated from each other and close together.)
-create table ckp (id integer primary key, d timespan, s text, v integer, check (d = s));
-create unique index ckp_v on ckp (v) where s = 'PT60M';
-insert into ckp values (1, 'PT60M', 'PT60M', 7);
-insert into ckp values (2, 'PT1H', 'PT1H', 7);
-
--- No `order by` here on purpose: adding one changes the plan enough to hide the
--- defect (it returned both rows even ungated), so the bare form is the case that
--- discriminates.
-select id from ckp where d = 'PT60M' and v = 7;
-→ [{"id":1},{"id":2}]
-
-drop table ckp;
+-- The partial-UNIQUE-index case of this regression (standalone `create unique index`)
+-- lives in 15.1.2-semantic-ordering-index.
 
 -- The hoisted-assertion route reaches the same extractor: a per-table assertion
 -- `not exists (select 1 from t where d <> s)` is negated into a synthetic per-row

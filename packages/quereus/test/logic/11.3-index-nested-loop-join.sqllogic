@@ -1,4 +1,7 @@
 -- 11.3-index-nested-loop-join.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
 -- Result-equality coverage for the index-nested-loop join (rule-join-physical-selection
 -- + rules/join/index-nested-loop.ts): a small outer joined to a large indexed inner
 -- replaces the inner walk with one IndexSeek per outer row. Every assertion here is
