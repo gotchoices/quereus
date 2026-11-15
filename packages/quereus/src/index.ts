@@ -195,7 +195,6 @@ export {
 	typeRegistry,
 	registerType,
 	getType,
-	getTypeOrDefault,
 	inferType
 } from './types/registry.js';
 export {

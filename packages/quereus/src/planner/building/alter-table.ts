@@ -14,12 +14,12 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
-import { inferType } from '../../types/registry.js';
+import { inferType, requireRegisteredTypeName } from '../../types/registry.js';
 import { buildCellCoercion } from '../../types/validation.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { astToString, expressionToString, quoteIdentifier } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
-import { opsToMask, validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
+import { columnTypeSubject, opsToMask, validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
@@ -100,6 +100,9 @@ export function buildAlterTableStmt(
 
     case 'addColumn': {
       const column = stmt.action.column;
+      // Same reason as SET DATA TYPE below: refuse the name before any module resolves it.
+      requireRegisteredTypeName(ctx.db.options, column.dataType,
+        columnTypeSubject(column.name, schemaName, tableName), stmt.loc?.start);
       // Reject a typo'd / mis-sited reserved `quereus.*` tag on the new column or any
       // of its inline named constraints at plan-build, before any heavier backfill /
       // check compilation — shares CREATE TABLE's per-column accumulation
@@ -164,6 +167,10 @@ export function buildAlterTableStmt(
       }, sql);
 
     case 'alterColumn':
+      // Before the module sees the name: the store, isolation and memory layers resolve it
+      // themselves and must never receive one this database would refuse.
+      requireRegisteredTypeName(ctx.db.options, stmt.action.setDataType,
+        columnTypeSubject(stmt.action.columnName, schemaName, tableName), stmt.loc?.start);
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'alterColumn',
         columnName: stmt.action.columnName,

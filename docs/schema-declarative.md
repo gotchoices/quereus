@@ -19,6 +19,8 @@ Destructive changes require explicit acknowledgement. The maintained-table backi
 
 Direct `create table` / `create view` DDL and the corresponding `declare schema` + `apply schema` body are guaranteed to produce indistinguishable catalogs and runtime behaviour.
 
+**Unknown type names are refused at `declare schema`** (under `strict_type_names`, see [types.md § Design Decisions](types.md#design-decisions)), before anything is stored. The CREATE / ALTER an apply generates would refuse them too, but the differ compares column types by their lenient resolution, so an unregistered name declared over an existing BLOB column produces no DDL and would otherwise pass unchecked — and the [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path) may skip the diff entirely.
+
 ## Applied-state snapshot (the unchanged-schema fast path)
 
 Re-applying an unchanged declaration used to pay for a full comparison to be told nothing changed, and `computeSchemaDiff` is two thirds to three quarters of a no-op apply's cost. `apply schema` therefore keeps, per `Database` and per (lowercased) schema name, an **applied-state snapshot**: what the declaration rendered to, what the live catalog rendered to, and the effective `default_collation`, as of the end of the last successful apply whose migration plan came out **empty**.

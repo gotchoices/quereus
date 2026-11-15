@@ -30,7 +30,10 @@ import { relationKeyOf } from './relation-key.js';
 import { extractConstraintsForTable } from './constraint-extractor.js';
 import { planTimeLiteralValue } from './predicate-shape.js';
 import { compareSqlValues } from '../../util/comparison.js';
-import { getTypeOrDefault } from '../../types/registry.js';
+import { getType } from '../../types/registry.js';
+import type { LogicalType } from '../../types/logical-type.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { castConverter } from '../../types/cast-semantics.js';
 import { CastNode } from '../nodes/scalar.js';
 
@@ -111,13 +114,29 @@ function portableFromScalarType(t: ScalarType): PortableScalarType {
 }
 
 /**
+ * The registered type a scope's type name names. The name was written from an
+ * already-resolved type, possibly in another process (a scope is portable), so a miss
+ * means this process never registered that type; a BLOB stand-in would convert and
+ * watch the wrong key values, so it is refused instead.
+ */
+function registeredScopeType(typeName: string): LogicalType {
+	const type = getType(typeName);
+	if (type) return type;
+	throw new QuereusError(
+		`Change scope names type '${typeName}', which is not registered in this process; register it (Database.registerType) before using the scope`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
  * Reconstruct a full {@link ScalarType} from a {@link PortableScalarType} by
  * resolving the logical type through the global type registry. Useful for
  * callers that received a deserialized {@link ChangeScope} and need to feed
- * the parameter type into other planner APIs.
+ * the parameter type into other planner APIs. Throws when the type is not
+ * registered in this process.
  */
 export function scalarTypeFromPortable(p: PortableScalarType): ScalarType {
-	const logical = getTypeOrDefault(p.typeName);
+	const logical = registeredScopeType(p.typeName);
 	return {
 		typeClass: 'scalar',
 		logicalType: logical,
@@ -1055,10 +1074,8 @@ export function bindParameters(scope: ChangeScope, params: SqlParameters | SqlVa
 		if (isParamScopeValue(v)) {
 			const bound = lookup(v.index);
 			if (bound !== undefined) {
-				// NOTE: a scope bound in a process that lacks a plugin's type falls back to BLOB
-				// here and watches a wrong key; if scopes cross such a boundary, reject it instead.
 				return v.conversion
-					? castConverter(getTypeOrDefault(v.conversion.typeName), v.conversion.synthetic)(bound)
+					? castConverter(registeredScopeType(v.conversion.typeName), v.conversion.synthetic)(bound)
 					: bound;
 			}
 		}

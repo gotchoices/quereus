@@ -11,7 +11,7 @@ export { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESTAMP_TYPE, TIMESPAN_TYPE } fr
 export { JSON_TYPE } from './json-type.js';
 
 // Type registry
-export { typeRegistry, registerType, getType, getTypeOrDefault, inferType } from './registry.js';
+export { typeRegistry, registerType, getType, inferType } from './registry.js';
 
 // Validation utilities
 export { validateValue, parseValue, validateAndParse, coerceRowToSchema, foldDefaultToType, isValidForType, tryParse } from './validation.js';

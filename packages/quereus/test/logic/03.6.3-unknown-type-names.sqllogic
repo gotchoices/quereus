@@ -1,0 +1,55 @@
+-- A type name nobody registered is an error under `strict_type_names` (the default),
+-- not a silent BLOB column or an affinity guess; a built-in or registered name with a
+-- parameter list resolves through its base name. See docs/types.md § Design Decisions.
+
+pragma strict_type_names;
+→ [{"name":"strict_type_names","value":true}]
+
+create table U (id integer primary key, v volume);
+-- error: Unknown type 'volume' for column 'v' of table 'main.U'
+
+-- An affinity substring does not rescue the name: `point` contains INT.
+create table P (id integer primary key, v point);
+-- error: Unknown type 'point' for column 'v' of table 'main.P'
+
+create table C (id integer primary key, v text) with context (who wibble);
+-- error: Unknown type 'wibble' for context variable 'who' of table 'main.C'
+
+select cast(1 as volume) as r;
+-- error: Unknown type 'volume' for cast
+
+create table A (id integer primary key, w text);
+-- run
+
+alter table A add column x foo;
+-- error: Unknown type 'foo' for column 'x' of table 'main.A'
+
+alter table A alter column w set data type foo;
+-- error: Unknown type 'foo' for column 'w' of table 'main.A'
+
+-- `apply schema` over an existing BLOB column would generate no DDL for an unknown
+-- name, so the declaration itself is refused.
+declare schema main {
+	table A (id integer primary key, w volume)
+}
+-- error: Unknown type 'volume' for column 'w' of table 'main.A'
+
+-- Parameter lists, and SQLite's single-word spellings, still resolve.
+create table K (id integer primary key, a varchar(100), b decimal(10,5), c nvarchar(20), d int8, e timestamp(3));
+-- run
+
+select name, type from table_info('K') order by cid;
+→ [{"name":"id","type":"INTEGER"},{"name":"a","type":"TEXT"},{"name":"b","type":"NUMERIC"},{"name":"c","type":"TEXT"},{"name":"d","type":"INTEGER"},{"name":"e","type":"TIMESTAMP"}]
+
+-- Off: SQLite affinity rules, then BLOB.
+pragma strict_type_names = false;
+create table U (id integer primary key, v volume, p point, r realm);
+-- run
+
+select name, type from table_info('U') order by cid;
+→ [{"name":"id","type":"INTEGER"},{"name":"v","type":"BLOB"},{"name":"p","type":"INTEGER"},{"name":"r","type":"REAL"}]
+
+select typeof(cast(1 as volume)) as r;
+→ [{"r":"blob"}]
+
+pragma strict_type_names = true;

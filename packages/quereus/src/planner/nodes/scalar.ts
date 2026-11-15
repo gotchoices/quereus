@@ -764,10 +764,10 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 	}
 
 	generateType = (): ScalarType => {
-		// Resolve through inferType, not getTypeOrDefault: this is the single resolution
-		// of the target name — `runtime/emit/cast.ts` reads it back off this node — and
-		// the two lookups disagree for any name that misses the registry but matches an
-		// affinity rule (`cast(5 as nvarchar)` produces TEXT, not BLOB).
+		// The single resolution of the target name — `runtime/emit/cast.ts` reads it back
+		// off this node, so plan and runtime cannot disagree. A user-written name was
+		// already checked against the registry at build time when `strict_type_names` is
+		// on; with it off, inferType's affinity rules apply here.
 		const logicalType = typeRegistry.inferType(this.expression.targetType);
 
 		// Nullability / collation rules live with the cast semantics, shared with the

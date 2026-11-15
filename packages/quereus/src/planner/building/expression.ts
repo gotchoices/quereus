@@ -18,6 +18,7 @@ import { resolveWindowFunction } from '../../schema/window-function.js';
 import { assertArgTypesAccepted, buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
 import { classifyBinaryOperator } from '../analysis/binary-operator-class.js';
+import { requireRegisteredTypeName } from '../../types/registry.js';
 
 /**
  * Plans a `QueryExpr` in scalar / IN / EXISTS expression position.
@@ -173,6 +174,9 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 		}
 
     case 'cast': {
+      // User-written only: the planner's own casts (coercion, set operations) are built
+      // from names of already-resolved types and never come through here.
+      requireRegisteredTypeName(ctx.db.options, expr.targetType, 'cast', expr.loc?.start);
       const castOperand = buildExpression(ctx, expr.expr, allowAggregates);
       return new CastNode(ctx.scope, expr, castOperand);
     }

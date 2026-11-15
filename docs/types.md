@@ -38,6 +38,7 @@ Quereus implements a **logical type system** that separates type semantics from 
 - **Date/Time**: Native DATE, TIME, DATETIME types using Temporal API internally, stored as ISO 8601 strings
 - **JSON**: Native JSON type with `PhysicalType.OBJECT` — values stored as JS objects in memory, serialized to JSON strings on disk
 - **Constraints**: Length, precision, and other restrictions handled via CHECK constraints, not type definitions
+- **Unknown type names**: A column, mutation-context variable, `ALTER TABLE … ADD COLUMN` / `ALTER COLUMN … SET DATA TYPE`, `declare schema` table or `cast(x as name)` whose type name names no registered type is an error, naming the type and the column (and table) or the cast. The name resolves by exact, case-insensitive match of the whole name or of its base name — the text before any `(…)` parameter list, so `varchar(100)` is `VARCHAR` and a registered `measure(3)` is `MEASURE`. SQLite's substring affinity rules are not consulted, so `point` is an error rather than INTEGER; SQLite's single-word spellings are registered aliases (`INT`, `INT2`, `INT8`, `TINYINT`, `SMALLINT`, `MEDIUMINT`, `BIGINT`, `CHAR`, `NCHAR`, `VARCHAR`, `NVARCHAR`, `CHARACTER`, `CLOB`, `STRING`, `FLOAT`, `DOUBLE`, `DECIMAL`, `BOOL`, `BYTES`, `BINARY`, `VARBINARY`, `INTERVAL`, `DURATION`). The check also runs when a stored table is reopened, so a persisted column whose type this process never registered fails to load, naming table and column, instead of reading as BLOB. The database option `strict_type_names` (default `true`) controls this; set it to `false` to get SQLite's behaviour back — the affinity rules (contains `INT` → INTEGER; `CHAR` / `CLOB` / `TEXT` → TEXT; `BLOB` → BLOB; `REAL` / `FLOA` / `DOUB` → REAL; `BOOL` → BOOLEAN; `NUMERIC` / `DECIMAL` → NUMERIC), then BLOB. A column declared with no type at all is BLOB either way. Checked at the entry points (`requireRegisteredTypeName` in `src/types/registry.ts`); everything behind them resolves through the lenient `inferType`, which returns the registered type for any name the check accepted.
 
 ---
 
@@ -885,8 +886,9 @@ lives). The exception matters at the write end: a `not null` lens column over
 temporal or JSON target is not and is correctly blocked. The emitter reads the
 resolved target type back off `CastNode.getType()` rather than re-resolving the
 name, so the plan and the runtime cannot disagree — they previously did for a
-name that misses the registry but matches an affinity rule (`nvarchar` → TEXT),
-which made a value-preserving cast read as converting and block an index seek.
+name that misses the registry but matches an affinity rule (with
+`strict_type_names` off, `mychar` → TEXT), which made a value-preserving cast
+read as converting and block an index seek.
 
 Standing regression coverage for "convert exactly once" (several JSON text
 scalars, across ordinary writes and the row-rewriting paths — `ALTER TABLE`
@@ -1301,6 +1303,10 @@ export default function register(db: Database) {
   };
 }
 ```
+
+The type registry is **process-wide**: `Database.registerType` (and a plugin's `types`) writes to one registry shared by every `Database` in the same JavaScript realm, so a type registered through one database is visible to all of them, and registering a name again replaces the earlier definition for all of them (with a warning in the log). A host running several processes (a browser client, a sync server, a simulation server) must register its custom types in each; with `strict_type_names` on, a process that forgot gets an error naming the type instead of a table whose column silently became BLOB. A change scope deserialized in a process that lacks one of its types is likewise refused (`scalarTypeFromPortable`, `bindParameters`).
+
+A declared type name may carry a parameter list — `measure(3)`, `measure(10, 2)` — and resolves to the registered base name (`MEASURE`). The parameters are kept in `ColumnSchema.declaredType` but have no effect on the type; restrictions such as precision belong in CHECK constraints.
 
 ### Using Custom Types
 

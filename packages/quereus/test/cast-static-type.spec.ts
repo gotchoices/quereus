@@ -52,18 +52,20 @@ describe('CastNode static type', () => {
 	}
 
 	it('resolves an affinity-only target name the same way the emitter does', async () => {
-		// NVARCHAR misses the registry but matches the CHAR affinity rule. Under the
-		// old `getTypeOrDefault` lookup the plan advertised BLOB while the emitter
-		// produced TEXT.
-		expect(findCast('select cast(id as nvarchar) as c from cst').getType().logicalType.name).to.equal('TEXT');
+		// With strict_type_names off, MYCHAR misses the registry but matches the CHAR
+		// affinity rule. When the planner resolved names by registry lookup alone, the
+		// plan advertised BLOB while the emitter produced TEXT.
+		await db.exec('pragma strict_type_names = false');
+		expect(findCast('select cast(id as mychar) as c from cst').getType().logicalType.name).to.equal('TEXT');
 		await db.exec("insert into cst values (1, 'a', null)");
-		expect(await typeofValue('select typeof(cast(id as nvarchar)) as ty from cst')).to.equal('text');
+		expect(await typeofValue('select typeof(cast(id as mychar)) as ty from cst')).to.equal('text');
 	});
 
-	it('treats an affinity-only alias of the operand type as a no-op cast', () => {
-		// TEXT column → NVARCHAR resolves to TEXT, so the cast converts nothing and
-		// keeps the operand's non-nullability.
-		expect(findCast('select cast(t as nvarchar) as c from cst').getType().nullable).to.equal(false);
+	it('treats an affinity-only alias of the operand type as a no-op cast', async () => {
+		// TEXT column → MYCHAR resolves to TEXT (strict_type_names off), so the cast
+		// converts nothing and keeps the operand's non-nullability.
+		await db.exec('pragma strict_type_names = false');
+		expect(findCast('select cast(t as mychar) as c from cst').getType().nullable).to.equal(false);
 	});
 
 	it('reports a converting cast as nullable even over a NOT NULL operand', () => {

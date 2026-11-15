@@ -474,6 +474,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			description: 'Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT.',
 		});
 
+		this.options.registerOption('strict_type_names', {
+			type: 'boolean',
+			defaultValue: true,
+			description: 'When true (default), a column, mutation-context variable, ALTER ... SET DATA TYPE or CAST whose type name ' +
+				'(ignoring any parameter list, so measure(3) is MEASURE) names no registered type or alias is an error. ' +
+				'When false, such a name falls back to SQLite affinity rules (contains INT → INTEGER, CHAR/CLOB/TEXT → TEXT, ' +
+				'REAL/FLOA/DOUB → REAL, ...) and finally BLOB. Checked when a statement is built and when a stored table is reopened.',
+		});
+
 		this.options.registerOption('nondeterministic_schema', {
 			type: 'boolean',
 			defaultValue: false,
@@ -2080,6 +2089,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Registers a custom logical type.
+	 *
+	 * The type registry is process-wide: the type becomes visible to every `Database` in
+	 * this JavaScript realm, and registering a name again replaces the earlier definition
+	 * for all of them (logged as a warning). A declared name with parameters (`measure(3)`)
+	 * resolves to the registered base name.
 	 * @param name The name of the type (case-insensitive).
 	 * @param definition The LogicalType implementation.
 	 * @example

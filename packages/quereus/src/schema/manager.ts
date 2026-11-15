@@ -11,7 +11,8 @@ import { resolveModuleCostProfile } from '../vtab/cost-profile.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { foldDefaultToType } from '../types/validation.js';
-import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
+import { requireRegisteredTypeName } from '../types/registry.js';
+import { buildColumnIndexMap, columnDefToSchema, columnTypeSubject, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
 import type { ViewSchema } from './view.js';
@@ -1810,7 +1811,9 @@ export class SchemaManager {
 		astColumns: readonly AST.ColumnDef[],
 		astConstraints: readonly AST.TableConstraint[] | undefined,
 		defaultNotNull: boolean,
-		defaultCollation: string = 'BINARY'
+		defaultCollation: string,
+		schemaName: string,
+		tableName: string,
 	): {
 		columns: ColumnSchema[];
 		pkDefinition: ReadonlyArray<import('./table.js').PrimaryKeyColumnDefinition>;
@@ -1825,6 +1828,11 @@ export class SchemaManager {
 		// type). Shared by fresh CREATE and catalog rehydrate (importTable), so a
 		// persisted custom-collation column re-validates on reopen — see docs/schema.md.
 		const isCollationRegistered = (name: string): boolean => this.db.isCollationRegistered(name);
+		// The type-name gate shares that site for the same reason: a persisted column whose
+		// type is no longer registered fails on reopen, naming it, instead of reading as BLOB.
+		for (const colDef of astColumns) {
+			requireRegisteredTypeName(this.db.options, colDef.dataType, columnTypeSubject(colDef.name, schemaName, tableName));
+		}
 		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull, defaultCollation, isCollationRegistered));
 		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict, synthesized } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
 
@@ -2022,7 +2030,7 @@ export class SchemaManager {
 		const defaultNotNull = defaultNullability === 'not_null';
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
+		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation, targetSchemaName, tableName);
 		// Statement-wide taken-set the CHECK / FK mint sites disambiguate against:
 		// seeded with every user-written constraint name up front, then accumulating
 		// each mint, so a colliding auto-name gets a `_<N>` suffix instead of
@@ -2035,7 +2043,11 @@ export class SchemaManager {
 		const uniqueConstraints = this.extractUniqueConstraints(astColumns, stmt.constraints, columnIndexMap);
 
 		const mutationContextSchemas: MutationContextDefinition[] | undefined = stmt.contextDefinitions
-			? stmt.contextDefinitions.map(varDef => mutationContextVarToSchema(varDef, defaultNotNull))
+			? stmt.contextDefinitions.map(varDef => {
+				requireRegisteredTypeName(this.db.options, varDef.dataType,
+					columnTypeSubject(varDef.name, targetSchemaName, tableName, 'context variable'));
+				return mutationContextVarToSchema(varDef, defaultNotNull);
+			})
 			: undefined;
 
 		// Extract generated-column dependencies and validate that they form a DAG.
@@ -2105,7 +2117,7 @@ export class SchemaManager {
 		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
+		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation, schemaName, tableName);
 		// Same statement-wide mint disambiguation as buildTableSchemaFromAST, so a
 		// logical spec and the physical table it describes mint identical names.
 		const takenConstraintNames = collectDeclaredConstraintNames(astColumns, stmt.constraints);

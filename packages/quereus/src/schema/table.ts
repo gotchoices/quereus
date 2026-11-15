@@ -610,6 +610,11 @@ export function resolveDefaultCollation(logicalType: LogicalType, defaultCollati
 	return 'BINARY';
 }
 
+/** Names what a declared type name types — a column or context variable of a table — for a refused name's message. */
+export function columnTypeSubject(name: string, schemaName: string, tableName: string, kind: 'column' | 'context variable' = 'column'): string {
+	return `${kind} '${name}' of table '${schemaName}.${tableName}'`;
+}
+
 /**
  * Converts a parsed ColumnDef AST node into a runtime ColumnSchema object
  *

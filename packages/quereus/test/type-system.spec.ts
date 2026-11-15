@@ -11,7 +11,6 @@ import {
 	typeRegistry,
 	registerType,
 	getType,
-	getTypeOrDefault,
 	inferType,
 } from '../src/types/registry.js';
 import {
@@ -69,14 +68,6 @@ describe('Type System', () => {
 
 		it('should return undefined for unknown types', () => {
 			expect(getType('UNKNOWN_NONEXISTENT')).to.be.undefined;
-		});
-
-		it('should return BLOB as default for unknown types', () => {
-			expect(getTypeOrDefault('UNKNOWN_NONEXISTENT')).to.equal(BLOB_TYPE);
-		});
-
-		it('should return BLOB as default for undefined name', () => {
-			expect(getTypeOrDefault(undefined)).to.equal(BLOB_TYPE);
 		});
 
 		it('should resolve standard SQL aliases', () => {
@@ -674,6 +665,14 @@ describe('Type System', () => {
 			expect(getType('EMAIL')).to.equal(EMAIL_TYPE);
 			expect(getType('email')).to.equal(EMAIL_TYPE); // case-insensitive
 			expect(typeRegistry.hasType('EMAIL')).to.be.true;
+		});
+
+		it('should resolve a registered name declared with parameters to that type', () => {
+			// No affinity keyword in the name, so only the base-name lookup can find it;
+			// the name is unique to this test because the registry is process-wide.
+			const MEASURE_TYPE: LogicalType = { ...REAL_TYPE, name: 'PARAM_MEASURE' };
+			registerType(MEASURE_TYPE);
+			expect(inferType('param_measure(3)')).to.equal(MEASURE_TYPE);
 		});
 	});
 

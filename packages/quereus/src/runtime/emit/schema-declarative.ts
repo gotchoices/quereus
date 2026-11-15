@@ -16,7 +16,8 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanNode } from '../../planner/nodes/plan-node.js';
 import type { Database } from '../../core/database.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
-import type { TableSchema } from '../../schema/table.js';
+import { columnTypeSubject, type TableSchema } from '../../schema/table.js';
+import { requireRegisteredTypeName } from '../../types/registry.js';
 import { quoteIdentifier } from '../../emit/ast-stringify.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
 import { createEventLoopPacer, type EventLoopPacer } from '../../util/event-loop.js';
@@ -113,6 +114,27 @@ function findDuplicateSeedTable(items: readonly AST.DeclareItem[]): string | und
 	return undefined;
 }
 
+/**
+ * Refuse a declared table whose column or context-variable type names no registered type
+ * (under `strict_type_names`). Apply would mostly refuse it through the CREATE / ALTER it
+ * generates, but the differ compares types by their lenient resolution, so an unknown name
+ * declared over an existing BLOB column generates no DDL and would pass unchecked.
+ */
+function requireDeclaredTypeNamesRegistered(db: Database, items: readonly AST.DeclareItem[], schemaName: string): void {
+	for (const item of items) {
+		if (item.type !== 'declaredTable') continue;
+		const table = item.tableStmt.table;
+		const tableSchemaName = table.schema ?? schemaName;
+		for (const col of item.tableStmt.columns) {
+			requireRegisteredTypeName(db.options, col.dataType, columnTypeSubject(col.name, tableSchemaName, table.name));
+		}
+		for (const varDef of item.tableStmt.contextDefinitions ?? []) {
+			requireRegisteredTypeName(db.options, varDef.dataType,
+				columnTypeSubject(varDef.name, tableSchemaName, table.name, 'context variable'));
+		}
+	}
+}
+
 export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const declareStmt = (plan as unknown as { statementAst: AST.DeclareSchemaStmt }).statementAst;
 
@@ -129,6 +151,7 @@ export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 				StatusCode.ERROR,
 			);
 		}
+		requireDeclaredTypeNamesRegistered(rctx.db, declareStmt.items, schemaName);
 
 		// Clear previous declaration and seed data for this schema
 		rctx.db.declaredSchemaManager.clearSeedData(schemaName);
