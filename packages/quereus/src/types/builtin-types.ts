@@ -384,8 +384,9 @@ export function numericPromotionClass(type: DeepReadonly<LogicalType>): NumericP
 /**
  * The stored form of a quantity type (`LogicalType.isQuantity`): its promotion class,
  * which registration (`TypeRegistry.registerType`) restricts to INTEGER or REAL.
- * `undefined` for a type that is not a quantity — including one that sets the flag but
- * never passed registration, which is then treated as a plain number.
+ * `undefined` for a type that is not a quantity — including a hand-built type object
+ * that sets the flag over a stored form registration would refuse (TEXT, NUMERIC), which
+ * is then treated as a plain number.
  */
 export function quantityClass(type: DeepReadonly<LogicalType>): 'INTEGER' | 'REAL' | undefined {
 	if (type.isQuantity !== true) return undefined;

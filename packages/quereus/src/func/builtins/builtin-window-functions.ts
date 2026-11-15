@@ -145,7 +145,11 @@ function registerAggregateAsWindowFunction(aggSchema: AggregateFunctionSchema): 
 		step: parts.step,
 		final: parts.final,
 		inverse: parts.inverse,
-		bindArgs: aggBindArgs && ((args) => aggregateWindowParts(bindAggregateSchema(aggSchema, args))),
+		bindArgs: aggBindArgs && ((args) => {
+			const bound = bindAggregateSchema(aggSchema, args);
+			// The aggregate declined (sum over a non-quantity argument): keep the declared parts.
+			return bound === aggSchema ? undefined : aggregateWindowParts(bound);
+		}),
 	});
 }
 
