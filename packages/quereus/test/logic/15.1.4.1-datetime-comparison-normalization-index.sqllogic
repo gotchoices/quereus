@@ -8,8 +8,8 @@
 -- `-- requires-capability:` directive is whole-file, so the shape lives here. Section
 -- numbers match 15.1.4 so the three shapes line up.
 --
--- THE RULE (docs/types-ordering.md § DATE, TIME, DATETIME and TIMESTAMP against text): comparing a DATETIME against text normalizes
--- that text the way a write does, so a timestamp ending in `Z` or an offset finds the
+-- THE RULE (docs/types-ordering.md § DATE, TIME, DATETIME and TIMESTAMP against text):
+-- comparing a DATETIME against text normalizes that text the way a write does, so a timestamp ending in `Z` or an offset finds the
 -- row it created and sorts by the instant it names. Text that does not parse compares
 -- as plain text, and a number is not read as an epoch.
 --

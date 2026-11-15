@@ -222,6 +222,10 @@ select id from mn where m <> '';
 → []
 select id from mp where m <> '';
 → []
+select id from mn where m <> '   ';
+→ []
+select id from mp where m <> '   ';
+→ []
 
 select id from mn where m not in ('');
 → []

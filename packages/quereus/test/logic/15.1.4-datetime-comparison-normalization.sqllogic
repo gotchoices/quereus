@@ -62,6 +62,16 @@ select id from dn where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00
 select id from dp where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
 → [{"id":1},{"id":2}]
 
+-- Other spellings of the same instant.
+select id from dn where t = '2020-01-01';
+→ [{"id":1}]
+select id from dp where t = '2020-01-01';
+→ [{"id":1}]
+select id from dn where t = '2020-01-01T00:00:00.000';
+→ [{"id":1}]
+select id from dp where t = '2020-01-01T00:00:00.000';
+→ [{"id":1}]
+
 -- A date-only upper bound is that date's midnight, so a row exactly at midnight is in
 -- range. Plain text order excluded it, because the bound sorted before the stored form.
 select id from dn where t between '2019-01-01' and '2020-01-01';
