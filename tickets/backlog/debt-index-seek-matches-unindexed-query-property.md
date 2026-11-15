@@ -17,6 +17,8 @@ Today nothing checks this. `property-planner.spec.ts` and `fuzz.spec.ts` compare
 
 `bug-prefix-range-seek-skips-rows-on-desc-trailing-column` returned wrong rows on the memory backend for `k = 'a' and r > 1` over `(k, r desc)`, and no existing test noticed. While fixing it, a throwaway check of this rule ran 35,400 queries over 12 key shapes against an unindexed copy. It found no differences on the fixed code, and 4,330 wrong queries when the direction was deliberately read from column 0 instead of the bound column. That check was not committed. `test/vtab/scan-layer-descending.spec.ts` pins an earlier bug in the same seek-direction logic.
 
+A second instance turned up while reviewing `between-with-placeholder-bounds-offered-to-modules`: an OR of two overlapping ranges on an indexed column (`x between 1 and 3 or x between 2 and 4`) returns the overlapping rows twice, while the unindexed copy returns them once. `or-of-overlapping-ranges-returns-rows-twice` (fix/) owns that bug. This test should also generate ORs of two or three ranges on one column, including overlapping, nested and repeated ranges, so it covers OR_RANGE seeks.
+
 ## Expected behaviour
 
 The test generates, with the `fast-check` setup these two spec files already use:
