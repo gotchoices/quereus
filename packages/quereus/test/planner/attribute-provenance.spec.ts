@@ -115,6 +115,13 @@ describe('computeAttributeProvenance', () => {
 		expect(() => computeAttributeProvenance(leaf)).to.throw(QuereusError, /Duplicate attribute ID 5/);
 	});
 
+	it('throws when a single node forwards one child id at two positions', () => {
+		const a = makeAttr(7);
+		const leaf = new LeafRel([a]);
+		const project = new PassThroughRel(leaf, [a, a]);
+		expect(() => computeAttributeProvenance(project)).to.throw(QuereusError, /Duplicate attribute ID 7/);
+	});
+
 	it('does not throw or hang on a shared child instance (DAG)', () => {
 		const shared = new LeafRel([makeAttr(90)]);
 		const parent = new (class extends PlanNode implements RelationalPlanNode {

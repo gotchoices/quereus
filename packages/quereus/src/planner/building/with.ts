@@ -354,10 +354,8 @@ function buildRecursiveCTE(
 
 /**
  * One fresh attribute per working-table column. The CTE's own attributes reuse the
- * start row's ids, and a start row that selects one column twice (`select id, id`)
- * publishes the same id in both positions — sharing them would bind both working-table
- * columns to one slot, so the recursive step would read the first column as the second.
- * Fresh ids also keep the step's reads from resolving to a slot of the start row's scan.
+ * start row's ids; fresh ids keep the recursive step's reads from resolving to a slot
+ * of the start row's scan.
  */
 function workingTableAttributes(recursiveCTENode: RecursiveCTENode): Attribute[] {
 	return recursiveCTENode.getAttributes().map((attr) => ({

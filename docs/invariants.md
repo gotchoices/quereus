@@ -170,9 +170,11 @@ An attribute ID is *originated* by exactly one node — the deepest relational n
 outputs it and whose direct relational children do not — and may then be *forwarded*
 verbatim by any number of ancestors. The invariant is "originated once", not "appears once":
 joins concatenate both sides' IDs, set operations mirror the left child's, and `ProjectNode`
-forwards a source ID for a bare column-reference projection. Two distinct nodes originating
-the same ID, or one node listing an ID twice, is a genuine bug and throws
-`QuereusError(INTERNAL)`.
+forwards a source ID for a bare column-reference projection. `ProjectNode` and
+`ReturningNode` forward a given ID at its first output position only and mint fresh IDs for
+repeats, because a set operation mirroring a repeated ID would bind two columns to one row
+slot. Two distinct nodes originating the same ID, or one node listing an ID twice (forwarded
+or originated), is a genuine bug and throws `QuereusError(INTERNAL)`.
 
 ### OPT-016 — `estimatedCost` is self-cost only
 

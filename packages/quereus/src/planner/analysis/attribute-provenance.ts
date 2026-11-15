@@ -44,7 +44,8 @@ export interface ProvenanceEntry {
  *
  * @throws QuereusError(INTERNAL) when two distinct relational nodes originate
  *   the same id (the genuine-bug case the old validator caught) or when a single
- *   node lists the same id more than once. Forwarding never throws.
+ *   node lists the same id more than once — forwarded or originated. Forwarding
+ *   an id at one position never throws.
  */
 export function computeAttributeProvenance(root: PlanNode): Map<number, ProvenanceEntry> {
 	const provenance = new Map<number, ProvenanceEntry>();
@@ -75,17 +76,23 @@ export function computeAttributeProvenance(root: PlanNode): Map<number, Provenan
 		}
 
 		const nodePath = nodeChain.join(' > ');
+		const listed = new Set<number>();
 		for (const attr of node.getAttributes()) {
+			// Checked before the forwarding skip: a forwarded id listed at two
+			// positions binds both to one row slot, which is wrong as soon as the
+			// positions can hold different values (a union mirroring the ids).
+			if (listed.has(attr.id)) {
+				throw new QuereusError(
+					`Duplicate attribute ID ${attr.id} within the output of ${nodePath}`,
+					StatusCode.INTERNAL,
+				);
+			}
+			listed.add(attr.id);
+
 			if (childIds.has(attr.id)) continue; // forwarded — not an origin
 
 			const existing = provenance.get(attr.id);
 			if (existing) {
-				if (existing.originNode === node) {
-					throw new QuereusError(
-						`Duplicate attribute ID ${attr.id} within the output of ${nodePath}`,
-						StatusCode.INTERNAL,
-					);
-				}
 				throw new QuereusError(
 					`Attribute ID ${attr.id} originated at two distinct nodes (${existing.path} and ${nodePath})`,
 					StatusCode.INTERNAL,

@@ -8,7 +8,7 @@ import { ColumnReferenceNode } from './reference.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
-import { disambiguateColumnNames } from '../util/output-names.js';
+import { disambiguateColumnNames, uniqueOutputId } from '../util/output-names.js';
 import { projectOrdering } from '../framework/physical-utils.js';
 import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 
@@ -17,6 +17,20 @@ export interface ReturningProjection {
   alias?: string;
   /** Optional predefined attribute ID to preserve during optimization */
   attributeId?: number;
+}
+
+/** The id a RETURNING column would publish if no earlier position had claimed it. */
+function candidateOutputId(proj: ReturningProjection): number {
+  // Optimizer path: an id carried over from an earlier instance of this node.
+  if (proj.attributeId !== undefined) return proj.attributeId;
+  // NOTE: unlike ProjectNode, this does not check the id against the executor's
+  // attributes, because these columns read the write's old and new row, which the
+  // executor may not publish. A correlated `(insert ... returning t.b)` keeps the
+  // outer id and reads as uncorrelated, which matches the run-once contract of a
+  // writing subquery in emitScalarSubquery. If RETURNING ever becomes re-runnable
+  // per outer row, this needs the same check.
+  if (proj.node instanceof ColumnReferenceNode) return proj.node.attributeId;
+  return PlanNode.nextAttrId();
 }
 
 /**
@@ -92,42 +106,15 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     // Get the computed column names from the type
     const outputType = this.getType();
 
-    // For each projection, preserve attribute ID if it's a simple column reference
-    return this.projections.map((proj, index) => {
-      // Check if projection has a predefined attribute ID
-      if (proj.attributeId !== undefined) {
-        return {
-          id: proj.attributeId,
-          name: outputType.columns[index].name,
-          type: proj.node.getType(),
-          sourceRelation: `${this.nodeType}:${this.id}`
-        };
-      }
-
-      // If this projection is a simple column reference, preserve its attribute ID
-      // NOTE: unlike ProjectNode, this does not check the id against the executor's
-      // attributes, because these columns read the write's old and new row, which the
-      // executor may not publish. A correlated `(insert ... returning t.b)` keeps the
-      // outer id and reads as uncorrelated, which matches the run-once contract of a
-      // writing subquery in emitScalarSubquery. If RETURNING ever becomes re-runnable
-      // per outer row, this needs the same check.
-      if (proj.node instanceof ColumnReferenceNode) {
-        return {
-          id: proj.node.attributeId,
-          name: outputType.columns[index].name, // Use the deduplicated name
-          type: proj.node.getType(),
-          sourceRelation: `${this.nodeType}:${this.id}`
-        };
-      } else {
-        // For computed expressions, generate new attribute ID
-        return {
-          id: PlanNode.nextAttrId(),
-          name: outputType.columns[index].name, // Use the deduplicated name
-          type: proj.node.getType(),
-          sourceRelation: `${this.nodeType}:${this.id}`
-        };
-      }
-    });
+    // `returning new.v, old.v` reads one attribute id from two rows, so a repeat is
+    // not limited to a column listed twice.
+    const published = new Set<number>();
+    return this.projections.map((proj, index) => ({
+      id: uniqueOutputId(published, candidateOutputId(proj)),
+      name: outputType.columns[index].name, // Use the deduplicated name
+      type: proj.node.getType(),
+      sourceRelation: `${this.nodeType}:${this.id}`
+    }));
   }
 
   getType(): RelationType {

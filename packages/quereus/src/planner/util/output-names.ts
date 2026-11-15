@@ -1,3 +1,5 @@
+import { PlanNode } from '../nodes/plan-node.js';
+
 /**
  * Output column-name disambiguation, shared by every node that publishes a
  * user-visible `RelationType.columns` list.
@@ -16,4 +18,18 @@ export function disambiguateColumnNames(baseNames: readonly string[]): string[] 
 		// First occurrence keeps the base name; subsequent ones are numbered.
 		return currentCount === 0 ? baseName : `${baseName}:${currentCount}`;
 	});
+}
+
+/**
+ * The attribute-id counterpart of {@link disambiguateColumnNames}, for nodes that
+ * forward a source id for a bare column reference: returns `id` the first time the
+ * node publishes it and a fresh id at any later position, so `select id as x, id as y`
+ * gives `y` its own id. A repeated id binds both positions to one row slot
+ * (`buildRowDescriptor`). That is harmless while both hold the same value, and wrong
+ * once a union mirrors the ids over a branch whose two columns differ.
+ */
+export function uniqueOutputId(published: Set<number>, id: number): number {
+	if (published.has(id)) return PlanNode.nextAttrId();
+	published.add(id);
+	return id;
 }

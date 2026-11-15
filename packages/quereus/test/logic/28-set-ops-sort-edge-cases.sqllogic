@@ -436,9 +436,36 @@ ORDER BY x;
 → [{"id":4,"x":1},{"id":2,"x":5},{"id":5,"x":10}]
 
 -- ============================================================
+-- SET OPERATIONS: first branch selects one column twice
+-- ============================================================
+-- The union's output columns must stay distinct when the first branch repeats a column;
+-- a reader above the union used to read x as y for the other branch's rows.
+
+create table sose_ra (id integer primary key);
+create table sose_rb (id integer primary key, a_id integer);
+create table sose_rk (id integer primary key);
+insert into sose_ra values (1);
+insert into sose_rb values (2, 1);
+insert into sose_rk values (1);
+
+select u.x, u.y
+from (select id as x, id as y from sose_ra union all select id as x, a_id as y from sose_rb) u
+join sose_rk k on k.id = u.y
+order by 1;
+→ [{"x":1,"y":1},{"x":2,"y":1}]
+
+select u.x
+from (select id as x, id as y from sose_ra union all select id as x, a_id as y from sose_rb) u
+order by 1;
+→ [{"x":1},{"x":2}]
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
 
 DROP TABLE sort_t;
 DROP TABLE sort_nulls;
 DROP TABLE sort_multi;
+drop table sose_ra;
+drop table sose_rb;
+drop table sose_rk;

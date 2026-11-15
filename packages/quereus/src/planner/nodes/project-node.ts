@@ -15,7 +15,7 @@ import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } fr
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
-import { disambiguateColumnNames } from '../util/output-names.js';
+import { disambiguateColumnNames, uniqueOutputId } from '../util/output-names.js';
 
 export interface Projection {
 	node: ScalarPlanNode;
@@ -153,55 +153,31 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			// captured `columnType`.
 			const sourceTypeById = this.sourceTypeById();
 
-			// If preserveInputColumns is false, only create attributes for projections
-			if (!this.preserveInputColumns) {
-				return this.projections.map((proj, index) => ({
-					id: proj.attributeId ?? PlanNode.nextAttrId(),
-					name: outputType.columns[index].name,
-					type: effectiveProjectionType(proj.node, sourceTypeById),
-					sourceRelation: `${this.nodeType}:${this.id}`,
-					relationName: 'projection'
-				}));
-			}
-
-			// For each projection, preserve attribute ID for simple column references
-			return this.projections.map((proj, index) => {
-				// Use predefined attribute ID if supplied (optimizer path)
-				if (proj.attributeId !== undefined) {
-					return {
-						id: proj.attributeId,
-						name: outputType.columns[index].name,
-						type: effectiveProjectionType(proj.node, sourceTypeById),
-						sourceRelation: `${this.nodeType}:${this.id}`,
-						relationName: 'projection'
-					};
-				}
-
-				if (proj.node instanceof ColumnReferenceNode && sourceTypeById.has(proj.node.attributeId)) {
-					// Preserve a column the source publishes so that any reference to the
-					// underlying column (e.g., in ORDER BY) remains valid after aliasing.
-					// A column the source does not publish belongs to an outer query:
-					// publishing that id would make this subquery appear to define it, and
-					// correlation detection would then read the subquery as uncorrelated.
-					return {
-						id: proj.node.attributeId,
-						name: outputType.columns[index].name,
-						type: effectiveProjectionType(proj.node, sourceTypeById),
-						sourceRelation: `${this.nodeType}:${this.id}`,
-						relationName: 'projection'
-					};
-				}
-
-				// Computed expression or aliased column – generate fresh attribute ID
-				return {
-					id: PlanNode.nextAttrId(),
-					name: outputType.columns[index].name,
-					type: effectiveProjectionType(proj.node, sourceTypeById),
-					sourceRelation: `${this.nodeType}:${this.id}`,
-					relationName: 'projection'
-				};
-			});
+			const published = new Set<number>();
+			return this.projections.map((proj, index) => ({
+				id: uniqueOutputId(published, this.candidateOutputId(proj, sourceTypeById)),
+				name: outputType.columns[index].name,
+				type: effectiveProjectionType(proj.node, sourceTypeById),
+				sourceRelation: `${this.nodeType}:${this.id}`,
+				relationName: 'projection'
+			}));
 		});
+	}
+
+	/** The id a projection would publish if no earlier position had claimed it. */
+	private candidateOutputId(proj: Projection, sourceTypeById: ReadonlyMap<number, ScalarType>): number {
+		// Optimizer path: an id carried over from an earlier instance of this node.
+		if (proj.attributeId !== undefined) return proj.attributeId;
+		if (!this.preserveInputColumns) return PlanNode.nextAttrId();
+		// Forward a column the source publishes so that any reference to the
+		// underlying column (e.g., in ORDER BY) remains valid after aliasing.
+		// A column the source does not publish belongs to an outer query:
+		// publishing that id would make this subquery appear to define it, and
+		// correlation detection would then read the subquery as uncorrelated.
+		if (proj.node instanceof ColumnReferenceNode && sourceTypeById.has(proj.node.attributeId)) {
+			return proj.node.attributeId;
+		}
+		return PlanNode.nextAttrId();
 	}
 
 	/** Maps each source attribute id to the type the source publishes for it.
