@@ -431,56 +431,58 @@ function extractBinaryConstraint(
 		return null;
 	}
 
-  const result: PredicateConstraint = {
+	const binding = classifyValueBinding(columnIsLeft ? right : left, tableInfo);
+	if (!binding) return null;
+
+	return {
 		columnIndex,
 		attributeId: columnRef.attributeId,
 		op: finalOp,
-		value: constant,
 		usable: true, // Usable since we found table mapping
 		sourceExpression: expr,
 		targetRelation: tableInfo.relationKey,
 		collation: binaryConstraintCollation(binaryOp),
-  };
+		...binding,
+	};
+}
 
-  // Attach dynamic binding metadata when RHS/LHS is not a literal
-  const rhs = (expr as BinaryOpNode).right;
-  const lhs = (expr as BinaryOpNode).left;
-  const nonLiteral = !isLiteralConstant(lhs) || !isLiteralConstant(rhs);
-  if (nonLiteral) {
-    // Determine which side is the value side
-    const valueSide = (columnIsLeft ? rhs : lhs) as ScalarPlanNode;
-    if (!isLiteralConstant(valueSide)) {
-      result.valueExpr = valueSide;
-      // Classification only — `valueExpr` above retains the cast, so a converting
-      // cast may be looked through here (see `unwrapCastForBindingKind`).
-      const innerValue = unwrapCastForBindingKind(valueSide);
-      if (innerValue.nodeType === PlanNodeType.ParameterReference) {
-        result.bindingKind = 'parameter';
-      } else if (innerValue.nodeType === PlanNodeType.ColumnReference) {
-        const rhsAttrId = (innerValue as unknown as ColumnReferenceNode).attributeId;
-        const sameTable = tableInfo.columnIndexMap.has(rhsAttrId);
-        if (sameTable) {
-          // Same-table column ref: value is unknown until the row is scanned —
-          // can never be a seek key. Decline; the predicate stays as residual.
-          return null;
-        }
-        result.bindingKind = 'correlated';
-      } else {
-        result.bindingKind = 'expression';
-      }
-      // Free-reference walk: a value side that touches any column outside the
-      // constrained table varies per outer row. This subsumes the bare
-      // other-table ColumnReference case ('correlated') and wrapped/general
-      // 'expression' cases like `outer.id + 1` or `cast(outer.id + 1 as int)`.
-      result.correlated = bindingReferencesOuterTable(valueSide, tableInfo);
-    } else {
-      result.bindingKind = 'literal';
-    }
-  } else {
-    result.bindingKind = 'literal';
-  }
+/** How a constraint's value side is supplied, as stamped onto the constraint. */
+type ValueBinding = Pick<PredicateConstraint, 'value' | 'valueExpr' | 'bindingKind' | 'correlated'>;
 
-  return result;
+/**
+ * Classify a constraint's value side, which the caller has already accepted as
+ * `isLiteralConstant || isDynamicValue`. Shared by the comparison and BETWEEN
+ * paths so the two spellings of one range cannot drift apart.
+ *
+ * Returns null when the value reads the constrained table's own row: it is
+ * unknown until that row is scanned, so it can never be a seek key and the
+ * predicate stays residual.
+ */
+function classifyValueBinding(valueSide: ScalarPlanNode, tableInfo: TableInfo): ValueBinding | null {
+	if (isLiteralConstant(valueSide)) {
+		return { value: getLiteralValue(valueSide), bindingKind: 'literal' };
+	}
+	// Classification only — `valueExpr` below retains the cast, so a converting
+	// cast may be looked through here (see `unwrapCastForBindingKind`).
+	const inner = unwrapCastForBindingKind(valueSide);
+	let bindingKind: BindingKind;
+	if (inner.nodeType === PlanNodeType.ParameterReference) {
+		bindingKind = 'parameter';
+	} else if (inner.nodeType === PlanNodeType.ColumnReference) {
+		if (tableInfo.columnIndexMap.has((inner as unknown as ColumnReferenceNode).attributeId)) return null;
+		bindingKind = 'correlated';
+	} else {
+		bindingKind = 'expression';
+	}
+	return {
+		valueExpr: valueSide,
+		bindingKind,
+		// Free-reference walk: a value side that touches any column outside the
+		// constrained table varies per outer row. This subsumes the bare
+		// other-table ColumnReference case ('correlated') and wrapped/general
+		// 'expression' cases like `outer.id + 1` or `cast(outer.id + 1 as int)`.
+		correlated: bindingReferencesOuterTable(valueSide, tableInfo),
+	};
 }
 
 /**
@@ -504,14 +506,14 @@ function extractBetweenConstraints(
   expr: BetweenNode,
   attributeToTableMap: Map<number, TableInfo>
 ): PredicateConstraint[] | null {
-  // Only support column BETWEEN literal AND literal
+  // `column BETWEEN v AND v`, each bound a value a comparison would accept
+  // (literal, parameter or outer column); anything else stays residual whole.
   const col = expr.expr;
-  const low = expr.lower;
-  const up = expr.upper;
-  const not = !!expr.expression.not;
-
   if (!isColumnReference(col)) return null;
-  if (!isLiteralConstant(low) || !isLiteralConstant(up)) return null;
+  // NOT BETWEEN not expressible as single contiguous range; leave as residual
+  if (expr.expression.not) return null;
+
+  if (![expr.lower, expr.upper].every(b => isLiteralConstant(b) || isDynamicValue(b))) return null;
 
   const columnRef = getColumnReference(col);
   const tableInfo = attributeToTableMap.get(columnRef.attributeId);
@@ -519,40 +521,25 @@ function extractBetweenConstraints(
   const columnIndex = tableInfo.columnIndexMap.get(columnRef.attributeId);
   if (columnIndex === undefined) return null;
 
-  if (not) {
-    // NOT BETWEEN not expressible as single contiguous range; leave as residual
-    return null;
-  }
+  const lowBinding = classifyValueBinding(expr.lower, tableInfo);
+  const upBinding = classifyValueBinding(expr.upper, tableInfo);
+  if (!lowBinding || !upBinding) return null;
+  // A literal NULL bound makes BETWEEN never true (3VL); leave as residual rather
+  // than pushing a seek bound that key ordering would satisfy. A run-time NULL
+  // needs no gate: a seek matches nothing on a NULL range bound.
+  if (lowBinding.value === null || upBinding.value === null) return null;
 
-  const lowVal = getLiteralValue(low);
-  const upVal = getLiteralValue(up);
-  // A NULL bound makes BETWEEN never true (3VL); leave as residual rather than
-  // pushing a seek bound that key ordering would satisfy.
-  if (lowVal === null || upVal === null) return null;
-  return [
-    {
-      columnIndex,
-      attributeId: columnRef.attributeId,
-      op: '>=',
-      value: lowVal,
-      usable: true,
-      bindingKind: 'literal',
-      sourceExpression: expr,
-      targetRelation: tableInfo.relationKey,
-      collation: effectiveBetweenBoundCollation(col, low),
-    },
-    {
-      columnIndex,
-      attributeId: columnRef.attributeId,
-      op: '<=',
-      value: upVal,
-      usable: true,
-      bindingKind: 'literal',
-      sourceExpression: expr,
-      targetRelation: tableInfo.relationKey,
-      collation: effectiveBetweenBoundCollation(col, up),
-    }
-  ];
+  const half = (op: '>=' | '<=', bound: ScalarPlanNode, binding: ValueBinding): PredicateConstraint => ({
+    columnIndex,
+    attributeId: columnRef.attributeId,
+    op,
+    usable: true,
+    sourceExpression: expr,
+    targetRelation: tableInfo.relationKey,
+    collation: effectiveBetweenBoundCollation(col, bound),
+    ...binding,
+  });
+  return [half('>=', expr.lower, lowBinding), half('<=', expr.upper, upBinding)];
 }
 
 function extractInConstraint(

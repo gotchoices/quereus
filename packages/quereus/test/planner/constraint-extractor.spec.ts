@@ -362,13 +362,50 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.residualPredicate).to.exist;
 		});
 
-		it('BETWEEN with non-literal bounds → residual', () => {
+		it('BETWEEN with a same-table column bound → residual', () => {
 			const col = colRef(101, 'a', 1);
 			const col2 = colRef(102, 'b', 2);
 			const expr = betweenNode(col, col2, lit(20));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(0);
 			expect(result.residualPredicate).to.exist;
+		});
+
+		it('BETWEEN with parameter bounds → two parameter constraints', () => {
+			const lo = paramRef(':lo');
+			const hi = paramRef(':hi');
+			const expr = betweenNode(colRef(101, 'a', 1), lo, hi);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints.map(c => c.op)).to.deep.equal(['>=', '<=']);
+			const [ge, le] = result.allConstraints;
+			for (const [c, param] of [[ge, lo], [le, hi]] as const) {
+				expect(c.bindingKind).to.equal('parameter');
+				expect(c.valueExpr).to.equal(param);
+				expect(c.correlated).to.equal(false);
+				expect(c.sourceExpression).to.equal(expr);
+			}
+			expect(result.residualPredicate).to.be.undefined;
+		});
+
+		it('BETWEEN with a literal and a parameter bound → one constraint of each kind', () => {
+			const expr = betweenNode(colRef(101, 'a', 1), lit(1), paramRef(':hi'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			const ge = result.allConstraints.find(c => c.op === '>=')!;
+			const le = result.allConstraints.find(c => c.op === '<=')!;
+			expect(ge.bindingKind).to.equal('literal');
+			expect(ge.value).to.equal(1);
+			expect(ge.valueExpr).to.be.undefined;
+			expect(le.bindingKind).to.equal('parameter');
+		});
+
+		it('BETWEEN with an outer-table column bound → correlated constraint', () => {
+			const expr = betweenNode(colRef(101, 'a', 1), colRef(200, 'x', 0), lit(20));
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(2);
+			const ge = result.allConstraints.find(c => c.op === '>=')!;
+			expect(ge.bindingKind).to.equal('correlated');
+			expect(ge.correlated).to.equal(true);
+			expect(ge.targetRelation).to.equal('t');
 		});
 
 		it('BETWEEN exact bound values (lower != upper)', () => {

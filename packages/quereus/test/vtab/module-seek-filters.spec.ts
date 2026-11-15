@@ -65,8 +65,7 @@ describe('module-listed seek arguments (moduleSeekFilters)', () => {
 	});
 
 	it('delivers a placeholder box as the listed constraints and arguments, per execution', async () => {
-		// Spelled with comparisons: a `between` with non-literal bounds is not offered to modules yet.
-		const sql = 'select id from t where x >= ? and x <= ? and y >= ? and y <= ? order by id';
+		const sql = 'select id from t where x between ? and ? and y between ? and ? order by id';
 
 		expect(await ids(db, sql, [1, 3, 1, 3])).to.deep.equal([1, 3]);
 		expect(await ids(db, sql, [2, 5, 4, 6])).to.deep.equal([2, 5]);
