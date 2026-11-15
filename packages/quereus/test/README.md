@@ -109,10 +109,13 @@ Each of these is a **hard error** that fails that one file's test — never a si
 
 | Token | Meaning |
 |---|---|
-| `standalone-index-ddl` | Backend accepts `create index`, `create unique index`, and `drop index` as standalone statements. |
+| `standalone-index-ddl` | Backend accepts `create index`, `create unique index`, and `drop index` as standalone statements — including the ones `apply schema` issues for the `index` members of a non-logical `declare schema`. |
 
-Adding a member is a deliberate quereus change: one entry in `SQLLOGIC_CAPABILITIES`, one row in this
-table, and at least one file annotated with it. The set being closed is the point — every consumer of the
+**Enforcement.** Quereus's own suite fails any file whose declared tokens differ from the ones its SQL uses (`logic-capabilities.spec.ts` § the real corpus), so a missing declaration cannot reach a downstream backend and an unneeded one cannot skip a file there for nothing. "Uses" is defined per token on the statements the engine's parser produces from each block, `-- error:` blocks included. For `standalone-index-ddl` it is a `create index` / `create unique index` statement, a `drop index` statement, or a `declare schema` (not `declare logical schema`) with at least one `index` member. When a block's whole text fails to parse, each `;`-separated piece that parses on its own still counts, because the harness runs `→` and `-- error:` blocks piece by piece. Downstream harnesses need not reimplement this check — they only read the directive.
+
+Adding a member is a deliberate quereus change: one entry in `SQLLOGIC_CAPABILITIES`, one detector in
+`CAPABILITY_USAGE` (`test/logic-capability-usage.ts`; the compiler refuses a token without one), one row
+in this table, and at least one file annotated with it. The set being closed is the point — every consumer of the
 corpus agrees on what the tokens mean, so a downstream backend cannot mint private tokens. Group tokens
 by "a feature a backend would realistically choose to omit wholesale"; do **not** mint a capability per test.
 

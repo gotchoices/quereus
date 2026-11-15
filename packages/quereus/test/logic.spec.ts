@@ -18,6 +18,7 @@ import {
 	type SqllogicCapability,
 } from './logic-capabilities.js';
 import { canonicalNumbers, parseExactJson } from './logic-exact-json.js';
+import { readSqllogicBlocks, splitBlockStatements, type SqllogicBlock } from './sqllogic-blocks.js';
 
 config.truncateThreshold = 1000;
 config.includeStack = true;
@@ -275,7 +276,7 @@ function generateDiagnostics(db: Database, sqlBlock: string, error: Error): stri
 	}
 
 	try {
-		const statements = sqlBlock.split(';').map(s => s.trim()).filter(s => s.length > 0);
+		const statements = splitBlockStatements(sqlBlock);
 		const lastStatement = statements[statements.length - 1];
 
 		if (lastStatement && (TEST_OPTIONS.showPlan || TEST_OPTIONS.planSummary)) {
@@ -581,23 +582,6 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 				// timeout; store mode is slower still.
 				this.timeout(USE_STORE_MODULE ? 30000 : 15000);
 
-				const lines = content.split(/\r?\n/);
-				let currentSql = '';
-				let expectedResultJson: string | null = null;
-				let expectedErrorSubstring: string | null = null;
-				let currentParams: any[] | null = null;
-				let lineNumber = 0;
-
-				/**
-				 * Resets the current state for the next SQL block
-				 */
-				const resetState = () => {
-					currentSql = '';
-					expectedResultJson = null;
-					expectedErrorSubstring = null;
-					currentParams = null;
-				};
-
 				/**
 				 * Fails the file if the block that just ran broke the connection lifecycle
 				 * contract (docs/invariants.md TXN-001), whatever its SQL outcome.
@@ -623,7 +607,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					// SELECT does not consume the result iterator, so errors thrown inside
 					// the generator body would otherwise stay latent. Setup statements run
 					// in a single db.exec so multi-statement DML batches retain atomicity.
-					const statements = sqlBlock.split(';').map(s => s.trim()).filter(s => s.length > 0);
+					const statements = splitBlockStatements(sqlBlock);
 					const setupStatements = statements.slice(0, -1);
 					const finalStatement = statements[statements.length - 1] ?? '';
 
@@ -673,7 +657,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					}
 
 					// Split into setup statements and final query
-					const statements = sqlBlock.split(';').map(s => s.trim()).filter(s => s.length > 0);
+					const statements = splitBlockStatements(sqlBlock);
 
 					// Execute all but the last statement as setup
 					if (statements.length > 1) {
@@ -764,74 +748,35 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 					}
 				};
 
-				for (const line of lines) {
-					lineNumber++;
-					const trimmedLine = line.trim();
-
-					if (trimmedLine === '') continue; // Skip empty lines
-
-					// Handle comment lines
-					if (trimmedLine.startsWith('--')) {
-						if (trimmedLine.toLowerCase().startsWith('-- error:')) {
-							// Set error expectation and execute immediately
-							expectedErrorSubstring = trimmedLine.substring(9).trim();
-
-							if (currentSql.trim()) {
-								await executeExpectingError(currentSql.trim(), expectedErrorSubstring, lineNumber);
-								assertConnectionLifecycle(lineNumber);
-								resetState();
-							}
-						} else if (trimmedLine.toLowerCase().startsWith('-- params:')) {
-							// Set bind parameters for the next query
-							const paramsJson = trimmedLine.substring(10).trim();
-							try {
-								currentParams = parseExactJson(paramsJson) as any[];
-							} catch (jsonError: any) {
-								throw new Error(`[${file}:${lineNumber}] Invalid params JSON: ${jsonError.message} - JSON: ${paramsJson}`);
-							}
-						} else if (trimmedLine.toLowerCase() === '-- run') {
-							// Run accumulated SQL as setup immediately
-							if (currentSql.trim()) {
-								await executeSetup(currentSql.trim(), lineNumber);
-								assertConnectionLifecycle(lineNumber);
-								resetState();
-							}
-						}
-						continue; // Skip all comment lines
+				/**
+				 * Bind parameters for a block. Parsed for every block that carries them, though
+				 * only a `→` block binds them, so a malformed `-- params:` line always fails.
+				 */
+				const parseParams = (params: SqllogicBlock['params']): any[] | null => {
+					if (!params) return null;
+					try {
+						return parseExactJson(params.json) as any[];
+					} catch (jsonError: any) {
+						throw new Error(`[${file}:${params.line}] Invalid params JSON: ${jsonError.message} - JSON: ${params.json}`);
 					}
+				};
 
-					// Handle result marker
-					if (trimmedLine.startsWith('→')) {
-						expectedResultJson = trimmedLine.substring(1).trim();
-
-						// Execute immediately with result expectation
-						if (currentSql.trim()) {
-							await executeExpectingResults(currentSql.trim(), expectedResultJson, lineNumber, currentParams);
-							assertConnectionLifecycle(lineNumber);
-							resetState();
-						}
-						continue; // Don't add to SQL
+				for (const block of readSqllogicBlocks(content)) {
+					const params = parseParams(block.params);
+					const { end } = block;
+					switch (end.kind) {
+						case 'result':
+							await executeExpectingResults(block.sql, end.json, end.line, params);
+							break;
+						case 'error':
+							await executeExpectingError(block.sql, end.substring, end.line);
+							break;
+						case 'run':
+						case 'eof':
+							await executeSetup(block.sql, end.line);
+							break;
 					}
-
-					// Process SQL line
-					let sqlPart = line;
-
-					// Strip trailing comment from the SQL part
-					const commentIndex = sqlPart.indexOf('--');
-					if (commentIndex !== -1) {
-						sqlPart = sqlPart.substring(0, commentIndex);
-					}
-
-					// Accumulate SQL
-					if (sqlPart.trim() !== '') {
-						currentSql += sqlPart + '\n';
-					}
-				}
-
-				// Process any remaining SQL at the end of the file (treat as setup)
-				if (currentSql.trim()) {
-					await executeSetup(currentSql.trim(), lineNumber);
-					assertConnectionLifecycle(lineNumber);
+					assertConnectionLifecycle(end.line);
 				}
 			});
 		});

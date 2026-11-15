@@ -35,8 +35,8 @@ export type SqllogicCapability = keyof typeof SQLLOGIC_CAPABILITIES;
 const DIRECTIVE_RE = /^--\s*requires-capability\s*:\s*(.*)$/i;
 
 /**
- * Anything that *looks* like the directive. `logic.spec.ts`'s main loop `continue`s past every
- * unrecognized `--` line, so without this guard a typo'd directive (`-- require-capability:`,
+ * Anything that *looks* like the directive. The harness's block reader (`sqllogic-blocks.ts`) ignores
+ * every unrecognized `--` line, so without this guard a typo'd directive (`-- require-capability:`,
  * `-- requires_capability:`) would vanish silently and the file would run with nobody the wiser.
  * Matches on the canonical form too — check `DIRECTIVE_RE` first.
  *

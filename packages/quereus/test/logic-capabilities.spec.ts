@@ -10,6 +10,7 @@ import {
 	STORE_BACKEND_CAPABILITIES,
 	type SqllogicCapability,
 } from './logic-capabilities.js';
+import { findCapabilityUses } from './logic-capability-usage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -207,60 +208,57 @@ describe('sqllogic capability directive', () => {
 			}
 		});
 
-		it('returns an empty set for every file that does not mention the directive', () => {
-			// Zero behavior change for the un-annotated bulk of the corpus. A regression here
-			// would skip or fail files wholesale. The count of annotated files is expected to
-			// grow, so assert only that unannotated files exist — never a magic threshold.
-			const unannotated = files.filter(
-				file => !/requires-capability/i.test(fs.readFileSync(path.join(logicTestDir, file), 'utf-8')),
-			);
-			expect(unannotated.length, 'corpus should still contain unannotated files').to.be.greaterThan(0);
-
-			for (const file of unannotated) {
+		// Downstream backends skip on the declaration alone, and quereus's own backends support
+		// every capability, so a missing declaration would otherwise fail only in someone else's
+		// repo — and an unneeded one would skip the file there for nothing.
+		it('declares exactly the capabilities each file uses', () => {
+			const violations: string[] = [];
+			for (const file of files) {
 				const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
-				expect([...parseRequiredCapabilities(file, content)], `for ${file}`).to.deep.equal([]);
+				const declared = parseRequiredCapabilities(file, content);
+				const used = findCapabilityUses(content);
+
+				for (const [capability, line] of used) {
+					if (!declared.has(capability)) {
+						violations.push(`${file}: uses ${capability} (first at line ${line}) but does not declare it`);
+					}
+				}
+				for (const capability of declared) {
+					if (!used.has(capability)) {
+						violations.push(`${file}: declares ${capability} but no statement uses it`);
+					}
+				}
 			}
+			expect(violations).to.deep.equal([]);
 		});
+	});
 
-		// Pins the corpus to the mechanism: quereus's own backends produce no skips, so without
-		// this a broken directive on the one annotated file would go unnoticed locally.
-		it('skips 10.1.2-ddl-in-transaction.sqllogic on a backend without standalone index DDL', () => {
-			const file = '10.1.2-ddl-in-transaction.sqllogic';
-			const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
-			const required = parseRequiredCapabilities(file, content);
+	describe('findCapabilityUses', () => {
+		function uses(...lines: string[]): [SqllogicCapability, number][] {
+			return [...findCapabilityUses(lines.join('\n'))];
+		}
 
-			expect([...required]).to.include(INDEX_DDL);
-			expect(missingCapability(required, new Set())).to.equal(INDEX_DDL);
-			expect(missingCapability(required, MEMORY_BACKEND_CAPABILITIES)).to.be.undefined;
-		});
-
-		// Pins the corpus-sweep ticket's result: files whose *subject* is index DDL (not
-		// merely a scenario that reaches for an index) carry the directive. A regression here
-		// means the sweep's annotations were lost or a file was renamed without updating them.
-		it('declares standalone-index-ddl on every file whose subject is index DDL', () => {
-			const subjectFiles = [
-				'06.3-schema.sqllogic',
-				'06.9.3-json-index-range-seek.sqllogic',
-				'10.1.3-ddl-drop-in-transaction.sqllogic',
-				'10.5-indexes.sqllogic',
-				'10.5.1-partial-indexes.sqllogic',
-				'10.5.2-expression-indexes.sqllogic',
-				'10.5.3-desc-index-ordering.sqllogic',
-				'10.5.4-composite-pk-index-update-phantom.sqllogic',
-				'10.5.5-index-name-uniqueness.sqllogic',
-				'10.5.7-implicit-unique-index-lifecycle.sqllogic',
-				'47.3.1-upsert-conflict-index-derived-collation.sqllogic',
-				'drop-unique-index.sqllogic',
+		it('counts a physical declare schema with an index member, not a logical one', () => {
+			const declare = (keyword: string) => [
+				`declare ${keyword} x { table t { id integer primary key, a integer } index ix on t (a) }`,
+				'-- run',
 			];
+			expect(uses(...declare('schema'))).to.deep.equal([[INDEX_DDL, 1]]);
+			expect(uses(...declare('logical schema'))).to.deep.equal([]);
+		});
 
-			for (const file of subjectFiles) {
-				// Named explicitly: a rename would otherwise surface as a bare ENOENT.
-				expect(files, `${file} was renamed or removed; update this list`).to.include(file);
+		it('counts drop index, not drop of another object', () => {
+			expect(uses('drop table t;', '-- run')).to.deep.equal([]);
+			expect(uses('drop table t;', '-- run', '', 'drop index ix;', '-- error: no such index'))
+				.to.deep.equal([[INDEX_DDL, 4]]);
+		});
 
-				const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
-				const required = parseRequiredCapabilities(file, content);
-				expect([...required], `${file} should declare standalone-index-ddl`).to.include(INDEX_DDL);
-			}
+		// The harness runs an `-- error:` block a `;`-separated piece at a time, so the pieces
+		// before a parse error still execute.
+		it('counts what parses on its own in a block whose whole text does not', () => {
+			expect(uses('create index ix on t (a);', 'select from;', '-- error: syntax'))
+				.to.deep.equal([[INDEX_DDL, 1]]);
+			expect(uses('create index on;', 'select from;', '-- error: syntax')).to.deep.equal([]);
 		});
 	});
 });
