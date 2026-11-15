@@ -8,7 +8,7 @@ import { Cached } from "../../util/cached.js";
 import { formatExpression, formatScalarType } from "../../util/plan-formatter.js";
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { NULL_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, ANY_TYPE } from "../../types/builtin-types.js";
+import { NULL_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, ANY_TYPE, numericPromotionClass, type NumericPromotionClass } from "../../types/builtin-types.js";
 import { inferLogicalTypeFromValue } from "../../common/type-inference.js";
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 import { mergeSetOpAdvertisedType } from "../analysis/set-op-type-merge.js";
@@ -171,6 +171,40 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 	}
 }
 
+/**
+ * Result type of arithmetic over two numeric operands, from their promotion classes
+ * (`numericPromotionClass`) rather than their type names, so a plugin type stored as REAL
+ * promotes like REAL. Always a builtin type.
+ */
+function promoteNumericArithmetic(
+	operator: string,
+	left: NumericPromotionClass,
+	right: NumericPromotionClass,
+): ScalarType['logicalType'] {
+	if (left === 'NUMERIC' || right === 'NUMERIC') {
+		// A NUMERIC operand's value space is `number | bigint`, so no
+		// arithmetic over it can promise anything narrower.
+		return NUMERIC_TYPE;
+	}
+	if (left === 'REAL' || right === 'REAL') {
+		// REAL + REAL stays REAL (both operand value spaces are `number`
+		// only, and the number path yields a number or null). A MIXED
+		// INTEGER/REAL pair announces NUMERIC: the runtime keeps a bigint
+		// INTEGER-class operand in the bigint domain when the REAL side holds an
+		// integral value (`mixedBigIntArithmetic`), so
+		// `int_col + real_col` over (9007199254740993, 2.0) returns a
+		// bigint — outside what REAL claims.
+		return left === right ? REAL_TYPE : NUMERIC_TYPE;
+	}
+	if (operator === '/') {
+		// INTEGER / INTEGER is real division on the number path (1/2 → 0.5)
+		// and truncating division on the bigint path (`buildNumericOpSpec`) —
+		// NUMERIC (number | bigint) is the only builtin space covering both.
+		return NUMERIC_TYPE;
+	}
+	return INTEGER_TYPE;
+}
+
 export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 	readonly nodeType = PlanNodeType.BinaryOp;
 	private cachedType: Cached<ScalarType>;
@@ -217,13 +251,16 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 				// Infinity) and `runTemporalCase` nulls a value its kind cannot parse — so
 				// `left.nullable || right.nullable` under-claimed (`select 1/0` announced
 				// non-nullable and produced null). The one closed shape is +, -, * over
-				// two INTEGERs: the number path cannot reach Infinity from safe-integer
-				// magnitudes and the bigint path is exact, so only there does the
-				// operand-derived nullability stand (which the lens prover relies on to
-				// prove a computed `v + 1` column NOT NULL).
-				// By NAME, like the promotion checks below — a schema round-tripped
-				// through persistence may hold a non-singleton LogicalType instance.
-				const bothInteger = leftType.logicalType.name === 'INTEGER' && rightType.logicalType.name === 'INTEGER';
+				// two INTEGER-class operands: by R2 each holds a safe integer or a bigint,
+				// the number path cannot reach Infinity from safe-integer magnitudes and
+				// the bigint path is exact, so only there does the operand-derived
+				// nullability stand (which the lens prover relies on to prove a computed
+				// `v + 1` column NOT NULL). Classified by name and physicalType, never by
+				// identity — a schema round-tripped through persistence may hold a
+				// non-singleton LogicalType instance.
+				const leftClass = numericPromotionClass(leftType.logicalType);
+				const rightClass = numericPromotionClass(rightType.logicalType);
+				const bothInteger = leftClass === 'INTEGER' && rightClass === 'INTEGER';
 				const closedOverIntegers = this.expression.operator === '+'
 					|| this.expression.operator === '-'
 					|| this.expression.operator === '*';
@@ -241,40 +278,17 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 					logicalType = temporalCase.resultType;
 					break;
 				}
-				// Arithmetic operators - implement numeric type promotion
-				// Rules: INTEGER + INTEGER -> INTEGER, INTEGER + REAL -> REAL, REAL + REAL -> REAL
-				if (leftType.logicalType.isNumeric && rightType.logicalType.isNumeric) {
-					// Both operands are numeric
-					if (leftType.logicalType.name === 'NUMERIC' || rightType.logicalType.name === 'NUMERIC') {
-						// A NUMERIC operand's value space is `number | bigint`, so no
-						// arithmetic over it can promise anything narrower.
-						logicalType = NUMERIC_TYPE;
-					} else if (leftType.logicalType.name === 'REAL' || rightType.logicalType.name === 'REAL') {
-						// REAL + REAL stays REAL (both operand value spaces are `number`
-						// only, and the number path yields a number or null). A MIXED
-						// INTEGER/REAL pair announces NUMERIC: the runtime keeps a bigint
-						// INTEGER operand in the bigint domain when the REAL side holds an
-						// integral value (`mixedBigIntArithmetic`), so
-						// `int_col + real_col` over (9007199254740993, 2.0) returns a
-						// bigint — outside what REAL claims.
-						logicalType = leftType.logicalType.name === rightType.logicalType.name
-							? REAL_TYPE
-							: NUMERIC_TYPE;
-					} else if (this.expression.operator === '/') {
-						// INTEGER / INTEGER is real division on the number path (1/2 → 0.5)
-						// and truncating division on the bigint path (`buildNumericOpSpec`) —
-						// NUMERIC (number | bigint) is the only builtin space covering both.
-						logicalType = NUMERIC_TYPE;
-					} else {
-						// Both are INTEGER, result is INTEGER
-						logicalType = INTEGER_TYPE;
-					}
+				if (leftClass && rightClass) {
+					logicalType = promoteNumericArithmetic(this.expression.operator, leftClass, rightClass);
 				} else {
-					// Neither a temporal case nor two numeric operands, so the declared types
-					// settle nothing — and `buildCoercingArithmeticRun` decides per row: a TEXT
-					// operand holding a duration string yields a TIMESPAN string, an ordinary
-					// string yields the number it coerces to (`'123' + 0` → 123, `'abc' + 0` →
-					// 0). The left operand's type is simply not one of the answers.
+					// Neither a temporal case nor two operands with a builtin numeric class,
+					// so the declared types settle nothing — and `buildCoercingArithmeticRun`
+					// decides per row: a TEXT operand holding a duration string yields a
+					// TIMESPAN string, an ordinary string yields the number it coerces to
+					// (`'123' + 0` → 123, `'abc' + 0` → 0). The left operand's type is simply
+					// not one of the answers. A plugin `isNumeric` type stored as TEXT,
+					// BOOLEAN or OBJECT lands here too: no builtin numeric class describes
+					// its values.
 					//
 					// ANY is the honest announcement, and the same conclusion
 					// `mergeSetOpAdvertisedType` reaches for an irreconcilable operand pair:

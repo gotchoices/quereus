@@ -172,15 +172,17 @@ Arithmetic takes the first of three arms:
 
 1. **A temporal operation table case** — `date - date` → `TIMESPAN`, `timespan / timespan`
    → `REAL`. See [Temporal arithmetic](types.md#temporal-types) for the table.
-2. **Both operands numeric** — promotion, first match wins:
+2. **Both operands have a numeric class** — promotion on the operand *classes*, first match wins:
 
-   | Operand pair | Operator | Result | Why |
+   | Operand class pair | Operator | Result | Why |
    |---|---|---|---|
    | either side `NUMERIC` | any | `NUMERIC` | a `NUMERIC` operand is already `number \| bigint`; nothing narrower can be promised |
    | `REAL` + `REAL` | any | `REAL` | both value spaces are `number` only, and the number path yields a `number` or null |
    | `INTEGER` + `REAL` (mixed) | any | `NUMERIC` | `mixedBigIntArithmetic` keeps a `bigint` INTEGER operand in the bigint domain when the REAL side holds an integral value, so `int_col + real_col` over `(9007199254740993, 2.0)` returns a `bigint` — outside what `REAL` claims |
    | `INTEGER` + `INTEGER` | `/` | `NUMERIC` | real division on the number path (`1/2` → `0.5`), truncating on the bigint path |
    | `INTEGER` + `INTEGER` | `+ - * %` | `INTEGER` | |
+
+   An operand's class is the builtin numeric value space its values inhabit (`numericPromotionClass`, `types/builtin-types.ts`): `NUMERIC` by name, otherwise `REAL` or `INTEGER` by `physicalType`, the same split `buildConformanceCheck` applies for [R2](types.md#physical-representation). So a plugin-registered `isNumeric` type stored as REAL promotes like `REAL` (`len * len` over a REAL-stored `LENGTH` announces `REAL`, not `INTEGER`), and one stored any other way (TEXT, BOOLEAN, OBJECT) has no class and takes the third arm. The result is always a builtin type; whether a custom type should survive arithmetic is an open question (`tickets/blocked/feat-custom-numeric-type-survives-arithmetic-and-sums.md`).
 3. **Otherwise** → `ANY`. The declared types settle nothing, so
    `buildCoercingArithmeticRun` decides per row: a TEXT operand holding a duration string
    yields a TIMESPAN string, an ordinary string coerces to a number (`'123' + 0` → `123`,
@@ -196,7 +198,7 @@ Arithmetic takes the first of three arms:
 operands, because it can *produce* NULL from non-null input: `buildNumericOpSpec` nulls a
 non-finite result (`1/0`, `%` by zero, REAL overflow to `Infinity`) and `runTemporalCase`
 nulls a value its declared kind cannot parse. The one exception is `+ - *` over two
-`INTEGER`s — the only shape with no non-finite path — where the operands' own nullability
+`INTEGER`-class operands (above) — the only shape with no non-finite path — where the operands' own nullability
 stands. That exception is load-bearing: the lens prover uses expression nullability to
 prove a computed `v + 1` column NOT NULL. The announced `nullable` flag is *not* yet
 consistent engine-wide; the remaining classes are tracked in

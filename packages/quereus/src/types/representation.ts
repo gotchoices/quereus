@@ -77,6 +77,10 @@ const OBJECT_CONFORMS: ConformanceCheck = value =>
  * - **`ANY`/NULL** (`PhysicalType.NULL`) impose no R2 constraint at all — an `ANY`
  *   position may legitimately hold any storage class.
  *
+ * `numericPromotionClass` (`types/builtin-types.ts`) applies the same NUMERIC / REAL /
+ * INTEGER split to pick arithmetic result types; the two must stay in agreement, or the
+ * planner announces a type whose values this check rejects.
+ *
  * TIMESTAMP needs no special case: it declares `physicalType` INTEGER because it IS an
  * integer instant, so it takes INTEGER's rule. The string temporals (DATE / TIME /
  * DATETIME / TIMESPAN) declare TEXT and take TEXT's — R2 must not demand a `Temporal`

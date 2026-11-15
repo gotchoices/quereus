@@ -352,6 +352,35 @@ export function isSummableType(type: DeepReadonly<LogicalType>): boolean {
 	return isNumericOrUnknownType(type) || type === BOOLEAN_TYPE;
 }
 
+/** The builtin numeric value space an arithmetic operand belongs to — see {@link numericPromotionClass}. */
+export type NumericPromotionClass = 'INTEGER' | 'REAL' | 'NUMERIC';
+
+/**
+ * Which builtin numeric value space a numeric type's values inhabit, for arithmetic
+ * result-type promotion (`BinaryOpNode.generateType`). Keyed on `physicalType` so a
+ * plugin-registered numeric type (a REAL-stored `LENGTH`, say) promotes by what it is
+ * stored as rather than falling through to INTEGER because its name is neither REAL nor
+ * NUMERIC.
+ *
+ * MUST agree with `buildConformanceCheck` (`types/representation.ts`), which decides the
+ * same question for R2: NUMERIC is matched by NAME because it shares REAL's
+ * `physicalType` and only its name says it admits `bigint` (same caveat as the NOTE
+ * there); otherwise REAL- and INTEGER-physical types take those classes.
+ *
+ * Returns `undefined` for a non-numeric type and for an `isNumeric` type stored any other
+ * way (TEXT, BOOLEAN, OBJECT, NULL): no builtin numeric class describes its values, so
+ * arithmetic over it can announce nothing narrower than ANY.
+ */
+export function numericPromotionClass(type: DeepReadonly<LogicalType>): NumericPromotionClass | undefined {
+	if (type.isNumeric !== true) return undefined;
+	if (type.name === 'NUMERIC') return 'NUMERIC';
+	switch (type.physicalType) {
+		case PhysicalType.REAL: return 'REAL';
+		case PhysicalType.INTEGER: return 'INTEGER';
+		default: return undefined;
+	}
+}
+
 /**
  * The three builtin types whose values share one numeric seek key space. Tested by
  * IDENTITY against the registry singletons, deliberately not by `type.isNumeric`:

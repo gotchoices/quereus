@@ -22,6 +22,7 @@ import type { SqlValue } from '../src/common/types.js';
 import { PlanNode } from '../src/planner/nodes/plan-node.js';
 import { BinaryOpNode } from '../src/planner/nodes/scalar.js';
 import { conformsToType } from '../src/types/representation.js';
+import { INTEGER_TYPE, REAL_TYPE } from '../src/types/builtin-types.js';
 import { classifyBinaryOperator } from '../src/planner/analysis/binary-operator-class.js';
 import { isComparisonOperator } from '../src/planner/analysis/comparison-collation.js';
 
@@ -146,6 +147,37 @@ describe('BinaryOpNode static type', () => {
 			await db.exec('create table dts (id integer primary key, a date not null, b date not null)');
 			// `date - date` is a TIMESPAN per types/temporal-ops.ts, not ANY.
 			expect(findBinary('select a - b as v from dts').getType().logicalType.name).to.equal('TIMESPAN');
+		});
+	});
+
+	describe('arithmetic over plugin-registered numeric types promotes by physical type', () => {
+		// The promotion chain once matched the names REAL and NUMERIC, so any other
+		// numeric type fell through to "both INTEGER": `len * len` over 1.5 announced
+		// INTEGER and produced 2.25. The spreads give fresh objects, so nothing matches
+		// these by identity against the builtin singletons.
+		beforeEach(() => {
+			db.registerType('BOPLEN', { ...REAL_TYPE, name: 'BOPLEN' });
+			db.registerType('BOPCOUNT', { ...INTEGER_TYPE, name: 'BOPCOUNT' });
+		});
+
+		const len = 'cast(1.5 as boplen)';
+		const count = (n: number): string => `cast(${n} as bopcount)`;
+
+		it('a REAL-stored type promotes like REAL', async () => {
+			expect(await expectAnnouncedAndInhabited(`${len} + ${len}`, 'REAL')).to.equal(3);
+			expect(await expectAnnouncedAndInhabited(`${len} * ${len}`, 'REAL')).to.equal(2.25);
+			expect(await expectAnnouncedAndInhabited(`${len} + 2.5`, 'REAL')).to.equal(4);
+			// REAL-class against INTEGER-class is the mixed pair, which announces NUMERIC.
+			expect(await expectAnnouncedAndInhabited(`${len} * 2`, 'NUMERIC')).to.equal(3);
+		});
+
+		it('an INTEGER-stored type promotes like INTEGER, nullability included', async () => {
+			expect(await expectAnnouncedAndInhabited(`${count(3)} + ${count(4)}`, 'INTEGER')).to.equal(7);
+			// The `+ - *` over two INTEGERs nullability exception the lens prover relies on.
+			// Columns, not casts: a converting cast is itself nullable.
+			await db.exec('create table bc (id integer primary key, a bopcount not null, b bopcount not null)');
+			expect(findBinary('select a + b as v from bc').getType().nullable).to.equal(false);
+			expect(await expectAnnouncedAndInhabited(`${count(3)} / ${count(4)}`, 'NUMERIC')).to.equal(0.75);
 		});
 	});
 
