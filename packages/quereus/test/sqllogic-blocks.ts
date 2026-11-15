@@ -77,6 +77,10 @@ export function readSqllogicBlocks(content: string): SqllogicBlock[] {
 
 		if (trimmed.startsWith('--')) {
 			const marker = readMarker(trimmed, lineNumber);
+			// NOTE: a second `-- params:` before the block closes replaces the first, and params
+			// pending at end of file are dropped — either way that line's JSON is never parsed (the
+			// old inline loop validated every params line). No corpus file has either shape; if one
+			// ever appears, report it here rather than silently ignoring it.
 			if (marker?.kind === 'params') params = { json: marker.json, line: marker.line };
 			else if (marker) close(marker);
 			return;

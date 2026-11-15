@@ -26,7 +26,7 @@
  */
 export const SQLLOGIC_CAPABILITIES = {
 	'standalone-index-ddl':
-		'`create index` / `create unique index` / `drop index` as standalone statements',
+		'`create index` / `create unique index` / `drop index` as standalone statements, including those `apply schema` issues for a non-logical `declare schema`\'s index members',
 } as const;
 
 export type SqllogicCapability = keyof typeof SQLLOGIC_CAPABILITIES;

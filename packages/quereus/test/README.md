@@ -102,7 +102,7 @@ Each of these is a **hard error** that fails that one file's test — never a si
 - a directive with no tokens,
 - a canonical directive appearing after the file's first SQL line,
 - a **near-miss spelling** — `-- require-capability:`, `-- requires_capability:`, `-- requires capability:`.
-  This last one matters: the runner `continue`s past every unrecognized `--` line, so without the guard a
+  This last one matters: the harness's block reader ignores every unrecognized `--` line, so without the guard a
   typo'd directive would vanish and the file would run with nobody the wiser.
 
 **Vocabulary** (closed set):
@@ -111,7 +111,7 @@ Each of these is a **hard error** that fails that one file's test — never a si
 |---|---|
 | `standalone-index-ddl` | Backend accepts `create index`, `create unique index`, and `drop index` as standalone statements — including the ones `apply schema` issues for the `index` members of a non-logical `declare schema`. |
 
-**Enforcement.** Quereus's own suite fails any file whose declared tokens differ from the ones its SQL uses (`logic-capabilities.spec.ts` § the real corpus), so a missing declaration cannot reach a downstream backend and an unneeded one cannot skip a file there for nothing. "Uses" is defined per token on the statements the engine's parser produces from each block, `-- error:` blocks included. For `standalone-index-ddl` it is a `create index` / `create unique index` statement, a `drop index` statement, or a `declare schema` (not `declare logical schema`) with at least one `index` member. When a block's whole text fails to parse, each `;`-separated piece that parses on its own still counts, because the harness runs `→` and `-- error:` blocks piece by piece. Downstream harnesses need not reimplement this check — they only read the directive.
+**Enforcement.** Quereus's own suite fails any file whose declared tokens differ from the ones its SQL uses (`logic-capabilities.spec.ts` § the real corpus), so a missing declaration cannot reach a downstream backend and an unneeded one cannot skip a file there for nothing. "Uses" is defined per token on the statements the engine's parser produces from each block, `-- error:` blocks included. For `standalone-index-ddl` it is a `create index` / `create unique index` statement, a `drop index` statement, or a `declare schema` (not `declare logical schema`) with at least one `index` member. When a block's whole text fails to parse, each `;`-separated piece that parses on its own still counts, because the harness cuts `→` and `-- error:` blocks at `;` and so may run the pieces before a bad final one. Where the bad piece shares a batch with good ones this over-counts, which can only make a file declare more. Downstream harnesses need not reimplement this check — they only read the directive.
 
 Adding a member is a deliberate quereus change: one entry in `SQLLOGIC_CAPABILITIES`, one detector in
 `CAPABILITY_USAGE` (`test/logic-capability-usage.ts`; the compiler refuses a token without one), one row

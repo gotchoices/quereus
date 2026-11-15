@@ -220,7 +220,7 @@ describe('sqllogic capability directive', () => {
 
 				for (const [capability, line] of used) {
 					if (!declared.has(capability)) {
-						violations.push(`${file}: uses ${capability} (first at line ${line}) but does not declare it`);
+						violations.push(`${file}: uses ${capability} (first in the block at line ${line}) but does not declare it`);
 					}
 				}
 				for (const capability of declared) {

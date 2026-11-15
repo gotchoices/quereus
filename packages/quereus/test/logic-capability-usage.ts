@@ -55,11 +55,13 @@ function tryParse(sql: string): AST.Statement[] | null {
 
 /**
  * The statements a block can run. `Database.exec` parses a whole batch before running any of it,
- * but the harness hands `→` and `-- error:` blocks to the engine one `;`-separated piece at a time
- * (setup pieces of an `-- error:` block as one batch, the final piece on its own), so a block whose
- * whole text fails to parse may still run the pieces before the bad one. Each piece that parses on
- * its own therefore counts. That over-counts a `-- run` block, which goes to one `exec` whole and so
- * runs nothing; no corpus block is affected.
+ * but the harness cuts `→` and `-- error:` blocks at `;` (a `→` block's pieces each go to the
+ * engine alone; an `-- error:` block's setup pieces go as one batch and its final piece alone), so
+ * a block whose final piece fails to parse still runs the pieces before it. Each piece that parses
+ * on its own therefore counts. That over-counts wherever the bad piece shares a batch with the good
+ * ones — a `-- run` block, or an `-- error:` block whose bad piece is a setup piece — and over-counting
+ * only makes a file declare more, never less. No corpus block is affected (all parse-failing blocks
+ * are `-- error:` blocks with no index DDL in any piece).
  */
 function blockStatements(sql: string): AST.Statement[] {
 	return tryParse(sql) ?? splitBlockStatements(sql).flatMap(piece => tryParse(piece) ?? []);
