@@ -161,6 +161,10 @@ function canPushAcrossProject(project: ProjectNode, predicate: ScalarPlanNode): 
 	// It is refused because the gate's rule is "must exist below", and an outer-scope id does
 	// not. Buying it back means distinguishing "outer-scope id" from "id this Project defines",
 	// e.g. by testing membership in the Project's own output attributes first.
+	// NOTE: a column the Project repeats (`select id as x, id as y`) gets a fresh id at its
+	// second position (`uniqueOutputId`), so a predicate on `y` is refused here although it
+	// reads one source column. If that shape ever matters, map the fresh id back to its
+	// projection's column reference before the check.
 	const sourceAttrIds = new Set(project.source.getAttributes().map(a => a.id));
 	const referenced = collectPredicateAttributeIds(predicate);
 	for (const id of referenced) {
