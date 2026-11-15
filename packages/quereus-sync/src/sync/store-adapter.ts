@@ -119,8 +119,8 @@
  * MV refresh).
  */
 
-import type { BackingRowChange, ColumnSchema, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
-import { compareSqlValues, expressionToString, generateIndexDDL, generateTableDDL, inferType, namedConstraintExists, Parser } from '@quereus/quereus';
+import type { BackingRowChange, ColumnSchema, Database, ExternalRowChange, LogicalType, Row, SqlValue, TableSchema } from '@quereus/quereus';
+import { compareSqlValues, expressionToString, generateIndexDDL, generateTableDDL, inferType, namedConstraintExists, Parser, typeRegistry } from '@quereus/quereus';
 import type { ExternalRowOp, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
 import { makePkIdentityEncoder } from '../metadata/pk-identity.js';
 import type {
@@ -983,7 +983,7 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
 
   switch (action.type) {
     case 'addColumn':
-      return decideAddColumn(local, action.column, change);
+      return decideAddColumn(db, local, action.column, change);
     case 'dropColumn':
       return localColumn(local, action.name) ? 'execute' : 'already-applied';
     case 'renameColumn': {
@@ -1040,7 +1040,7 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
         return 'already-applied';
       }
       if (action.setDataType !== undefined) {
-        return inferType(action.setDataType).name === col.logicalType.name ? 'already-applied' : 'execute';
+        return localColumnType(db, action.setDataType)?.name === col.logicalType.name ? 'already-applied' : 'execute';
       }
       if (action.setNotNull !== undefined) {
         // A `set not null` executes against the rows this peer currently holds, so
@@ -1096,6 +1096,21 @@ function localColumn(table: TableSchema, name: string): ColumnSchema | undefined
 }
 
 /**
+ * The type a replicated column type name resolves to on this peer, or undefined when
+ * this peer refuses the name (`strict_type_names` on and the type not registered
+ * here). Undefined makes the caller execute the DDL, so the engine reports the unknown
+ * type: a lenient lookup would read it as BLOB, call a BLOB column already converged,
+ * and leave the two peers' column types silently different.
+ */
+function localColumnType(db: Database, typeName: string | undefined): LogicalType | undefined {
+  if (typeName !== undefined && db.options.getBooleanOption('strict_type_names')
+    && !typeRegistry.resolveDeclaredType(typeName)) {
+    return undefined;
+  }
+  return inferType(typeName);
+}
+
+/**
  * ADD COLUMN idempotency: absent ⇒ execute; present with the same LOGICAL TYPE ⇒
  * converged; present with a different type ⇒ conflict.
  *
@@ -1113,13 +1128,15 @@ function localColumn(table: TableSchema, name: string): ColumnSchema | undefined
  * schemas, not rendered text.
  */
 function decideAddColumn(
+  db: Database,
   local: TableSchema,
   column: ColumnDef,
   change: SchemaChangeToApply,
 ): SchemaChangeAction {
   const existing = localColumn(local, column.name);
   if (!existing) return 'execute';
-  const wanted = inferType(column.dataType);
+  const wanted = localColumnType(db, column.dataType);
+  if (!wanted) return 'execute';
   if (wanted.name === existing.logicalType.name) return 'already-applied';
   throw new Error(
     `Schema conflict applying remote ${change.type} for ${change.schema}.${change.table}: ` +

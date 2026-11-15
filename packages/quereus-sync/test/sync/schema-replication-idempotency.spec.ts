@@ -586,6 +586,24 @@ describe('schema replication idempotency', () => {
 				expect(result.errors[0].error.message).to.include('INTEGER');
 			});
 
+			it('refuses a remote column type this peer never registered instead of converging on BLOB', async () => {
+				// A lenient lookup reads `volume` as BLOB, which would call both arms
+				// already applied and leave the peers' column types silently different.
+				await db.exec('alter table orders add column v blob null');
+				schemaEvents = [];
+
+				for (const ddl of [
+					'alter table "orders" add column v volume null',
+					'alter table "orders" alter column v set data type volume',
+				]) {
+					const result = await apply(alter(ddl));
+					expect(result.schemaChangesApplied, ddl).to.equal(0);
+					expect(result.errors, ddl).to.have.lengthOf(1);
+					expect(result.errors[0].error.message, ddl).to.include("Unknown type 'volume'");
+				}
+				expect(schemaEvents).to.deep.equal([]);
+			});
+
 			it('counts a drop column for an absent column applied', async () => {
 				const result = await apply(alter('alter table "orders" drop column gone'));
 

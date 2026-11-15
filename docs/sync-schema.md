@@ -290,6 +290,8 @@ whether `not null` is even spelled) — a false conflict permanently blocks the 
 is strictly worse than converging on a constraint-level difference. So constraint-level
 drift between two same-named, same-typed columns converges silently.
 
+Both type comparisons (`add column` and `set data type`) resolve the replicated type name the way this peer's engine would. Under `strict_type_names` (see [types.md § Design Decisions](types.md#design-decisions)) a name this peer never registered is never "already applied": the DDL executes, and the engine refuses it with an `Unknown type` error, so a peer missing a plugin's type stops at that migration instead of reading the type as BLOB and converging on a column type that differs from the origin's.
+
 Silent convergence matters beyond noise reduction: a schema-change throw lands in
 `ApplyToStoreResult.errors`, and any non-empty `errors` aborts the whole admission unit
 *before* its CRDT metadata commits (see

@@ -185,7 +185,7 @@ class TypeRegistry {
  * The parser yields one identifier with any parameter list glued on (`varchar(100)`,
  * `decimal(10,5)`), so the first `(` is where the parameters start.
  */
-export function declaredTypeBase(typeName: string): string {
+function declaredTypeBase(typeName: string): string {
 	const paren = typeName.indexOf('(');
 	return (paren < 0 ? typeName : typeName.slice(0, paren)).trim();
 }

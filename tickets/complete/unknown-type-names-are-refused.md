@@ -1,4 +1,4 @@
-description: A column, cast or schema declaration that names a type nobody registered now fails with an error instead of quietly becoming a binary column, and a registered type declared with parameters such as `measure(3)` now resolves to that type. Review the change for gaps in where the check runs.
+description: A column, cast or schema declaration that names a type nobody registered now fails with an error instead of quietly becoming a binary column, and a registered type declared with parameters such as `measure(3)` now resolves to that type. Reviewed; one gap in sync schema replication was fixed.
 architecture: docs/types.md
 files:
   - packages/quereus/src/types/registry.ts  # declaredTypeBase, resolveDeclaredType, requireRegisteredTypeName, new aliases; getTypeOrDefault removed
@@ -12,6 +12,9 @@ files:
   - packages/quereus/src/planner/nodes/scalar.ts  # CastNode.generateType comment
   - packages/quereus/src/index.ts, packages/quereus/src/types/index.ts  # getTypeOrDefault export removed
   - packages/quereus/test/logic/03.6.3-unknown-type-names.sqllogic  # new
+  - packages/quereus-sync/src/sync/store-adapter.ts  # review: localColumnType for replicated ADD COLUMN / SET DATA TYPE decisions
+  - packages/quereus-sync/test/sync/schema-replication-idempotency.spec.ts  # review: unregistered remote type test
+  - docs/sync-schema.md  # review
   - packages/quereus/test/type-system.spec.ts, test/cast-static-type.spec.ts, test/plan/cast-seek-blocking.spec.ts
   - docs/types.md, docs/usage.md, docs/schema-declarative.md, docs/optimizer-rule-families.md
 ----
@@ -59,3 +62,24 @@ files:
 - **db-less resolution stays lenient by design**: `columnDefToSchema`, `createBasicSchema`, `planRetypeConversion`, `quereus-sync`'s `store-adapter.ts` `inferType` calls, and the memory / store / isolation layers' own `columnDefToSchema` calls. They are only reached after the entry-point checks above. If a new user-facing path that takes a type name is added, it needs its own `requireRegisteredTypeName` call — there is no type-level guard against forgetting.
 - **Multi-word SQLite spellings** (`double precision`, `unsigned big int`) still don't parse as one type name, so they are out of scope as the ticket said.
 - **Base-name split** is `indexOf('(')` on the parser's glued string. That is safe because the parser only ever produces `ident` or `ident(…)`; a name registered with a `(` in it would still match through the whole-string step first.
+
+## Review findings
+
+Read the `ticket(implement): unknown-type-names-are-refused` diff first, then the handoff.
+
+**Coverage of entry points (checked).** The parser produces a type name in exactly three AST fields — `ColumnDef.dataType`, `MutationContextVar.dataType`, `AlterColumn.setDataType` — plus `CastExpr.targetType`. Every route those reach in the engine (CREATE TABLE, `importTable` rehydrate, lens logical tables, context variables, ADD COLUMN, SET DATA TYPE, `declare schema`, user and parser-synthesized `cast` — `->>` builds `cast(… as text)`, which passes) goes through `requireRegisteredTypeName` before the lenient `inferType`. The remaining `inferType` callers in core (`runtime/emit/alter-table.ts`, `types/validation.ts`, `schema/table.ts`, `schema-differ.ts`) are behind those checks.
+
+**Found and fixed — sync replication skipped the check (major class, fixed inline).** `quereus-sync`'s `store-adapter.ts` decides whether a replicated `add column` or `alter column … set data type` is "already applied" by comparing `inferType(remoteName)` to the local column's type. On a peer that never registered the origin's type, `inferType('volume')` is BLOB, so over a local BLOB column both arms converged silently and the DDL never ran — the peers' column types stayed different with no error, exactly the outcome this ticket removes. Added `localColumnType(db, name)`: under `strict_type_names`, a name this peer cannot resolve returns undefined and the adapter executes the DDL, so the engine refuses it with its own `Unknown type` message (lenient mode keeps the old comparison). New test in `schema-replication-idempotency.spec.ts` covers both arms; documented in `docs/sync-schema.md` § decision table. The `create_table` arm compares rendered DDL text, so it already reports a type-name difference as a conflict.
+
+**Minor, fixed.** `declaredTypeBase` was exported but used only inside `registry.ts`; made module-private.
+
+**Checked, no change:**
+- Docs: `types.md`, `usage.md`, `schema-declarative.md`, `optimizer-rule-families.md` match the code; the alias list in `types.md` matches the registry constructor. No stale `getTypeOrDefault` references remain outside tickets.
+- Prepared statements: the check runs at build, so a statement prepared with the option off keeps its lenient resolution after the option is turned on. Same "baked at prepare" behaviour `runtime_fuse_scalars` documents; the option's description says "checked when a statement is built". Only the engine's internal statement cache keys on SQL text, and it never uses user type names. No tripwire needed.
+- Reopen test gap (raised in handoff): declined to add a committed test. The rehydrate path and CREATE share the single gate in `buildColumnSchemas`, which the sqllogic file covers; a reopen test would have to rewrite persisted catalog bytes, which costs more than it pins.
+- Declare-time vs apply-time option read, and stored view/CHECK/DEFAULT expressions with a `cast` to a since-unregistered type failing at next plan rather than at reopen — both consistent with "error instead of wrong result"; left as the handoff describes them.
+- Tests: the implementer's new sqllogic and `type-system.spec.ts` case pin the contract (refusal per entry point, base-name resolution); the `nvarchar` → `mychar` switches keep the affinity-only cases meaningful. Nothing to cut.
+- Pre-existing duplication: the parser has three copies of the type-name-with-parameters loop (`parseDataTypeName`, `columnDefinition`, `parseMutationContextDefinitions`). Not introduced here and outside this ticket's diff; left alone.
+- Type safety / error handling: `TypeNameOptions` keeps `types/` independent of `core/`; errors carry `StatusCode.ERROR` and source location where the AST has one.
+
+**Validation.** `yarn workspace @quereus/quereus lint` clean; `tsc -b tsconfig.build.json` clean; `@quereus/quereus` test 11148 passing / 26 pending; `yarn test:store` 11141 passing / 33 pending (the implementer had not run this); `@quereus/sync` test 879 passing.
