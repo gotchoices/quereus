@@ -124,6 +124,12 @@ export interface LogicalType {
 	// Metadata
 	/** Is this a numeric type? */
 	isNumeric?: boolean;
+	/**
+	 * Values are amounts of one measure (a length, a mass, an amount of money). Opts the
+	 * type in to being kept through arithmetic and aggregates that leave the measure
+	 * unchanged. Requires isNumeric and a physicalType of INTEGER or REAL.
+	 */
+	isQuantity?: boolean;
 	/** Is this a textual type? */
 	isTextual?: boolean;
 	/** Is this a temporal type? */

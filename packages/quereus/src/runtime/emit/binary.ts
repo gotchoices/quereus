@@ -18,6 +18,7 @@ import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
 import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
+import { isRealStoredQuantity } from "../../types/builtin-types.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { classifyBinaryOperator } from "../../planner/analysis/binary-operator-class.js";
 import { literalValue } from "../../planner/analysis/predicate-shape.js";
@@ -187,7 +188,20 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let run: (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue;
 	let note: string;
 
-	if (leftLogical.isTemporal || rightLogical.isTemporal) {
+	if (isRealStoredQuantity(plan.getType().logicalType)) {
+		// Selected by the announced type, so it cannot disagree with `generateType`, which
+		// announces a REAL-stored quantity only over two numeric-class operands with no
+		// temporal case. Floating point on purpose, not `mixedBigIntArithmetic`: that keeps
+		// a `bigint` operand exact against a whole number, returning a `bigint` (outside the
+		// REAL-stored type) and truncating `/` (`7.0 / 2n` → 3). A measured amount wants
+		// neither.
+		run = function runRealQuantity(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+			if (v1 === null || v2 === null) return null;
+			const result = inner(Number(v1), Number(v2));
+			return Number.isFinite(result) ? result : null;
+		};
+		note = `${plan.expression.operator}(real-quantity)`;
+	} else if (leftLogical.isTemporal || rightLogical.isTemporal) {
 		// Temporal path. Both operands' declared logical types are already in hand — that
 		// is *why* this branch was selected — so the (operator, left kind, right kind)
 		// lookup into the operation table (types/temporal-ops.ts) happens once here rather

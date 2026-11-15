@@ -1,13 +1,15 @@
 import { createLogger } from '../../common/logger.js';
-import { StatusCode, type SqlValue } from '../../common/types.js';
+import { StatusCode, type DeepReadonly, type SqlValue } from '../../common/types.js';
+import type { ScalarType } from '../../common/datatype.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { QuereusError } from '../../common/errors.js';
 import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer, ArgTypeValidator } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, getSqlDataTypeName, BINARY_COLLATION } from '../../util/comparison.js';
 import { canonicalizeInteger } from '../../util/numeric-canonical.js';
-import { isSummableType } from '../../types/builtin-types.js';
+import { isRealStoredQuantity, isSummableType, quantityClass } from '../../types/builtin-types.js';
 import { valueToText } from '../../util/value-text.js';
-import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
+import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN, scalarReturn } from './return-types.js';
 
 const log = createLogger('func:builtins:aggregate');
 const warnLog = log.extend('warn');
@@ -217,6 +219,32 @@ function finalizeSum(acc: SumAccumulator): number | bigint | null {
 	return Number(acc.exact) + real;
 }
 
+/**
+ * Return-type inference for sum, avg and total: the argument's own quantity type
+ * (`LogicalType.isQuantity`) when its stored form is one of `keptFor`, else `declared`.
+ * The static `returnType` stays `declared`: the materialized-view delta gate reads it,
+ * and that decision must not depend on the argument.
+ */
+function keepQuantityArgType(
+	keptFor: readonly ('INTEGER' | 'REAL')[],
+	declared: ScalarType,
+): (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType {
+	return (argTypes) => {
+		const argType = argTypes[0];
+		const stored = argType && quantityClass(argType);
+		return stored && keptFor.includes(stored)
+			? scalarReturn(argType as LogicalType, declared.nullable)
+			: declared;
+	};
+}
+
+/** sum's finalize for a REAL-stored quantity argument: a REAL-stored type admits no
+ *  `bigint`, which sum produces when every row was whole and the total passed 2^53. */
+function finalizeSumAsNumber(acc: SumAccumulator): number | null {
+	const total = finalizeSum(acc);
+	return typeof total === 'bigint' ? Number(total) : total;
+}
+
 export const sumFunc = createAggregateFunction(
 	{
 		name: 'sum', numArgs: 1, initialValue: null,
@@ -225,7 +253,19 @@ export const sumFunc = createAggregateFunction(
 		// (`isExactIntegerDomain`), so even a REAL-typed argument whose rows happen to
 		// hold safe integers accumulates in the exact part and can finalize a `bigint`
 		// past 2^53 (`addWithPromotion`). No static argument type promises `number`.
+		// The one narrowing is a quantity argument, whose bound finalize below makes a
+		// REAL-stored total a `number`.
 		returnType: NUMERIC_RETURN,
+		inferReturnType: keepQuantityArgType(['INTEGER', 'REAL'], NUMERIC_RETURN),
+		// No stepFunction and no algebra: bindAggregateSchema keeps the declared ones.
+		// NOTE: a rollup answering a coarser sum(len) from a materialized view of finer
+		// sums reads partials this finalize already made `number`, so past 2^53 its total
+		// can differ from a direct sum in the last digits. Matters only for a quantity
+		// whose totals exceed 9e15 in its stored unit.
+		bindArgs: (args) => {
+			const argType = args[0]?.logicalType;
+			return argType && isRealStoredQuantity(argType) ? { finalizeFunction: finalizeSumAsNumber } : undefined;
+		},
 		validateArgTypes: validateSummableArg,
 		// NOTE: declared unconditionally; exactness under retraction is a value-domain
 		// property (floats drift) the function cannot see, so the write-side delta arm
@@ -292,6 +332,8 @@ export const avgFunc = createAggregateFunction(
 	{
 		name: 'avg', numArgs: 1, initialValue: null,
 		returnType: REAL_RETURN,
+		// An INTEGER-stored quantity keeps REAL: an average of whole cents is not whole.
+		inferReturnType: keepQuantityArgType(['REAL'], REAL_RETURN),
 		validateArgTypes: validateSummableArg,
 		// No decode — the stored quotient forgets the count and cannot reconstruct
 		// an accumulator. Maintained/rolled up via its decomposition instead.
@@ -439,7 +481,12 @@ export const groupConcatFuncRev = createAggregateFunction(
 // maintenance-equivalence oracle compares byte-exactly. Residual-only is correct,
 // just not incremental. Same for group_concat / var_* / stddev_* below.
 export const totalFunc = createAggregateFunction(
-	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: REAL_RETURN_NOT_NULL, validateArgTypes: validateSummableArg },
+	{
+		name: 'total', numArgs: 1, initialValue: 0.0, returnType: REAL_RETURN_NOT_NULL,
+		// An INTEGER-stored quantity keeps REAL: total always adds in floating point.
+		inferReturnType: keepQuantityArgType(['REAL'], REAL_RETURN_NOT_NULL),
+		validateArgTypes: validateSummableArg,
+	},
 	(acc: number, value: SqlValue): number => {
 		const summand = toSummand('total', value);
 		return summand === null ? acc : acc + Number(summand);

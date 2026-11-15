@@ -276,6 +276,7 @@ export interface LogicalType {
 
   // Metadata
   isNumeric?: boolean;
+  isQuantity?: boolean;                      // Amounts of one measure; see Quantity types
   isTextual?: boolean;
   isTemporal?: boolean;
 
@@ -1319,6 +1320,31 @@ create table users (
 
 insert into users values ('550e8400-e29b-41d4-a716-446655440000', 'Alice');
 ```
+
+### Quantity types
+
+A numeric type can say what its values measure (a length, a mass, an amount of money) by setting `isQuantity`. The type is then kept through the arithmetic and aggregates that leave the measure unchanged, so `len + len`, `len * 2` and `sum(len)` announce `LENGTH` rather than the builtin REAL. Without the flag, every arithmetic operator and `sum`, `avg` and `total` announce a builtin type. The rules are in [Binary operator result types](types-inference.md#binary-operator-result-types) and, for aggregates, [Omitting the return type](types-inference.md#omitting-the-return-type).
+
+```typescript
+db.registerType('LENGTH', { ...REAL_TYPE, name: 'LENGTH', isQuantity: true });   // stored as REAL
+db.registerType('CENTS', { ...INTEGER_TYPE, name: 'CENTS', isQuantity: true });  // stored as INTEGER
+```
+
+Registration throws unless the type also sets `isNumeric`, is stored as INTEGER or REAL (`physicalType`), is not named `NUMERIC`, and does not set `isTemporal`.
+
+By setting the flag the host agrees to two things the engine cannot check:
+
+- **A plain number is a pure scale factor.** `len * 2` is a length, and so is `len * qty` where `qty` is a count. The engine cannot tell a count from a rate, so `len * unit_price` also announces `LENGTH` when `unit_price` is a plain REAL column, although the value is money. A host that keeps rates or money in the same tables declares those columns with their own quantity types: two different quantities multiplied or divided announce the builtin type, which is the correct "no known measure" answer.
+- **`validate` and `parse` do not run on a computed value.** A value announced as `LENGTH` and written into a `LENGTH` column is trusted; the write path checks only its JavaScript form (`buildCellCoercion`, `types/validation.ts`). `len - len` can be negative and `len / 3` can have any number of decimals, so a quantity type must not use `validate` or `parse` to restrict range or precision. Those restrictions belong in CHECK constraints.
+
+Where the quantity is not kept, the announcement is the builtin type it would have been without the flag; no combination raises an error. These shapes fall back today:
+
+- **A quantity mixed with a plain number where no conversion happens**: `coalesce(sum(len), 0)`, `case when c then len else 0 end`, `select len from a union all select 0` announce ANY, because neither branch is converted. Use `total(len)` for an empty group's zero (REAL-stored types only), or `cast(0 as length)`.
+- **Products and quotients of quantities**: `width * height` announces REAL. Use `cast(width * height as area)`.
+- **Fractions of an INTEGER-stored quantity**: `cents / 2`, `cents * 1.5`, `avg(cents)` and `total(cents)` announce the builtin type, since the value need not be whole.
+- **Other functions**: `sqrt`, `floor`, `ceil`, the statistical aggregates and the rest keep their declared return types.
+
+Set the flag before creating materialized views over the type. A view persisted earlier keeps a `sum` backing column declared NUMERIC, while the plan recomputed after the flag announces the quantity type.
 
 ---
 

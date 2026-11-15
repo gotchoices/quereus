@@ -107,7 +107,15 @@ Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the e
   and store `1.4142135623730951` in an INTEGER column. `sum()` declares `NUMERIC` for the
   same reason, and deliberately does *not* narrow to its argument's type: its exact/approx
   accumulator split routes per **value**, so even a REAL-typed column whose rows happen to
-  hold safe integers can finalize a `bigint` past 2^53.
+  hold safe integers can finalize a `bigint` past 2^53. The exception is a quantity argument
+  ([types.md § Quantity types](types.md#quantity-types)): `sum(len)` announces the argument's
+  own type for either stored form, and for a REAL-stored one `sum`'s `bindArgs` binds a
+  finalize that turns a `bigint` total into a `number`, so the announcement holds in every
+  place the aggregate runs (grouped, window, materialized-view maintenance and rollup).
+  `avg` and `total` keep a REAL-stored quantity only — an average of whole cents is not
+  whole, and `total` always adds in floating point — and need no runtime change, since both
+  always return a `number`. All three keep their static `returnType`, which the
+  materialized-view delta gate reads to decide whether a sum is maintained incrementally.
 
 Because of that default, **`validateArgTypes` must let an argument through whose type the
 planner cannot classify** — rejecting `ANY` at plan time makes the function unusable over
@@ -133,7 +141,7 @@ The following built-in functions use type inference:
 - **Numeric functions**: `abs()`, `round()`, `nullif()`, `sqrt()`, `floor()`, `ceil()`, `ceiling()`, `clamp()`
 - **Common type resolution**: `coalesce()`, `iif()`, `greatest()`, `least()`, `choose()` — all five return one of their arguments *verbatim*, so their declared type must cover every argument they could pick. That is exactly a set operation's output column, so the fold is `mergeSetOpAdvertisedType` (`findCommonType` in `func/builtins/scalar.ts`): identical types keep theirs, a NULL argument yields to the other side (`greatest(int_col, null)` stays INTEGER), differing builtin numerics merge to `NUMERIC`, and an irreconcilable pair is `ANY` (`coalesce(int_col, text_col)`). See "Semantic ordering".
 - **String functions**: `length()`, `upper()`, `lower()`, `trim()`, `ltrim()`, `rtrim()`, `substr()`, `substring()`, `replace()`, `reverse()`, `lpad()`, `rpad()`, `instr()`
-- **Aggregate functions**: `MIN()`, `MAX()`
+- **Aggregate functions**: `MIN()`, `MAX()`; `SUM()`, `AVG()`, `TOTAL()` over a quantity type (see above)
 - **Window navigation**: `LAG()`, `LEAD()` — arg[0] passed through, folded with the optional default arg[2] through the same merge, since the default is emitted verbatim when the offset runs off the partition. arg[1] (the offset) never surfaces in the result.
 - **Arithmetic operators**: `+`, `-`, `*`, `/`, `%` — see the promotion table below
 
@@ -182,7 +190,22 @@ Arithmetic takes the first of three arms:
    | `INTEGER` + `INTEGER` | `/` | `NUMERIC` | real division on the number path (`1/2` → `0.5`), truncating on the bigint path |
    | `INTEGER` + `INTEGER` | `+ - * %` | `INTEGER` | |
 
-   An operand's class is the builtin numeric value space its values inhabit (`numericPromotionClass`, `types/builtin-types.ts`): `NUMERIC` by name, otherwise `REAL` or `INTEGER` by `physicalType`, the same split `buildConformanceCheck` applies for [R2](types.md#physical-representation). So a plugin-registered `isNumeric` type stored as REAL promotes like `REAL` (`len * len` over a REAL-stored `LENGTH` announces `REAL`, not `INTEGER`), and one stored any other way (TEXT, BOOLEAN, OBJECT) has no class and takes the third arm. The result is always a builtin type today; a type that opts in as a quantity will be kept through the operations that leave its measure unchanged (`tickets/implement/feat-custom-numeric-type-survives-arithmetic-and-sums.md`).
+   An operand's class is the builtin numeric value space its values inhabit (`numericPromotionClass`, `types/builtin-types.ts`): `NUMERIC` by name, otherwise `REAL` or `INTEGER` by `physicalType`, the same split `buildConformanceCheck` applies for [R2](types.md#physical-representation). So a plugin-registered `isNumeric` type stored as REAL promotes like `REAL` (`len * len` over a REAL-stored `LENGTH` announces `REAL`, not `INTEGER`), and one stored any other way (TEXT, BOOLEAN, OBJECT) has no class and takes the third arm.
+
+   **Quantity types.** A type that sets `isQuantity` ([types.md § Quantity types](types.md#quantity-types)) is then kept where the operation leaves its measure unchanged (`quantityArithmeticResult`, `types/builtin-types.ts`). Below, `Q` is a quantity type, `Q'` a different one, and `n` any other operand with a numeric class; a custom numeric type without the flag counts as `n`. Step 1 picks a candidate:
+
+   | Expression | Candidate |
+   |---|---|
+   | `Q + Q`, `Q - Q`, `Q % Q` (same type on both sides, compared by name) | `Q` |
+   | `Q * n`, `n * Q`, `Q / n`, `Q % n` | `Q` |
+   | anything else: `Q * Q`, `Q / Q`, `n / Q`, `n % Q`, `Q + n`, `n - Q`, and every operator between `Q` and `Q'` | none |
+
+   Step 2 checks the candidate against the stored form of `Q`, with `P` the builtin type the table above gives:
+
+   - `Q` stored as REAL: the candidate always stands. `buildNumericOpSpec` evaluates an expression announced as a REAL-stored quantity in floating point rather than through `mixedBigIntArithmetic`, which can return a `bigint` and truncates `/` (`7.0 / 2n` gives 3), so the value is always a `number`.
+   - `Q` stored as INTEGER: the candidate stands only when `P` is `INTEGER`. `cents + cents`, `cents % cents`, `cents * 2` keep it; `cents / 2` and `cents * 1.5` can be fractional and announce `P`.
+
+   With no candidate, or one that does not stand, the announcement is `P`; a combination that makes no sense as a measure is never an error. The announced type is the quantity operand's own object, never a copy, because the write path and `mergeSetOpColumnType` compare types by identity. Nullability does not depend on this rule.
 3. **Otherwise** → `ANY`. The declared types settle nothing, so
    `buildCoercingArithmeticRun` decides per row: a TEXT operand holding a duration string
    yields a TIMESPAN string, an ordinary string coerces to a number (`'123' + 0` → `123`,

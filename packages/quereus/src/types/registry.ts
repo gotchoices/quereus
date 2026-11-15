@@ -8,6 +8,7 @@ import {
 	BOOLEAN_TYPE,
 	NUMERIC_TYPE,
 	ANY_TYPE,
+	quantityClass,
 } from './builtin-types.js';
 import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESTAMP_TYPE, TIMESPAN_TYPE } from './temporal-types.js';
 import { JSON_TYPE } from './json-type.js';
@@ -18,6 +19,20 @@ import { StatusCode } from '../common/types.js';
 const log = createLogger('types:registry');
 const warnLog = log.extend('warn');
 const debugLog = log.extend('debug');
+
+/**
+ * Refuses a type that sets `isQuantity` without being stored as a builtin INTEGER or REAL
+ * value space, or that is also temporal, so no planner or evaluator code has to handle a
+ * TEXT-stored or NUMERIC quantity.
+ */
+function assertValidQuantityDeclaration(type: LogicalType): void {
+	if (type.isQuantity !== true) return;
+	if (quantityClass(type) !== undefined && type.isTemporal !== true) return;
+	throw new QuereusError(
+		`Type '${type.name}' sets isQuantity, which requires isNumeric, a physicalType of INTEGER or REAL, a name other than NUMERIC, and no isTemporal`,
+		StatusCode.ERROR,
+	);
+}
 
 /**
  * Global type registry that maps type names to logical type definitions.
@@ -85,6 +100,7 @@ class TypeRegistry {
 	 * @param type The logical type to register
 	 */
 	registerType(type: LogicalType): void {
+		assertValidQuantityDeclaration(type);
 		const upperName = type.name.toUpperCase();
 		if (this.types.has(upperName)) {
 			warnLog(`Overwriting existing type: ${upperName}`);

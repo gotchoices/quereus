@@ -22,7 +22,8 @@ import type { SqlValue } from '../src/common/types.js';
 import { PlanNode } from '../src/planner/nodes/plan-node.js';
 import { BinaryOpNode } from '../src/planner/nodes/scalar.js';
 import { conformsToType } from '../src/types/representation.js';
-import { INTEGER_TYPE, REAL_TYPE } from '../src/types/builtin-types.js';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
+import { getType } from '../src/types/registry.js';
 import { classifyBinaryOperator } from '../src/planner/analysis/binary-operator-class.js';
 import { isComparisonOperator } from '../src/planner/analysis/comparison-collation.js';
 
@@ -178,6 +179,83 @@ describe('BinaryOpNode static type', () => {
 			await db.exec('create table bc (id integer primary key, a bopcount not null, b bopcount not null)');
 			expect(findBinary('select a + b as v from bc').getType().nullable).to.equal(false);
 			expect(await expectAnnouncedAndInhabited(`${count(3)} / ${count(4)}`, 'NUMERIC')).to.equal(0.75);
+		});
+	});
+
+	describe('arithmetic over quantity types keeps the measure', () => {
+		// BOPQLEN and BOPQMASS are REAL-stored quantities, BOPQCENTS an INTEGER-stored one.
+		beforeEach(() => {
+			db.registerType('BOPQLEN', { ...REAL_TYPE, name: 'BOPQLEN', isQuantity: true });
+			db.registerType('BOPQMASS', { ...REAL_TYPE, name: 'BOPQMASS', isQuantity: true });
+			db.registerType('BOPQCENTS', { ...INTEGER_TYPE, name: 'BOPQCENTS', isQuantity: true });
+		});
+
+		const len = (n: number): string => `cast(${n} as bopqlen)`;
+		const mass = (n: number): string => `cast(${n} as bopqmass)`;
+		const cents = (n: number): string => `cast(${n} as bopqcents)`;
+
+		const cases: ReadonlyArray<readonly [expr: string, typeName: string, value: number]> = [
+			// Step 1, measure kept: same quantity on both sides of + - %, scaled by a plain number.
+			[`${len(1.5)} + ${len(1.5)}`, 'BOPQLEN', 3],
+			[`${len(1.5)} - ${len(1)}`, 'BOPQLEN', 0.5],
+			[`${len(3.5)} % ${len(1.5)}`, 'BOPQLEN', 0.5],
+			[`${len(1.5)} * 2`, 'BOPQLEN', 3],
+			[`2 * ${len(1.5)}`, 'BOPQLEN', 3],
+			[`${len(1.5)} / 2`, 'BOPQLEN', 0.75],
+			[`${len(3.5)} % 2`, 'BOPQLEN', 1.5],
+			// Step 1, no known measure: the builtin promotion stands.
+			[`${len(1.5)} * ${len(1.5)}`, 'REAL', 2.25],
+			[`${len(3)} / ${len(1.5)}`, 'REAL', 2],
+			[`3 / ${len(1.5)}`, 'NUMERIC', 2],
+			[`3 % ${len(2)}`, 'NUMERIC', 1],
+			[`${len(1.5)} + 2`, 'NUMERIC', 3.5],
+			[`2 - ${len(1.5)}`, 'NUMERIC', 0.5],
+			[`${len(1.5)} + ${mass(2)}`, 'REAL', 3.5],
+			[`${len(1.5)} - ${mass(2)}`, 'REAL', -0.5],
+			[`${len(1.5)} * ${mass(2)}`, 'REAL', 3],
+			[`${len(3)} / ${mass(2)}`, 'REAL', 1.5],
+			[`${len(3)} % ${mass(2)}`, 'REAL', 1],
+			// Step 2, INTEGER-stored: kept only where the builtin promotion is INTEGER.
+			[`${cents(3)} + ${cents(4)}`, 'BOPQCENTS', 7],
+			[`${cents(3)} - ${cents(4)}`, 'BOPQCENTS', -1],
+			[`${cents(7)} % ${cents(4)}`, 'BOPQCENTS', 3],
+			[`${cents(3)} * 2`, 'BOPQCENTS', 6],
+			[`2 * ${cents(3)}`, 'BOPQCENTS', 6],
+			[`${cents(7)} % 4`, 'BOPQCENTS', 3],
+			[`${cents(3)} * 1.5`, 'NUMERIC', 4.5],
+			[`${cents(3)} / 2`, 'NUMERIC', 1.5],
+			[`${cents(3)} * ${cents(4)}`, 'INTEGER', 12],
+		];
+
+		it('announces the quantity exactly where the rule keeps it, and the value inhabits it', async () => {
+			for (const [expr, typeName, value] of cases) {
+				expect(await expectAnnouncedAndInhabited(expr, typeName), expr).to.equal(value);
+				if (typeName.startsWith('BOPQ')) {
+					// The operand's own object: the write path compares types by identity.
+					expect(findBinary(`select ${expr} as v`).getType().logicalType, expr).to.equal(getType(typeName));
+				}
+			}
+		});
+
+		it('computes a REAL-stored quantity in floating point, never as a bigint', async () => {
+			// 9007199254740993 is a bigint literal; the bigint-preserving body would return a bigint.
+			const product = await expectAnnouncedAndInhabited(`${len(3)} * 9007199254740993`, 'BOPQLEN');
+			expect(typeof product).to.equal('number');
+			const divided = findBinary(`select ${len(1.5)} / 0 as v`);
+			expect(divided.getType().logicalType.name).to.equal('BOPQLEN');
+			expect(divided.getType().nullable).to.equal(true);
+			expect(await firstValue(`select ${len(1.5)} / 0 as v`)).to.equal(null);
+		});
+
+		it('keeps + over two NOT NULL INTEGER-stored quantity columns non-nullable', async () => {
+			await db.exec('create table qc (id integer primary key, a bopqcents not null, b bopqcents not null)');
+			expect(findBinary('select a + b as v from qc').getType().nullable).to.equal(false);
+		});
+
+		it('refuses a quantity type stored as TEXT', () => {
+			expect(() => db.registerType('BOPQTEXT', { ...TEXT_TYPE, name: 'BOPQTEXT', isNumeric: true, isQuantity: true }))
+				.to.throw(/isQuantity/);
+			expect(getType('BOPQTEXT')).to.equal(undefined);
 		});
 	});
 

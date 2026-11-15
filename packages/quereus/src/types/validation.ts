@@ -131,9 +131,13 @@ export function coerceRowToSchema(row: Row, columns: readonly ColumnSchema[], la
  *   and re-converting them would be destructive: JSON's `parse` reads a plain JS string
  *   as JSON *source*, so re-converting a stored JSON text value either changes it (the
  *   text `9` becomes the number 9) or throws (`abc` is not valid JSON source). But the
- *   claim is a static INFERENCE the engine does not otherwise enforce — `sum()` announces
- *   REAL and can produce a `bigint`; an untyped positional `?` announces TEXT and can be
- *   bound to anything — so it is checked against the value in hand rather than trusted.
+ *   claim is a static INFERENCE the engine does not otherwise enforce — a function's
+ *   declared return type is its author's word (`sum()` once announced REAL while
+ *   producing a `bigint`; it announces NUMERIC now), and a virtual table can return a
+ *   value outside its declared column type — so it is checked against the value in hand
+ *   rather than trusted. Only the JavaScript form is checked: a quantity type's
+ *   (`isQuantity`) `validate` does not run on a computed `len - len`, which is why such a
+ *   type must not restrict range or precision there (docs/types.md § Quantity types).
  *   `conformsToType` (`types/representation.ts`) answers "does this value inhabit this
  *   type" — the same predicate
  *   the `QUEREUS_REPR_STRICT` checker enforces (rule R2 of docs/types.md § Physical

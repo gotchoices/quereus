@@ -382,6 +382,74 @@ export function numericPromotionClass(type: DeepReadonly<LogicalType>): NumericP
 }
 
 /**
+ * The stored form of a quantity type (`LogicalType.isQuantity`): its promotion class,
+ * which registration (`TypeRegistry.registerType`) restricts to INTEGER or REAL.
+ * `undefined` for a type that is not a quantity — including one that sets the flag but
+ * never passed registration, which is then treated as a plain number.
+ */
+export function quantityClass(type: DeepReadonly<LogicalType>): 'INTEGER' | 'REAL' | undefined {
+	if (type.isQuantity !== true) return undefined;
+	const cls = numericPromotionClass(type);
+	return cls === 'INTEGER' || cls === 'REAL' ? cls : undefined;
+}
+
+/** True for a quantity type stored as REAL, whose arithmetic and sums must yield a `number`. */
+export function isRealStoredQuantity(type: DeepReadonly<LogicalType>): boolean {
+	return quantityClass(type) === 'REAL';
+}
+
+/**
+ * The quantity type an arithmetic expression keeps, or `undefined` when it announces the
+ * builtin `promoted` type (what `promoteNumericArithmetic` gave for the operand classes).
+ * Both operands must already have a numeric promotion class. See docs/types-inference.md
+ * § Binary operator result types for the rule table.
+ *
+ * The result is the operand's own object, never a copy: the write path and
+ * `mergeSetOpColumnType` compare types by identity.
+ */
+export function quantityArithmeticResult(
+	operator: string,
+	left: LogicalType,
+	right: LogicalType,
+	promoted: DeepReadonly<LogicalType>,
+): LogicalType | undefined {
+	const candidate = measurePreservingOperand(operator, left, right);
+	if (!candidate) return undefined;
+	// An INTEGER-stored quantity holds only whole values, so it survives only where the
+	// builtin promotion already promises an integer (`cents / 2`, `cents * 1.5` do not).
+	// A REAL-stored one always survives: the evaluator computes it in floating point.
+	if (quantityClass(candidate) === 'REAL' || numericPromotionClass(promoted) === 'INTEGER') {
+		return candidate;
+	}
+	return undefined;
+}
+
+/**
+ * Step 1 of {@link quantityArithmeticResult}: the quantity operand whose measure the
+ * operation keeps. A plain number is a pure scale factor (`len * 2`, `len / 2`), adding or
+ * taking a remainder needs the same quantity on both sides, and everything else — a
+ * product or quotient of quantities, a plain number divided by one, two different
+ * quantities — has no known measure.
+ */
+function measurePreservingOperand(operator: string, left: LogicalType, right: LogicalType): LogicalType | undefined {
+	const leftIsQuantity = quantityClass(left) !== undefined;
+	const rightIsQuantity = quantityClass(right) !== undefined;
+	if (leftIsQuantity && rightIsQuantity) {
+		// By name, not identity: a schema read back from persistence can hold a second
+		// LogicalType object for the same registered type.
+		if (left.name.toUpperCase() !== right.name.toUpperCase()) return undefined;
+		return operator === '+' || operator === '-' || operator === '%' ? left : undefined;
+	}
+	if (leftIsQuantity) {
+		return operator === '*' || operator === '/' || operator === '%' ? left : undefined;
+	}
+	if (rightIsQuantity) {
+		return operator === '*' ? right : undefined;
+	}
+	return undefined;
+}
+
+/**
  * The three builtin types whose values share one numeric seek key space. Tested by
  * IDENTITY against the registry singletons, deliberately not by `type.isNumeric`:
  * a plugin-registered numeric type supplies its own `compare`, which is what a

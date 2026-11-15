@@ -11,6 +11,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
+import { INTEGER_TYPE, REAL_TYPE } from '../src/types/builtin-types.js';
 
 describe('Announced result-column types match produced values', () => {
 	let db: Database;
@@ -105,6 +106,46 @@ describe('Announced result-column types match produced values', () => {
 		it('announces REAL for avg() and total(), which always return a number', async () => {
 			expect(await announcedType('select avg(i) as v from t')).to.equal('REAL');
 			expect(await announcedType('select total(i) as v from t')).to.equal('REAL');
+		});
+
+		describe('over a quantity type', () => {
+			// ARTLEN is a REAL-stored quantity, ARTCENTS an INTEGER-stored one.
+			beforeEach(async () => {
+				db.registerType('ARTLEN', { ...REAL_TYPE, name: 'ARTLEN', isQuantity: true });
+				db.registerType('ARTCENTS', { ...INTEGER_TYPE, name: 'ARTCENTS', isQuantity: true });
+				await db.exec('create table q (id integer primary key, len artlen null, c artcents null)');
+			});
+
+			const cases: ReadonlyArray<readonly [call: string, typeName: string, nullable: boolean]> = [
+				['sum(len)', 'ARTLEN', true],
+				['sum(c)', 'ARTCENTS', true],
+				['avg(len)', 'ARTLEN', true],
+				// An average of whole cents is not whole.
+				['avg(c)', 'REAL', true],
+				['total(len)', 'ARTLEN', false],
+				// total always adds in floating point.
+				['total(c)', 'REAL', false],
+			];
+
+			it('keeps the quantity where its stored form admits the result', async () => {
+				for (const [call, typeName, nullable] of cases) {
+					const sql = `select ${call} as v from q`;
+					expect(await announcedType(sql), call).to.equal(typeName);
+					expect(await announcedNullable(sql), call).to.equal(nullable);
+				}
+			});
+
+			it('finalizes a REAL-stored quantity sum past 2^53 as a number', async () => {
+				// Both rows are whole, so sum accumulates exactly and would finalize a bigint.
+				await db.exec('insert into q (id, len) values (1, 9007199254740991), (2, 2)');
+				for (const sql of ['select sum(len) as v from q', 'select sum(len) over () as v from q']) {
+					expect(await announcedType(sql), sql).to.equal('ARTLEN');
+					for await (const row of db.eval(sql)) {
+						expect(typeof row.v, sql).to.equal('number');
+						expect(row.v, sql).to.equal(9007199254740992);
+					}
+				}
+			});
 		});
 	});
 

@@ -8,7 +8,7 @@ import { Cached } from "../../util/cached.js";
 import { formatExpression, formatScalarType } from "../../util/plan-formatter.js";
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { NULL_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, ANY_TYPE, numericPromotionClass, type NumericPromotionClass } from "../../types/builtin-types.js";
+import { NULL_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, ANY_TYPE, numericPromotionClass, quantityArithmeticResult, type NumericPromotionClass } from "../../types/builtin-types.js";
 import { inferLogicalTypeFromValue } from "../../common/type-inference.js";
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 import { mergeSetOpAdvertisedType } from "../analysis/set-op-type-merge.js";
@@ -174,7 +174,8 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 /**
  * Result type of arithmetic over two numeric operands, from their promotion classes
  * (`numericPromotionClass`) rather than their type names, so a plugin type stored as REAL
- * promotes like REAL. Always a builtin type.
+ * promotes like REAL. Always a builtin type; `quantityArithmeticResult` may then keep a
+ * quantity operand's type instead.
  */
 function promoteNumericArithmetic(
 	operator: string,
@@ -279,7 +280,12 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 					break;
 				}
 				if (leftClass && rightClass) {
-					logicalType = promoteNumericArithmetic(this.expression.operator, leftClass, rightClass);
+					const promoted = promoteNumericArithmetic(this.expression.operator, leftClass, rightClass);
+					// A quantity type (`isQuantity`) is kept where the operation leaves its
+					// measure unchanged and its stored form admits the result — `len * 2` is a
+					// length. Nullability above does not depend on it.
+					logicalType = quantityArithmeticResult(
+						this.expression.operator, leftType.logicalType, rightType.logicalType, promoted) ?? promoted;
 				} else {
 					// Neither a temporal case nor two operands with a builtin numeric class,
 					// so the declared types settle nothing — and `buildCoercingArithmeticRun`
