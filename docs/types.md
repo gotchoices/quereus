@@ -1346,8 +1346,10 @@ Moved to [Parameter Types](types-parameters.md#parameter-types).
 
 **Type Inference**:
 - `src/planner/analysis/binary-operator-class.ts` - The binary-operator classification (`classifyBinaryOperator`), read by `BinaryOpNode.generateType`, `buildBinaryOpSpec`, `isComparisonOperator`, `building/expression.ts` and `analysis/scalar-param-usage.ts`
-- `src/common/type-inference.ts` - Type inference utilities (`findCommonType`, `promoteNumericTypes`)
-- `src/planner/build-function-call.ts` - Planning-time type inference for function calls
+- `src/types/builtin-types.ts` - `numericPromotionClass`, the INTEGER / REAL / NUMERIC class an arithmetic operand promotes by (see [Binary operator result types](types-inference.md#binary-operator-result-types))
+- `src/common/type-inference.ts` - `inferLogicalTypeFromValue`, the logical type of a runtime value (literals, bound parameters)
+- `src/func/builtins/scalar.ts` - `findCommonType`, the result type of the value-returning polymorphic builtins
+- `src/planner/building/function-call.ts` - Planning-time type inference for function calls
 
 ---
 
