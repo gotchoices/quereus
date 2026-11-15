@@ -1,0 +1,27 @@
+-- 21.2.1-between-correlated-range-seek-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 21.2-between-edges: that file's BETWEEN coverage needs no index
+-- DDL, so this section, which needs a standalone secondary index to be offered a
+-- correlated range seek, moves here instead of costing a backend without
+-- first-class CREATE INDEX the whole BETWEEN file.
+--
+-- Subject: BETWEEN with outer-query bounds in a correlated subquery is offered to
+-- the index as a correlated range seek, so a NULL or reversed outer bound must
+-- still match nothing.
+
+create table bc_i (id integer primary key, x integer);
+create index bc_i_x on bc_i(x);
+create table bc_o (id integer primary key, lo integer null, hi integer null);
+insert into bc_i values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
+insert into bc_o values (1, 2, 4), (2, 4, 2), (3, null, 3), (4, 5, 5);
+
+select count(*) as seeks from query_plan('select (select count(*) from bc_i where bc_i.x between bc_o.lo and bc_o.hi) from bc_o') where op = 'INDEXSEEK';
+→ [{"seeks":1}]
+
+select bc_o.id, (select count(*) from bc_i where bc_i.x between bc_o.lo and bc_o.hi) as n from bc_o order by bc_o.id;
+→ [{"id":1,"n":3},{"id":2,"n":0},{"id":3,"n":0},{"id":4,"n":1}]
+
+drop table bc_i;
+drop table bc_o;
