@@ -1,0 +1,125 @@
+-- 50.0.2-declare-schema-indexes.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 50-declarative-schema: an `index` or `unique index` member of a `declare
+-- schema` block lowers to a standalone `create index` / `drop index` at apply, which not
+-- every backend implements, and the `-- requires-capability:` directive is whole-file.
+-- 50-declarative-schema keeps the rest of the declarative lifecycle. Its steps 38–48 used to
+-- declare, apply and remove these indexes inside that file's running `main` sequence; § 1
+-- rebuilds them here against a fresh database. § 2 is that file's declarative `unique index`
+-- section, moved verbatim. Index renames live in 50.2.1-declare-schema-index-renames.
+--
+-- Subject: declared indexes diff as `create index` after their table, apply creates them, a
+-- converged schema re-diffs empty, and dropping one member diffs as exactly one
+-- `DROP INDEX IF EXISTS`; a declared `unique index` stringifies with its qualifier and
+-- enforces uniqueness after apply.
+
+-- ===================================================================
+-- 1. Index lifecycle: create with the table, converge, remove one
+-- ===================================================================
+
+declare schema main {
+	table products {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		category TEXT,
+		price REAL
+	}
+
+	index idx_products_name on products(name)
+	index idx_products_category on products(category, price)
+}
+
+-- run
+
+-- The table comes first, then its indexes.
+diff schema main;
+→ [{"ddl": "create table products (id INTEGER primary key, name TEXT not null, category TEXT, price REAL)"}, {"ddl": "create index idx_products_name on products (name)"}, {"ddl": "create index idx_products_category on products (category, price)"}]
+
+apply schema main;
+
+-- run
+
+insert into products values (1, 'Laptop', 'Electronics', 999.99);
+insert into products values (2, 'Book', 'Books', 29.99);
+insert into products values (3, 'Shirt', 'Clothing', 19.99);
+
+select * from products order by name;
+→ [{"id": 2, "name": "Book", "category": "Books", "price": 29.99}, {"id": 1, "name": "Laptop", "category": "Electronics", "price": 999.99}, {"id": 3, "name": "Shirt", "category": "Clothing", "price": 19.99}]
+
+-- Converged: the applied indexes match the declaration.
+diff schema main;
+→ []
+
+-- Remove one index member.
+declare schema main {
+	table products {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		category TEXT,
+		price REAL
+	}
+
+	index idx_products_name on products(name)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP INDEX IF EXISTS idx_products_category"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+-- ===================================================================
+-- 2. Declarative `unique index` — parser admits the UNIQUE qualifier and
+-- the diff stringifies it back as `create unique index` so that the
+-- apply path enforces uniqueness the same way a top-level
+-- `CREATE UNIQUE INDEX` does.
+-- ===================================================================
+
+declare schema decl_uniq {
+	table T (
+		id INTEGER PRIMARY KEY,
+		email TEXT NOT NULL,
+		a TEXT,
+		b TEXT
+	)
+
+	unique index ix_T_email on T(email)
+	unique index ix_T_a_b on T(a, b)
+}
+
+-- run
+
+-- Diff stringifies the declared indexes with the `unique` qualifier.
+diff schema decl_uniq;
+→ [{"ddl": "create table decl_uniq.T (id INTEGER primary key, email TEXT not null, a TEXT, b TEXT)"}, {"ddl": "create unique index decl_uniq.ix_T_email on decl_uniq.T (email)"}, {"ddl": "create unique index decl_uniq.ix_T_a_b on decl_uniq.T (a, b)"}]
+
+apply schema decl_uniq;
+
+-- run
+
+-- Apply was idempotent; re-diff is empty.
+diff schema decl_uniq;
+→ []
+
+-- Single-column unique enforcement.
+insert into decl_uniq.T values (1, 'x@y', 'p', 'q');
+insert into decl_uniq.T values (2, 'x@y', 'r', 's');
+-- error: UNIQUE
+
+-- Multi-column unique enforcement (compound key collides on (p,q)).
+insert into decl_uniq.T values (3, 'a@y', 'p', 'q');
+-- error: UNIQUE
+
+-- Distinct compound key is accepted.
+insert into decl_uniq.T values (4, 'b@y', 'p', 'r');
+
+select count(*) as cnt from decl_uniq.T;
+→ [{"cnt": 2}]

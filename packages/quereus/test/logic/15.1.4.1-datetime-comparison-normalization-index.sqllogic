@@ -1,0 +1,83 @@
+-- 15.1.4.1-datetime-comparison-normalization-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 15.1.4-datetime-comparison-normalization, which runs each seekable
+-- predicate over a scan filter (`dn`) and a primary-key seek (`dp`). This file carries the
+-- third shape, a secondary-index seek (`di`), which needs `create index`; the
+-- `-- requires-capability:` directive is whole-file, so the shape lives here. Section
+-- numbers match 15.1.4 so the three shapes line up.
+--
+-- THE RULE (docs/types-ordering.md § DATE, TIME, DATETIME and TIMESTAMP against text): comparing a DATETIME against text normalizes
+-- that text the way a write does, so a timestamp ending in `Z` or an offset finds the
+-- row it created and sorts by the instant it names. Text that does not parse compares
+-- as plain text, and a number is not read as an epoch.
+--
+-- Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`), whose seeks encode their keys differently — most of why this
+-- shape is tested separately from the primary-key seek.
+
+create table di (id integer primary key, t datetime null);
+-- run
+create index di_t on di (t);
+-- run
+insert into di values (1, '2020-01-01T00:00:00Z'), (2, '2021-06-05T10:00:00+02:00');
+-- run
+
+-- ============================================================
+-- 1. Equality, range, BETWEEN and IN
+-- ============================================================
+
+select id from di where t = '2020-01-01T00:00:00Z';
+→ [{"id":1}]
+
+select id from di where t = '2021-06-05T10:00:00+02:00';
+→ [{"id":2}]
+
+select id from di where t >= '2021-06-05T09:00:00+02:00';
+→ [{"id":2}]
+
+select id from di where t < '2021-06-05T09:00:00+02:00';
+→ [{"id":1}]
+
+select id from di where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
+→ [{"id":2}]
+
+select id from di where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
+→ [{"id":1},{"id":2}]
+
+-- Other spellings of the same instant.
+select id from di where t = '2020-01-01';
+→ [{"id":1}]
+select id from di where t = '2020-01-01T00:00:00.000';
+→ [{"id":1}]
+
+-- ============================================================
+-- 2. Bound parameters
+-- ============================================================
+
+-- params: ["2020-01-01T00:00:00Z"]
+select id from di where t = ?;
+→ [{"id":1}]
+
+-- params: {"p":"2021-06-05T10:00:00+02:00"}
+select id from di where t >= :p;
+→ [{"id":2}]
+
+-- Only text normalizes: a number is not read as an epoch, though a cast or a write would.
+-- params: [1577836800000]
+select id from di where t = ?;
+→ []
+
+-- ============================================================
+-- 3. Text that does not parse compares as plain text
+-- ============================================================
+
+select id from di where t = 'garbage';
+→ []
+
+select id from di where t < 'garbage' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from di where t > 'garbage';
+→ []

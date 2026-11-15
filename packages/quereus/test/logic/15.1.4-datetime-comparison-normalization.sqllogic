@@ -7,6 +7,9 @@
 --
 -- The seekable predicates run over three shapes because each reaches the comparison
 -- by a different route: a scan filter, a secondary-index seek and a primary-key seek.
+-- This file carries the scan filter (`dn`) and the primary-key seek (`dp`); the
+-- secondary-index seek needs `create index`, so it lives in
+-- 15.1.4.1-datetime-comparison-normalization-index under the same section numbers.
 -- The remaining comparison sites share one coercion decision, so they run once.
 --
 -- Runs under both the memory module (`yarn test`) and the store module
@@ -14,15 +17,9 @@
 
 create table dn (id integer primary key, t datetime null);
 -- run
-create table di (id integer primary key, t datetime null);
--- run
-create index di_t on di (t);
--- run
 create table dp (t datetime primary key, id integer null);
 -- run
 insert into dn values (1, '2020-01-01T00:00:00Z'), (2, '2021-06-05T10:00:00+02:00');
--- run
-insert into di values (1, '2020-01-01T00:00:00Z'), (2, '2021-06-05T10:00:00+02:00');
 -- run
 insert into dp values ('2020-01-01T00:00:00Z', 1), ('2021-06-05T10:00:00+02:00', 2);
 -- run
@@ -37,51 +34,33 @@ select id, t from dn order by id;
 
 select id from dn where t = '2020-01-01T00:00:00Z';
 → [{"id":1}]
-select id from di where t = '2020-01-01T00:00:00Z';
-→ [{"id":1}]
 select id from dp where t = '2020-01-01T00:00:00Z';
 → [{"id":1}]
 
 select id from dn where t = '2021-06-05T10:00:00+02:00';
-→ [{"id":2}]
-select id from di where t = '2021-06-05T10:00:00+02:00';
 → [{"id":2}]
 select id from dp where t = '2021-06-05T10:00:00+02:00';
 → [{"id":2}]
 
 select id from dn where t >= '2021-06-05T09:00:00+02:00';
 → [{"id":2}]
-select id from di where t >= '2021-06-05T09:00:00+02:00';
-→ [{"id":2}]
 select id from dp where t >= '2021-06-05T09:00:00+02:00';
 → [{"id":2}]
 
 select id from dn where t < '2021-06-05T09:00:00+02:00';
-→ [{"id":1}]
-select id from di where t < '2021-06-05T09:00:00+02:00';
 → [{"id":1}]
 select id from dp where t < '2021-06-05T09:00:00+02:00';
 → [{"id":1}]
 
 select id from dn where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
 → [{"id":2}]
-select id from di where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
-→ [{"id":2}]
 select id from dp where t between '2021-06-05T09:00:00+02:00' and '2021-06-05T11:00:00+02:00';
 → [{"id":2}]
 
 select id from dn where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
 → [{"id":1},{"id":2}]
-select id from di where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
-→ [{"id":1},{"id":2}]
 select id from dp where t in ('2020-01-01T00:00:00Z', '2021-06-05T10:00:00+02:00') order by id;
 → [{"id":1},{"id":2}]
-
--- Other spellings of the same instant.
-select id from di where t = '2020-01-01';
-→ [{"id":1}]
-select id from di where t = '2020-01-01T00:00:00.000';
-→ [{"id":1}]
 
 -- A date-only upper bound is that date's midnight, so a row exactly at midnight is in
 -- range. Plain text order excluded it, because the bound sorted before the stored form.
@@ -96,17 +75,11 @@ select id from dn where t between '2019-01-01' and '2020-01-01';
 select id from dn where t = ?;
 → [{"id":1}]
 -- params: ["2020-01-01T00:00:00Z"]
-select id from di where t = ?;
-→ [{"id":1}]
--- params: ["2020-01-01T00:00:00Z"]
 select id from dp where t = ?;
 → [{"id":1}]
 
 -- params: {"p":"2021-06-05T10:00:00+02:00"}
 select id from dn where t >= :p;
-→ [{"id":2}]
--- params: {"p":"2021-06-05T10:00:00+02:00"}
-select id from di where t >= :p;
 → [{"id":2}]
 -- params: {"p":"2021-06-05T10:00:00+02:00"}
 select id from dp where t >= :p;
@@ -115,9 +88,6 @@ select id from dp where t >= :p;
 -- Only text normalizes: a number is not read as an epoch, though a cast or a write would.
 -- params: [1577836800000]
 select id from dn where t = ?;
-→ []
--- params: [1577836800000]
-select id from di where t = ?;
 → []
 -- params: [1577836800000]
 select id from dp where t = ?;
@@ -129,21 +99,15 @@ select id from dp where t = ?;
 
 select id from dn where t = 'garbage';
 → []
-select id from di where t = 'garbage';
-→ []
 select id from dp where t = 'garbage';
 → []
 
 select id from dn where t < 'garbage' order by id;
 → [{"id":1},{"id":2}]
-select id from di where t < 'garbage' order by id;
-→ [{"id":1},{"id":2}]
 select id from dp where t < 'garbage' order by id;
 → [{"id":1},{"id":2}]
 
 select id from dn where t > 'garbage';
-→ []
-select id from di where t > 'garbage';
 → []
 select id from dp where t > 'garbage';
 → []

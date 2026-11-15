@@ -1,4 +1,6 @@
 -- Test declarative schema full lifecycle
+-- Declared `index` / `unique index` members need standalone index DDL, so they live in
+-- 50.0.2-declare-schema-indexes.
 
 -- Step 1: Declare a schema with a table
 declare schema main {
@@ -413,8 +415,10 @@ apply schema main;
 select count(*) from user_summary;
 -- error: not found in schema path:
 
--- Step 38: Test indexes in declarative schema
--- Note: Using a unique table name to avoid DROP TABLE bug where data persists
+-- Step 38: Replace the declared table with a new one
+-- The index members this step once declared, and the index-removal steps 45–48, live in
+-- 50.0.2-declare-schema-indexes (they need standalone index DDL); the table keeps its name
+-- so the later steps' diffs still see it.
 declare schema main {
 	table products_with_indexes {
 		id INTEGER PRIMARY KEY,
@@ -422,18 +426,15 @@ declare schema main {
 		category TEXT,
 		price REAL
 	}
-
-	index idx_products_name on products_with_indexes(name)
-	index idx_products_category on products_with_indexes(category, price)
 }
 
 -- run
 
--- Step 39: Diff should show table and indexes to create
+-- Step 39: Diff should drop the old table and create the new one
 diff schema main;
-→ [{"ddl": "DROP TABLE IF EXISTS users"}, {"ddl": "create table products_with_indexes (id INTEGER primary key, name TEXT not null, category TEXT, price REAL)"}, {"ddl": "create index idx_products_name on products_with_indexes (name)"}, {"ddl": "create index idx_products_category on products_with_indexes (category, price)"}]
+→ [{"ddl": "DROP TABLE IF EXISTS users"}, {"ddl": "create table products_with_indexes (id INTEGER primary key, name TEXT not null, category TEXT, price REAL)"}]
 
--- Step 40: Apply schema with indexes
+-- Step 40: Apply schema
 apply schema main;
 
 -- run
@@ -455,31 +456,7 @@ select * from products_with_indexes order by name;
 diff schema main;
 → []
 
--- Step 45: Test index removal
-declare schema main {
-	table products_with_indexes {
-		id INTEGER PRIMARY KEY,
-		name TEXT NOT NULL,
-		category TEXT,
-		price REAL
-	}
-
-	index idx_products_name on products_with_indexes(name)
-}
-
--- run
-
--- Step 46: Diff should show one index to drop
-diff schema main;
-→ [{"ddl": "DROP INDEX IF EXISTS idx_products_category"}]
-
--- Step 47: Apply to remove index
-apply schema main;
-
--- run
-
--- Step 48: Diff again - should be empty
-diff schema main;
+-- Steps 45–48 (index removal) moved to 50.0.2-declare-schema-indexes.
 
 -- Test NOT EXISTS in CHECK constraint (regression test for operator spacing)
 -- This tests that "NOT EXISTS" is properly stringified with a space between NOT and EXISTS
@@ -668,7 +645,7 @@ declare schema main {
 
 -- Step 55: Diff should show drops for old main objects plus CREATE TABLE and CREATE ASSERTION
 diff schema main;
-→ [{"ddl": "DROP TABLE IF EXISTS products_with_indexes"}, {"ddl": "DROP INDEX IF EXISTS idx_products_name"}, {"ddl": "create table assert_accounts (id INTEGER primary key, balance INTEGER not null)"}, {"ddl": "create assertion positive_balance check (not exists (select 1 from assert_accounts where balance < 0))"}]
+→ [{"ddl": "DROP TABLE IF EXISTS products_with_indexes"}, {"ddl": "create table assert_accounts (id INTEGER primary key, balance INTEGER not null)"}, {"ddl": "create assertion positive_balance check (not exists (select 1 from assert_accounts where balance < 0))"}]
 
 -- Step 56: Apply creates the table and assertion
 apply schema main with seed;
@@ -946,53 +923,7 @@ insert into assert_rename.t2 values (-1);
 commit;
 -- error: Integrity assertion failed: assert_rename.range_check
 
--- ===================================================================
--- Declarative `unique index` — parser admits the UNIQUE qualifier and
--- the diff stringifies it back as `create unique index` so that the
--- apply path enforces uniqueness the same way a top-level
--- `CREATE UNIQUE INDEX` does.
--- ===================================================================
-
-declare schema decl_uniq {
-	table T (
-		id INTEGER PRIMARY KEY,
-		email TEXT NOT NULL,
-		a TEXT,
-		b TEXT
-	)
-
-	unique index ix_T_email on T(email)
-	unique index ix_T_a_b on T(a, b)
-}
-
--- run
-
--- Diff stringifies the declared indexes with the `unique` qualifier.
-diff schema decl_uniq;
-→ [{"ddl": "create table decl_uniq.T (id INTEGER primary key, email TEXT not null, a TEXT, b TEXT)"}, {"ddl": "create unique index decl_uniq.ix_T_email on decl_uniq.T (email)"}, {"ddl": "create unique index decl_uniq.ix_T_a_b on decl_uniq.T (a, b)"}]
-
-apply schema decl_uniq;
-
--- run
-
--- Apply was idempotent; re-diff is empty.
-diff schema decl_uniq;
-→ []
-
--- Single-column unique enforcement.
-insert into decl_uniq.T values (1, 'x@y', 'p', 'q');
-insert into decl_uniq.T values (2, 'x@y', 'r', 's');
--- error: UNIQUE
-
--- Multi-column unique enforcement (compound key collides on (p,q)).
-insert into decl_uniq.T values (3, 'a@y', 'p', 'q');
--- error: UNIQUE
-
--- Distinct compound key is accepted.
-insert into decl_uniq.T values (4, 'b@y', 'p', 'r');
-
-select count(*) as cnt from decl_uniq.T;
-→ [{"cnt": 2}]
+-- The declarative `unique index` section moved to 50.0.2-declare-schema-indexes.
 
 -- Regression for github.com/gotchoices/quereus/issues/22 — prefix NOT against
 -- a subquery predicate inside CHECK, through the declare/apply round-trip.
