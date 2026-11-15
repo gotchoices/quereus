@@ -172,7 +172,7 @@ operators (`util/mutation-statement.ts` builds `operator: 'and'`).
 | *(unclassified)* | anything else | `ANY` — `buildBinaryOpSpec` raises `UNSUPPORTED`, so no value exists to describe |
 
 Only the comparison and `IS` classes resolve a collation across their operands
-(`isComparisonOperator`, [Comparison collation resolution](types.md#comparison-collation-resolution)).
+(`isComparisonOperator`, [Comparison collation resolution](types-collations.md#comparison-collation-resolution)).
 `LIKE` is deliberately excluded: `buildLikeOpSpec` ignores collation entirely, so a conflict
 raised there would be about a collation the operator never applies.
 

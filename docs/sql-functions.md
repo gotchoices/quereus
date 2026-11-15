@@ -82,7 +82,7 @@ select
 - `nullif(X, Y)`: Returns NULL if X equals Y, otherwise returns X. "Equals" means
   exactly what the `=` operator means at that call site — the operands' declared
   collation and semantic-ordering type apply, not raw byte comparison. The same
-  holds for `greatest`/`least`; see [types.md](types.md#comparison-collation-resolution)
+  holds for `greatest`/`least`; see [types.md](types-collations.md#comparison-collation-resolution)
 - `iif(X, Y, Z)`: If X is true, returns Y, otherwise returns Z
 - `choose(index, val1, val2, ...)`: Returns the value at the given index (1-based)
 

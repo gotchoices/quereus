@@ -574,7 +574,7 @@ SELECT str_concat(name) FROM users;
 
 ## Collation Plugins
 
-Collations control text sorting and comparison behavior. For the `LogicalType` interface, type-specific collation support, and custom type registration, see the [Type System Documentation](types.md#collations-and-types).
+Collations control text sorting and comparison behavior. For the `LogicalType` interface, type-specific collation support, and custom type registration, see the [Type System Documentation](types-collations.md).
 
 ### Basic Collation
 

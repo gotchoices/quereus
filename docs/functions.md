@@ -91,7 +91,7 @@ select choose(2, 'a', 'b', 'c');   -- 'b'
 do — honoring a column's declared collation, semantic-ordering types like TIMESPAN,
 JSON documents, and the numeric reading of a numeric-looking string (`nullif(int_col,
 '1')` matches, as `int_col = '1'` does) — rather than raw bytes. See
-[types.md](types.md#comparison-collation-resolution).
+[types.md](types-collations.md#comparison-collation-resolution).
 
 The reconciliation applies to the *comparison* only. All three return one of their
 arguments verbatim, so a converted copy is what gets compared and the original
