@@ -1,0 +1,39 @@
+-- Lens prover: nullability mismatch blocks the deploy. Split from
+-- 55-lens-prover.sqllogic because a backend whose module declares
+-- permitsGrandfatheredNotNullViolators admits this deploy with a warning-severity
+-- advisory instead of the error (see docs/lens-prover.md, Type / nullability
+-- conformance and Grandfathered NOT NULL), and the other lens-prover scenarios
+-- are worth running on such a backend.
+
+-- ===================================
+-- Nullability mismatch blocks the deploy (NOT NULL logical over nullable basis)
+-- ===================================
+
+declare schema basis3 {
+	table t (
+		id integer primary key,
+		note text null
+	)
+}
+
+-- run
+
+apply schema basis3;
+
+-- run
+
+declare logical schema app3 {
+	table t (
+		id integer primary key,
+		note text
+	)
+}
+
+-- run
+
+declare lens for app3 over basis3 { }
+
+-- run
+
+apply schema app3;
+-- error: lens.nullability-mismatch

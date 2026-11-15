@@ -7,6 +7,10 @@
 -- boundary. (Per-obligation classification + the advisory report are unit-tested
 -- in test/lens-prover.spec.ts; the live per-write enforcement of row-local /
 -- set-level / FK obligations is the follow-up `lens-constraint-enforcement-wiring`.)
+--
+-- The nullability-mismatch scenario lives in 55.0.1-lens-prover-nullability.sqllogic:
+-- backends that admit grandfathered NOT NULL violators demote it to a warning,
+-- and the scenarios here are still worth running on them.
 
 -- ===================================
 -- 1. A proved logical schema deploys and reads through the lens
@@ -82,39 +86,6 @@ declare lens for app2 over basis2 { }
 
 apply schema app2;
 -- error: lens.type-mismatch
-
--- ===================================
--- 3. Nullability mismatch blocks the deploy (NOT NULL logical over nullable basis)
--- ===================================
-
-declare schema basis3 {
-	table t (
-		id integer primary key,
-		note text null
-	)
-}
-
--- run
-
-apply schema basis3;
-
--- run
-
-declare logical schema app3 {
-	table t (
-		id integer primary key,
-		note text
-	)
-}
-
--- run
-
-declare lens for app3 over basis3 { }
-
--- run
-
-apply schema app3;
--- error: lens.nullability-mismatch
 
 -- ===================================
 -- 4. A check over a computed (non-invertible) column is unrealizable
