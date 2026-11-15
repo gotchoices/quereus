@@ -22,7 +22,8 @@
  * the memory backend visited a multi-seek's keys in seek-argument order instead of the
  * scanned index's own key order (fix/bug-isolation-multiseek-merge-order). Both forms
  * are now covered: the literal-list regressions live in the "literal IN-list" describe
- * block below.
+ * block below. An OR of ranges on the primary key (a `plan=6` multi-range seek) had the
+ * same hazard; its regression is the last describe block.
  *
  * The underlying is a plain memory module here, instrumented so each test can prove
  * the read really was served as a multi-seek rather than passing vacuously on a
@@ -533,6 +534,29 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 				{ pk: 3, v: 30, tag: 'c' },
 			]);
 			expect(mem.seen('t')[0]).to.match(multiSeekRe('ix_v'));
+			await db.exec(`rollback`);
+		});
+	});
+
+	describe('OR-of-ranges multi-range seek (or-of-overlapping-ranges-returns-rows-twice)', () => {
+		// `pk between 4 and 5 or pk between 1 and 2` is a `plan=6` multi-range seek, the range
+		// analogue of the literal IN-list above. The memory backend used to walk the ranges in
+		// SQL-text order, so `mergeStreams` met stored rows 4, 5, 1, 2: it spent the staged
+		// tombstone for pk 1 before stored row 1 arrived, and the deleted row came back.
+
+		it('keeps a staged delete deleted when the ranges are written high-to-low', async () => {
+			await db.exec(`create table t (pk integer primary key, v text) using isolated`);
+			await db.exec(`insert into t values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')`);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where pk = 1`);
+			mem.reset();
+			expect(await rowsOf(`select pk, v from t where pk between 4 and 5 or pk between 1 and 2`),
+				'the deleted row does not reappear').to.deep.equal([
+				{ pk: 2, v: 'two' },
+				{ pk: 4, v: 'four' },
+				{ pk: 5, v: 'five' },
+			]);
+			expect(mem.seen('t')[0], 'the underlying served a multi-range seek').to.match(/^idx=_primary_\(0\);plan=6;/);
 			await db.exec(`rollback`);
 		});
 	});

@@ -1,0 +1,43 @@
+-- 05.1.2-or-of-ranges-seek.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Subject: an OR of ranges on the leading column of an index (a multi-range seek) returns
+-- each matching row once, however the ranges overlap, and never a row whose column is NULL.
+-- orr is keyed on id and indexed on x; orr_plain holds the same rows with neither column
+-- indexed, so its full-scan answers are the reference for the seeks. The store does not
+-- serve an OR of ranges as one seek, so there these check the planner's fallback instead;
+-- the memory module's seek is pinned by test/optimizer/or-multi-range-seek.spec.ts.
+
+create table orr (id integer primary key, x integer null);
+create index orr_x on orr (x);
+create table orr_plain (rid integer primary key, id integer, x integer null);
+insert into orr values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, null);
+insert into orr_plain values (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 5, 5), (6, 6, null);
+
+-- Overlapping ranges, on the secondary index and on the primary key
+select id from orr_plain where x between 1 and 3 or x between 2 and 4 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+select id from orr where x between 1 and 3 or x between 2 and 4 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+select id from orr where id between 1 and 3 or id between 2 and 4 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+-- Nested, and touching at an inclusive bound
+select id from orr where x between 1 and 4 or x between 2 and 3 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+select id from orr where x between 1 and 3 or x between 3 and 5 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+-- Ranges that together cover every value still exclude the NULL row
+select id from orr_plain where x < 2 or x > 1 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+select id from orr where x < 2 or x > 1 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]
+
+drop table orr;
+drop table orr_plain;

@@ -817,6 +817,8 @@ This enables efficient parameterized queries and correlated subqueries.
 
 An `OR_RANGE` constraint can carry non-literal bounds. Such a bound in `ranges[i].lower` or `ranges[i].upper` has `value: undefined`, plus a `valueExpr` and a per-bound `bindingKind`. The constraint's own `bindingKind` summarizes its bounds, and is `'mixed'` when they differ. A `'parameter'` bound keeps one value for a whole execution of the statement, but can change when the prepared statement is rebound and run again, so don't carry its value across `query()` calls. A `'correlated'` bound can change per outer row, and its `correlated` flag is `true`.
 
+The ranges of an `OR_RANGE` may overlap, nest, repeat, be empty, or be reversed (lower above upper), and with non-literal bounds you only find out at query time. However the ranges relate, return each matching row exactly once, and never a row whose column is NULL. A range with a NULL bound matches no row, so drop it before combining ranges. Take care when combining ranges into one: `x < 2 or x > 1` covers every non-NULL value, and a single unbounded range would also return the NULLs. If your module sits under the isolation layer and serves an `OR_RANGE` on its primary key, also return the rows in primary-key order: the overlay merge pairs staged rows with stored rows by position, so a stream out of key order lets a staged delete or update miss the row it shadows. The memory module meets these rules by sorting the ranges, cutting each one to start where the previous one ends, and walking the pieces in index order.
+
 ## Transaction Support
 
 Modules can implement transaction methods for ACID compliance:

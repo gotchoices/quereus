@@ -1,5 +1,6 @@
-import type { ScanPlan, ScanPlanRangeBound } from './scan-plan.js';
+import type { ScanPlan, ScanPlanRange, ScanPlanRangeBound } from './scan-plan.js';
 import type { Layer } from './interface.js';
+import type { TableSchema } from '../../../schema/table.js';
 import { keyParts, leadingKeyPart, PK_HIGH, PK_LOW, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type IndexTreeKey, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
@@ -47,6 +48,110 @@ function orderSeekKeys(
 	return plan.descending
 		? [...keys].sort((a, b) => -compare(a, b))
 		: [...keys].sort(compare);
+}
+
+type ValueComparator = ResolvedScanComparators['bound'];
+
+/**
+ * A multi-range plan's ranges (an `OR_RANGE` such as `x between 1 and 3 or x between 2 and 4`)
+ * as the walk must visit them: disjoint, and in the scanned structure's order. The planner cannot
+ * rule out overlap, since a placeholder or correlated bound is known only at run time, so a row in
+ * two ranges would otherwise be yielded twice. And `quereus-isolation`'s primary-key merge pairs
+ * staged rows with stored rows by position (see merge-iterator.ts), so ranges walked out of key
+ * order let a staged delete or update miss the row it shadows.
+ *
+ * Ranges that match nothing (a NULL bound, crossed bounds) are dropped first. The rest are sorted
+ * by where they start, and each is cut to begin where the last kept range ends, or dropped when
+ * that range already covers it. Cutting rather than merging keeps every walked range bounded on at
+ * least one side, which is what makes a walk reject keys whose bound column is NULL
+ * (`planAppliesToKey`): merging `x < 2 or x > 1` into one unbounded range would return NULLs.
+ *
+ * `compare` is the bound column's comparator, which mirrors the tree's own order, so the result
+ * ascends in structure order; `highToLow` reverses it for a walk that visits the bound column from
+ * its high end (see {@link seeksFromUpper}).
+ */
+function normalizeRanges(
+	ranges: readonly ScanPlanRange[],
+	compare: ValueComparator,
+	highToLow: boolean,
+): ScanPlanRange[] {
+	const ascending = ranges
+		.filter(range => rangeCanMatch(range, compare))
+		.sort((a, b) => compareLowerBounds(a.lowerBound, b.lowerBound, compare));
+	const kept: ScanPlanRange[] = [];
+	for (const range of ascending) {
+		const last = kept[kept.length - 1];
+		const remainder = last ? remainderAfter(last, range, compare) : range;
+		if (remainder) kept.push(remainder);
+	}
+	return highToLow ? kept.reverse() : kept;
+}
+
+/**
+ * False for a range no value satisfies: a NULL bound (`v <op> NULL` is never true), bounds that
+ * cross, or bounds that meet at a value one of them excludes.
+ */
+function rangeCanMatch(range: ScanPlanRange, compare: ValueComparator): boolean {
+	const { lowerBound: lower, upperBound: upper } = range;
+	if (lower?.value === null || upper?.value === null) return false;
+	if (!lower || !upper) return true;
+	const cmp = compare(lower.value, upper.value);
+	return cmp < 0 || (cmp === 0 && !isExclusiveBound(lower) && !isExclusiveBound(upper));
+}
+
+/** Orders ranges by where they start: unbounded first, then by value, inclusive before exclusive on one value. */
+function compareLowerBounds(
+	a: ScanPlanRangeBound | undefined,
+	b: ScanPlanRangeBound | undefined,
+	compare: ValueComparator,
+): number {
+	if (!a || !b) return (a ? 1 : 0) - (b ? 1 : 0);
+	return compare(a.value, b.value) || Number(isExclusiveBound(a)) - Number(isExclusiveBound(b));
+}
+
+/**
+ * The part of `next`, which starts no earlier than `last`, that lies past `last`'s end: `next` itself
+ * when the two are disjoint, `next` with its lower bound raised to `last`'s end when they overlap
+ * (`[1,3]` then `[2,4]` leaves `(3,4]`), or undefined when `last` covers all of `next`.
+ */
+function remainderAfter(last: ScanPlanRange, next: ScanPlanRange, compare: ValueComparator): ScanPlanRange | undefined {
+	const end = last.upperBound;
+	if (!end) return undefined;
+	if (next.lowerBound && startsAfter(next.lowerBound, end, compare)) return next;
+	const cut: ScanPlanRange = { lowerBound: boundJustAbove(end), upperBound: next.upperBound };
+	return rangeCanMatch(cut, compare) ? cut : undefined;
+}
+
+/** True when no value satisfies both `upper` and `lower`: they meet at a value one excludes, or `lower` is higher. */
+function startsAfter(lower: ScanPlanRangeBound, upper: ScanPlanRangeBound, compare: ValueComparator): boolean {
+	const cmp = compare(lower.value, upper.value);
+	return cmp > 0 || (cmp === 0 && (isExclusiveBound(lower) || isExclusiveBound(upper)));
+}
+
+/** The lower bound that admits exactly the values above `upper`: `<= v` becomes `> v`, `< v` becomes `>= v`. */
+function boundJustAbove(upper: ScanPlanRangeBound): ScanPlanRangeBound {
+	return { op: isExclusiveBound(upper) ? IndexConstraintOp.GE : IndexConstraintOp.GT, value: upper.value };
+}
+
+/**
+ * True when the walk visits the range-bound column (the key column at `boundPosition`) from its
+ * high values to its low ones, so it seeks from the upper bound and terminates at the lower. The
+ * four {walk direction}×{column direction} combinations:
+ *   ascending  + ASC bound column  → seek from lower, terminate at upper
+ *   ascending  + DESC bound column → seek from upper, terminate at lower
+ *   descending + ASC bound column  → seek from upper, terminate at lower
+ *   descending + DESC bound column → seek from lower, terminate at upper
+ * i.e. exactly when the walk ascends and the column is DESC, or the reverse. It depends on the
+ * PHYSICAL walk direction, not just the column's declared one.
+ *
+ * The synthesized all-columns primary-key fallback carries no `desc`, and a prefix as long as the
+ * key has no bound column, so the lookup yields "not DESC" for both, which is correct.
+ */
+function seeksFromUpper(plan: ScanPlan, schema: TableSchema, boundPosition: number): boolean {
+	const boundColumn = plan.indexName === 'primary'
+		? schema.primaryKeyDefinition?.[boundPosition]
+		: schema.indexes?.find(idx => idx.name === plan.indexName)?.columns[boundPosition];
+	return !plan.descending === (boundColumn?.desc === true);
 }
 
 /**
@@ -283,13 +388,13 @@ function* scanLayerResolved(
 		return;
 	}
 
-	// Multi-range: iterate over multiple range specs
+	// Multi-range: an OR of ranges over the leading index column. The ranges are cut into
+	// disjoint ones and walked in index order (see `normalizeRanges`): disjoint so no row is
+	// yielded twice, in order because isolation's primary-key merge depends on it. Every range
+	// bounds the leading column, so there is no equality prefix and the bound sits at position 0.
 	if (plan.ranges && plan.ranges.length > 0) {
-		// NOTE: ranges are visited in SQL-text order, not index order (harmless: no multi-range
-		// seek advertises an ordering). If one ever does, or a backwards walk reaches here, sort
-		// the ranges by leading bound under the index comparator (reversed for a backwards
-		// walk), as `orderSeekKeys` does for multi-seek keys.
-		for (const range of plan.ranges) {
+		const highToLow = seeksFromUpper(plan, layer.getSchema(), 0);
+		for (const range of normalizeRanges(plan.ranges, comparators.bound, highToLow)) {
 			const singlePlan: ScanPlan = {
 				...plan,
 				ranges: undefined,
@@ -330,11 +435,6 @@ function* scanLayerResolved(
 		}
 
 		const isAscending = !plan.descending;
-		// When the bound PK column is DESC the BTree is physically ordered with that
-		// column descending. The synthesized all-columns fallback definition carries
-		// no `desc`, and a full-key prefix has no bound column, so the `?.` chain
-		// yields false for both, which is correct.
-		const isDescBoundColumn = schema.primaryKeyDefinition?.[boundPosition]?.desc === true;
 		// NOTE: `walkStartKey` reads `keyArity > 1` as composite, whereas the key-shape flag
 		// `comparators.keyIsTuple` uses `!== 1`.
 		// They differ only for the zero-column singleton PK, which stores `[]`: neither
@@ -343,17 +443,9 @@ function* scanLayerResolved(
 		// zero-arity plan ever does reach here, switch this to `keyIsTuple`.
 		const keyArity = schema.primaryKeyDefinition?.length ?? schema.columns.length;
 
-		// Seek-start selection must depend on the *physical* walk direction, not just
-		// the bound column's declared direction. The four {isAscending}×{isDescBoundColumn}
-		// combinations each seek from one bound and terminate at the other:
-		//   ascending  + ASC bound column  → seek from lower, terminate at upper
-		//   ascending  + DESC bound column → seek from upper, terminate at lower
-		//   descending + ASC bound column  → seek from upper, terminate at lower
-		//   descending + DESC bound column → seek from lower, terminate at upper
-		// i.e. seek from the upper bound exactly when isAscending === isDescBoundColumn
-		// (and terminate at the complement). Absent the chosen bound we fall back to
-		// the tree end `safeIterate` picks for the direction, or to the prefix's group.
-		const seekFromUpper = isAscending === isDescBoundColumn;
+		// Absent the bound the walk seeks from, it starts from the tree end `safeIterate`
+		// picks for the direction, or from the prefix's group.
+		const seekFromUpper = seeksFromUpper(plan, schema, boundPosition);
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 		const keys: WalkKeys<BTreeKeyForPrimary, Row> = { seekKey: seek => seek, structureKey: primaryKeyExtractorFromRow };
 		const startKey = walkStartKey(tree, plan, seekBound, keyArity, keys, comparators);
@@ -395,13 +487,8 @@ function* scanLayerResolved(
 
 		const isAscending = !plan.descending;
 		const indexDef = schema.indexes?.find(idx => idx.name === plan.indexName);
-		const isDescBoundColumn = indexDef?.columns[boundPosition]?.desc === true;
-
-		// Seek-from end depends on the physical walk direction (see the primary
-		// branch for the full rationale): seek from the upper bound exactly when
-		// isAscending === isDescBoundColumn, terminate at the complement.
 		const keyArity = indexDef?.columns.length ?? 1;
-		const seekFromUpper = isAscending === isDescBoundColumn;
+		const seekFromUpper = seeksFromUpper(plan, schema, boundPosition);
 		const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 		const sentinel = seekSentinel(isAscending, seekBound);
 		const keys: WalkKeys<IndexTreeKey, MemoryIndexEntry> = {

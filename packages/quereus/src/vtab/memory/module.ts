@@ -728,8 +728,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 	/**
 	 * Compute the monotonic-ordering advertisement for a chosen access plan.
-	 * Returns an empty object when the path is non-monotonic (multi-IN multi-seek,
-	 * OR_RANGE multi-range, or a single-row equality seek).
+	 * Returns an empty object when the path is non-monotonic (multi-IN multi-seek or a
+	 * single-row equality seek) or not advertised as monotonic (OR_RANGE multi-range).
 	 *
 	 * Also empty when the leading column is walked descending (a DESC key walked forwards,
 	 * or an ASC key walked backwards) and a NULL could reach it: a `direction: 'desc'` claim
@@ -745,8 +745,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		availableIndexes: IndexSchema[],
 	): Pick<BestAccessPlanResult, 'monotonicOn' | 'supportsAsofRight'> {
 		// Multi-value IN multi-seek visits values in seek-key order (a runtime-valued
-		// set included); OR_RANGE concatenates disjoint ranges. Neither emits in
-		// monotonic order.
+		// set included), so it never emits in monotonic order. OR_RANGE is walked as
+		// disjoint ranges in index order (`normalizeRanges` in
+		// layer/scan-layer.ts), but is still not advertised as monotonic.
+		// NOTE: OR_RANGE's emission is index-ordered now, so it could advertise
+		// `monotonicOn` here and claim ordering in `adjustPlanForOrdering` /
+		// `evaluateOrderingOnlyPlans`. Left off because it changes plans; if a Sort above
+		// an OR_RANGE seek ever matters, turn both on together, with plan tests.
 		for (let i = 0; i < bestPlan.handledFilters.length; i++) {
 			if (!bestPlan.handledFilters[i]) continue;
 			const f = request.filters[i];
@@ -1085,8 +1090,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// Determine whether plan A's existing access pattern can claim the
 		// required ordering. It can iff the chosen filter index satisfies the
 		// ordering AND the access pattern walks the index monotonically — i.e.,
-		// not OR_RANGE (concatenated ranges) and not multi-value IN on an
-		// ordering column (visits values in IN-list order).
+		// not OR_RANGE (never claimed; see `buildMonotonicAdvertisement`) and not
+		// multi-value IN on an ordering column (visits values in IN-list order).
 		const filterIndex = plan.indexName
 			? availableIndexes.find(idx => idx.name === plan.indexName)
 			: undefined;
