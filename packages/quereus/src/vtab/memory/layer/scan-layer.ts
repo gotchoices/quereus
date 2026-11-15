@@ -66,9 +66,9 @@ type ValueComparator = ResolvedScanComparators['bound'];
  * least one side, which is what makes a walk reject keys whose bound column is NULL
  * (`planAppliesToKey`): merging `x < 2 or x > 1` into one unbounded range would return NULLs.
  *
- * `compare` is the bound column's comparator, which mirrors the tree's own order, so the result
- * ascends in structure order; `highToLow` reverses it for a walk that visits the bound column from
- * its high end (see {@link seeksFromUpper}).
+ * `compare` is the bound column's value comparator (its type and collation, as the tree uses, but
+ * never reversed for a DESC column), so the result ascends by value; `highToLow` reverses it for a
+ * walk that visits the bound column from its high end (see {@link seeksFromUpper}).
  */
 function normalizeRanges(
 	ranges: readonly ScanPlanRange[],
@@ -78,6 +78,9 @@ function normalizeRanges(
 	const ascending = ranges
 		.filter(range => rangeCanMatch(range, compare))
 		.sort((a, b) => compareLowerBounds(a.lowerBound, b.lowerBound, compare));
+	// Checking each range against only the last kept one suffices: the kept ranges cover
+	// everything from the last one's original input range's start up to its end, and every
+	// later range starts no earlier than that, so only the part past its end can be new.
 	const kept: ScanPlanRange[] = [];
 	for (const range of ascending) {
 		const last = kept[kept.length - 1];

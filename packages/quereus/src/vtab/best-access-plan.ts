@@ -203,9 +203,10 @@ export function rangeServesKeyColumn(f: PredicateConstraint, keyCol: Pick<IndexC
  *
  * The set is deliberately INCOMPLETE, which costs an optimization and never correctness —
  * a missing op declines a claim that would in fact have been sound. `OR_RANGE` is a union
- * of NULL-rejecting ranges, but it already disqualifies an ordering claim on other grounds
- * in both shipped backends (concatenated windows emit in range order, not column order),
- * so listing it would widen what has to be argued and buy nothing. `NOT IN`, `MATCH`,
+ * of NULL-rejecting ranges, but no shipped backend makes an ordering claim for it (the
+ * memory module walks its windows in index order but does not advertise it — see
+ * `buildMonotonicAdvertisement`; the store does not serve it as a seek), so listing it
+ * would widen what has to be argued and buy nothing. `NOT IN`, `MATCH`,
  * `LIKE` and `GLOB` are NULL-rejecting too and could be added on demand; none of them
  * reaches an ordering claim today.
  */
