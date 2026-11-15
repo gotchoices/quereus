@@ -12,7 +12,8 @@
  * `isolation-ddl-validation-ignores-overlay-rows`, and `set not null` (reject + DEFAULT backfill,
  * issuer + foreign overlay) by `bug-set-not-null-ignores-uncommitted-rows`. The store + isolation
  * paths for those are covered by their own specs (see packages/quereus-isolation/test); the
- * rollback-state refusals are cross-backend in 41.2.4-ddl-rollback-states.sqllogic.
+ * rollback-state refusals are cross-backend in 41.2.4-ddl-rollback-states.sqllogic (the UNIQUE
+ * index builds in 41.2.4.1-ddl-rollback-states-unique-index.sqllogic).
  *
  * See docs/memory-table.md § DDL and transactions.
  */

@@ -346,7 +346,8 @@ effective rows *and* the savepoint states as one bundle (`IssuerRowSources`, see
 [module-authoring-transactions.md](module-authoring-transactions.md#when-the-pending-rows-live-outside-your-module-issuerrowsources));
 the manager's base is then exactly the committed rows, and a wrapper's frame is judged as-is for
 `SET NOT NULL` because no rewrite of the manager reaches it. The cross-backend cases are pinned
-in `41.2.4-ddl-rollback-states.sqllogic`.
+in `41.2.4-ddl-rollback-states.sqllogic`, and the ones that build a standalone unique index in
+`41.2.4.1-ddl-rollback-states-unique-index.sqllogic`.
 
 `ALTER TABLE ... ADD CONSTRAINT ... CHECK` and an inline CHECK on `ALTER TABLE ... ADD COLUMN`
 follow the same rule, but the engine runs their existing-row scan, not the manager: the manager

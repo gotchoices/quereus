@@ -93,7 +93,8 @@ insert into ddl_tx_c values (4, 'b');
 -- ===================================
 -- 6. A pending DELETE removes a committed duplicate: the build is not ILLEGAL, but a rollback
 --    would restore the duplicate under the index, so it is refused as retryable and lands once
---    the delete is committed (41.2.4-ddl-rollback-states.sqllogic has the full matrix).
+--    the delete is committed (41.2.4-ddl-rollback-states.sqllogic has the full matrix; its
+--    `create unique index` cases are in 41.2.4.1-ddl-rollback-states-unique-index).
 -- ===================================
 
 create table ddl_tx_e (id integer primary key, v text);
