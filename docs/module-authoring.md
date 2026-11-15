@@ -508,7 +508,7 @@ sensitive consumers refuse an unresolved plan rather than guess — so the alias
 descriptor path is a correctness bug in the module, not a slow path. Name the primary key
 `_primary_` or supply the descriptor.
 
-The one exception is a module-listed seek (`moduleSeekFilters`, plan kind `moduleSeek`) that claims no order — no `providesOrdering`, no `monotonicOn` — over an index the engine cannot resolve. That plan is recorded as `{ kind: 'unorderedIndex', indexName, plan }`, without a warning: nothing above relies on its emission order, which for a multi-dimensional index no `IndexDescriptor` can state anyway. A consumer that merges by sort key must merge such a stream as a set. (The isolation layer does not yet; a merged read over an `unorderedIndex` fails loudly until it does.)
+The one exception is a module-listed seek (`moduleSeekFilters`, plan kind `moduleSeek`) that claims no order — no `providesOrdering`, no `monotonicOn` — over an index the engine cannot resolve. That plan is recorded as `{ kind: 'unorderedIndex', indexName, plan }`, without a warning: nothing above relies on its emission order, which for a multi-dimensional index no `IndexDescriptor` can state anyway. A consumer that merges by sort key must merge such a stream as a set, as the isolation layer does (docs/design-isolation-layer.md § Which index is being scanned).
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 

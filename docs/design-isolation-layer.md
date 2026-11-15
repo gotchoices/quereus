@@ -610,6 +610,7 @@ the planner's typed, validated {@link AccessPath} record (`resolveScanIndex` in
 | `fullScan` / `empty`         | primary key (see the full-scan contract below)                |
 | `index`, `role: 'primary'`   | primary key — **regardless of the index's name** (an alias like `_primary_1` still merges by PK); reversed when the descriptor sets `reverse` |
 | `index`, `role: 'secondary'` | `(indexKey…, pk…)`, using the descriptor's full `keyColumns`; reversed when the descriptor sets `reverse` |
+| `unorderedIndex`             | none — a set merge (`mergedUnorderedQuery`): drop the underlying rows whose primary key the overlay touched, then append the overlay's in-window live rows. Output order is unspecified, which is sound because the plan claimed no order (the planner kept any `Sort`) |
 | `unresolvedIndex`            | **INTERNAL error** (see below)                                |
 
 This holds **regardless of the plan kind**, not only for a plain unbounded or bounded-range
@@ -625,7 +626,9 @@ backends — the in-memory table (`scan-layer.ts`) and the persistent store
 before visiting them for exactly this reason; see `docs/module-authoring.md` for the
 contract as stated to third-party module authors.
 
-The two merges differ in how much they lean on that order. The secondary-index merge (`mergedSecondaryIndexQuery`) drops shadowed committed rows by membership in the set of primary keys the transaction touched, so an underlying stream that is out of order *within one index value* only misplaces staged rows among that value's rows; it is the primary-key merge (`mergeStreams`) whose shadowing depends on order.
+The merges differ in how much they lean on that order. The secondary-index merge (`mergedSecondaryIndexQuery`) drops shadowed committed rows by membership in the set of primary keys the transaction touched, so an underlying stream that is out of order *within one index value* only misplaces staged rows among that value's rows; the unordered merge shares that step (`collectOverlayDelta`) and does not interleave at all; it is the primary-key merge (`mergeStreams`) whose shadowing depends on order.
+
+A `moduleSeek` window (`plan=8`, the filters a module listed in `moduleSeekFilters`) is a **conjunction**: `buildConstraintMatcher` requires every EQ value and every range bound to hold, so `x = 1 and x = 2` admits no staged row — unlike the other seek kinds, where several EQ constraints on one column encode an `IN` list. It compares under the index key column's collation when the descriptor holds the column, else BINARY (never the table column's declared collation): the planner accepted each listed filter only when its collation matched exactly that, so the matcher reproduces the predicate the module enforces.
 
 `role` is authoritative, not `name`. A module that mints a per-plan alias for its primary
 key (lamina-quereus appends a counter: `_primary_` → `_primary_1`, `_primary_2`, …) is still
