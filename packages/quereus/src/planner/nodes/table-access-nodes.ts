@@ -520,8 +520,10 @@ export class IndexSeekNode extends TableAccessNode {
 		 *   the position it intends to re-apply at.
 		 *
 		 * Undefined ⇒ this node was built by a path that did not thread the consumed set
-		 * (never true for `selectPhysicalNode`'s output). An empty array is impossible: a
-		 * seek exists only because at least one constraint was consumed.
+		 * (never true for `selectPhysicalNode`'s output). An empty array means the seek
+		 * enforces nothing on the engine's behalf — only a module-listed seek with an empty
+		 * `moduleSeekFilters` builds one; every other seek consumed at least one constraint.
+		 * The rewrites that read this decline on an empty array.
 		 *
 		 * NOTE: deliberately NOT exposed via `getChildren` (OPT-009). No emitter reads these
 		 * expressions — `runtime/emit/scan.ts` emits `seekKeys` only — so they are inert and

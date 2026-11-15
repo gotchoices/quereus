@@ -43,3 +43,7 @@ there is exactly the wrong-results failure this ticket is trying to make less li
 
 No behavior change. The plan shapes chosen must be identical before and after; the existing
 `test/plan/` and `test/optimizer/` suites are the check.
+
+## Update (review of `module-listed-seek-arguments-planner`)
+
+`wc -l packages/quereus/src/planner/rules/access/rule-select-access-path.ts` → 1925 lines (was 1643). Most of the growth is the module-listed seek arm: `selectPhysicalNodeFromModuleSeek` plus its helpers `isRangeComparison`, `moduleSeekIndexOp`, `moduleSeekKey`, `moduleSeekCover` and `moduleSeekKeepsItsSeek`. That arm shares only `makeIndexFilterInfo`, `makeIndexSeek`, the seek-key builders, the collation-cover classifier and `createEmptyResultNode` with the rest of the file, so it is the easiest piece to move into its own module, and doing that first would shrink the file before the harder split of `selectPhysicalNodeFromPlan`.

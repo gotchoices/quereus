@@ -1,5 +1,5 @@
 ---
-description: Review the query-planner half of a new opt-in contract that lets a storage module name exactly which filters it enforces inside its chosen index and receive their values, in order, when the query runs — so a multi-dimensional index can be handed placeholder box bounds. The transaction-overlay half is a separate ticket.
+description: Lets a storage module name exactly which filters it enforces inside its chosen index and receive their values, in order, when the query runs — so a multi-dimensional index can be handed placeholder box bounds. This is the query-planner half; the transaction-overlay half is a separate ticket.
 architecture: docs/module-authoring.md
 files:
   - packages/quereus/src/vtab/best-access-plan.ts                           # BestAccessPlanResult.moduleSeekFilters; isModuleSeekFilterOp; moduleSeekFiltersProblem; validateAccessPlan call
@@ -19,7 +19,7 @@ files:
   - docs/optimizer.md                                                       # access-path seam: new kind and the moduleSeek arm
 ---
 
-# Module-listed seek arguments — planner half (review)
+# Module-listed seek arguments — planner half (complete)
 
 ## What was built
 
@@ -61,8 +61,24 @@ Inspection only: resolvable index with matching BINARY collations keeps the seek
 
 `yarn build` green; `yarn test` green across all workspaces (quereus 11179 passing); `yarn workspace @quereus/quereus run lint` green.
 
-## Known gaps / for the reviewer
+## Known gaps (carried forward)
 
-- The isolation overlay cannot merge a `moduleSeek` read yet: `unorderedIndex` throws INTERNAL, and a resolved-index `moduleSeek` goes through the existing merge, whose window matcher reads several EQs on one column as an IN set rather than a conjunction. Both are the scope of `module-listed-seek-arguments-isolation-overlay` (already in implement/, prereq on this ticket).
+- The isolation overlay cannot merge a `moduleSeek` read yet: `unorderedIndex` throws INTERNAL, and a resolved-index `moduleSeek` goes through the existing merge, whose window matcher reads several EQs on one column as an IN set rather than a conjunction. Both are the scope of `module-listed-seek-arguments-isolation-overlay`.
 - `moduleSeekFiltersProblem` is not exported from the package index; out-of-tree modules get it through `validateAccessPlan`.
-- No test drives a described index (descriptor or schema index) through the arm, nor the ordering-claim interaction above.
+- `x between ? and ?` is not offered to modules: `between-with-placeholder-bounds-offered-to-modules` (plan/).
+
+## Review findings
+
+Read the `ticket(implement): module-listed-seek-arguments-planner` diff first, then the handoff; ran lint and the quereus suite.
+
+- **Correctness of the arm** — checked by reading: the shared validity check runs before anything consumes; every return path consumes exactly the listed filters (seek keys, the collation residual, or the empty fold), so `reattachUnconsumedConstraints` re-checks only handled-but-unlisted filters; `provesEmpty` runs before dispatch; a single-value `IN` delivers through `equalitySeekKey` as `EQ`; the singleton-FD exclusion is right for repeated-column keys; `rule-monotonic-range-access` only annotates and tolerates two bounds on one column (both hold, either is valid). No defect found.
+- **Ordering-claim interaction (the implementer's extra change)** — confirmed it is needed and correct: every Sort-dropping site in `rule-grow-retrieve` goes through `planDeliversOrdering` → `orderingClaimSurvivesCollation`. It was untested, so added one test (`keeps the Sort when the arm will decline a described index the module claims an order from`): a NOCASE equality on a NOCASE descriptor column, no `honorsCollatedRangeBounds`, order claimed. Verified it fails (`[2, 1]` instead of `[1, 2]`) with the guard disabled and passes with it. The test double gained an optional `descriptor` that also makes the plan claim (but not honour) ascending order on the descriptor's last key column. This also covers the previously untested described-index path through the arm's collation cover.
+- **Pre-existing prefix-range inconsistency** the implementer flagged (prefix-range arm applies the range rule to prefix equalities; the ordering check uses the equality lattice) — tried to reproduce with `CollationBlindMemoryModule` (BINARY prefix equality over a NOCASE `(a, b)` index plus a range on `b`); the memory module planned an equality seek and the order was correct. Not reproduced, so recorded as a `NOTE:` tripwire on `orderingClaimSurvivesCollation` rather than a ticket.
+- **Rewrites that re-plan a seek leaf** — `index-nested-loop` and `rule-key-set-seek` both admit an `IndexSeekNode` by its `pushedConstraints`; a moduleSeek leaf with listed filters is admitted and re-probed, and the re-probe declines at the `seekColumnIndexes` gate if the module answers with `moduleSeekFilters` again. An empty-list moduleSeek records no pushed constraints and both rules decline it. Safe. Fixed the `pushedConstraints` doc comment in `table-access-nodes.ts`, which claimed an empty array was impossible.
+- **Docs** — `docs/module-authoring.md` and `docs/optimizer.md` match the code (validation rules, idxStr shape, collation rule, `unorderedIndex`, BETWEEN caveat). No change needed.
+- **Tests** — the implementer's tests each pin a contract (value delivery and order, unlisted re-check, NULL fold, collation decline, validation table); none restate a mock. Kept all; added the one above.
+- **Size / hygiene** — `rule-select-access-path.ts` is now 1925 lines (`wc -l`). Added an update to `debt-access-path-seek-selection-is-one-giant-function` (backlog) naming the self-contained module-seek arm as the first piece to move out. Comments in the new code explain reasons, not statements.
+- **Error handling / type safety** — malformed lists throw (FORMAT in validation, INTERNAL in the planner, with table name); the dormant `unorderedIndex` case in `IsolatedTable.resolveScanIndex` throws INTERNAL, as the exhaustive switch requires. No `any`. Nothing to change.
+- **Performance / resource cleanup** — the arm allocates one map per listed filter at plan time and nothing at run time; `walksOneWindow` NOTE left as is. Nothing found.
+
+Validation: `yarn workspace @quereus/quereus run lint` green; `yarn workspace @quereus/quereus run test` 11180 passing, 26 pending.

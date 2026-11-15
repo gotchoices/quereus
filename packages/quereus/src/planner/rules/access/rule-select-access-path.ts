@@ -1735,6 +1735,15 @@ function indexColumnCollationLookup(
  *
  * Whether the ordered columns themselves sort as the index does is the module's to answer,
  * since it can see both collations: see `providesOrdering` in docs/module-authoring.md.
+ *
+ * NOTE: the prefix-range arm (`selectPhysicalNodeFromPlan`) classifies its prefix equalities
+ * by the range rule, which is stricter than the equality lattice below (a BINARY prefix
+ * equality over a NOCASE key column, or a matched non-BINARY one without
+ * `honorsCollatedRangeBounds`). For that shape this check can let a Sort go while the arm
+ * declines to an unordered scan. Not reproduced: the collation-blind memory double plans
+ * such a query as an equality seek. If a module is seen claiming an order over a declined
+ * prefix-range seek, derive this answer from that arm's cover, as `moduleSeekKeepsItsSeek`
+ * does for the module-listed arm.
  */
 export function orderingClaimSurvivesCollation(
 	tableSchema: TableSchema,

@@ -2,7 +2,7 @@
  * Test virtual-table module that answers with module-listed seek arguments
  * (`BestAccessPlanResult.moduleSeekFilters`): it handles every `=` and range filter on a
  * configurable set of columns, lists them in `request.filters` order on a minted index
- * name with no descriptor, and applies whatever `FilterInfo.constraints` / `args` it gets
+ * name with no descriptor (unless one is configured), and applies whatever `FilterInfo.constraints` / `args` it gets
  * back. That is the shape a multi-dimensional index answering a box query takes.
  *
  * Rows are emitted in reverse insertion order, which is not primary-key order, so a test
@@ -16,6 +16,7 @@ import type { TableSchema } from '../../src/schema/table.js';
 import type { Row, SqlValue, UpdateResult } from '../../src/common/types.js';
 import { IndexConstraintOp } from '../../src/common/constants.js';
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
+import type { IndexDescriptor } from '../../src/vtab/index-descriptor.js';
 import { decodeIdxStr, idxStrSentinel, planCodeFromKind } from '../../src/vtab/idx-str.js';
 import { compareSqlValues } from '../../src/util/comparison.js';
 import {
@@ -41,6 +42,12 @@ export class TestModuleSeekModule implements VirtualTableModule<TestModuleSeekTa
 	unlistedColumn: number | undefined;
 	/** When true the plan lists nothing, while still handling what it would have listed. */
 	listNothing = false;
+	/**
+	 * When set, the plan describes its index with this descriptor and claims ascending
+	 * order on its last key column. The claim is not honoured: rows still come out in
+	 * reverse insertion order, so a test only passes if the engine keeps its Sort.
+	 */
+	descriptor: IndexDescriptor | undefined;
 	/** The FilterInfo of the most recent `query()`, for assertions. */
 	lastFilterInfo: FilterInfo | undefined;
 	queryCount = 0;
@@ -80,9 +87,20 @@ export class TestModuleSeekModule implements VirtualTableModule<TestModuleSeekTa
 				.setExplanation('TestModuleSeekModule box lookup')
 				.build(),
 			moduleSeekFilters: listed,
+			...this.orderingClaim(),
 		};
 		validateAccessPlan(request, plan, tableInfo.vtabModuleName);
 		return plan;
+	}
+
+	private orderingClaim(): Partial<BestAccessPlanResult> {
+		if (!this.descriptor) return {};
+		const last = this.descriptor.keyColumns[this.descriptor.keyColumns.length - 1];
+		return {
+			indexDescriptor: this.descriptor,
+			orderingIndexName: MODULE_SEEK_INDEX_NAME,
+			providesOrdering: [{ columnIndex: last.columnIndex, desc: false }],
+		};
 	}
 }
 

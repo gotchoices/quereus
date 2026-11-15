@@ -120,6 +120,17 @@ describe('module-listed seek arguments (moduleSeekFilters)', () => {
 		expect(await ids(db, sql)).to.deep.equal([1, 2]);
 	});
 
+	it('keeps the Sort when the arm will decline a described index the module claims an order from', async () => {
+		// A NOCASE equality on a NOCASE key column matches under the equality lattice, but the
+		// arm's range rule declines it (no honorsCollatedRangeBounds) to an unordered scan.
+		module.listedColumns = new Set([4]);
+		module.descriptor = {
+			name: MODULE_SEEK_INDEX_NAME, role: 'secondary', unique: true,
+			keyColumns: [{ columnIndex: 4, desc: false, collation: 'NOCASE' }, { columnIndex: 0, desc: false }],
+		};
+		expect(await ids(db, "select id from t where name = 'bob' order by id")).to.deep.equal([1, 2]);
+	});
+
 	describe('validateAccessPlan', () => {
 		const columns: ColumnMeta[] = [0, 1].map(index => ({
 			index, name: `c${index}`, type: INTEGER_TYPE, isPrimaryKey: index === 0, isUnique: index === 0,
