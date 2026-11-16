@@ -1,0 +1,62 @@
+-- 53.5.1-materialized-view-over-lens-redeploy.sqllogic — a materialized view whose body
+-- reads a lens view (a logical schema's table) goes stale when a redeploy of that logical
+-- schema changes the view's get-body or removes the view, as a dropped plain view does
+-- (53.5). Every `apply schema` of a logical schema redeploys its lens, so a redeploy that
+-- leaves the get-body unchanged must leave the view live and maintained.
+
+declare schema ybasis { table t { id integer primary key, name text } }
+-- run
+
+apply schema ybasis;
+insert into ybasis.t values (1, 'alpha');
+-- run
+
+declare logical schema appx { table t { id integer primary key, name text } }
+-- run
+
+-- explicit basis: once the materialized view populates main, the default is ambiguous
+declare lens for appx over ybasis { }
+-- run
+
+apply schema appx;
+create materialized view main.mm as select id, name from appx.t;
+-- run
+
+-- unchanged redeploy: the inlined body is the same, so maintenance continues
+apply schema appx;
+insert into ybasis.t values (2, 'beta');
+select id, name from main.mm order by id;
+→ [{"id":1,"name":"alpha"},{"id":2,"name":"beta"}]
+
+-- redeploy that drops a column the body reads: stale, and writes no longer propagate
+declare logical schema appx { table t { id integer primary key } }
+-- run
+
+apply schema appx;
+insert into ybasis.t values (3, 'gamma');
+select id, name from main.mm order by id;
+-- error: is stale
+
+-- the column is back: the body plans again, so the stale snapshot is served
+declare logical schema appx { table t { id integer primary key, name text } }
+-- run
+
+apply schema appx;
+select id, name from main.mm order by id;
+→ [{"id":1,"name":"alpha"},{"id":2,"name":"beta"}]
+
+-- REFRESH re-derives the rows from the current body and resumes maintenance
+refresh materialized view main.mm;
+insert into ybasis.t values (4, 'delta');
+select id, name from main.mm order by id;
+→ [{"id":1,"name":"alpha"},{"id":2,"name":"beta"},{"id":3,"name":"gamma"},{"id":4,"name":"delta"}]
+
+-- redeploy that removes the table from the declaration: stale, the body no longer plans
+declare logical schema appx { }
+-- run
+
+apply schema appx;
+select id, name from main.mm order by id;
+-- error: is stale
+
+drop materialized view main.mm;

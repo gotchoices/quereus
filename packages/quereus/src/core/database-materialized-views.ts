@@ -52,6 +52,7 @@ import { compareSqlValuesFast, resolveCollationFunctions } from '../util/compari
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { FunctionSchema } from '../schema/function.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
+import type { ViewSchema } from '../schema/view.js';
 import { coveringMvHonorsIndexCollation, uniqueEnforcementComparators } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
 import type { MaintenanceCollisionEvent } from './database-events.js';
@@ -96,6 +97,21 @@ import {
 export type { BackingConnectionCache, ResidualKeyBatch } from './database-materialized-views-plans.js';
 
 const log = createLogger('core:materialized-views');
+
+/**
+ * Whether a lens redeploy changed what a reader of the view inlines: its get-body
+ * or its output column names. The lens slot also contributes asserted key FDs at
+ * the inlining site, but those are facts about the body over the (untouched) basis
+ * — proved by the body or enforced by a basis structure — so a redeploy that
+ * changes only constraints or tags leaves a plan built on the old body sound.
+ */
+function lensGetBodyChanged(oldView: ViewSchema, newView: ViewSchema): boolean {
+	if (oldView.sql !== newView.sql) return true;
+	const oldColumns = oldView.columns ?? [];
+	const newColumns = newView.columns ?? [];
+	return oldColumns.length !== newColumns.length
+		|| oldColumns.some((name, i) => name.toLowerCase() !== newColumns[i].toLowerCase());
+}
 
 /** Caller-supplied context for {@link MaterializedViewManager.registerMaterializedView}. */
 export interface RegisterMaterializedViewOptions {
@@ -192,23 +208,29 @@ export class MaterializedViewManager {
 				// directly. The table is already in the catalog when this fires.
 				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
 				this.rebuildConstraintValidatorsFor(changed, /*matchOwnName*/ false);
-			} else if (event.type === 'view_removed') {
-				// A plain view the body reads (directly or through other views) was dropped.
-				// The planner inlined its body into the row-time plan, so that plan keeps
-				// computing the old definition. No recompile is attempted: a later view of
-				// the same name may carry a different body, and the backing rows came from
-				// this one — only REFRESH re-derives them. No `view_added` / `view_modified`
-				// arm: a view cannot be redefined in place, so a redefinition always passes
+			} else if (event.type === 'view_removed' || event.type === 'lens_view_removed'
+				|| (event.type === 'lens_view_replaced' && lensGetBodyChanged(event.oldObject, event.newObject))) {
+				// A view the body reads (directly or through other views) was dropped or,
+				// for a lens view, redeployed with a different get-body. The planner inlined
+				// the old body into the row-time plan, so that plan keeps computing the old
+				// definition. No recompile is attempted: the backing rows came from the old
+				// body — only REFRESH re-derives them. No `view_added` / `view_modified` arm:
+				// a plain view cannot be redefined in place, so a redefinition always passes
 				// through this drop, and `view_modified` fires only for tag changes and the
 				// rename propagation's semantics-preserving rewrite.
-				const removed = `${event.schemaName}.${event.objectName}`.toLowerCase();
-				for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
-					if (mv.derivation.sourceViews.includes(removed)) this.markMaterializedViewStale(mv, `${event.type} on ${removed}`);
-				}
+				this.markViewDependentsStale(event.schemaName, event.objectName, event.type);
 			} else if (event.type === 'materialized_view_removed') {
 				this.releaseRowTime(mvKey(event.schemaName, event.objectName));
 			}
 		});
+	}
+
+	/** Mark stale every materialized view whose body inlined the named view. */
+	private markViewDependentsStale(schemaName: string, viewName: string, eventType: string): void {
+		const view = `${schemaName}.${viewName}`.toLowerCase();
+		for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
+			if (mv.derivation.sourceViews.includes(view)) this.markMaterializedViewStale(mv, `${eventType} on ${view}`);
+		}
 	}
 
 	/**

@@ -421,3 +421,34 @@ describe('lens foundation: column-name contract', () => {
 		}
 	});
 });
+
+describe('lens foundation: redeploy invalidates cached plans', () => {
+	it('a prepared read of a lens view re-plans against the redeployed body', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t { id integer primary key, name text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.t values (1, 'alpha')");
+			await db.exec('declare logical schema x { table t { id integer primary key, name text } }');
+			await db.exec('apply schema x');
+
+			const stmt = db.prepare('select * from x.t');
+			try {
+				const collect = async () => {
+					const out: Array<Record<string, unknown>> = [];
+					for await (const r of stmt.all()) out.push(r as Record<string, unknown>);
+					return out;
+				};
+				expect(await collect()).to.deep.equal([{ id: 1, name: 'alpha' }]);
+
+				await db.exec('declare logical schema x { table t { id integer primary key } }');
+				await db.exec('apply schema x');
+				expect(await collect(), 'the cached plan must not keep the old body').to.deep.equal([{ id: 1 }]);
+			} finally {
+				await stmt.finalize();
+			}
+		} finally {
+			await db.close();
+		}
+	});
+});

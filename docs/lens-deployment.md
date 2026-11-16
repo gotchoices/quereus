@@ -16,6 +16,8 @@ Quereus is a query-processing engine, not a deployment system, but it exposes th
 
 The compile is **atomic**: every logical table is compiled and [proved](lens-prover.md#coverage-checklist) before any catalog mutation, and the blocking errors of every table are aggregated into one deploy failure, so a blocked deploy leaves the previously deployed lens state untouched.
 
+A re-deploy is **clear-and-rebuild**: every lens view and slot of the logical schema is replaced. After the catalog mutation it fires one schema-change event per previously deployed view — `lens_view_replaced` (old and new view) when the table is still declared, `lens_view_removed` when it left the declaration; a first deploy fires none. These are deliberately not the `view_added` / `view_removed` a plain `create view` / `drop view` fires: a store-backed catalog persists views on those, and a lens view is recompiled on every deploy, never stored. A prepared statement that read a lens view re-plans on either event; a materialized view whose body read one goes stale on removal, and on replacement only when the get-body or its column names changed ([Schema-change staleness](mv-schema-change.md)). A blocked deploy fires nothing.
+
 The authored source stays sparse (signal only). The *compiled* effective mapping is the inspectable, generated-on-demand artifact (the noise). Because the basis is frozen and the effective lens is recomputed at compile from frozen inputs, the result is deterministic, not a moving target.
 
 ## The deployed basis representation

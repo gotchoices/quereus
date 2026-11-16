@@ -243,7 +243,8 @@ export function deployLogicalSchema(
 	// freshly compiled set. A logical schema's views are exclusively lens bodies,
 	// so dropping every view is safe and implements detach for tables removed
 	// from the declaration (logical removals never touch basis storage).
-	for (const view of Array.from(logicalSchema.getAllViews())) {
+	const priorViews = Array.from(logicalSchema.getAllViews());
+	for (const view of priorViews) {
 		logicalSchema.removeView(view.name);
 	}
 	logicalSchema.clearLensSlots();
@@ -254,11 +255,13 @@ export function deployLogicalSchema(
 		log('Deployed lens for %s.%s over %s', logicalSchemaName, slot.logicalTable.name, slot.defaultBasis.schemaName);
 	}
 
-	// The lens-slot set just changed (the only slot-mutating site that fires no
-	// `SchemaChangeEvent`), so the lens basis-FK gate is stale — reset it directly,
-	// sibling to the snapshot rotation. The next basis write rebuilds it and reflects
-	// any added / removed logical FK in this deploy.
+	// The lens-slot set just changed (the only slot-mutating site; the lens view
+	// events below fire only for prior views, so a first deploy raises none), so the
+	// lens basis-FK gate is stale — reset it directly, sibling to the snapshot
+	// rotation. The next basis write rebuilds it and reflects any added / removed
+	// logical FK in this deploy.
 	schemaManager.invalidateLensFkGate();
+	notifyLensViewsReplaced(schemaManager, priorViews, compiled.map(c => c.view));
 
 	// Capture + rotate the deployed-basis snapshot AFTER a successful catalog
 	// mutation, so an aborted re-apply leaves the prior snapshot untouched. The
@@ -276,6 +279,29 @@ export function deployLogicalSchema(
 	const report: LensDeployReport = { errors: [], warnings: proveWarnings, acknowledged, obligationsByTable };
 	db.declaredSchemaManager.setDeployedLensReport(logicalSchemaName, report);
 	return report;
+}
+
+/**
+ * Announces a redeploy's view replacement to plans and materialized views that
+ * inlined a prior get-body: `lens_view_replaced` for each prior view the new set
+ * still has (case-insensitive name match), `lens_view_removed` for the rest. Fired
+ * after the catalog mutation so listeners see the new views; the stored names of
+ * the prior view are what readers recorded as their dependency.
+ */
+function notifyLensViewsReplaced(
+	schemaManager: SchemaManager,
+	priorViews: ReadonlyArray<ViewSchema>,
+	deployedViews: ReadonlyArray<ViewSchema>,
+): void {
+	const deployedByName = new Map(deployedViews.map(v => [v.name.toLowerCase(), v]));
+	const notifier = schemaManager.getChangeNotifier();
+	for (const oldObject of priorViews) {
+		const newObject = deployedByName.get(oldObject.name.toLowerCase());
+		const target = { schemaName: oldObject.schemaName, objectName: oldObject.name, oldObject };
+		notifier.notifyChange(newObject
+			? { type: 'lens_view_replaced', ...target, newObject }
+			: { type: 'lens_view_removed', ...target });
+	}
 }
 
 /**

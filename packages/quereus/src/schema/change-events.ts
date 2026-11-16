@@ -57,7 +57,9 @@ export type AssertionModifiedEvent = SchemaObjectModified<'assertion_modified', 
  * bodies, any other direct `schema.addView` caller) which must NOT be persisted
  * to a store-backed catalog — they are re-derived, not stored. A store catalog
  * subscribes to these to persist/forget a view incrementally. Mirrors how the MV
- * emitters fire `materialized_view_added`/`_removed`.
+ * emitters fire `materialized_view_added`/`_removed`. A lens redeploy announces
+ * its view replacement on the separate `lens_view_*` events below, which a
+ * persisting consumer ignores.
  */
 export type ViewAddedEvent = SchemaObjectAdded<'view_added', ViewSchema>;
 export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
@@ -73,6 +75,24 @@ export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
  * a persistence re-create.
  */
 export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
+
+// ── Lens view events ───────────────────────────────────────────────
+// Fired by `deployLogicalSchema` after it replaces a logical schema's views, so a
+// prepared statement or materialized view that inlined the old get-body can
+// invalidate. Separate from `view_*` because lens views are recompiled on every
+// deploy and must never be persisted as `create view` DDL. No added event: nothing
+// can hold a dependency on a lens view that did not exist before the deploy.
+
+/** A lens view present before the deploy and absent after it (its logical table left the declaration). */
+export type LensViewRemovedEvent = SchemaObjectRemoved<'lens_view_removed', ViewSchema>;
+
+/**
+ * A lens view present before and after the deploy (matched case-insensitively by
+ * name). Fired for every surviving view, whether or not its body changed: a cached
+ * write-through plan also depends on the lens slot (constraints, inverse,
+ * provenance), which can change while the get-body does not.
+ */
+export type LensViewReplacedEvent = SchemaObjectModified<'lens_view_replaced', ViewSchema>;
 
 // ── Materialized view events ───────────────────────────────────────
 // Keyed by the maintained table's own name (unified model: one `TableSchema`
@@ -129,6 +149,8 @@ export type SchemaChangeEvent =
 	| ViewAddedEvent
 	| ViewRemovedEvent
 	| ViewModifiedEvent
+	| LensViewRemovedEvent
+	| LensViewReplacedEvent
 	| MaterializedViewAddedEvent
 	| MaterializedViewRemovedEvent
 	| MaterializedViewModifiedEvent

@@ -223,7 +223,7 @@ export type { ImportCatalogOptions } from './schema/manager.js';
 // scope/result types — `@quereus/sync` resolves a replicated index migration's
 // owning table through it rather than re-scanning the schema itself.
 export type { IndexLookupScope, IndexOwnerMatch } from './schema/manager.js';
-export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
+export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent, LensViewRemovedEvent, LensViewReplacedEvent } from './schema/change-events.js';
 // `collectTableConstraintNames` + `disambiguateAutoConstraintName` are the two halves of
 // the auto-constraint-name mint rule (build the table's case-folded taken-set, then pick a
 // free spelling). Exported for out-of-tree vtab modules that mint their own constraint

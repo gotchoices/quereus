@@ -449,6 +449,8 @@ The `SchemaChangeEvent` discriminated union includes:
 | `view_added` | `newObject: ViewSchema` | After `CREATE VIEW` (fired from the runtime emitter, not `Schema.addView`) |
 | `view_removed` | `oldObject: ViewSchema` | After `DROP VIEW` |
 | `view_modified` | `oldObject`, `newObject: ViewSchema` | After `ALTER VIEW … SET TAGS`, or when an `ALTER TABLE/COLUMN RENAME` rewrites a dependent view body or its `with defaults` clause (which rides inside the body select, so the body rewrite covers it) |
+| `lens_view_removed` | `oldObject: ViewSchema` | After an `apply schema` of a logical schema, for each lens view whose table left the declaration ([Lens Deployment](lens-deployment.md#deployment-is-a-compile-step)) |
+| `lens_view_replaced` | `oldObject`, `newObject: ViewSchema` | After an `apply schema` of a logical schema, for each lens view redeployed under the same name — body changed or not. Never persisted, unlike `view_*` |
 | `materialized_view_added` | `newObject: TableSchema` (the maintained table) | After `CREATE MATERIALIZED VIEW`; also under the new name when `ALTER TABLE … RENAME TO` re-keys a maintained table |
 | `materialized_view_removed` | `oldObject: TableSchema` (the maintained table) | After `DROP MATERIALIZED VIEW` — or `DROP TABLE` on a maintained table (one record, one drop); also under the old name on a maintained-table rename |
 | `materialized_view_modified` | `oldObject`, `newObject: TableSchema` (the maintained table) | After `ALTER MATERIALIZED VIEW … SET TAGS` (catalog-only, no re-materialize), or when an `ALTER TABLE/COLUMN RENAME` rewrites a dependent MV body or its `with defaults` clause |
