@@ -157,6 +157,14 @@ export interface SchemaDiff {
 	 * such drop; see {@link dropsReleasedByDeclaration}. Not rendered by `diff schema`.
 	 */
 	releasedDrops: string[];
+	/**
+	 * True when the plan removes for good a table or view the declared schema may still refer to:
+	 * one it does not release (see {@link releasedDrops}), or one a declared foreign key names. The plan
+	 * then runs `DROP CONSTRAINT` in stage 2 of the table alters, after the object drops, so a rule the
+	 * declaration changes still holds its old body when the object's drop is judged, and refuses it
+	 * before any rows are lost. Absent means false.
+	 */
+	removalsStillReferenced?: boolean;
 }
 
 export interface ColumnAttributeChange {
@@ -1044,6 +1052,7 @@ export function computeSchemaDiff(
 	}
 
 	diff.releasedDrops = dropsReleasedByDeclaration(diff, declaredTables, declaredBodies, actualTables, targetSchemaName);
+	if (removalsStillReferenced(diff, declaredTables, targetSchemaName)) diff.removalsStillReferenced = true;
 	return diff;
 }
 
@@ -2771,8 +2780,7 @@ function dropsReleasedByDeclaration(
 	actualTables: ReadonlyMap<string, CatalogTable>,
 	schemaName: string,
 ): string[] {
-	const recreated = objectsRecreatedByDiff(diff, schemaName);
-	const removed = [...diff.tablesToDrop, ...diff.viewsToDrop].filter(name => !recreated.has(objectRefKey(schemaName, name)));
+	const removed = objectsRemovedByDiff(diff, schemaName);
 	if (removed.length === 0) return [];
 	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
 	const keptGenerated = [...actualTables].flatMap(([name, table]) => dropped.has(name)
@@ -2783,6 +2791,20 @@ function dropsReleasedByDeclaration(
 	const reached = objectsRulesReach(rules, declaredBodies, schemaName);
 	if (reached === undefined || removed.some(name => reached.has(name.toLowerCase()))) return [];
 	return removed;
+}
+
+/** The {@link SchemaDiff.tablesToDrop} / {@link SchemaDiff.viewsToDrop} names the diff does not create again. */
+function objectsRemovedByDiff(diff: SchemaDiff, schemaName: string): string[] {
+	const recreated = objectsRecreatedByDiff(diff, schemaName);
+	return [...diff.tablesToDrop, ...diff.viewsToDrop].filter(name => !recreated.has(objectRefKey(schemaName, name)));
+}
+
+/** {@link SchemaDiff.removalsStillReferenced}. Runs after {@link dropsReleasedByDeclaration}. */
+function removalsStillReferenced(diff: SchemaDiff, declaredTables: ReadonlyMap<string, AST.DeclaredTable>, schemaName: string): boolean {
+	const removed = new Set(objectsRemovedByDiff(diff, schemaName).map(name => objectRefKey(schemaName, name)));
+	if (removed.size === 0) return false;
+	if (diff.releasedDrops.length === 0) return true;
+	return [...declaredTables.values()].some(({ tableStmt }) => foreignKeyParents(tableStmt, schemaName).some(parent => removed.has(parent)));
 }
 
 /** A written-row expression with the mutation-context variables its owning table declares (none for a generated body). */
@@ -3501,6 +3523,22 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 		}
 	}
 
+	const sink: AlterStepSink = { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo };
+
+	// Constraint drops before every object drop and column change. A rule the declaration removes
+	// or changes must not judge a step on the way: a foreign key would refuse its parent's
+	// `DROP TABLE`, and a CHECK reading a column would refuse its `RENAME COLUMN`. `DROP CONSTRAINT`
+	// resolves by name alone, so nothing has to precede it, and it still comes before every re-add
+	// (`ADD CONSTRAINT`, `RENAME CONSTRAINT` onto a dropped name) and before `ALTER PRIMARY KEY`, so a
+	// dropped UNIQUE cannot strand a key dependency. A kept foreign key is not dropped, so it still
+	// refuses its parent's drop while referencing rows exist, before any rows are lost. When the
+	// declaration may still refer to an object it removes, the drops wait for stage 2 instead (see
+	// `SchemaDiff.removalsStillReferenced`).
+	const constraintDropsFirst = !diff.removalsStillReferenced;
+	if (constraintDropsFirst) {
+		for (const alter of diff.tablesToAlter) pushConstraintDrops(alter, sink);
+	}
+
 	// Drop items (reverse order)
 	for (const tableName of diff.tablesToDrop) {
 		pushText(`DROP TABLE IF EXISTS ${schemaPrefix}${quoteIdentifier(tableName)}`, u => u.droppedTable(tableName));
@@ -3522,7 +3560,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	const maintainedCreates = diff.tablesToCreate.filter(create => isMaintainedCreate(create.ast));
 	pushCreates(orderTableCreates(plainTableCreates, schemaName ?? 'main'), 'table');
 
-	pushTableAlters(diff.tablesToAlter, [...diff.viewsToCreate, ...maintainedCreates], { schemaName: schemaName ?? 'main', schemaPrefix, pushText, pushCreate, undo });
+	pushTableAlters(diff.tablesToAlter, [...diff.viewsToCreate, ...maintainedCreates], sink, !constraintDropsFirst);
 
 	// Attach / re-attach maintained tables (`set maintained as`) LATE — after every
 	// table create/alter and every new view or maintained create, so the target's final shape and
@@ -3682,10 +3720,12 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
 /**
  * Emits the table alters in stages that span every table, because an `ALTER` validates what it
  * refers to, and one table's statement can refer to what another table's statement changes.
- * Within one table the steps keep the relative order the stages give them.
+ * Within one table the steps keep the relative order the stages give them. `DROP CONSTRAINT` runs
+ * before the object drops (see {@link pushConstraintDrops}), unless `dropsConstraints` puts it in
+ * stage 2 (see {@link SchemaDiff.removalsStillReferenced}).
  *
  *   1. RENAME COLUMN, so every later statement in any table sees post-rename names.
- *   2. Per table: ADD COLUMN, ALTER COLUMN, RENAME CONSTRAINT, DROP CONSTRAINT, ALTER PRIMARY KEY.
+ *   2. Per table: ADD COLUMN, ALTER COLUMN, RENAME CONSTRAINT, [DROP CONSTRAINT,] ALTER PRIMARY KEY.
  *      A table follows the tables its new columns refer to: an inline foreign key or DEFAULT
  *      arrives inside `ADD COLUMN` and cannot wait for stage 3. These stay per table rather than
  *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
@@ -3707,9 +3747,9 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      drops precede those of the tables its dropped columns' expressions read.
  *   5. SET TAGS, last, because a constraint's tags can name a constraint from stage 3.
  */
-function pushTableAlters(alters: readonly TableAlterDiff[], bodyCreates: readonly MigrationCreate[], sink: AlterStepSink): void {
+function pushTableAlters(alters: readonly TableAlterDiff[], bodyCreates: readonly MigrationCreate[], sink: AlterStepSink, dropsConstraints: boolean): void {
 	for (const alter of alters) pushColumnRenames(alter, sink);
-	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink)), ...createStageTwoItems(bodyCreates, alters, sink)];
+	const stageTwo = [...alters.map(a => alterStageTwoItem(a, sink, dropsConstraints)), ...createStageTwoItems(bodyCreates, alters, sink)];
 	const preferredTiers = [(i: StageTwoItem) => i.prefersToRunAfter, (i: StageTwoItem) => i.alsoPrefersToRunAfter];
 	for (const item of orderDependenciesFirst(stageTwo, i => i.key, i => i.runsAfter, preferredTiers)) item.push();
 	for (const alter of alters) pushConstraintAdds(alter, sink);
@@ -3717,7 +3757,7 @@ function pushTableAlters(alters: readonly TableAlterDiff[], bodyCreates: readonl
 	for (const alter of alters) pushTagChanges(alter, sink);
 }
 
-function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwoItem {
+function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink, dropsConstraints: boolean): StageTwoItem {
 	return {
 		key: alterKey(alter),
 		runsAfter: alter.addedColumnReads ?? [],
@@ -3727,7 +3767,8 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 		push: () => {
 			pushColumnAdds(alter, sink);
 			pushColumnAlters(alter, sink);
-			pushConstraintRenamesAndDrops(alter, sink);
+			pushConstraintRenames(alter, sink);
+			if (dropsConstraints) pushConstraintDrops(alter, sink);
 			pushPrimaryKeyChange(alter, sink);
 		},
 	};
@@ -3836,16 +3877,27 @@ function pushColumnAlters(alter: TableAlterDiff, sink: AlterStepSink): void {
 	}
 }
 
-/** RENAME frees a name and DROP removes a stale constraint, both before any re-add, and before the PK change so a dropped UNIQUE can't strand a PK dependency. */
-function pushConstraintRenamesAndDrops(alter: TableAlterDiff, sink: AlterStepSink): void {
+/** RENAME frees a name before any re-add. */
+function pushConstraintRenames(alter: TableAlterDiff, sink: AlterStepSink): void {
 	const quotedTable = quotedAlterTable(alter, sink);
 	for (const r of alter.constraintsToRename ?? []) {
 		sink.pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
 			() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
 		sink.undo?.constraintRenameLanded(alter.tableName, r);
 	}
+}
+
+/**
+ * Usually runs before every column change, with only the table renames in force, so the undo re-adds
+ * the constraint with its pre-apply column names: by the time it runs, the plan's column renames have
+ * been taken back. The undo renderer is told of each drop because the drop frees the name for a later
+ * `ADD COLUMN` CHECK mint.
+ */
+function pushConstraintDrops(alter: TableAlterDiff, sink: AlterStepSink): void {
+	const quotedTable = quotedAlterTable(alter, sink);
 	for (const name of alter.constraintsToDrop ?? []) {
 		sink.pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`, u => u.readdConstraint(alter.tableName, name, quotedTable));
+		sink.undo?.constraintDropLanded(alter.tableName, name);
 	}
 }
 
@@ -4001,6 +4053,11 @@ class UndoRenderer {
 
 	constraintRenameLanded(table: string, r: ColumnRenameOp): void {
 		this.constraintRenames.push({ table, oldName: r.oldName, newName: r.newName });
+	}
+
+	/** Frees the name for a later `ADD COLUMN` CHECK mint, as the forward drop does. */
+	constraintDropLanded(table: string, name: string): void {
+		this.constraintNamesHeld(table).delete(name.toLowerCase());
 	}
 
 	// --- Arms ---
@@ -4194,9 +4251,12 @@ class UndoRenderer {
 
 	/**
 	 * The lowercased constraint names a table holds at its next `ADD COLUMN` step: what that
-	 * step's CHECK mint disambiguates against. The pre-apply catalog is still accurate there,
-	 * because every phase that renames, drops or adds a constraint comes after `ADD COLUMN`.
-	 * The set then lives for the plan, so a later `ADD COLUMN` sees what earlier ones installed.
+	 * step's CHECK mint disambiguates against. Seeded from the pre-apply catalog, less each name
+	 * a `DROP CONSTRAINT` frees (`constraintDropLanded`); the drops usually run before every
+	 * `ADD COLUMN`, and when they wait for stage 2 they follow all of their table's. That is
+	 * accurate because every phase that renames or adds a constraint comes after the table's
+	 * `ADD COLUMN` steps. The set then lives for the plan, so a later `ADD COLUMN` sees what
+	 * earlier ones installed.
 	 *
 	 * NOTE: a `create unique index _check_d` also takes that name from the forward mint, but
 	 * the UNIQUE it derives is in neither catalog constraint list and `CatalogIndex` has no

@@ -961,7 +961,7 @@ declare schema main {
 -- run
 
 diff schema main;
-→ [{"ddl": "ALTER TABLE t28 RENAME COLUMN who TO w"}, {"ddl": "ALTER TABLE t28 DROP CONSTRAINT k"}, {"ddl": "ALTER TABLE t28 ADD constraint k check (w > 0)"}]
+→ [{"ddl": "ALTER TABLE t28 DROP CONSTRAINT k"}, {"ddl": "ALTER TABLE t28 RENAME COLUMN who TO w"}, {"ddl": "ALTER TABLE t28 ADD constraint k check (w > 0)"}]
 
 apply schema main;
 

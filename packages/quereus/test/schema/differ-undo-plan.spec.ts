@@ -361,32 +361,52 @@ describe('generateMigrationPlan undo', () => {
 	});
 
 	describe('the two rules under renames', () => {
-		it('a constraint dropped after a column it names was renamed: the restored body names the post-rename column', async () => {
+		it('a constraint dropped before the column it names is renamed: the restored body names the pre-rename column', async () => {
 			const db = await databaseWith(['create table t (id integer primary key, qty integer, constraint ck_qty check (qty > 0))']);
 			const plan = planFor(db, `table t { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') }`);
 			expect(plan.map(s => s.sql)).to.deep.equal([
-				'ALTER TABLE t RENAME COLUMN qty TO cap',
 				'ALTER TABLE t DROP CONSTRAINT ck_qty',
+				'ALTER TABLE t RENAME COLUMN qty TO cap',
 			]);
-			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck_qty', ['ALTER TABLE t ADD constraint ck_qty check on insert, update (cap > 0)']);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck_qty', ['ALTER TABLE t ADD constraint ck_qty check on insert, update (qty > 0)']);
 		});
 
-		it('UNIQUE and FK column lists, and the FK parent, follow the renames in force', async () => {
+		it('when the declaration still reads a view it removes, the drops wait for stage 2 and their undo follows every column rename, another table\'s included', async () => {
+			const db = await databaseWith([
+				'create table p (id integer primary key, flag integer)',
+				'create table t (id integer primary key, qty integer, constraint ck_qty check (qty > 0), constraint ck_p check ((select count(*) from p where p.flag = 1) >= 0))',
+				'create view v as select id from t',
+				'create table u (id integer primary key, constraint ck_v check ((select count(*) from v) >= 0))',
+			]);
+			const plan = planFor(db, `
+				table p { id integer primary key, active integer with tags ("quereus.previous_name" = 'flag') }
+				table t { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') }
+				table u { id integer primary key, constraint ck_v check ((select count(*) from v) >= 0) }
+			`);
+			expect(plan.map(s => s.sql)).to.deep.equal([
+				'DROP VIEW IF EXISTS v',
+				'ALTER TABLE p RENAME COLUMN flag TO active',
+				'ALTER TABLE t RENAME COLUMN qty TO cap',
+				'ALTER TABLE t DROP CONSTRAINT ck_qty',
+				'ALTER TABLE t DROP CONSTRAINT ck_p',
+			]);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck_qty', ['ALTER TABLE t ADD constraint ck_qty check on insert, update (cap > 0)']);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck_p', ['ALTER TABLE t ADD constraint ck_p check on insert, update ((select count(*) from p where p.active = 1) >= 0)']);
+		});
+
+		it('UNIQUE and FK column lists keep their pre-rename names, and the FK parent follows the table rename', async () => {
 			const db = await databaseWith([
 				'create table p (pid integer primary key)',
 				'create table t (id integer primary key, code text, ref integer, constraint uq unique (code), constraint fk foreign key (ref) references p (pid))',
 			]);
-			// The parent table is renamed (first step) and, in the SAME table block as the
-			// drops, the child's columns are renamed before the constraints drop.
+			// The parent table is renamed (first step); every column rename, the parent's
+			// included, comes after the constraint drops.
 			const plan = planFor(db, `
 				table parent { pid2 integer primary key with tags ("quereus.previous_name" = 'pid') } with tags ("quereus.previous_name" = 'p')
 				table t { id integer primary key, code2 text with tags ("quereus.previous_name" = 'code'), ref2 integer with tags ("quereus.previous_name" = 'ref') }
 			`);
-			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT uq', ['ALTER TABLE t ADD constraint uq unique (code2)']);
-			// The parent's column rename lives in `parent`'s alter block. Whether it is in force at
-			// this step depends on block order; pin whichever the differ produces so a change is noticed.
-			const parentRenamedFirst = plan.findIndex(s => s.sql === 'ALTER TABLE parent RENAME COLUMN pid TO pid2') < plan.findIndex(s => s.sql === 'ALTER TABLE t DROP CONSTRAINT fk');
-			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT fk', [`ALTER TABLE t ADD constraint fk foreign key (ref2) references parent(${parentRenamedFirst ? 'pid2' : 'pid'}) on delete restrict on update restrict`]);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT uq', ['ALTER TABLE t ADD constraint uq unique (code)']);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT fk', ['ALTER TABLE t ADD constraint fk foreign key (ref) references parent(pid) on delete restrict on update restrict']);
 		});
 
 		it('a view and an assertion dropped in a diff that renames their source table are restored against the new name', async () => {
@@ -427,26 +447,10 @@ describe('generateMigrationPlan undo', () => {
 			expectUndo(plan, 'DROP VIEW IF EXISTS v', ['create view v as select qty from t']);
 		});
 
-		it('a CHECK whose subquery reads ANOTHER table follows that table\'s column rename when it precedes the drop', async () => {
-			const db = await databaseWith([
-				'create table p (id integer primary key, flag integer)',
-				'create table t (id integer primary key, pid integer, constraint ck check ((select count(*) from p where p.flag = 1) >= 0))',
-			]);
-			const plan = planFor(db, `
-				table p { id integer primary key, active integer with tags ("quereus.previous_name" = 'flag') }
-				table t { id integer primary key, pid integer }
-			`);
-			expect(plan.map(s => s.sql)).to.deep.equal([
-				'ALTER TABLE p RENAME COLUMN flag TO active',
-				'ALTER TABLE t DROP CONSTRAINT ck',
-			]);
-			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck', ['ALTER TABLE t ADD constraint ck check on insert, update ((select count(*) from p where p.active = 1) >= 0)']);
-		});
-
-		it('a CHECK with a qualified self-reference follows the table rename, then the column rename', async () => {
+		it('a CHECK with a qualified self-reference follows the table rename, and not the later column rename', async () => {
 			const db = await databaseWith(['create table a (id integer primary key, qty integer, constraint ck check (a.qty > 0))']);
 			const plan = planFor(db, `table b { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') } with tags ("quereus.previous_name" = 'a')`);
-			expectUndo(plan, 'ALTER TABLE b DROP CONSTRAINT ck', ['ALTER TABLE b ADD constraint ck check on insert, update (b.cap > 0)']);
+			expectUndo(plan, 'ALTER TABLE b DROP CONSTRAINT ck', ['ALTER TABLE b ADD constraint ck check on insert, update (b.qty > 0)']);
 		});
 	});
 
@@ -460,17 +464,13 @@ describe('generateMigrationPlan undo', () => {
 			['create table t (id integer primary key)'],
 			'table t { id integer primary key, e integer constraint _check_f unique, f integer check (f > 0) }'));
 
-		it('a column rename with a CHECK over it dropped (Rule 2)', () => expectRoundTrip(
+		it('an added column whose CHECK mint takes a name the plan dropped before it', () => expectRoundTrip(
+			['create table t (id integer primary key, b integer, constraint _check_e check (b > 0))'],
+			'table t { id integer primary key, b integer, e integer check (e > 0) }'));
+
+		it('a column rename with a CHECK over it dropped', () => expectRoundTrip(
 			['create table t (id integer primary key, qty integer, constraint ck_qty check (qty > 0))'],
 			`table t { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') }`));
-
-		it('another table\'s column rename with a cross-table CHECK subquery dropped (the non-owning walk)', () => expectRoundTrip([
-			'create table p (id integer primary key, flag integer)',
-			'create table t (id integer primary key, pid integer, constraint ck check ((select count(*) from p where p.flag = 1) >= 0))',
-		], `
-			table p { id integer primary key, active integer with tags ("quereus.previous_name" = 'flag') }
-			table t { id integer primary key, pid integer }
-		`));
 
 		it('a table rename with its dependent view, assertion and index dropped', () => expectRoundTrip([
 			'create table a (id integer primary key, qty integer)',
@@ -715,6 +715,7 @@ const BROAD_DDL_MAIN = [
 	'ALTER TABLE old_t RENAME TO new_t',
 	'DROP ASSERTION IF EXISTS gone_a',
 	'ALTER TABLE new_t DROP MAINTAINED',
+	'ALTER TABLE new_t DROP CONSTRAINT ck_stale',
 	'DROP TABLE IF EXISTS gone_t',
 	'DROP VIEW IF EXISTS gone_v',
 	'DROP INDEX IF EXISTS gone_idx',
@@ -731,7 +732,6 @@ const BROAD_DDL_MAIN = [
 	'ALTER TABLE new_t ALTER COLUMN qty DROP DEFAULT',
 	'ALTER TABLE new_t ALTER COLUMN qty DROP NOT NULL',
 	'ALTER TABLE new_t RENAME CONSTRAINT ck_old TO ck_new',
-	'ALTER TABLE new_t DROP CONSTRAINT ck_stale',
 	'ALTER TABLE new_t ALTER PRIMARY KEY (id, b desc)',
 	'create view fresh_v as select id from fresh',
 	'create materialized view mv1 as select id from fresh',
@@ -752,6 +752,7 @@ const BROAD_DDL_ANALYTICS = [
 	'ALTER TABLE analytics.old_t RENAME TO new_t',
 	'DROP ASSERTION IF EXISTS analytics.gone_a',
 	'ALTER TABLE analytics.new_t DROP MAINTAINED',
+	'ALTER TABLE analytics.new_t DROP CONSTRAINT ck_stale',
 	'DROP TABLE IF EXISTS analytics.gone_t',
 	'DROP VIEW IF EXISTS analytics.gone_v',
 	'DROP INDEX IF EXISTS analytics.gone_idx',
@@ -768,7 +769,6 @@ const BROAD_DDL_ANALYTICS = [
 	'ALTER TABLE analytics.new_t ALTER COLUMN qty DROP DEFAULT',
 	'ALTER TABLE analytics.new_t ALTER COLUMN qty DROP NOT NULL',
 	'ALTER TABLE analytics.new_t RENAME CONSTRAINT ck_old TO ck_new',
-	'ALTER TABLE analytics.new_t DROP CONSTRAINT ck_stale',
 	'ALTER TABLE analytics.new_t ALTER PRIMARY KEY (id, b desc)',
 	'create view fresh_v as select id from fresh',
 	'create materialized view mv1 as select id from fresh',

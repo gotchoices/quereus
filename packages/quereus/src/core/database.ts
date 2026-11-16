@@ -3026,7 +3026,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Holds the `objectRefKey`s of the objects the running `apply schema` plan drops for
 	 *  good while no rule of the declared schema reaches them (`SchemaDiff.releasedDrops`). A forward
 	 *  `DROP` of one of them passes the expression guard (`assertNoExpressionDependsOn`) for a rule on
-	 *  a table in the applied schema, because the plan drops or rewrites every such rule later; a rule
+	 *  a table in the applied schema, because the plan drops or rewrites every such rule; a rule
 	 *  on another schema's table still refuses it. The object does not exist after the plan, so unlike
 	 *  {@link _setSchemaRecreatedObjects} no rows are judged for it; the apply instead fails if any
 	 *  rule still reaches it then. Same holding contract as that holder: set only with the statement

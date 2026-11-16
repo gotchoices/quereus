@@ -2479,3 +2479,95 @@ insert into uc_x values (1, 1);
 
 drop table uc_x;
 drop table uc_p;
+
+-- ===================================================================
+-- A declaration that removes a rule together with what the rule blocks
+-- applies, because every DROP CONSTRAINT runs before the table drops and
+-- column changes. A foreign key the declaration keeps still refuses its
+-- parent's drop while rows reference it, before any parent rows are lost.
+-- ===================================================================
+
+pragma foreign_keys = true;
+
+create table fkr_t (id integer primary key);
+insert into fkr_t values (1);
+create table fkr_p (id integer primary key, r integer null, constraint pf foreign key (r) references fkr_t(id));
+insert into fkr_p values (1, 1);
+
+declare schema main {
+	table fkr_p { id integer primary key, r integer null, constraint pf foreign key (r) references fkr_t(id) }
+}
+
+-- run
+
+apply schema main;
+-- error: still has rows referencing it
+
+select id from fkr_t;
+→ [{"id": 1}]
+
+-- The same holds for a foreign key the declaration changes but still points
+-- at the removed table: its drop waits until after the table's, so the old
+-- body still refuses the drop.
+declare schema main {
+	table fkr_p { id integer primary key, r integer null, constraint pf foreign key (r) references fkr_t(id) on delete cascade }
+}
+
+-- run
+
+apply schema main;
+-- error: still has rows referencing it
+
+select id from fkr_t;
+→ [{"id": 1}]
+
+declare schema main {
+	table fkr_p { id integer primary key, r integer null }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE fkr_p DROP CONSTRAINT pf"}, {"ddl": "DROP TABLE IF EXISTS fkr_t"}]
+
+apply schema main;
+
+-- run
+
+select id, r from fkr_p;
+→ [{"id": 1, "r": 1}]
+
+select id from fkr_t;
+-- error: not found in schema path:
+
+drop table fkr_p;
+
+-- A CHECK the declaration rewrites off a column no longer refuses that
+-- column's rename to a context variable's name.
+create table ckr (a integer primary key, x integer null, constraint k check (x > 0)) with context (who integer null);
+insert into ckr with context who = 1 values (1, 5);
+
+declare schema main {
+	table ckr {
+		a integer primary key,
+		who integer null with tags ("quereus.previous_name" = 'x'),
+		constraint k check (new.who > 0)
+	} with context (who integer null)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE ckr DROP CONSTRAINT k"}, {"ddl": "ALTER TABLE ckr RENAME COLUMN x TO who"}, {"ddl": "ALTER TABLE ckr ADD constraint k check (new.who > 0)"}]
+
+apply schema main;
+
+-- run
+
+select a, who from ckr;
+→ [{"a": 1, "who": 5}]
+
+insert into ckr with context who = 5 values (2, -1);
+-- error: CHECK constraint failed
+
+drop table ckr;

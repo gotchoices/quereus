@@ -26,3 +26,7 @@ Found while working `bug-apply-schema-refuses-parent-removed-with-its-foreign-ke
 ## Expected behavior
 
 With foreign keys enforced, the apply is refused before its first step when a foreign key the plan adds names a table the plan removes and does not recreate, and the child has rows whose foreign-key columns are all non-null (the rows `ADD CONSTRAINT` would reject). Nothing changes. With no such rows, or with foreign keys off, the apply behaves as today (it ends with a foreign key naming a missing table, as the same statements run by hand do).
+
+## Note from the constraint-drop reorder
+
+`computeSchemaDiff` now sets `SchemaDiff.removalsStillReferenced` when a declared foreign key names a table the plan removes for good (or a declared CHECK, DEFAULT or generated expression may reach a removed table or view). A pre-check for this case can start from that flag rather than walking the declaration again. With the flag set, the plan keeps its `DROP CONSTRAINT` steps in stage 2 of the table alters, after `DROP TABLE`, so a foreign key the declaration changes but still points at the removed table refuses the drop with the rows intact; only a foreign key that is new in the declaration still reaches this bug.
