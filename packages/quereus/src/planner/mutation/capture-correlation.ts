@@ -35,7 +35,9 @@ export function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo 
  * capture (`__vmupd_keys`) reader to its target row, and equally a decomposition
  * lens's stitch-key correlations (the get body's `anchor ⋈ member` ON condition
  * and EAV entity subquery in `schema/lens-compiler.ts`, and the write fan-out's
- * anchor EXISTS correlation in `decomposition.ts`):
+ * anchor EXISTS correlation in `decomposition.ts`), and a lens's commit-time
+ * primary-key count (`synthesizeUniqueCountExpr` in `lens-enforcement.ts`, NULL-safe
+ * only for a primary key — a `unique` there keeps the NULL-distinct plain `=`):
  *
  * ```
  * left = right                                    -- column declared NOT NULL
