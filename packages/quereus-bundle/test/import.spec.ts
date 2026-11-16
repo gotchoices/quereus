@@ -134,10 +134,13 @@ describe('importBundle', () => {
 		}
 	});
 
-	it('under skip-batch, loses only a document with a YAML error, and says where it is', async () => {
+	// One-character chunks put a chunk boundary at every offset, including inside the
+	// header's `tables:` indentation, which the `yaml` lexer misreads unless fed whole lines.
+	it('under skip-batch, loses only a document with a YAML error, and says where it is, whatever the chunking', async () => {
 		await db.exec('create table t (id integer primary key, v text)');
 
-		const report = await importBundle(db, tBundle([['[1, a]'], ['[2, "bad \\q escape"]'], ['[3, c]']]), { errorPolicy: 'skip-batch' });
+		const text = tBundle([['[1, a]'], ['[2, "bad \\q escape"]'], ['[3, c]']]);
+		const report = await importBundle(db, text.split(''), { errorPolicy: 'skip-batch' });
 
 		expect(report.errors[0]).to.include({ kind: 'format', documentIndex: 2, line: 14 });
 		expect(await rowsOf(db, 'select id from t order by id')).to.deep.equal([[1], [3]]);

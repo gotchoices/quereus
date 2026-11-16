@@ -59,6 +59,10 @@ async function checkForeignKey(db: Database, child: TableSchema, fk: ForeignKeyC
  * `not exists` away (`ruleAntiJoinFkEmpty`) when the child is non-null. So, as
  * `validateForeignKeyOverExistingRows` requires of a caller whose child already declares
  * the key, the scan runs while the catalog holds the child without its foreign keys.
+ *
+ * NOTE: the same strip-scan-restore runs in `runtime/emit/materialized-view-helpers.ts`;
+ * if a third caller needs it, export an engine helper that validates a declared foreign
+ * key so callers outside the engine stop writing the catalog.
  */
 async function withoutDeclaredForeignKeys(db: Database, child: TableSchema, scan: () => Promise<void>): Promise<void> {
 	const schema = db.schemaManager.getSchema(child.schemaName);

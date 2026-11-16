@@ -26,9 +26,8 @@ export type BundleSource = string | Iterable<string> | AsyncIterable<string>;
 /**
  * Yields the YAML documents of `source` one at a time, so memory stays bounded by the
  * largest document rather than the file. Chunks may split the text anywhere, including
- * inside a line: the `yaml` library's incremental parser buffers the incomplete tail.
- * Documents are composed with the codec's parse options, so ints read as `bigint` and
- * `!!binary` uses the package's own tag.
+ * inside a line ({@link wholeLines}). Documents are composed with the codec's parse
+ * options, so ints read as `bigint` and `!!binary` uses the package's own tag.
  *
  * @throws MisuseError when a chunk is not a string (a byte stream that was not decoded).
  */
@@ -45,16 +44,40 @@ export async function* readDocuments(source: BundleSource): AsyncGenerator<Bundl
 		}
 	}
 
+	for await (const text of wholeLines(source)) {
+		for (const token of parser.parse(text, true)) yield* emit(composer.next(token));
+	}
+	for (const token of parser.parse('', false)) yield* emit(composer.next(token));
+	yield* emit(composer.end());
+}
+
+/**
+ * Regroups `source`'s chunks so each piece ends at a line end, except the text after the
+ * file's last newline, which comes last. The `yaml` library's incremental lexer (2.9.0)
+ * misreads a chunk boundary inside a line's indentation: `tables:\n ` then
+ * ` - schema: main\n    table: t` composes as a nested compact mapping, which is the
+ * exporter's header shape. Boundaries at line ends read correctly. The parts of a line
+ * that spans chunks are joined once, so a long line costs its length, not chunks × length.
+ *
+ * @throws MisuseError when a chunk is not a string.
+ */
+async function* wholeLines(source: BundleSource): AsyncGenerator<string> {
+	let pending: string[] = [];
 	for await (const chunk of chunksOf(source)) {
 		if (typeof chunk !== 'string') {
 			throw new MisuseError(`A bundle source must yield strings, got ${describe(chunk)}; decode bytes as UTF-8 first`);
 		}
-		// An empty chunk would make the parser report a second line start at offset 0.
-		if (chunk.length === 0) continue;
-		for (const token of parser.parse(chunk, true)) yield* emit(composer.next(token));
+		const end = chunk.lastIndexOf('\n') + 1;
+		if (end === 0) {
+			// An empty chunk would make the parser report a second line start at offset 0.
+			if (chunk.length > 0) pending.push(chunk);
+			continue;
+		}
+		pending.push(chunk.slice(0, end));
+		yield pending.join('');
+		pending = end < chunk.length ? [chunk.slice(end)] : [];
 	}
-	for (const token of parser.parse('', false)) yield* emit(composer.next(token));
-	yield* emit(composer.end());
+	if (pending.length > 0) yield pending.join('');
 }
 
 function chunksOf(source: BundleSource): Iterable<unknown> | AsyncIterable<unknown> {

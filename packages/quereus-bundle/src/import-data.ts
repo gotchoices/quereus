@@ -176,6 +176,9 @@ export class DataLoader {
 		const problem = targetProblem(entry, target);
 		if (problem) return this.reject(load, problem);
 		try {
+			// NOTE: `prepare` compiles on first run, so an insert that cannot compile fails each
+			// document (each row under `skip-row`) instead of rejecting the table once. The
+			// checks above leave no known compile failure; if one turns up, compile here.
 			load.statement = this.run.db.prepare(insertSql(entry, target, this.run.settings.onConflict), anyTypedParameters(entry.columns.length));
 		} catch (e) {
 			return this.reject(load, messageOf(e), e);
@@ -213,9 +216,13 @@ export class DataLoader {
 		this.reportFailure(batchError(load.entry, item, failure), failure.rollbackError !== undefined);
 	}
 
-	/** `skip-row`: each row in its own transaction, so only the failing rows are lost. */
+	/**
+	 * `skip-row`: each row in its own transaction, so only the failing rows are lost. Rows
+	 * commit one by one, so `onError` answering `'abort'` stops before the next row.
+	 */
 	private async applyRowByRow(load: TableLoad, statement: Statement, rows: readonly unknown[], item: BundleDocument): Promise<void> {
 		for (const [rowIndex, node] of rows.entries()) {
+			if (this.run.stopped) return;
 			let values: SqlValue[];
 			try {
 				values = decodeRow(load.entry, node, rowIndex, item);
