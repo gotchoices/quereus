@@ -918,7 +918,7 @@ function rejectUpsertOnCommitTimeSetLevelKey(ctx: PlanningContext, view: Mutable
 		reason: 'lens-set-level-conflict-resolution',
 		table: view.name,
 		message: `cannot upsert (on conflict do …) through lens-backed table '${view.name}': its logical unique/primary key has no basis covering structure, so it enforces via an O(n) commit-time scan that no conflict target can match`,
-		suggestion: 'Add a basis covering materialized view (order by the key columns) to upgrade the key to row-time enforcement, or use a plain insert (which ABORTs on a duplicate).',
+		suggestion: 'Add a basis covering materialized view (order by the key columns) to upgrade the key to row-time enforcement — a primary key must also declare its columns not null — or use a plain insert (which ABORTs on a duplicate).',
 	});
 }
 

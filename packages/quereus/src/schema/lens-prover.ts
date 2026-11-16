@@ -1527,8 +1527,9 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  * by **bijection transport** ({@link proveKeyByBijectionTransport} — every key column
  * bare-reconstructible or authored-bijective, mapping to a declared basis key over
  * the put targets) ⇒ `proved`; else `enforced-set-level`, row-time when a basis
- * covering structure answers it, commit-time (+ `lens.no-backing-index` warning) when
- * none does. The warning is suppressed for a read-only table — its set-level
+ * covering structure answers it (never for a primary key with a nullable column — the
+ * NULL-distinct basis UNIQUE cannot enforce key equality), commit-time
+ * (+ `lens.no-backing-index` warning) otherwise. The warning is suppressed for a read-only table — its set-level
  * enforcement is moot.
  *
  * Whenever the key classifies `proved`, a **governing** basis key (if any) resolves a
@@ -1637,19 +1638,32 @@ function classifyKeyConstraint(
 	}
 
 	// Not proved → enforced set-level. Row-time iff a basis row-time covering
-	// structure answers it (a non-stale covering MV); commit-time otherwise.
-	const covering = findBasisCovering(ctx, logicalColumns);
+	// structure answers it (a non-stale covering MV); commit-time otherwise. A row-time
+	// key is enforced only by the basis UNIQUE it maps to, which is NULL-distinct, so it
+	// cannot enforce a primary key with a nullable column: key equality treats two NULL
+	// keys as the same key (docs/schema.md § Primary-key nullability). Such a key goes to
+	// the commit-time count, which correlates its nullable columns NULL-safely.
+	const nullablePrimaryKey = isPrimaryKey && logicalColumns.some(li => !ctx.table.columns[li]?.notNull);
+	const covering = nullablePrimaryKey ? undefined : findBasisCovering(ctx, logicalColumns);
 	if (covering) {
 		rejectRowTimeConflictAction(ctx, constraint, covering, label, columnNames, readOnly, errors);
 		return { constraint, kind: 'enforced-set-level', mode: 'row-time', structure: covering.ref };
 	}
 
 	if (!readOnly) {
+		// The remedy shared by the two diagnostics below; a nullable primary key must
+		// first become NOT NULL before any covering structure can answer it.
+		const upgrade = nullablePrimaryKey
+			? 'Declare the key columns not null and add an explicit basis covering materialized view (order by the key columns) to upgrade to row-time enforcement'
+			: 'Add an explicit basis covering materialized view (order by the key columns) to upgrade to row-time enforcement';
+		const nullableNote = nullablePrimaryKey
+			? ' A basis UNIQUE treats NULLs as distinct, but two NULL primary keys are the same key, so no covering structure can enforce this key while a key column is nullable.'
+			: '';
 		warnings.push({
 			code: 'lens.no-backing-index',
 			severity: 'warning',
 			site: { table: ctx.table.name, constraint: label },
-			message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) has no basis covering structure — it enforces via an O(n) commit-time scan. Add an explicit basis covering materialized view (order by the constraint columns) to upgrade to row-time enforcement; row-time conflict resolution (insert or replace / or ignore / or fail / or rollback, upsert) requires that structure and is otherwise rejected.`,
+			message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) has no basis covering structure — it enforces via an O(n) commit-time scan.${nullableNote} ${upgrade}; row-time conflict resolution (insert or replace / or ignore / or fail / or rollback, upsert) requires that structure and is otherwise rejected.`,
 			fingerprintInputs: buildFingerprint(ctx, columnNames, false),
 		});
 
@@ -1667,7 +1681,7 @@ function classifyKeyConstraint(
 				code: 'lens.unenforceable-conflict-action',
 				severity: 'error',
 				site: { table: ctx.table.name, constraint: label },
-				message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict replace/ignore' but has no basis covering structure, so the action cannot be honored (a commit-time scan can only ABORT). Add a basis covering materialized view (order by the key columns) to upgrade to row-time enforcement, or drop the conflict action.`,
+				message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict replace/ignore' but has no basis covering structure, so the action cannot be honored (a commit-time scan can only ABORT).${nullableNote} ${upgrade}, or drop the conflict action.`,
 			});
 		}
 

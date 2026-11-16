@@ -1366,6 +1366,15 @@ function setLevelConstraintName(c: Extract<LogicalConstraint, { kind: 'primaryKe
 	return c.constraint.name ? `lens:unique:${c.constraint.name}` : 'lens:unique';
 }
 
+/** One logical key column of a commit-time set-level count, as {@link synthesizeUniqueCountExpr} correlates it. */
+interface SetLevelKeyColumn {
+	readonly logicalColumn: string;
+	/** The NEW.* expression reconstructing the column's logical key value from the basis write row. */
+	readonly newSide: AST.Expression;
+	/** Correlate NULL-safely: a nullable primary-key column, where two NULLs are the same key. */
+	readonly nullSafe: boolean;
+}
+
 /**
  * Builds the deferred count-subquery uniqueness predicate for one logical key:
  *
@@ -1383,22 +1392,24 @@ function setLevelConstraintName(c: Extract<LogicalConstraint, { kind: 'primaryKe
  * to a logical-domain value, not a basis-domain one. The `count(*)` is a `count`
  * with empty args — `astToString` renders it `count(*)` and the planner treats it as
  * the row-count aggregate. The contained scalar subquery makes the constraint
- * pipeline auto-defer the check to commit. NULL key columns fall out for free:
- * `_u.lk = <newSide>` is `NULL` (never true) when either side is NULL, so a NULL-key
- * row is never counted — SQL UNIQUE's NULL-distinct rule.
+ * pipeline auto-defer the check to commit.
+ *
+ * NULL handling follows the key's kind, per column ({@link captureKeyEquality}): a
+ * `unique` column (and a NOT NULL primary-key column) correlates with plain `=`,
+ * which is never true when either side is NULL, so a NULL-key row is never counted —
+ * SQL UNIQUE's NULL-distinct rule. A **nullable primary-key** column (`nullSafe`)
+ * correlates NULL-safely instead, because key equality treats NULL as equal to
+ * itself (docs/schema.md § Primary-key nullability): two rows keyed NULL there are a
+ * duplicate key.
  */
 function synthesizeUniqueCountExpr(
 	logicalSchema: string,
 	logicalTable: string,
-	keyColumns: ReadonlyArray<{ logicalColumn: string; newSide: AST.Expression }>,
+	keyColumns: ReadonlyArray<SetLevelKeyColumn>,
 ): AST.Expression {
 	const alias = '_u';
-	const conditions: AST.Expression[] = keyColumns.map(({ logicalColumn, newSide }) => ({
-		type: 'binary',
-		operator: '=',
-		left: { type: 'column', name: logicalColumn, table: alias } as AST.ColumnExpr,
-		right: newSide,
-	} as AST.BinaryExpr));
+	const conditions = keyColumns.map(({ logicalColumn, newSide, nullSafe }) =>
+		captureKeyEquality({ type: 'column', name: logicalColumn, table: alias } as AST.ColumnExpr, newSide, nullSafe));
 
 	const whereExpr = conditions.reduce((acc, cond) => ({
 		type: 'binary',
@@ -1473,21 +1484,25 @@ export function collectLensSetLevelConstraints(slot: LensSlot, schemaManager?: S
 		// basis columns its NEW side references — the per-op decomposition gate's write-row
 		// dependency set, attributed below to each column's owning member relation.
 		const writeRow: Array<{ logicalColumn: string; basisColumns: string[] }> = [];
-		const keyColumns = logicalColumns.map(li => {
-			const logicalColumn = slot.logicalTable.columns[li]?.name ?? `#${li}`;
+		const keyColumns = logicalColumns.map((li): SetLevelKeyColumn => {
+			const column = slot.logicalTable.columns[li];
+			const logicalColumn = column?.name ?? `#${li}`;
+			// An unresolvable column reads as nullable, as in `keyColumnInfo`: the NULL-safe
+			// form is semantically identical for a NOT NULL column, merely less index-friendly.
+			const nullSafe = c.kind === 'primaryKey' && !column?.notNull;
 			const lc = logicalColumn.toLowerCase();
 			const basisColumn = map.get(lc);
 			if (basisColumn !== undefined) {
 				writeRow.push({ logicalColumn, basisColumns: [basisColumn.toLowerCase()] });
-				return { logicalColumn, newSide: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr };
+				return { logicalColumn, nullSafe, newSide: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr };
 			}
 			const forward = forwards.get(lc);
 			if (forward !== undefined) {
 				writeRow.push({ logicalColumn, basisColumns: collectColumnRefNames(forward).map(f => f.toLowerCase()) });
-				return { logicalColumn, newSide: transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' })) };
+				return { logicalColumn, nullSafe, newSide: transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' })) };
 			}
 			writeRow.push({ logicalColumn, basisColumns: [logicalColumn.toLowerCase()] });
-			return { logicalColumn, newSide: { type: 'column', name: logicalColumn, table: 'NEW' } as AST.ColumnExpr };
+			return { logicalColumn, nullSafe, newSide: { type: 'column', name: logicalColumn, table: 'NEW' } as AST.ColumnExpr };
 		});
 		constraints.push({
 			name: setLevelConstraintName(c),
@@ -1496,24 +1511,31 @@ export function collectLensSetLevelConstraints(slot: LensSlot, schemaManager?: S
 			// a delete cannot create one (and is excluded by the caller anyway).
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
-			commitOnly: setLevelCommitOnly(slot, c, keyColumns.map(k => k.logicalColumn)),
+			commitOnly: setLevelCommitOnly(slot, c, keyColumns),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
 	return constraints;
 }
 
-/** The count reads the logical view the write lands in — commit-only, named as the user declared the key. */
+/**
+ * The count reads the logical view the write lands in — commit-only, named as the user
+ * declared the key. A nullable primary key gets its own remedy: a basis UNIQUE treats
+ * NULLs as distinct, so no covering structure can enforce it per row until its columns
+ * are NOT NULL (the prover never classifies it row-time — `classifyKeyConstraint`).
+ */
 function setLevelCommitOnly(
 	slot: LensSlot,
 	c: Extract<LogicalConstraint, { kind: 'primaryKey' | 'unique' }>,
-	logicalColumns: readonly string[],
+	keyColumns: readonly SetLevelKeyColumn[],
 ): ConstraintCheckCommitOnly {
 	const named = c.kind === 'unique' && c.constraint.name ? ` '${c.constraint.name}'` : '';
 	const kind = c.kind === 'primaryKey' ? 'primary key' : 'unique key';
+	const columns = keyColumns.map(k => k.logicalColumn).join(', ');
+	const coveringRemedy = 'add a basis covering materialized view (ordered by the key columns) so the key is enforced per row';
 	return {
-		description: `the ${kind}${named} (${logicalColumns.join(', ')}) of logical table '${qualifiedLogicalName(slot)}' (no basis covering structure)`,
-		remedy: 'add a basis covering materialized view (ordered by the key columns) so the key is enforced per row',
+		description: `the ${kind}${named} (${columns}) of logical table '${qualifiedLogicalName(slot)}' (no basis covering structure)`,
+		remedy: keyColumns.some(k => k.nullSafe) ? `declare the key columns not null and ${coveringRemedy}` : coveringRemedy,
 	};
 }
 

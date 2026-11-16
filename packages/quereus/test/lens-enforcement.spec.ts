@@ -789,6 +789,30 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 		}
 	});
 
+	it('a nullable re-keyed PK (commit-time) treats NULL keys as equal: a second NULL-keyed row ABORTs (single and composite)', async () => {
+		const db = new Database();
+		try {
+			// Key equality, not UNIQUE's NULL-distinct rule (docs/schema.md § Primary-key nullability).
+			await db.exec('declare schema y { table t (id integer primary key, code text null), table t2 (id integer primary key, a integer null, b integer null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (code text null primary key, id integer) }');
+			await db.exec('declare logical schema x2 { table t (a integer null, b integer null, id integer, primary key (a, b)) }');
+			await db.exec('declare lens for x2 over y { view t as select a, b, id from y.t2 }');
+			await db.exec('apply schema x');
+			await db.exec('apply schema x2');
+
+			await db.exec('insert into x.t (code, id) values (null, 1)');
+			await expectThrows(() => db.exec('insert into x.t (code, id) values (null, 2)'), /lens:pk/);
+			expect(await rows(db, 'select id from x.t where code is null')).to.deep.equal([{ id: 1 }]);
+
+			await db.exec('insert into x2.t (a, b, id) values (1, null, 10), (2, null, 11)');
+			await expectThrows(() => db.exec('insert into x2.t (a, b, id) values (1, null, 12)'), /lens:pk/);
+			expect(await rows(db, 'select id from x2.t where b is null order by id')).to.deep.equal([{ id: 10 }, { id: 11 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('the synthesized count check references the basis column on NEW and the logical column inside the subquery (rename override)', async () => {
 		const db = new Database();
 		try {
@@ -957,6 +981,24 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
 			await db.exec('apply schema x');
 			expect(collectLensSetLevelConstraints(slot(db, 'u')), 'row-time unique ⇒ []').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a nullable PK over a basis UNIQUE + covering MV classifies commit-time, not row-time: the NULL-distinct basis UNIQUE cannot enforce it', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, code text null, unique (code)) }');
+			await db.exec('apply schema y');
+			await db.exec('create materialized view y.ix_t_code as select code, id from y.t where code is not null order by code');
+			await db.exec('declare logical schema x { table t (code text null primary key, id integer) }');
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 't')), 'nullable PK ⇒ commit-time').to.deep.equal(['commit-time']);
+			await db.exec('insert into x.t (code, id) values (null, 1)');
+			await expectThrows(() => db.exec('insert into x.t (code, id) values (null, 2)'), /lens:pk/);
+			expect(await rows(db, 'select id from x.t where code is null')).to.deep.equal([{ id: 1 }]);
 		} finally {
 			await db.close();
 		}
@@ -1413,12 +1455,12 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 	it('re-keyed PK over a basis `unique(code)` is PROVED (not row-time) yet still resolves detection + replace through the basis key', async () => {
 		const db = new Database();
 		try {
-			// A logical PK is NOT NULL, so when the basis carries a matching NOT-NULL
-			// `unique(code)` the body *proves* the key outright ⇒ obligation `proved`,
-			// never `enforced-set-level`. A row-time PK is therefore unreachable for a
-			// faithful single-source projection: a basis UNIQUE+NOT-NULL proves it, and
-			// with no basis UNIQUE it falls to a `commit-time` scan (covered in the
-			// commit-time suite's re-keyed-PK case). The covering MV here is incidental.
+			// This logical PK is NOT NULL (the session default), so when the basis carries a
+			// matching NOT-NULL `unique(code)` the body *proves* the key outright ⇒ obligation
+			// `proved`, never `enforced-set-level`; with no basis UNIQUE it falls to a
+			// `commit-time` scan (covered in the commit-time suite's re-keyed-PK case), and a
+			// nullable PK never classifies row-time (the commit-time suite's nullable-PK case).
+			// The covering MV here is incidental.
 			// What this still pins: a re-keyed PK backed by a basis key resolves detection
 			// AND `or replace` end-to-end through that basis key (no lens code, as for the
 			// row-time class — both ride the basis structure).
