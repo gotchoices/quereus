@@ -709,6 +709,22 @@ select n from v_fsrc;
 drop view v_fsrc;
 drop table f;
 
+-- 15d. A LATERAL subquery source sees its left side: its bare `x` binds
+-- `t_lat.x`, so the rename follows it even though the subquery body is walked
+-- before the enclosing FROM frame exists.
+
+create table t_lat (id integer primary key, x integer);
+insert into t_lat values (1, 3);
+create view v_lat as select l.y from t_lat join lateral (select x + 1 as y) l on 1 = 1;
+
+alter table t_lat rename column x to xx;
+
+select y from v_lat;
+→ [{"y":4}]
+
+drop view v_lat;
+drop table t_lat;
+
 -- ===================================
 -- 16. CHECK subquery with correlated outer ref — owner column legitimately captured
 -- ===================================

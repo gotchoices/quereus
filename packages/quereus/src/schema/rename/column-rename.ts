@@ -528,8 +528,8 @@ const PROBE_TARGET_KEY = '\u0000.\u0000';
  *
  * Shares the walker's remaining scope residual: a `*` over a function source
  * or a non-exposing CTE source has no askable column set, so a publication
- * arriving only that way is not seen. A `*` over an aliased REAL source is seen — the alias binds like
- * any other qualifier.
+ * arriving only that way is not seen. A `*` over an aliased REAL source is
+ * seen — the alias binds like any other qualifier.
  */
 export function bodyPublishesColumnNamed(
 	body: AST.QueryExpr | undefined,
