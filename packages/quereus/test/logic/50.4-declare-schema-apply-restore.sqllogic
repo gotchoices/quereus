@@ -1304,3 +1304,93 @@ drop table d_q;
 drop table d_p;
 drop view d_v9;
 drop table d_t2;
+
+-- ===================================
+-- 22. A view or maintained definition the undo recreates is put back whether or not it would
+-- pass a fresh check
+-- ===================================
+
+-- The plan drops a view whose body no longer compiles and detaches two derivations, one whose rows
+-- break the table's foreign key and one whose source is now past the full-rebuild size limit, then
+-- ub fails. Any one refusal would stop the unwind and be named in the error.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+
+create table g (id integer primary key);
+create view v as select id from g;
+drop table g;
+
+create table p (id integer primary key);
+create table src (id integer primary key, x integer null);
+insert into src values (1, 99);
+create table m (id integer primary key, x integer null, constraint c foreign key (x) references p(id));
+pragma foreign_keys = off;
+alter table m set maintained as select id, x from src;
+pragma foreign_keys = on;
+
+-- A distinct body is maintained only by a full rebuild, which the size limit then refuses.
+create table sz (id integer primary key, v integer);
+insert into sz values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
+create table sz_m (v integer primary key);
+alter table sz_m set maintained as select distinct v from sz;
+analyze sz;
+pragma materialized_view_rebuild_row_threshold = 2;
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		constraint ub unique (b)
+	}
+	table p {
+		id integer primary key
+	}
+	table src {
+		id integer primary key,
+		x integer null
+	}
+	table m {
+		id integer primary key,
+		x integer null,
+		constraint c foreign key (x) references p(id)
+	}
+	table sz {
+		id integer primary key,
+		v integer
+	}
+	table sz_m {
+		v integer primary key
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+-- A restored catalog plans the detaches and the view's drop again.
+diff schema main;
+→ [{"ddl": "ALTER TABLE m DROP MAINTAINED"}, {"ddl": "ALTER TABLE sz_m DROP MAINTAINED"}, {"ddl": "DROP VIEW IF EXISTS v"}, {"ddl": "ALTER TABLE t ADD constraint ub unique (b)"}]
+
+-- The orphan row is still there. The derivation is live again and its foreign key holds new rows.
+select * from m;
+→ [{"id": 1, "x": 99}]
+
+insert into src values (2, 98);
+-- error: FOREIGN KEY constraint failed: c
+
+insert into p values (98);
+insert into src values (2, 98);
+select * from m order by id;
+→ [{"id": 1, "x": 99}, {"id": 2, "x": 98}]
+
+-- run
+
+pragma materialized_view_rebuild_row_threshold = 10000;
+drop view v;
+drop table sz_m;
+drop table sz;
+drop table m;
+drop table src;
+drop table p;
+drop table t;

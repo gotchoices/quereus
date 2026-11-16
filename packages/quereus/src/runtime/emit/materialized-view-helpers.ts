@@ -1485,9 +1485,15 @@ export async function attachMaintainedDerivation(
 		// reconcile writes roll back with the failing statement. On the reshape arm
 		// the scan resolves against the attributes the post-reconcile ops below are
 		// about to land, keeping this path identical to the refresh reshape arm
-		// (`reshapeBackingInPlace` → `rebuildBacking`).
-		await validateDeclaredConstraintsOverContents(db, live,
-			reshapePlan ? previewReshapedColumns(live, shape) : undefined);
+		// (`reshapeBackingInPlace` → `rebuildBacking`). An unwind skips the scan: it re-attaches
+		// the derivation the table already had, over rows it already held, so a refusal would
+		// only leave the schema partially migrated (docs/schema-undo-plan.md § Guards during an
+		// unwind). The body still compiles and the shape and row-set checks above still run,
+		// because the reconcile derives the rows from it.
+		if (!db._isSchemaUnwinding()) {
+			await validateDeclaredConstraintsOverContents(db, live,
+				reshapePlan ? previewReshapedColumns(live, shape) : undefined);
+		}
 
 		if (reshapePlan && reshapePlan.postReconcileOps.length > 0) {
 			// Data-validating attribute ops (retype / recollate / tighten NOT NULL)

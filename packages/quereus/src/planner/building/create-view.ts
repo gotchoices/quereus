@@ -51,6 +51,22 @@ export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.Q
 }
 
 /**
+ * Plans the body (read-only, so star-expansion and CTEs are resolved) to reject a DML body
+ * at plan time and to check an explicit column list's arity against the body's projection.
+ */
+function validateViewBody(ctx: PlanningContext, viewName: string, stmt: AST.CreateViewStmt, schemaName: string): void {
+	const planned = planViewBody(ctx, viewName, stmt.select, schemaName);
+	if (!stmt.columns || stmt.columns.length === 0) return;
+	const bodyArity = planned.getAttributes().length;
+	if (stmt.columns.length !== bodyArity) {
+		throw new QuereusError(
+			`View '${viewName}' has ${stmt.columns.length} declared columns but body produces ${bodyArity}`,
+			StatusCode.ERROR
+		);
+	}
+}
+
+/**
  * Builds a plan node for CREATE VIEW statements.
  */
 export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewStmt): CreateViewNode {
@@ -61,21 +77,11 @@ export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewSt
 	const schemaName = stmt.view.schema ? sm.canonicalSchemaName(stmt.view.schema) : sm.getCurrentSchemaName();
 	const viewName = stmt.view.name;
 
-	// If an explicit column list was provided, validate that its arity matches the body's projection.
-	// Plan the body (read-only) so star-expansion and CTEs are resolved.
-	if (stmt.columns && stmt.columns.length > 0) {
-		const planned = planViewBody(ctx, viewName, stmt.select, schemaName);
-		const bodyArity = planned.getAttributes().length;
-		if (stmt.columns.length !== bodyArity) {
-			throw new QuereusError(
-				`View '${viewName}' has ${stmt.columns.length} declared columns but body produces ${bodyArity}`,
-				StatusCode.ERROR
-			);
-		}
-	} else {
-		// No explicit column list — still run the gate so a DML body is
-		// rejected at plan time rather than waiting until first reference.
-		planViewBody(ctx, viewName, stmt.select, schemaName);
+	// An unwind recreates a view the pre-apply catalog held, so its body is not planned: the
+	// view goes back exactly as it was, even when what it reads is gone or not yet restored
+	// (docs/schema-undo-plan.md § Guards during an unwind).
+	if (!ctx.db._isSchemaUnwinding()) {
+		validateViewBody(ctx, viewName, stmt, schemaName);
 	}
 
 	// The original SQL text is needed for the view definition

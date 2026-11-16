@@ -1323,9 +1323,12 @@ export function buildFullRebuildPlan(ctx: MaterializedViewManagerContext, mv: Ma
 	const sourceStats = estimateMaintenanceStats(ctx, largestSchema, backing.columns.length, /*hasPredicate*/ false);
 
 	// Size reject: full-rebuild is the only sound strategy here, so a source past the
-	// configurable threshold makes every write pathological. `0` disables the reject.
+	// configurable threshold makes every write pathological. `0` disables the reject. An
+	// unwind skips it: it re-registers a derivation the table already had, whose source may
+	// have grown, or the threshold dropped, since (docs/schema-undo-plan.md § Guards during
+	// an unwind).
 	const rebuildThreshold = db.options.getNumberOption('materialized_view_rebuild_row_threshold');
-	if (isFullRebuildPathological(sourceStats, rebuildThreshold)) {
+	if (!db._isSchemaUnwinding() && isFullRebuildPathological(sourceStats, rebuildThreshold)) {
 		const largestBase = `${largestSchema.schemaName}.${largestSchema.name}`.toLowerCase();
 		throw cannotMaterialize(mv.name,
 			`its only sound maintenance strategy is a full body rebuild, but its largest source '${largestBase}' has `

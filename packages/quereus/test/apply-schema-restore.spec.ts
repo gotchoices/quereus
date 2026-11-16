@@ -375,6 +375,27 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			expect(await planOf(db)).to.deep.equal([]);
 			expect(await rows(db, 'select D from V3')).to.deep.equal([{ D: 9 }]);
 		});
+
+		it('restores a chain through another schema, recreating a view before the view it reads', async () => {
+			// The differ sees only schema s, so it drops V1 before V3, and the undo recreates V3
+			// while s.V1, which it reads through main.M, is still gone.
+			await db.exec('declare schema s { table T { Id integer primary key, N integer } view V1 as select Id, N as S from T }');
+			await db.exec('apply schema s');
+			await db.exec('insert into s.T values (1, 10)');
+			await db.exec('create view main.M as select S from s.V1');
+			await db.exec('create view s.V3 as select S as D from main.M');
+			await db.exec(`declare schema s {
+				table T { Id integer primary key, N integer }
+				view V1 as select Id, N + 1 as S from T
+				view V3 as select S + 0 as D from main.M
+				view Bad as select * from nothere
+			}`);
+
+			const err = await rejection(db.exec('apply schema s'));
+			expect(err.message).to.match(/^Failed to execute DDL: create view s\.Bad/);
+			expect(err.message).to.not.match(/could not be restored/);
+			expect(await rows(db, 'select D from s.V3')).to.deep.equal([{ D: 10 }]);
+		});
 	});
 
 	describe('redefining what a CHECK reads', () => {

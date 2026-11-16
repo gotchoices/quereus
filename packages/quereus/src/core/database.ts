@@ -2980,8 +2980,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  to what it named before the apply. ADD CONSTRAINT also stops judging the constraint
 	 *  against the rows and its parent table, and tells the module through the `restoring`
 	 *  field of `SchemaChangeInfo`, because the constraint is one the table already had.
-	 *  `unwindJournal` compares the catalog with its pre-apply rendering afterwards. Set
-	 *  only around the journal's statements, with the statement mutex held, so no other
+	 *  For the same reason CREATE VIEW does not plan the recreated view's body, and SET
+	 *  MAINTAINED does not scan the re-attached table's declared CHECKs and foreign keys over
+	 *  its rows or apply the full-rebuild size limit. `unwindJournal` compares the catalog
+	 *  with its pre-apply rendering afterwards. Set only around the journal's statements,
+	 *  with the statement mutex held, so no other
 	 *  statement observes it. Returns the prior value so the caller restores it in a
 	 *  `finally`. Docs: `docs/schema-undo-plan.md` § Restoring a failed apply. */
 	public _setSchemaUnwinding(value: boolean): boolean {

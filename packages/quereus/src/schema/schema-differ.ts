@@ -4320,6 +4320,10 @@ class UndoRenderer {
 
 	// --- Catalog-sourced bodies with the renames in force applied forward (Rule 2) ---
 
+	// NOTE: the re-attach derives the rows from the body, so a stale derivation whose body no
+	// longer compiles (its source dropped, or a column it reads dropped) cannot be put back: the
+	// undo fails and the apply reports the schema partially migrated. Restoring it needs an undo
+	// that records the derivation stale without deriving (bug-apply-undo-cannot-reattach-stale-derivation).
 	private setMaintainedFrom(maintained: NonNullable<CatalogTable['maintained']>, table: string): StepUndo {
 		if (!maintained.select) return this.cannotUndo(`the derivation of ${table}`, 'the pre-apply catalog carries no body for it');
 		const select = cloneQueryExpr(maintained.select);
