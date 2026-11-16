@@ -1175,6 +1175,33 @@ export interface RowConstraintSchema {
 	 * path).
 	 */
 	referencedWriteRowRelations?: readonly ReferencedWriteRowRelation[];
+	/**
+	 * Set on a SYNTHESIZED constraint that reads the relation its own write feeds (the lens
+	 * commit-time set-level key count and the grouped row-local logical-row re-read both
+	 * read the logical view the write lands in), so it can only be decided once the
+	 * statement's rows are written. The constraint builder carries it onto the built check
+	 * (where it also derives the same marker structurally for a user CHECK that reads its
+	 * own table); see {@link ConstraintCheckCommitOnly}. Transient — set only on a
+	 * write-plan-time constraint, never persisted to the catalog.
+	 */
+	commitOnly?: ConstraintCheckCommitOnly;
+}
+
+/**
+ * Marks a check that is evaluated only at COMMIT, under every conflict action: it reads
+ * the relation the write itself lands in, so evaluated at row time — before the row is
+ * written — it sees the relation without that row and passes a violating one. The
+ * runtime defers it regardless of the effective conflict action, and an INSERT whose
+ * statement OR clause is not ABORT is refused at plan time
+ * (`rejectConflictClauseForCommitOnlyChecks` in `planner/building/constraint-builder.ts`).
+ */
+export interface ConstraintCheckCommitOnly {
+	/** The rule in the user's own terms, for the refusal diagnostic — e.g. `the unique key
+	 *  (email) of logical table 'x.u'`. A lens-synthesized constraint's basis-level name
+	 *  (`lens:unique`) means nothing to the user, so the synthesizer supplies this. */
+	readonly description: string;
+	/** A remedy beyond "use a plain insert", completing `…, or <remedy>`. */
+	readonly remedy?: string;
 }
 
 /**

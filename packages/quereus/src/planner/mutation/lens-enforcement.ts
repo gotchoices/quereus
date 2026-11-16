@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
-import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema, ReferencedWriteRowRelation } from '../../schema/table.js';
+import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema, ReferencedWriteRowRelation, ConstraintCheckCommitOnly } from '../../schema/table.js';
 import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import type { BasisRelationRef } from '../../vtab/mapping-advertisement.js';
@@ -915,8 +915,22 @@ export function synthesizeLensRowLocalDeferredConstraint(
 			column: relationKeyColumn.toLowerCase(),
 		}],
 		messageValued: true,
+		commitOnly: lensRowLocalCommitOnly(slot, checks),
 		tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 	};
+}
+
+/** The grouped re-read reads the logical view the write lands in — commit-only, named by its rules. */
+function lensRowLocalCommitOnly(slot: LensSlot, checks: readonly LensRowLocalLogicalCheck[]): ConstraintCheckCommitOnly {
+	const names = checks.map(check => `'${check.name}'`).join(', ');
+	return {
+		description: `the CHECK constraint${checks.length > 1 ? 's' : ''} ${names} of logical table '${qualifiedLogicalName(slot)}' (re-read from the written logical row)`,
+		remedy: 'restate the CHECK so it references only the logical row',
+	};
+}
+
+function qualifiedLogicalName(slot: LensSlot): string {
+	return `${slot.logicalTable.schemaName}.${slot.logicalTable.name}`;
 }
 
 /**
@@ -1482,18 +1496,34 @@ export function collectLensSetLevelConstraints(slot: LensSlot, schemaManager?: S
 			// a delete cannot create one (and is excluded by the caller anyway).
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
+			commitOnly: setLevelCommitOnly(slot, c, keyColumns.map(k => k.logicalColumn)),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
 	return constraints;
 }
 
+/** The count reads the logical view the write lands in — commit-only, named as the user declared the key. */
+function setLevelCommitOnly(
+	slot: LensSlot,
+	c: Extract<LogicalConstraint, { kind: 'primaryKey' | 'unique' }>,
+	logicalColumns: readonly string[],
+): ConstraintCheckCommitOnly {
+	const named = c.kind === 'unique' && c.constraint.name ? ` '${c.constraint.name}'` : '';
+	const kind = c.kind === 'primaryKey' ? 'primary key' : 'unique key';
+	return {
+		description: `the ${kind}${named} (${logicalColumns.join(', ')}) of logical table '${qualifiedLogicalName(slot)}' (no basis covering structure)`,
+		remedy: 'add a basis covering materialized view (ordered by the key columns) so the key is enforced per row',
+	};
+}
+
 /**
  * Whether the slot carries any `enforced-set-level` `commit-time` obligation — the
  * detection-only set-level class. The view-mutation builder consults this to reject
- * `or replace` / `or ignore` (and matching upserts), which the commit-time scan
- * cannot honor (row-time conflict resolution needs a covering structure). Returns
- * `false` for a non-lens / plain view / proved- or row-time-keyed slot.
+ * an upsert, whose conflict target no index backs (a non-ABORT statement OR clause is
+ * refused by the general commit-only seam instead — the synthesized count carries
+ * `commitOnly`). Returns `false` for a non-lens / plain view / proved- or
+ * row-time-keyed slot.
  */
 export function hasCommitTimeSetLevelObligation(slot: LensSlot): boolean {
 	return (slot.obligations ?? []).some(o => o.kind === 'enforced-set-level' && o.mode === 'commit-time');

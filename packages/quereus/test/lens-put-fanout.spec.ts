@@ -2566,12 +2566,11 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		const db = new Database();
 		try {
 			await setupSurrogateWithChecks(db);
-			// The decomposition INSERT path threads the commit-time set-level count CHECK now, so its
-			// `rejectLensSetLevelConflictResolution` gate must fire here too (it sits below the
-			// decomposition early-return in `buildViewMutation`, so `buildDecompositionInsert` runs it
-			// itself). `docKey` has no basis covering structure ⇒ commit-time only ⇒ `or replace`
-			// cannot be honored row-time, so it is rejected at plan time rather than silently ABORTing
-			// at commit.
+			// The decomposition INSERT path threads the commit-time set-level count CHECK onto the
+			// anchor member insert, where the commit-only refusal
+			// (`rejectConflictClauseForCommitOnlyChecks`) fires. `docKey` has no basis covering
+			// structure ⇒ commit-time only ⇒ `or replace` cannot be honored row-time, so it is
+			// rejected at plan time rather than silently ABORTing at commit.
 			await expectThrows(
 				() => db.exec("insert or replace into x.Doc (docKey, title, body) values ('k1', 'dup', 'bd')"),
 				/replace|conflict|covering structure|commit-time/i);

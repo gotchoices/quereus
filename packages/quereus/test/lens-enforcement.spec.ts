@@ -903,7 +903,7 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 		}
 	});
 
-	it('rejects `or replace` / `or ignore` / upsert against a commit-time set-level key; `or abort` / plain insert pass', async () => {
+	it('rejects every non-ABORT conflict clause and upsert against a commit-time set-level key; `or abort` / plain insert pass', async () => {
 		const db = new Database();
 		try {
 			await db.exec('declare schema y { table u (id integer primary key, email text null) }');
@@ -911,9 +911,15 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 			await db.exec('declare logical schema x { table u (id integer primary key, email text null, unique (email)) }');
 			await db.exec('apply schema x');
 
-			await expectThrows(() => db.exec(`insert or ignore into x.u (id, email) values (1, 'a@x')`), /covering|commit-time scan|conflict/i);
-			await expectThrows(() => db.exec(`insert or replace into x.u (id, email) values (1, 'a@x')`), /covering|commit-time scan|conflict/i);
-			await expectThrows(() => db.exec(`insert into x.u (id, email) values (1, 'a@x') on conflict (email) do nothing`), /covering|commit-time scan|conflict/i);
+			await db.exec(`insert into x.u (id, email) values (1, 'a@x')`);
+			// Each would need the count decided per row, before the duplicate is written —
+			// where it cannot see it (`or fail` / `or rollback` used to slip a duplicate in).
+			for (const clause of ['or ignore', 'or replace', 'or fail', 'or rollback']) {
+				await expectThrows(() => db.exec(`insert ${clause} into x.u (id, email) values (2, 'a@x')`), /checked only at commit/i);
+			}
+			await expectThrows(() => db.exec(`insert into x.u (id, email) values (2, 'a@x') on conflict (email) do nothing`), /no conflict target can match/i);
+			expect(await rows(db, 'select id from x.u')).to.deep.equal([{ id: 1 }]);
+			await db.exec(`delete from x.u where id = 1`);
 
 			// `or abort` and a plain insert are NOT rejected (still subject to the duplicate check).
 			await db.exec(`insert or abort into x.u (id, email) values (1, 'a@x')`);
@@ -1336,9 +1342,9 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await deployRowTimeUniqueLens(db);
 			// The negative of the commit-time rejection test: a row-time key has no
 			// `enforced-set-level` `commit-time` obligation, so the conflict-resolution
-			// gate (`rejectLensSetLevelConflictResolution`) declines to reject — the
-			// covering MV resolves at row-time. None of these raise the
-			// `lens-set-level-conflict-resolution` diagnostic.
+			// refusals (`rejectUpsertOnCommitTimeSetLevelKey`, and the commit-only seam
+			// `rejectConflictClauseForCommitOnlyChecks`) decline to reject — the covering MV
+			// resolves at row-time. None of these is refused.
 			await db.exec(`insert or replace into x.u (id, email) values (1, 'a@x')`);
 			await db.exec(`insert or ignore into x.u (id, email) values (2, 'b@x')`);
 			await db.exec(`insert into x.u (id, email) values (3, 'c@x') on conflict (email) do nothing`);
@@ -1530,14 +1536,13 @@ describe('lens enforcement: set-level (unique / PK) row-time at the write bounda
 			await db.exec('declare logical schema x { table u (id integer primary key, email text null, code text null, unique (email), unique (code)) }');
 			await db.exec('apply schema x');
 
-			// The commit-time `code` key keeps the slot's commit-time obligation set non-empty,
-			// so `rejectLensSetLevelConflictResolution` fires on ANY conflict-resolution write —
-			// this is the intended conservative behavior (the commit-time key genuinely cannot
-			// replace-resolve), even though `email` alone is row-time-capable.
+			// The commit-time `code` key's count CHECK rides the insert and is commit-only, so
+			// any non-ABORT conflict clause is refused — the commit-time key genuinely cannot
+			// replace-resolve, even though `email` alone is row-time-capable.
 			expect(hasCommitTimeSetLevelObligation(slot(db, 'u')), 'commit-time obligation present').to.be.true;
 			// Both classes genuinely co-exist on the slot (email row-time, code commit-time).
 			expect(setLevelModes(slot(db, 'u')).slice().sort(), 'one row-time + one commit-time key').to.deep.equal(['commit-time', 'row-time']);
-			await expectThrows(() => db.exec(`insert or replace into x.u (id, email, code) values (1, 'a@x', 'A')`), /covering|commit-time scan|conflict/i);
+			await expectThrows(() => db.exec(`insert or replace into x.u (id, email, code) values (1, 'a@x', 'A')`), /checked only at commit/i);
 		} finally {
 			await db.close();
 		}

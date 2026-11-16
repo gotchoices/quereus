@@ -49,6 +49,8 @@ export interface ConstraintMetadataEntry {
 	/** Carried from {@link ConstraintCheck.messageValued}: the expression yields NULL when
 	 *  satisfied and the violation message when violated (see {@link constraintFailed}). */
 	messageValued?: boolean;
+	/** Carried from {@link ConstraintCheck.commitOnly}: deferred under every conflict action. */
+	commitOnly: boolean;
 }
 
 export interface NotNullDefaultRuntime {
@@ -161,6 +163,7 @@ export function buildConstraintMetadata(
 		referencedKeyColumns: check.referencedKeyColumns,
 		violationMessage: check.violationMessage,
 		messageValued: check.messageValued,
+		commitOnly: check.commitOnly !== undefined,
 	}));
 }
 
@@ -337,11 +340,14 @@ async function checkCheckConstraints(
 		}
 
 		// Resolve effective action up front; non-default actions (IGNORE/REPLACE/FAIL/ROLLBACK)
-		// must be applied at row time, so we cannot let those defer to commit.
+		// must be applied at row time, so they pull a deferrable check forward — right for a
+		// check reading OTHER relations, which already hold their final state. A commit-only
+		// check reads the relation this write lands in: at row time it cannot see the row
+		// and would pass a violation, so it stays deferred whatever the action.
 		const effectiveAction = pickAction(stmtOR, metadata.schema.defaultConflict);
 		const mustEvaluateNow = effectiveAction !== ConflictResolution.ABORT;
 
-		if (metadata.shouldDefer && !mustEvaluateNow) {
+		if (metadata.shouldDefer && (metadata.commitOnly || !mustEvaluateNow)) {
 			const activeConnectionId = rctx.activeConnection?.connectionId;
 			// Wrap so the deferred queue's evaluation at COMMIT throws the same
 			// attributed message as the immediate path below, instead of the queue's
@@ -349,8 +355,12 @@ async function checkCheckConstraints(
 			// already uses for maintained tables. The wrapper always throws before
 			// returning a failing value, so the queue's own generic message never fires
 			// here (a message-valued pass IS NULL, which the queue treats as a pass).
-			// Only ABORT reaches this branch (see mustEvaluateNow), so throwing is the
-			// whole of the deferred failure contract — no IGNORE/REPLACE leg needed.
+			// Throwing is the whole of the deferred failure contract — no IGNORE/REPLACE
+			// leg: an ABORT action reaches this branch, and so does a commit-only check
+			// under any action. A statement OR clause other than ABORT never meets a
+			// commit-only check here (the INSERT builder refuses that statement —
+			// `rejectConflictClauseForCommitOnlyChecks`), so a non-ABORT action on this
+			// path can only be a constraint-level `on conflict`, which then acts as ABORT.
 			// The message is computed at evaluation time: a message-valued constraint's
 			// message IS its evaluated value, unknowable before commit.
 			const deferredEvaluator = async (dctx: RuntimeContext): Promise<SqlValue> => {

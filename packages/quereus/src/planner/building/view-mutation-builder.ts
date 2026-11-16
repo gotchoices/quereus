@@ -31,7 +31,6 @@ import type { StorageShape, BasisRelationRef } from '../../vtab/mapping-advertis
 import { cloneExpr, transformExpr, transformAliasScopedExpr } from '../mutation/scope-transform.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import type { EnvelopeRowCheck } from '../nodes/view-mutation-node.js';
-import { ConflictResolution } from '../../common/constants.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
@@ -151,16 +150,15 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({ ...sel, storedBodyEnv })),
 		};
 
-	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
-	// covering structure) enforces via an O(n) deferred count scan, which cannot
-	// perform `or replace` / `or ignore`. Reject those up front so a write that would
-	// silently ABORT-at-commit instead of skipping/replacing is caught with a clear
-	// diagnostic. A row-time key (backed by a basis UNIQUE + covering MV) is NOT
-	// gated — its basis UC's covering-MV enforcement resolves the conflict action for
-	// free (`lens-set-level-rowtime-enforcement`, delivered). Placed above every insert
-	// dispatch: each insert fan-out (decomposition, join, single-source) threads the
-	// commit-time count CHECK.
-	rejectLensSetLevelConflictResolution(ctx, view, req);
+	// Upsert gate for a commit-time set-level key (no basis covering structure): an
+	// upsert's conflict target names a key no index backs, so it can never match. Placed
+	// above every insert dispatch. A statement OR clause (`or replace` / `or ignore` /
+	// `or fail` / `or rollback`) against that key is refused by the general seam instead —
+	// the synthesized count CHECK is commit-only, and the INSERT builder refuses any
+	// non-ABORT OR clause meeting a commit-only check
+	// (`rejectConflictClauseForCommitOnlyChecks`). A row-time key (basis UNIQUE + covering
+	// MV) is gated by neither: the basis UC resolves every conflict action per row.
+	rejectUpsertOnCommitTimeSetLevelKey(ctx, view, req);
 
 	// A decomposition INSERT fans out one insert per member off the same shared-
 	// surrogate envelope, materialized once and read back per member through an
@@ -788,26 +786,6 @@ function substituteUnsuppliedLogicalColumns(
 }
 
 /**
- * Refuse an INSERT whose statement OR clause would force a deferred logical-row
- * re-read to row-time evaluation, where it reads a logical image the row has not
- * joined yet and so cannot detect the violation. Only ABORT (and a plain insert)
- * leave the constraint deferred; see {@link buildDecompositionRowLocalChecks}.
- */
-function rejectRowLocalDeferredConflictResolution(
-	view: MutableViewLike,
-	checkName: string,
-	onConflict: ConflictResolution | undefined,
-): void {
-	if (onConflict === undefined || onConflict === ConflictResolution.ABORT) return;
-	raiseMutationDiagnostic({
-		reason: 'lens-row-local-unenforceable',
-		table: view.name,
-		message: `cannot insert with a conflict clause through logical table '${view.name}': its row-local CHECK '${checkName}' reads other relations, so it is evaluated at commit against the written row's logical image — a non-ABORT conflict clause forces row-time evaluation, where that image does not yet include the row and the check cannot detect a violation`,
-		suggestion: 'Use a plain insert (or `insert or abort`), or restate the CHECK so it references only the logical row.',
-	});
-}
-
-/**
  * Build the row-local CHECK enforcement for a decomposition INSERT: every
  * `enforced-row-local` CHECK of the slot, split by shape —
  *
@@ -824,15 +802,11 @@ function rejectRowLocalDeferredConflictResolution(
  *    pipeline gives every relation-reading check — one planned probe with
  *    per-rule failure attribution via its message-valued CASE.
  *
- * A non-ABORT statement OR clause is rejected up front for the deferred shape:
- * `runtime/row-constraints.ts` forces a deferrable constraint to ROW time when
- * the effective action is not ABORT (it must be able to skip/replace the
- * offending row), and this constraint reads the written row back OUT of the
- * logical view — at row time that row does not exist yet, so the re-read
- * trivially passes and a violating row would persist silently. Refusing is the
- * same posture {@link rejectLensSetLevelConflictResolution} takes for the other
- * commit-time class. The envelope shape is unaffected: it evaluates the row
- * image directly and honors every OR clause itself.
+ * The deferred shape reads the written row back out of the logical view, so it is
+ * commit-only: a non-ABORT statement OR clause is refused for it by the general
+ * seam (`rejectConflictClauseForCommitOnlyChecks`, run when the anchor member
+ * insert is built). The envelope shape evaluates the row image directly and
+ * honours every OR clause itself.
  *
  * Returns empty parts for a non-lens / check-free decomposition — the common
  * case pays nothing.
@@ -842,7 +816,6 @@ function buildDecompositionRowLocalChecks(
 	view: MutableViewLike,
 	storage: StorageShape,
 	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
-	onConflict: ConflictResolution | undefined,
 ): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor; deferredConstraints: RowConstraintSchema[] } {
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	const checks = slot ? collectLensRowLocalLogicalChecks(slot) : [];
@@ -856,7 +829,6 @@ function buildDecompositionRowLocalChecks(
 		if (astContainsSubquery(substituted)) {
 			// Deferred logical-row re-read riding the anchor op — NEW-correlated,
 			// INSERT-masked (the anchor insert always runs, whatever the row's NULLs).
-			rejectRowLocalDeferredConflictResolution(view, check.name, onConflict);
 			deferredChecks.push(check);
 			continue;
 		}
@@ -929,36 +901,26 @@ function compileEnvelopeRowChecks(
 }
 
 /**
- * Reject a conflict-resolution write the commit-time set-level scan cannot honor.
- * The detection-only count scan (no basis covering structure) can only ABORT on a
- * duplicate; it cannot replace or skip the offending row — that requires a row-time
- * covering structure. A **row-time** key (backed by a basis `UNIQUE` + covering MV)
- * is *not* gated here: it carries no commit-time obligation, so the basis UC's
- * covering-MV enforcement resolves `or replace` / `or ignore` for free
- * (`lens-set-level-rowtime-enforcement`, delivered). Only the commit-time class is
- * rejected. So an `insert or replace` / `or ignore` (or any upsert) against a logical table
- * with a commit-time set-level key is rejected up front rather than silently
- * ABORTing at commit instead of replacing/skipping. `or abort` / `or fail` /
- * `or rollback` (and a plain insert) are fine — they ABORT, consistent with
- * detection-only. UPDATE carries no statement-level OR clause, so only INSERT is
- * gated. Upsert matching the key is awkward to disambiguate, so v1 conservatively
- * rejects **any** upsert when a commit-time set-level obligation is present.
+ * Reject an upsert against a logical table carrying a commit-time set-level key (no
+ * basis covering structure). That key is enforced only by a commit-time count scan —
+ * no index backs it — so an upsert's conflict target cannot match it: a question of
+ * what the statement means, not of when the check runs. Telling which key a conflict
+ * target names is awkward, so this conservatively rejects **any** upsert while such a
+ * key is present. A **row-time** key (basis `UNIQUE` + covering MV) is not gated: the
+ * basis UC resolves the conflict per row. The statement OR clauses are not handled
+ * here — the commit-time count CHECK is commit-only, so the INSERT builder refuses any
+ * non-ABORT OR clause that meets it (`rejectConflictClauseForCommitOnlyChecks`).
  */
-function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): void {
-	if (req.op !== 'insert') return;
+function rejectUpsertOnCommitTimeSetLevelKey(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): void {
+	if (req.op !== 'insert' || !req.stmt.upsertClauses || req.stmt.upsertClauses.length === 0) return;
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
 	if (!slot || !hasCommitTimeSetLevelObligation(slot)) return;
-
-	const reject = (clause: string): never => raiseMutationDiagnostic({
+	raiseMutationDiagnostic({
 		reason: 'lens-set-level-conflict-resolution',
 		table: view.name,
-		message: `cannot ${clause} through lens-backed table '${view.name}': its logical unique/primary key has no basis covering structure, so it enforces via an O(n) commit-time scan that cannot perform row-time conflict resolution`,
+		message: `cannot upsert (on conflict do …) through lens-backed table '${view.name}': its logical unique/primary key has no basis covering structure, so it enforces via an O(n) commit-time scan that no conflict target can match`,
 		suggestion: 'Add a basis covering materialized view (order by the key columns) to upgrade the key to row-time enforcement, or use a plain insert (which ABORTs on a duplicate).',
 	});
-
-	if (req.stmt.onConflict === ConflictResolution.REPLACE) reject('insert or replace');
-	if (req.stmt.onConflict === ConflictResolution.IGNORE) reject('insert or ignore');
-	if (req.stmt.upsertClauses && req.stmt.upsertClauses.length > 0) reject('upsert (on conflict do …)');
 }
 
 /**
@@ -1301,7 +1263,7 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	// `MutationEnvelope.rowChecks`, row-time), a subquery-bearing one as a deferred
 	// logical-row re-read riding the anchor op (which an INSERT always plans) — never both
 	// seams, so no check is evaluated twice.
-	const rowLocal = buildDecompositionRowLocalChecks(ctx, view, storage, plan.suppliedColumns, stmt.onConflict);
+	const rowLocal = buildDecompositionRowLocalChecks(ctx, view, storage, plan.suppliedColumns);
 	const extraConstraints = [
 		...rowLocal.deferredConstraints,
 		...lensForeignKeyConstraints(ctx, view),

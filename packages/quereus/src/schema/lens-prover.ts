@@ -54,7 +54,7 @@ const log = createLogger('schema:lens-prover');
  *    deferred basis-term `EXISTS` against the logical parent gated by the
  *    `foreign_keys` pragma; the `enforced-set-level` `commit-time` obligation is a
  *    deferred `(select count(*) … ) <= 1` count-subquery CHECK over the logical key,
- *    detection-only — `or replace`/`or ignore` against such a key is rejected). The
+ *    detection-only — any non-ABORT conflict clause, and any upsert, against such a key is rejected). The
  *    `enforced-set-level` `row-time` write path (covering structure, conflict-
  *    resolution-capable) is **delivered** with no dedicated lens code: by this
  *    classifier's own precondition a row-time key is backed by a matching basis
@@ -1649,7 +1649,7 @@ function classifyKeyConstraint(
 			code: 'lens.no-backing-index',
 			severity: 'warning',
 			site: { table: ctx.table.name, constraint: label },
-			message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) has no basis covering structure — it enforces via an O(n) commit-time scan. Add an explicit basis covering materialized view (order by the constraint columns) to upgrade to row-time enforcement; row-time conflict resolution (insert or replace / or ignore) requires that structure and is otherwise rejected.`,
+			message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) has no basis covering structure — it enforces via an O(n) commit-time scan. Add an explicit basis covering materialized view (order by the constraint columns) to upgrade to row-time enforcement; row-time conflict resolution (insert or replace / or ignore / or fail / or rollback, upsert) requires that structure and is otherwise rejected.`,
 			fingerprintInputs: buildFingerprint(ctx, columnNames, false),
 		});
 
@@ -1657,9 +1657,10 @@ function classifyKeyConstraint(
 		// replace`/`ignore` (the PK's via `ctx.table`, a UNIQUE's via its own
 		// `defaultConflict`) is an action the scan can never honor — an unsound
 		// schema. Block it at deploy here rather than silently over-ABORTing per
-		// write: the statement-level gate (`rejectLensSetLevelConflictResolution`)
-		// only inspects `req.stmt.onConflict`, so the constraint-level channel never
-		// reaches it. ABORT / FAIL / ROLLBACK (and no declared action) are fine.
+		// write: the statement-level refusal (`rejectConflictClauseForCommitOnlyChecks`)
+		// only inspects the INSERT's own OR clause, so the constraint-level channel never
+		// reaches it. ABORT / FAIL / ROLLBACK (and no declared action) are fine — the
+		// commit-only count stays deferred under every action, so they act as ABORT.
 		const effectiveConflict = effectiveKeyDefaultConflict(ctx, constraint);
 		if (effectiveConflict === ConflictResolution.REPLACE || effectiveConflict === ConflictResolution.IGNORE) {
 			errors.push({

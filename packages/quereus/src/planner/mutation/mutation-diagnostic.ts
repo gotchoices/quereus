@@ -36,7 +36,7 @@ export type MutationDiagnosticReason =
 	| 'unsupported-subquery-correlation' // a view-column ref nested in a predicate/value subquery cannot be proven correlated (unresolvable source / select * / TVF / embedded DML)
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only'             // logical table whose PK is not reconstructible at the lens boundary
-	| 'lens-set-level-conflict-resolution' // or replace / or ignore / upsert against a commit-time set-level lens key (needs a covering structure)
+	| 'lens-set-level-conflict-resolution' // upsert against a commit-time set-level lens key (no index backs it, so no conflict target can match; statement OR clauses are refused by the general commit-only seam)
 	| 'lens-row-local-unenforceable' // a row-local logical CHECK on a decomposition write cannot be evaluated on the logical row (the shared key is hidden/composite, so the post-write logical row cannot be addressed) — refuse loudly rather than skip enforcement
 	// --- decomposition (lens multi-source put) fan-out, advertisement-driven ---
 	| 'unsupported-decomposition-insert'    // internal guard: a decomposition INSERT is built via buildDecompositionInsert (envelope), not propagate

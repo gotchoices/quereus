@@ -6,7 +6,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { RowOpFlag } from '../../schema/table.js';
-import type { RowConstraintSchema } from '../../schema/table.js';
+import type { RowConstraintSchema, ConstraintCheckCommitOnly } from '../../schema/table.js';
 import type { ConflictResolution } from '../../common/constants.js';
 import type { Expression } from '../../parser/ast.js';
 
@@ -46,6 +46,12 @@ export interface ConstraintCheck {
    * evaluated value itself — on both the immediate and the deferred path.
    */
   messageValued?: boolean;
+  /**
+   * Set when the check can only be decided at COMMIT (it reads the relation this write
+   * lands in), so no conflict action may pull it forward to row time — see
+   * {@link ConstraintCheckCommitOnly}. Always implies `needsDeferred`.
+   */
+  commitOnly?: ConstraintCheckCommitOnly;
 }
 
 /**

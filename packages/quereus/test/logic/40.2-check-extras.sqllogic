@@ -443,6 +443,52 @@ drop view t_selfq_vk;
 drop view t_selfq_vw;
 drop table t_selfq_vsrc;
 
+-- A CHECK that reads its OWN table can only be decided at commit: before then the table
+-- does not yet hold the row being written, so a duplicate looks absent. A statement OR
+-- clause other than ABORT would need a per-row verdict, so it is refused at plan time;
+-- a plain insert defers the check and catches the violation at commit.
+create table t_selfread (
+	id integer primary key,
+	x integer,
+	constraint x_once check ((select count(*) from t_selfread as o where o.x = new.x) <= 1)
+);
+
+insert into t_selfread values (1, 7);
+
+insert or ignore into t_selfread values (2, 7);
+-- error: checked only at commit
+
+insert or fail into t_selfread values (2, 7);
+-- error: checked only at commit
+
+insert into t_selfread values (2, 7);
+-- error: x_once
+
+insert into t_selfread values (2, 8);
+
+select id, x from t_selfread order by id;
+→ [{"id":1,"x":7},{"id":2,"x":8}]
+
+drop table t_selfread;
+
+-- A constraint-level `on conflict` action cannot pull such a CHECK to row time either
+-- (that refusal would reject every insert): it stays deferred and acts as ABORT.
+create table t_selfread_ci (
+	id integer primary key,
+	x integer,
+	constraint x_once_ci check ((select count(*) from t_selfread_ci as o where o.x = new.x) <= 1) on conflict ignore
+);
+
+insert into t_selfread_ci values (1, 7);
+
+insert into t_selfread_ci values (2, 7);
+-- error: x_once_ci
+
+select id from t_selfread_ci;
+→ [{"id":1}]
+
+drop table t_selfread_ci;
+
 -- ===================================
 -- CHECK comparisons resolve declared column collations, exactly like read-path
 -- queries (and ALTER backfill validation / assertion enforcement, which compile

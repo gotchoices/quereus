@@ -331,13 +331,13 @@ describe('lens row-local CHECK seam routing — subquery-bearing checks defer to
 			try {
 				await setupSubquery(db, shape.check);
 				await db.exec("insert into main.Allowed values ('ok')");
-				// A non-ABORT OR clause forces the deferred re-read to row time, where the
-				// written row is not yet in the logical image and the check cannot see the
+				// A non-ABORT OR clause would need the deferred re-read decided per row, where
+				// the written row is not yet in the logical image and the check cannot see the
 				// violation. Refuse the statement instead of accepting a violating row.
 				for (const clause of ['or ignore', 'or fail', 'or rollback', 'or replace']) {
 					await expectThrows(
 						() => db.exec(`insert ${clause} into x.W (id, name, tag) values (2, 'beta', 'nope')`),
-						/non-ABORT conflict clause forces row-time evaluation/i);
+						/checked only at commit/i);
 				}
 				expect(await rows(db, 'select id from x.W')).to.deep.equal([]);
 				// The plain form still works for a satisfying row.

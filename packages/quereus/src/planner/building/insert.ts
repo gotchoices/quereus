@@ -31,7 +31,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan, type UpsertUpdateValidation } from '../nodes/dml-executor-node.js';
 import { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
-import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
+import { buildConstraintChecks, buildNotNullDefaults, rejectConflictClauseForCommitOnlyChecks } from './constraint-builder.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
@@ -1001,6 +1001,7 @@ export function buildInsertStmt(
 		);
 		constraintChecks.push(...fkChecks);
 	}
+	rejectConflictClauseForCommitOnlyChecks(constraintChecks, stmt.onConflict, stmt.loc);
 
 	// Pre-build DEFAULT evaluators for NOT NULL columns. Used by REPLACE to
 	// substitute the default when the user supplied NULL.

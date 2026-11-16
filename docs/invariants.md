@@ -1167,6 +1167,20 @@ converted cell; the two late single-cell injectors read that already-converted r
 convert only the cell they inject. A site that evaluated before converting would compute a
 different value for the same written input than its siblings do.
 
+### RT-002 — A check that reads the relation its write lands in is decided only at commit
+
+- code: `packages/quereus/src/planner/building/constraint-builder.ts` — `rejectConflictClauseForCommitOnlyChecks`
+- code: `packages/quereus/src/runtime/row-constraints.ts` — `commitOnly`
+- guard: `packages/quereus/test/logic/40.2-check-extras.sqllogic`
+- doc: [SQL DML § Conflict Resolution](sql-dml.md#conflict-resolution-or-clause)
+
+A CHECK that reads its own table outside `committed.*`, and every lens commit-time rule (the
+set-level key count, the decomposition row-local re-read), is commit-only: the runtime defers
+it under every conflict action, because evaluated before the row is written it cannot see
+that row and passes a violation. An INSERT whose OR clause is not ABORT is refused at plan
+time when any commit-only check applies; a constraint-level `on conflict` action on one acts
+as ABORT.
+
 ## SCH — Schema
 
 ### SCH-001 — Index names are unique per schema
@@ -1348,14 +1362,16 @@ cascade walker, RESTRICT pre-check, and divergent-action suppression run only fo
 
 - code: `packages/quereus/src/planner/mutation/lens-enforcement.ts` — `synthesizeLensRowLocalDeferredConstraint`
 - code: `packages/quereus/src/planner/building/view-mutation-builder.ts` — `lens-row-local-unenforceable`
+- code: `packages/quereus/src/planner/building/constraint-builder.ts` — `rejectConflictClauseForCommitOnlyChecks`
 - guard: `packages/quereus/test/lens-row-local-null-write.spec.ts` — `lens row-local CHECK on a NULL write — decomposition`
 - doc: [Lens Constraint Attachment](lens-constraints.md#row-local-checks-on-a-decomposition-write)
 
 On a decomposition write a logical CHECK or undefaulted NOT NULL is evaluated once per logical
 row against the whole logical row image — at the insert envelope, or by a deferred re-read of
 the logical view by logical key — never on the member op that writes its column, which is
-skipped for a NULL value. When the row cannot be addressed, or a non-ABORT conflict clause would
-force the re-read to row time, the write is refused with `lens-row-local-unenforceable`.
+skipped for a NULL value. When the row cannot be addressed, the write is refused with
+`lens-row-local-unenforceable`; the deferred re-read is commit-only, so a non-ABORT conflict
+clause is refused by the general rule (RT-002).
 
 ### LENS-005 — Asserted-key FDs come only from uniqueness the boundary guarantees
 

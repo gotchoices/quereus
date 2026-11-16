@@ -1,5 +1,8 @@
 import type { PlanningContext } from '../planning-context.js';
-import type { TableSchema, RowConstraintSchema } from '../../schema/table.js';
+import type { TableSchema, RowConstraintSchema, ConstraintCheckCommitOnly } from '../../schema/table.js';
+import { ConflictResolution } from '../../common/constants.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { Attribute, RowDescriptor } from '../nodes/plan-node.js';
 import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-check-node.js';
@@ -209,7 +212,8 @@ export function buildConstraintChecks(
         needsDeferred,
         kind: 'check',
         violationMessage: constraint.violationMessage,
-        messageValued: constraint.messageValued
+        messageValued: constraint.messageValued,
+        commitOnly: constraint.commitOnly ?? selfReadingCheckCommitOnly(expression, tableSchema, constraint),
       } satisfies ConstraintCheck;
     } finally {
       // Restore original schema context
@@ -300,16 +304,74 @@ export function buildNotNullDefaults(
 }
 
 /**
- * Walks the full expression tree (descending into subquery plan children)
- * to find any TableReferenceNode with readCommitted === true.
+ * Refuse an INSERT whose statement OR clause cannot be honoured by a commit-only check
+ * among `checks` (see {@link ConstraintCheckCommitOnly}). IGNORE / REPLACE / FAIL /
+ * ROLLBACK resolve a violation per row, while the row is in hand — but a commit-only
+ * check decided then reads its relation before the row is written and passes a
+ * violating one, and deferred to commit it can only ABORT. Refusing beats both silent
+ * outcomes. INSERT is the only statement carrying an OR clause, so `buildInsertStmt` is
+ * the one caller; a constraint-level `on conflict` action on such a check is not refused
+ * (it would reject every insert into the table) — the runtime keeps the check deferred,
+ * so it acts as ABORT.
+ */
+export function rejectConflictClauseForCommitOnlyChecks(
+  checks: readonly ConstraintCheck[],
+  onConflict: ConflictResolution | undefined,
+  loc: AST.AstNode['loc'],
+): void {
+  if (onConflict === undefined || onConflict === ConflictResolution.ABORT) return;
+  const rule = checks.find(check => check.commitOnly !== undefined)?.commitOnly;
+  if (!rule) return;
+  const clause = `or ${ConflictResolution[onConflict].toLowerCase()}`;
+  const remedy = rule.remedy ? `, or ${rule.remedy}` : '';
+  throw new QuereusError(
+    `cannot insert with '${clause}': ${rule.description} is checked only at commit, once the statement's rows are written, `
+      + `but a conflict clause other than ABORT needs each row's verdict before that row is written, when the check cannot yet see it. `
+      + `Use a plain insert or 'insert or abort' (a violation then aborts at commit)${remedy}.`,
+    StatusCode.ERROR,
+    undefined,
+    loc?.start.line,
+    loc?.start.column,
+  );
+}
+
+/**
+ * The commit-only marker for a user CHECK that reads its own table outside `committed.*`
+ * — e.g. `check ((select count(*) from t as o where o.x = new.x) <= 1)`. Its answer
+ * depends on the row being written already being visible, so it can only be decided at
+ * commit. A `committed.<t>` read sees pre-statement state by design and does not need the
+ * write; another table already holds its final state at row time.
+ */
+function selfReadingCheckCommitOnly(
+  expression: ScalarPlanNode,
+  tableSchema: TableSchema,
+  constraint: RowConstraintSchema,
+): ConstraintCheckCommitOnly | undefined {
+  const schemaName = tableSchema.schemaName.toLowerCase();
+  const tableName = tableSchema.name.toLowerCase();
+  const readsOwnTable = someTableReference(expression, ref =>
+    !ref.readCommitted
+    && ref.tableSchema.schemaName.toLowerCase() === schemaName
+    && ref.tableSchema.name.toLowerCase() === tableName);
+  if (!readsOwnTable) return undefined;
+  const named = constraint.name ? ` '${constraint.name}'` : '';
+  return { description: `the CHECK constraint${named} of table '${tableSchema.schemaName}.${tableSchema.name}' (it reads its own table)` };
+}
+
+/**
  * This is a defensive check: committed.* refs necessarily contain subqueries,
  * but this ensures they are always deferred even if subquery detection changes.
  */
 function containsCommittedRef(expr: ScalarPlanNode): boolean {
+  return someTableReference(expr, ref => ref.readCommitted);
+}
+
+/** Walks the full expression tree, descending into subquery plan children, for a matching table reference. */
+function someTableReference(expr: ScalarPlanNode, matches: (ref: TableReferenceNode) => boolean): boolean {
   const stack: PlanNode[] = [expr];
   while (stack.length) {
     const n = stack.pop()!;
-    if (n instanceof TableReferenceNode && n.readCommitted) {
+    if (n instanceof TableReferenceNode && matches(n)) {
       return true;
     }
     for (const c of n.getChildren()) {
