@@ -485,7 +485,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
 	 * reserved tags on this basis schema's tables. Returns `[]` for a schema with no
 	 * such tags (the common case), leaving the lens default mapper on its name-match
-	 * path. See `docs/lens.md` § The Default Mapper.
+	 * path. See `docs/lens-default-mapper.md`.
 	 */
 	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
 		return buildAdvertisementsFromTags(basisSchema);

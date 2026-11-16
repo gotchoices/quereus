@@ -145,7 +145,7 @@ export interface SchemaDiff {
 	/**
 	 * Logical-schema lens detaches: registered lens bodies absent from the
 	 * declaration. A logical removal detaches the lens and **never** drops basis
-	 * storage (see `docs/lens.md` § Deployment) — so this is emitted *instead of*
+	 * storage (see `docs/lens-deployment.md`) — so this is emitted *instead of*
 	 * a basis-table drop.
 	 */
 	lensToDetach: string[];
@@ -1040,7 +1040,7 @@ export function computeSchemaDiff(
  *   - a registered lens body absent from the declaration → detach.
  *
  * Crucially, this never populates `tablesToDrop` — a logical removal detaches
- * the lens and leaves basis storage intact (see `docs/lens.md` § Deployment).
+ * the lens and leaves basis storage intact (see `docs/lens-deployment.md`).
  * Physical buckets stay empty; `generateMigrationDDL` emits nothing for a
  * logical diff (attach/detach happens in the lens compiler at apply time).
  */

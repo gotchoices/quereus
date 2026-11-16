@@ -1120,7 +1120,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 
 /**
  * Build the shared-surrogate envelope substrate for an INSERT through a
- * decomposition-backed logical table (docs/lens.md § The Default Mapper,
+ * decomposition-backed logical table (docs/lens-default-mapper.md,
  * docs/vu-mutation-context.md § Mutation Context). The dual of
  * `buildMultiSourceInsert`, generalized from two FK-ordered sides to an n-way,
  * anchor-first member fan-out with optional / EAV members.
@@ -1147,7 +1147,7 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	// gate (the decomposition routing sits above it), so run the gate here too. Now that the fan-out
 	// threads the commit-time set-level count CHECK (below), an `insert or replace` / `or ignore` /
 	// upsert through a decomposition with a commit-time set-level key would otherwise silently
-	// ABORT-at-commit instead of getting the documented up-front diagnostic (docs/lens.md
+	// ABORT-at-commit instead of getting the documented up-front diagnostic (docs/lens-constraints.md
 	// § Enforcement by constraint class). A plain insert / `or abort` is unaffected.
 	rejectLensSetLevelConflictResolution(ctx, view, { op: 'insert', stmt });
 

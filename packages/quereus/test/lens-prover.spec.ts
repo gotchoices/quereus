@@ -1,6 +1,6 @@
 /**
- * Lens prover + constraint attachment (docs/lens.md §§ Constraint Attachment /
- * Coverage checklist; ticket `lens-prover-and-attachment`).
+ * Lens prover + constraint attachment (docs/lens-constraints.md;
+ * docs/lens-prover.md § Coverage checklist; ticket `lens-prover-and-attachment`).
  *
  * Covers the prover that flips the lens layer from read-correct to read-correct
  * AND classified-for-write-soundness: the five blocking errors, the three

@@ -23,8 +23,7 @@ import { StatusCode } from '../common/types.js';
  * `quereus.lens.decomp.*` tags on the basis tables (validated by the typed
  * registry in {@link ./reserved-tags.ts}). This builder reads those tags and
  * assembles the equivalent {@link MappingAdvertisement} list, which the module
- * returns from `getMappingAdvertisements`. See `docs/lens.md` § The Default
- * Mapper.
+ * returns from `getMappingAdvertisements`. See `docs/lens-default-mapper.md`.
  *
  * Tag mini-language (the facet leads the key so each is a single-placeholder
  * registry template; one decomposition `<id>`'s facts are distributed across its

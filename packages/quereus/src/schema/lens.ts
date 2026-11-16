@@ -38,7 +38,7 @@ export interface SchemaRef {
  * A logical constraint carried verbatim from the logical declaration onto the
  * compiled view body. The prover ticket routes these to enforcement; this
  * ticket only stores them. Reuses the existing constraint-schema shapes rather
- * than re-modelling (see `docs/lens.md` § Constraint Attachment).
+ * than re-modelling (see `docs/lens-constraints.md`).
  */
 export type LogicalConstraint =
 	| { kind: 'primaryKey'; columns: ReadonlyArray<PrimaryKeyColumnDefinition> }
@@ -158,7 +158,7 @@ export interface LensSlot {
 	 * fact to the prover via the slot rather than seeding it at the member scan (which
 	 * would not reach the prover — the body is planned before the slot is committed).
 	 * Only computed for the synthesized-decomposition body (not a full hand-authored
-	 * override or the single-source default body). See docs/lens.md § The module
+	 * override or the single-source default body). See docs/lens-default-mapper.md § The module
 	 * mapping advertisement and docs/optimizer-fd.md § Inclusion Dependency Tracking
 	 * (Wave 3). Absent when no advertisement backs the table, the body is not the
 	 * synthesized decomposition, or the decomposition has only optional members / an
@@ -172,7 +172,7 @@ export interface LensSlot {
  * `(basisColumn → logicalColumn)` pair it supplies, including shared join-key
  * columns threaded across the decomposition's members (so a split member that
  * carries the key — but does not project it — is still backfillable). Captured in
- * the per-deploy {@link LensTableSnapshot} (see `docs/lens.md` § The deployed
+ * the per-deploy {@link LensTableSnapshot} (see `docs/lens-deployment.md` § The deployed
  * basis representation).
  */
 export interface LensRelationBacking {
@@ -197,7 +197,7 @@ export interface LensRelationBacking {
 	 * classifier nulls the SQL out rather than emit an un-runnable insert. Captured
 	 * from the member's full {@link TableSchema} in `deriveRelationBacking`, so it
 	 * also covers required columns the lens maps to *no* logical column (an omitted
-	 * column never appears in {@link columns}). See `docs/lens.md` § Classification.
+	 * column never appears in {@link columns}). See `docs/lens-deployment.md` § Classification — re-decomposition vs needs-data.
 	 */
 	requiredBasisColumns: readonly string[];
 }
@@ -234,7 +234,7 @@ export interface LensTableSnapshot {
 
 /**
  * The persisted, hash-coded record of one logical schema's lens deployment over
- * its basis — the "deployed basis representation" `docs/lens.md` § Deployment
+ * its basis — the "deployed basis representation" `docs/lens-deployment.md`
  * requires. Captured by `deployLogicalSchema` on each successful `apply schema X`
  * and rotated (previous ← current) so the prior deploy survives one re-apply,
  * letting the backfill differ diff `previous → current`.
@@ -256,8 +256,7 @@ export interface LensDeploymentSnapshot {
 /**
  * Collects the logical spec's constraints into the verbatim
  * {@link LogicalConstraint} list stored on the lens slot. The primary key is
- * always included (even the empty / singleton key — see `docs/lens.md`
- * § The Default Mapper); the prover decides how to realize each.
+ * always included (even the empty / singleton key — see `docs/lens-default-mapper.md`); the prover decides how to realize each.
  */
 export function buildLogicalConstraints(logicalTable: TableSchema): LogicalConstraint[] {
 	const result: LogicalConstraint[] = [];

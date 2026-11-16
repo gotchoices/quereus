@@ -55,7 +55,7 @@ export class DeclaredSchemaManager {
 	 * Rotated lens deployment snapshots keyed by *logical* schema name. Each
 	 * `apply schema X` rotates (`previous = current; current = fresh`), so the
 	 * prior deploy survives one re-apply — the source of truth the
-	 * `quereus_basis_backfill` differ diffs (see `docs/lens.md`
+	 * `quereus_basis_backfill` differ diffs (see `docs/lens-deployment.md`
 	 * § The deployed basis representation).
 	 */
 	private deployedLensSnapshots: Map<string, LensSnapshotPair> = new Map();
@@ -194,7 +194,7 @@ export class DeclaredSchemaManager {
 	/**
 	 * Stores (replacing any prior) the lens block for a logical schema. Keyed by
 	 * the logical schema name (`for X`); re-declaring a lens for X overwrites,
-	 * matching `declare schema`'s overwrite-on-redeclare. See docs/lens.md § D1.
+	 * matching `declare schema`'s overwrite-on-redeclare. See docs/lens.md § Syntax.
 	 */
 	setLensDeclaration(logicalSchemaName: string, declaration: AST.DeclareLensStmt): void {
 		this.lensDeclarations.set(logicalSchemaName.toLowerCase(), declaration);

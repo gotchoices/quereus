@@ -1,5 +1,5 @@
 /**
- * Decomposition **put** fan-out (docs/lens.md § The Default Mapper, ticket
+ * Decomposition **put** fan-out (docs/lens-default-mapper.md, ticket
  * `lens-multi-source-put-fanout`).
  *
  * A logical table backed by a `primary-storage` decomposition advertisement is
@@ -501,8 +501,8 @@ describe('lens decomposition put: UPDATE fan-out', () => {
 		// null write raises a base constraint error — caught ATOMICALLY (row 3's T_c is untouched), never a
 		// silent corruption. (For a *nullable* optional column the read-back would instead write null and
 		// the row would stay invisible — no widen; that branch needs a fixture with both a mandatory
-		// non-anchor member and a nullable optional, which neither fixture has.) docs/lens.md
-		// § Current Limitations documents the divergence; it is confined to malformed states.
+		// non-anchor member and a nullable optional, which neither fixture has.) docs/lens-default-mapper.md
+		// § Current limitations documents the divergence; it is confined to malformed states.
 		const db = new Database();
 		try {
 			await setup(db);
@@ -1216,7 +1216,7 @@ describe('lens decomposition put: EAV DELETE fan-out', () => {
 		// `set p = q + 1` captures null) writes `val = null`. With a NULLABLE value column that is a
 		// benign physical divergence (covered above); with a **NOT NULL** value column it instead
 		// hits the base NOT NULL constraint and raises atomically — reject-don't-widen, the EAV
-		// analogue of the columnar invisible-row NOT-NULL boundary (docs/lens.md § Current limitations).
+		// analogue of the columnar invisible-row NOT-NULL boundary (docs/lens-default-mapper.md § Current limitations).
 		const db = new Database();
 		try {
 			const mod = new AdvertisingModule();
@@ -2033,8 +2033,8 @@ describe('lens decomposition put: column-classification robustness', () => {
 
 /**
  * Stitch-key / EAV-conflict-target uniqueness guard
- * (`view-write-decomp-stitch-key-unique-guard`, docs/lens.md
- * § The `put` fan-out).
+ * (`view-write-decomp-stitch-key-unique-guard`, docs/lens-default-mapper.md
+ * § Stitch-key uniqueness).
  *
  * The put fan-out cedes the matched rows to the matched UPDATE only through the
  * materialize INSERT's `on conflict (<target>) do nothing`, which the runtime fires
@@ -3319,7 +3319,7 @@ describe('lens decomposition stitch correlation: MIXED nullability keeps the pla
 			// Assigning the optional cell of the NULL-keyed row RAISES rather than silently
 			// no-opping: the matched UPDATE misses (`… in (select null …)` is UNKNOWN) and the
 			// materialize INSERT threads the anchor's NULL into the member's NOT NULL key.
-			// Loud + atomic, the documented boundary (docs/lens.md § Current Limitations).
+			// Loud + atomic, the documented boundary (docs/lens-default-mapper.md § Current limitations).
 			await expectThrows(() => db.exec('update x.N set c = 5 where id is null'), /NOT NULL constraint failed: N_c\.id/);
 			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 21 }]);
 			// The non-NULL row's cell still writes normally.
@@ -3358,7 +3358,7 @@ describe('lens decomposition stitch correlation: MIXED nullability keeps the pla
 
 describe('lens decomposition put: all-null assignment under a NULL stitch key', () => {
 	// Assigning null to EVERY value column of an optional member empties the component →
-	// the member write lowers to a base DELETE (docs/lens.md § put fan-out UPDATE), which
+	// the member write lowers to a base DELETE (docs/lens-default-mapper.md § UPDATE), which
 	// routes through the same anchor correlation as the fan-out DELETE. Under a nullable
 	// stitch key that correlation must reach the NULL-keyed component too, or the emptied
 	// cell survives as a stale row.

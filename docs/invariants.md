@@ -1304,7 +1304,82 @@ of all table data rather than relying on this.
 
 ## LENS — Lens
 
-Reserved.
+A lens maps a design-only logical table onto the module-backed basis tables that store it. The
+topic docs ([Lenses and Layered Schemas](lens.md) and its satellites) carry the exposition.
+
+### LENS-001 — A logical removal never drops basis storage
+
+- code: `packages/quereus/src/schema/schema-differ.ts` — `computeLogicalSchemaDiff`
+- guard: `packages/quereus/test/lens-foundation.spec.ts` — `a removed logical table detaches its lens and never drops basis`
+- doc: [Lens Deployment](lens-deployment.md#deployment-is-a-compile-step)
+
+Removing a table or column from a logical schema never drops or alters basis storage. A logical
+diff only attaches or detaches lens bodies: `computeLogicalSchemaDiff` fills `lensToAttach` /
+`lensToDetach`, never `tablesToDrop`, and no migration DDL is generated for it. A removed
+logical table detaches its lens; its basis tables keep their rows and schema hash, and
+reclaiming them is the application's decision.
+
+### LENS-002 — Every stitch key and EAV conflict target is a declared unique key
+
+- code: `packages/quereus/src/schema/lens-compiler.ts` — `validatePrimaryAdvertisement`
+- guard: `packages/quereus/test/lens-put-fanout.spec.ts` — `lens decomposition put: stitch-key uniqueness guard`
+- doc: [The Lens Default Mapper](lens-default-mapper.md#stitch-key-uniqueness)
+
+A decomposition deploys only when each columnar member's stitch key, each EAV pivot's
+`(entity, attribute)`, and the anchor's key equal a declared PRIMARY KEY or non-partial UNIQUE
+on that basis relation. Reads depend on it (the stitch join and the EAV subquery cannot
+multiply rows), and so do writes: the materialize INSERT's `on conflict (<target>) do nothing`
+cedes exactly the matched rows to the member UPDATE. Plan-time builders rely on it unchecked.
+
+### LENS-003 — Logical constraints bind only writes routed through the lens
+
+- code: `packages/quereus/src/runtime/foreign-key-actions.ts` — `lensRouted`
+- code: `packages/quereus/src/planner/building/foreign-key-builder.ts` — `lensRouted`
+- guard: `packages/quereus/test/lens-enforcement.spec.ts` — `lens enforcement: parent-side FK is lens-routed-only`
+- doc: [Lens Constraint Attachment](lens-constraints.md#the-lens-boundary-is-the-only-place-logical-constraints-apply)
+
+A write through a logical table bears its logical CHECK, NOT NULL, key and FK rules; a write
+straight to a basis table bears only the basis's own, even where a logical FK covers the same
+columns. Lens-synthesized constraints attach only on the view-mutation path, and the logical
+cascade walker, RESTRICT pre-check, and divergent-action suppression run only for a write marked
+`lensRouted`.
+
+### LENS-004 — A decomposition write checks row-local rules on the logical row or refuses
+
+- code: `packages/quereus/src/planner/mutation/lens-enforcement.ts` — `synthesizeLensRowLocalDeferredConstraint`
+- code: `packages/quereus/src/planner/building/view-mutation-builder.ts` — `lens-row-local-unenforceable`
+- guard: `packages/quereus/test/lens-row-local-null-write.spec.ts` — `lens row-local CHECK on a NULL write — decomposition`
+- doc: [Lens Constraint Attachment](lens-constraints.md#row-local-checks-on-a-decomposition-write)
+
+On a decomposition write a logical CHECK or undefaulted NOT NULL is evaluated once per logical
+row against the whole logical row image — at the insert envelope, or by a deferred re-read of
+the logical view by logical key — never on the member op that writes its column, which is
+skipped for a NULL value. When the row cannot be addressed, or a non-ABORT conflict clause would
+force the re-read to row time, the write is refused with `lens-row-local-unenforceable`.
+
+### LENS-005 — Asserted-key FDs come only from uniqueness the boundary guarantees
+
+- code: `packages/quereus/src/schema/lens-prover.ts` — `computeLensAssertedKeyFds`
+- guard: `packages/quereus/test/lens-fd-contribution.spec.ts` — `lens FD contribution: the soundness gate`
+- doc: [Lens Constraint Attachment](lens-constraints.md#fd-contribution-to-the-optimizer)
+
+A lens boundary asserts read-path FDs only for keys unique wherever a reader can look: a
+`proved` key gives `key → others`, an empty key `∅ → all`, and a row-time key only the guarded
+`[key IS NOT NULL]` FD, and only while a non-stale covering materialized view still answers its
+basis UNIQUE — re-checked at plan time, since basis DDL does not re-run the prover. A commit-time
+key, a row-local rule, and an FK give none.
+
+### LENS-006 — A writable lens column that fails its round-trip check blocks the deploy
+
+- code: `packages/quereus/src/schema/lens-prover.ts` — `emitRoundTrip`
+- guard: `packages/quereus/test/lens-prover.spec.ts` — `lens prover: round-trip (computed deploy-time predicate)`
+- doc: [The Lens Prover](lens-prover.md#coverage-checklist)
+
+For a single-source projection-and-filter body, a deploy fails with `lens.non-invertible` when a
+column presented as writable, or tagged `quereus.lens.writable = true`, has no proven-faithful
+round trip, and with `lens.putget-violation` when an authored inverse, evaluated over its
+enumerable CHECK domain, does not read back the value written. Outside that fragment nothing is
+raised at deploy; the mutation-time checks govern.
 
 ## TXN — Transactions
 

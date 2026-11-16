@@ -761,7 +761,7 @@ export interface VirtualTableModule<
 	 * `logicalSchemaName` (read back from the manager's rotated `current`, never
 	 * re-derived), so a module backing the basis can realise / reconcile its
 	 * backing relations against the freshly deployed lens (e.g. the Lamina adapter's
-	 * deploy → basis-reconcile path; see `docs/lens.md` § Module deployment
+	 * deploy → basis-reconcile path; see `docs/lens-deployment.md` § Module deployment
 	 * notification).
 	 *
 	 * Firing contract:

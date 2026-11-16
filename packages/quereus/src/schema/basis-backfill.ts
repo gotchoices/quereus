@@ -4,7 +4,7 @@ import type { LensDeploymentSnapshot, LensTableSnapshot } from './lens.js';
 
 /**
  * Engine-emitted backfill DDL for lens basis re-decompositions
- * (docs/lens.md § The deployed basis representation).
+ * (docs/lens-deployment.md § The deployed basis representation).
  *
  * A basis re-decomposition (split / merge / rename) changes *how* a logical
  * relation is stored but not the relation itself:

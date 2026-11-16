@@ -2009,7 +2009,7 @@ interface BasisCovering {
  * Conservative: a multi-source body, an unmapped column, or a missing basis
  * UC/structure all yield `undefined` (⇒ commit-time scan). The retired auto-index
  * is deliberately NOT consulted for a logical schema — the explicit covering MV is
- * the sole row-time structure (`docs/lens.md` § Constraint Attachment). Reads no
+ * the sole row-time structure (`docs/lens-constraints.md`). Reads no
  * `ctx.root`, so it is safe over a lightweight (un-planned) context.
  */
 function findBasisCovering(ctx: ProveContext, logicalColumns: readonly number[]): BasisCovering | undefined {
@@ -2209,7 +2209,7 @@ function authoredPutTargetBasisColumn(ctx: ProveContext, logicalColumn: string, 
 
 // ---------------------------------------------------------------------------
 // Read-side: declared-key FD contribution to the optimizer (the inlined-view
-// boundary). See docs/lens.md § Constraint Attachment and docs/optimizer-fd.md.
+// boundary). See docs/lens-constraints.md § FD contribution to the optimizer and docs/optimizer-fd.md.
 // ---------------------------------------------------------------------------
 
 /**

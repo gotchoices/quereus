@@ -86,7 +86,7 @@ export interface MutationEnvelope {
 	 * Per-row logical CHECKs evaluated once per produced logical row, at the
 	 * envelope — BEFORE the shared key is minted and before any member op runs.
 	 * This is the row-local lens constraint seam for a decomposition INSERT
-	 * (docs/lens.md § Constraint Attachment): the envelope row IS the produced
+	 * (docs/lens-constraints.md): the envelope row IS the produced
 	 * logical row, so a check here fires regardless of which member ops the
 	 * fan-out plans (an omitted / explicit-NULL column suppresses the member
 	 * write, never the check). Subquery-free checks only — a subquery-bearing

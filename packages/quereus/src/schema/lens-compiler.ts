@@ -33,7 +33,7 @@ const log = createLogger('schema:lens-compiler');
  * ordinary `ViewSchema`. The query processor then sees a view; reads ride the
  * standard view-resolution path and writes ride view-updateability.
  *
- * v1 is **single-source, name-based** (see `docs/lens.md` § The Default Mapper):
+ * v1 is **single-source, name-based** (see `docs/lens-default-mapper.md`):
  * a logical table maps to a name-matching basis table, and each logical column
  * to a name-matching basis column. Type/nullability conformance and the n-way
  * decomposition shape are deferred to the prover / decomposition tickets.
@@ -47,7 +47,7 @@ const log = createLogger('schema:lens-compiler');
  * This is how asymmetric removal falls out for free — a logical table dropped
  * from the declaration is simply not rebuilt (its view + slot vanish), and the
  * basis is never touched (logical removals never cascade to basis storage; see
- * `docs/lens.md` § Deployment).
+ * `docs/lens-deployment.md`).
  */
 export function deployLogicalSchema(
 	db: Database,
@@ -61,7 +61,7 @@ export function deployLogicalSchema(
 
 	// The lens block (explicit `over Y` basis + sparse overrides), if declared.
 	// Re-read from source on every deploy — that is what lets a rename and a
-	// later column-add compose without attribute-ID plumbing (docs/lens.md § D2).
+	// later column-add compose without attribute-ID plumbing (docs/lens.md § Coverage is name-based and re-read from source).
 	const lensDecl = db.declaredSchemaManager.getLensDeclaration(logicalSchemaName);
 	const overridesByTable = indexOverrides(lensDecl, declaredSchema, logicalSchemaName);
 
@@ -73,7 +73,7 @@ export function deployLogicalSchema(
 	const resolveBasis = (): { schema: Schema; schemaName: string } => {
 		if (lensDecl) {
 			// Explicit `over Y` binding resolves the foundation's default-basis
-			// ambiguity (docs/lens.md § D4); `inferDefaultBasis` is NOT consulted.
+			// ambiguity (docs/lens.md § Syntax); `inferDefaultBasis` is NOT consulted.
 			const basisSchema = schemaManager.getSchema(lensDecl.basisSchema);
 			if (!basisSchema) {
 				throw new QuereusError(
@@ -131,7 +131,7 @@ export function deployLogicalSchema(
 			compiledBody = merged.body;
 			provenance = merged.provenance;
 			effectiveColumns = merged.effectiveColumns;
-			// Override ⊕ advertisement composition (docs/lens.md § Override-vs-advertisement):
+			// Override ⊕ advertisement composition (docs/lens-default-mapper.md § Override composition with an advertisement):
 			// a *sparse* override (one that relies on gap-fill) must not re-anchor or
 			// reference relations outside the advertised decomposition. A *full*
 			// hand-authored override (no gap-fill) bypasses the advertisement and is
@@ -144,7 +144,7 @@ export function deployLogicalSchema(
 			}
 		} else if (advertisement) {
 			// A resolved primary-storage advertisement → synthesize the n-way `get`
-			// join body from the decomposition (docs/lens.md § The Default Mapper).
+			// join body from the decomposition (docs/lens-default-mapper.md).
 			compiledBody = compileDecompositionBody(logicalTable, logicalSchemaName, basis, advertisement, db);
 			provenance = logicalTable.columns.map(c => ({ logicalColumn: c.name, source: 'default' as const }));
 			effectiveColumns = logicalTable.columns.map(c => c.name);
@@ -162,7 +162,7 @@ export function deployLogicalSchema(
 		// advertisement (lens-multi-source-ind-injection): one relation-IND per
 		// mandatory non-anchor member, threaded to the prover via the slot so the
 		// mandatory inner-joins are provably row-loss-free and the put fan-out is
-		// sound against a derived existence fact. See docs/lens.md § The module
+		// sound against a derived existence fact. See docs/lens-default-mapper.md § The module
 		// mapping advertisement and docs/optimizer-fd.md § Inclusion Dependency Tracking.
 		//
 		// Gated (R2) to the synthesized-decomposition body: only
@@ -263,7 +263,7 @@ export function deployLogicalSchema(
 	// Capture + rotate the deployed-basis snapshot AFTER a successful catalog
 	// mutation, so an aborted re-apply leaves the prior snapshot untouched. The
 	// snapshot is the source of truth the `quereus_basis_backfill` differ reads
-	// (docs/lens.md § The deployed basis representation).
+	// (docs/lens-deployment.md § The deployed basis representation).
 	const snapshot = buildDeploymentSnapshot(db, compiled, basis, logicalSchemaName);
 	db.declaredSchemaManager.rotateDeployedLensSnapshot(logicalSchemaName, snapshot);
 
@@ -351,7 +351,7 @@ function requiredBasisColumnsOf(table: TableSchema): string[] {
 /**
  * Derives, per basis relation, the `(basisColumn → logicalColumn)` pairs it backs
  * for one compiled effective body — the record a later re-decomposition diffs and
- * backfills (docs/lens.md § The deployed basis representation). Two contributions:
+ * backfills (docs/lens-deployment.md § The deployed basis representation). Two contributions:
  *
  * 1. **Projection.** The body's projection is exactly the logical
  *    columns, in declaration order (see `compileDefaultBody` / `compileOverrideBody`);
@@ -520,7 +520,7 @@ function collectEqualityPairs(expr: AST.Expression): Array<[AST.ColumnExpr, AST.
  * The basis-relation keys (`schema.table`, lowercased) of a slot's surrogate-keyed
  * decomposition members, or undefined when there is no advertisement / the shared
  * key is a logical-tuple. Lets the differ defer an unsound multi-member surrogate
- * split (see `docs/lens.md` § The Default Mapper — evaluate-once-and-thread).
+ * split (see `docs/lens-default-mapper.md` — evaluate-once-and-thread).
  */
 function deriveSurrogateMemberKeys(
 	slot: LensSlot,
@@ -548,7 +548,7 @@ function deriveSurrogateMemberKeys(
  * the other compile-time lens errors, and atomic because validation runs before
  * catalog mutation. `severity:'warning'` diagnostics (e.g. an empty
  * `quereus.lens.ack` rationale) are logged via the existing `log` channel; the
- * deploy-summary warning channel (`docs/lens.md:169`) is `3-lens-prover` Phase
+ * deploy-summary warning channel (`docs/lens-prover.md` § Coverage checklist) is `3-lens-prover` Phase
  * C's to build. Errors take precedence — warnings only log when none fail.
  *
  * This validates shape/site only — no reserved tag carries behavior read here.
@@ -712,7 +712,7 @@ export function compileDefaultBody(
 }
 
 // ===========================================================================
-// n-way decomposition synthesis (docs/lens.md § The Default Mapper)
+// n-way decomposition synthesis (docs/lens-default-mapper.md)
 // ===========================================================================
 //
 // When a logical table is backed by a resolved primary-storage advertisement,
@@ -845,7 +845,7 @@ function compileDecompositionBody(
 
 /**
  * Computes the existence-anchor inclusion dependencies for a decomposition
- * (`lens-multi-source-ind-injection`, docs/lens.md § The module mapping
+ * (`lens-multi-source-ind-injection`, docs/lens-default-mapper.md § The module mapping
  * advertisement). For each **mandatory**, non-anchor, non-EAV member, injects one
  * IND asserting the existence **anchor's** shared-key tuple is included in that
  * member's key — the propagated fact that lets the prover discharge the
@@ -977,7 +977,7 @@ function memberTableSource(table: TableSchema, basisSchemaName: string, alias: s
  * side (a member row keyed NULL is then a genuine orphan and `=` correctly
  * matches nothing). An empty key column list (the `primary key ()` singleton)
  * yields the vacuously-true `1 = 1` — no singleton-specific branch
- * (docs/lens.md § The Default Mapper).
+ * (docs/lens-default-mapper.md).
  *
  * NOTE: accepted tradeoff — the gate reads **declared** nullability, so under
  * `pragma default_column_nullability = nullable` every stitch key is declared
@@ -1250,7 +1250,7 @@ interface OverrideSource {
 
 /**
  * Composes one effective **read** body for a logical table that has a
- * `declare lens` override, per docs/lens.md § D2:
+ * `declare lens` override, per docs/lens.md § Overrides are merged per-attribute:
  *
  *   covered columns (override projection) ⊕ default-mapper gap-fill.
  *
@@ -1280,7 +1280,7 @@ function compileOverrideBody(
 
 	// Every FROM source the override names must live in the declared basis — an
 	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
-	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
+	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § Body-shape restrictions).
 	validateOverrideBasisSources(select, basisSchemaName, schemaManager, cteNames, logicalSchemaName, logicalName);
 
 	// Resolve FROM-source basis tables once — used for both `*` expansion and
@@ -1676,7 +1676,7 @@ function gapFillError(
 		? 'the override FROM exposes no introspectable basis table'
 		: `basis source(s) ${sources.map(s => s.table.name).join(', ')} have no column '${colName}'`;
 	if (sources.length > 1 || hasOpaqueSource) {
-		// Cross-basis / partial-coverage fidelity boundary (docs/lens.md § D2).
+		// Cross-basis / partial-coverage fidelity boundary (docs/lens.md § Gap-fill fidelity boundary).
 		return `lens: override for logical table '${logicalSchemaName}.${logicalName}' covers only some columns; uncovered column '${colName}' is not reachable from the override's FROM (${sourceDesc}) — it would need a basis source the single-source mapper cannot join in. Cover it explicitly.`;
 	}
 	// Every logical column must map to basis (docs/lens.md § Gap-fill fidelity boundary).
@@ -1684,7 +1684,7 @@ function gapFillError(
 }
 
 // ===========================================================================
-// Module mapping advertisement resolution (docs/lens.md § The Default Mapper)
+// Module mapping advertisement resolution (docs/lens-default-mapper.md)
 // ===========================================================================
 //
 // The protocol seam: a virtual-table module advertises how a set of its basis
@@ -1774,7 +1774,7 @@ function resolveAdvertisement(
 /**
  * Validates a `primary-storage` advertisement's structural coherence. Each check
  * pushes a sited message to `errors` (aggregated by the caller); none mutate the
- * catalog. See `docs/lens.md` § The Default Mapper for the field semantics.
+ * catalog. See `docs/lens-default-mapper.md` for the field semantics.
  */
 function validatePrimaryAdvertisement(
 	ad: MappingAdvertisement,
@@ -1893,8 +1893,8 @@ function validatePrimaryAdvertisement(
 		}
 	}
 
-	// Stitch-key / EAV-conflict-target uniqueness (docs/lens.md § The `put`
-	// fan-out). The put fan-out cedes the matched rows to the matched
+	// Stitch-key / EAV-conflict-target uniqueness (docs/lens-default-mapper.md § Stitch-key
+	// uniqueness). The put fan-out cedes the matched rows to the matched
 	// UPDATE only through the materialize INSERT's `on conflict (<target>) do nothing`,
 	// which the runtime fires solely on a declared PK / UNIQUE violation; the get side
 	// is sound only when that same target is 1:1 (a non-unique columnar stitch key
@@ -2041,8 +2041,7 @@ function annotateProvenanceWithAdvertisement(
 }
 
 /**
- * Override ⊕ advertisement conflict (docs/lens.md § Override-vs-advertisement
- * composition): a *sparse* override (one that relies on gap-fill) may correct an
+ * Override ⊕ advertisement conflict (docs/lens-default-mapper.md § Override composition with an advertisement): a *sparse* override (one that relies on gap-fill) may correct an
  * advertised column mapping, but must NOT re-anchor or reference basis relations
  * outside the advertised decomposition. Every introspectable basis-table source
  * in the override's FROM must be one of the advertisement's member relations;

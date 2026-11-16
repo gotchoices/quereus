@@ -23,7 +23,7 @@ const log = createLogger('planner:lens-enforcement');
 
 /**
  * Lens row-local constraint enforcement (the write side of the lens prover's
- * `enforced-row-local` obligation class — `docs/lens.md` § Constraint Attachment).
+ * `enforced-row-local` obligation class — `docs/lens-constraints.md`).
  *
  * The prover (`schema/lens-prover.ts`) classifies every logical constraint into a
  * {@link import('../../schema/lens-prover.js').ConstraintObligation} on
@@ -143,7 +143,7 @@ function buildWriteRowRelations(
  * while leaving a **subquery-local** ref (one a nested FROM introduces) untouched, so
  * a CHECK whose subquery correlates a write-row column with a logical≠basis name spells
  * that ref in basis terms at the constraint-build boundary instead of crashing on a
- * column the basis write row does not carry (`docs/lens.md` § Constraint Attachment).
+ * column the basis write row does not carry (`docs/lens-constraints.md`).
  * The descent itself owns shadow accumulation / taint propagation; this object decides
  * per column:
  *
@@ -785,7 +785,7 @@ function lensRowLocalRuleMessage(check: LensRowLocalLogicalCheck): string {
  * Because the re-read evaluates the WHOLE logical row image, a cross-member
  * CHECK (one the per-member gate could never thread) is enforced here too — the
  * decomposition write paths that use this seam therefore close the documented
- * cross-member deferral as a side effect (docs/lens.md § Constraint Attachment).
+ * cross-member deferral as a side effect (docs/lens-constraints.md).
  */
 export function synthesizeLensRowLocalDeferredConstraint(
 	ctx: PlanningContext,
@@ -907,7 +907,7 @@ function basisFksSubsuming(
  * Whether the lens-level child-side FK check for `fk` is **provably** redundant
  * with an equivalent FK the basis child write already enforces via
  * `buildChildSideFKChecks` — so the lens-level `EXISTS` is pure double-enforcement
- * cost (`docs/lens.md` § Constraint Attachment). All three conditions must hold;
+ * cost (`docs/lens-constraints.md`). All three conditions must hold;
  * **any** gap (multi-source child, non-plain mapping, missing/permuted basis FK, no
  * parent lens slot, a parent body that might filter rows) returns `false`, defaulting
  * to enforce — a false `true` would silently drop enforcement (a soundness hole).

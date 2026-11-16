@@ -1,7 +1,6 @@
 /**
  * The GROUPED deferred logical-row re-read on decomposition writes (ticket
- * `perf-lens-decomposition-update-probe-per-check`; docs/lens.md § Constraint
- * Attachment).
+ * `perf-lens-decomposition-update-probe-per-check`; docs/lens-constraints.md).
  *
  * A decomposition UPDATE's row-local rules (authored CHECKs and synthesized
  * NOT NULL obligations) are decided by ONE planned probe per

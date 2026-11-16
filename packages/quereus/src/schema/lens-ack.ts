@@ -441,7 +441,7 @@ function resurface(w: LensDiagnostic, recorded: string, current: string): LensDi
 	};
 }
 
-/** The meta-warning for an ack whose rationale is empty (docs/lens.md:211). */
+/** The meta-warning for an ack whose rationale is empty (docs/lens-prover.md § Acknowledging advisories). */
 function emptyRationaleWarning(w: LensDiagnostic): LensDiagnostic {
 	return {
 		code: w.code,

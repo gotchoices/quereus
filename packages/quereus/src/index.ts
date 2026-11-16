@@ -401,7 +401,7 @@ export type { ModuleCapabilities, IsolationCapableTable } from './vtab/capabilit
 // Schema type (needed by external modules implementing getMappingAdvertisements)
 export type { Schema } from './schema/schema.js';
 
-// Module mapping-advertisement protocol (lens default mapper — docs/lens.md)
+// Module mapping-advertisement protocol (lens default mapper — docs/lens-default-mapper.md)
 export type {
 	MappingAdvertisement,
 	StorageShape,
@@ -415,7 +415,7 @@ export type {
 } from './vtab/mapping-advertisement.js';
 export { buildAdvertisementsFromTags } from './schema/mapping-advertisement-tags.js';
 
-// Lens-deployment surface (logical-schema → basis; docs/lens.md § Deployment).
+// Lens-deployment surface (logical-schema → basis; docs/lens-deployment.md).
 // `deployLogicalSchema` is the `apply schema X` compile step for a logical
 // schema; it produces a `LensDeploymentSnapshot` (the deployed basis
 // representation) that the module deployment-notification hook

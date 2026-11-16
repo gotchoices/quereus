@@ -4,7 +4,7 @@ import type * as AST from '../parser/ast.js';
  * Module mapping advertisement protocol — the typed surface a virtual-table
  * module exposes to tell the lens default mapper how a set of *its* basis
  * relations jointly back one logical table (columnar split / EAV / column-family
- * / nd-tree). See `docs/lens.md` § "The Default Mapper".
+ * / nd-tree). See `docs/lens-default-mapper.md`.
  *
  * The advertisement is load-bearing in both directions of the lens:
  * - **`get`** — the join fan-out shape + which basis relation backs each logical

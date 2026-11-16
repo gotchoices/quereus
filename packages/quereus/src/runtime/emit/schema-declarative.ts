@@ -188,7 +188,7 @@ export function emitDeclareLens(plan: PlanNode, _ctx: EmissionContext): Instruct
 		log('DECLARE LENS for %s over %s', logicalSchema, lensStmt.basisSchema);
 
 		// Re-declaration is an error at the per-table grain: two `view T as` for
-		// the same logical table within one block (see docs/lens.md § D1).
+		// the same logical table within one block (see docs/lens.md § Syntax).
 		const seen = new Set<string>();
 		for (const ov of lensStmt.overrides) {
 			const key = ov.table.toLowerCase();
@@ -304,7 +304,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// Logical schema: deploy the lens layer instead of diffing + migrating
 		// basis storage. The compiler builds slots, compiles the effective body
 		// per logical table, and registers each as a ViewSchema. No basis DDL is
-		// generated. See docs/lens.md § Deployment Is a Compile Step.
+		// generated. See docs/lens-deployment.md § Deployment is a compile step.
 		if (declaredSchema.isLogical) {
 			if (lowerSchemaName === 'main' || lowerSchemaName === 'temp') {
 				throw new QuereusError(
@@ -326,7 +326,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			// Hand the freshly-deployed snapshot to every registered module so a
 			// basis-backing module can reconcile its storage against the new lens.
 			// Fires only on a successful deploy (an atomic deploy throws before
-			// reaching here on any blocking diagnostic). See docs/lens.md
+			// reaching here on any blocking diagnostic). See docs/lens-deployment.md
 			// § Module deployment notification.
 			await notifyLensDeploymentAll(rctx.db, schemaName);
 			return [];

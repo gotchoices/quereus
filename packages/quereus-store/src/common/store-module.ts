@@ -210,7 +210,7 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
 	 * reserved tags on this basis schema's tables. Returns `[]` when the schema has no
 	 * such tags, leaving the lens default mapper on its name-match path.
-	 * See `docs/lens.md` § The Default Mapper.
+	 * See `docs/lens-default-mapper.md`.
 	 */
 	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
 		return buildAdvertisementsFromTags(basisSchema);

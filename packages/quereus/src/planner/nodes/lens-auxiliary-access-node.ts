@@ -62,8 +62,8 @@ export interface RoutableAuxiliary {
  * A unary pass-through marker wired around an inlined **lens** view body that
  * carries the table's routable auxiliary-access advertisements (nd-tree spatial,
  * vector knn, full-text, …) to the read-path-selection optimizer rule
- * (`rule-lens-auxiliary-access`). See `docs/lens.md` § "The module mapping
- * advertisement" and the design ticket `lens-access-shape-path-selection`.
+ * (`rule-lens-auxiliary-access`). See `docs/lens-default-mapper.md` § "Auxiliary-access read-path
+ * routing" and the design ticket `lens-access-shape-path-selection`.
  *
  * Modeled exactly on {@link AssertedKeysNode}: column shape and attribute IDs are
  * the source's (pass-through `getType` / `getAttributes`), `computePhysical`

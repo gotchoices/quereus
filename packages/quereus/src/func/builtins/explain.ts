@@ -791,7 +791,7 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 				{ name: 'inverse', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				// Advertisement-backed provenance: the member relationId of the resolved
 				// primary-storage decomposition that backs this column, or NULL when the
-				// column is name-match / override-only (docs/lens.md § The Default Mapper).
+				// column is name-match / override-only (docs/lens-default-mapper.md).
 				{ name: 'advertised_member', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				// The resolved decomposition's anchor relationId (= advertisement id), or
 				// NULL when no advertisement backs this logical table.
@@ -867,7 +867,7 @@ function lensInverseDispositions(db: Database, slot: LensSlot): string[] {
 
 // Basis re-decomposition backfill introspection: per-new-basis-relation backfill
 // DDL the engine generates for a pure re-decomposition, tagged engine-generated
-// vs app-supplied (docs/lens.md § The deployed basis representation).
+// vs app-supplied (docs/lens-deployment.md § The deployed basis representation).
 //
 // Sequencing contract (the generated SQL reads the PRIOR get-body over the PRIOR
 // basis tables, which must still hold data when the app runs it):

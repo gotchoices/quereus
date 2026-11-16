@@ -1,5 +1,5 @@
 /**
- * Module mapping advertisement protocol (docs/lens.md § The Default Mapper,
+ * Module mapping advertisement protocol (docs/lens-default-mapper.md,
  * ticket `lens-module-mapping-advertisement`).
  *
  * Covers the protocol seam: the `MappingAdvertisement` descriptor a module

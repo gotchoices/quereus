@@ -8,7 +8,7 @@ import type { SqlValue } from '../common/types.js';
  * precise mini-language designed across the docs:
  *
  * - `quereus.lens.ack.<code>[:<target>]`, `quereus.lens.access.<col>`
- *   — lens advisory acknowledgments / access-pattern hints (`docs/lens.md`
+ *   — lens advisory acknowledgments / access-pattern hints (`docs/lens-prover.md`
  *   § Acknowledging advisories).
  * - `quereus.id` / `quereus.previous_name`
  *   — declarative-differ rename hints (docs/schema-rename-detection.md).
@@ -63,7 +63,7 @@ export type TagSite =
 	| 'physical-index'      // tags on a physical declared index (differ)
 	| 'physical-constraint';// tags on a physical declared named constraint (differ)
 
-/** Closed value set for `quereus.lens.decomp.role.<id>` (docs/lens.md § The Default Mapper). */
+/** Closed value set for `quereus.lens.decomp.role.<id>` (docs/lens-default-mapper.md). */
 export const DECOMP_ROLE_VALUES = ['primary-storage', 'auxiliary-access'] as const;
 /** Closed value set for `quereus.lens.decomp.presence.<id>`. */
 export const DECOMP_PRESENCE_VALUES = ['mandatory', 'optional'] as const;
@@ -167,7 +167,7 @@ export type TagDiagnosticReason =
  * `MutationDiagnostic` pattern (`planner/mutation/mutation-diagnostic.ts`), with
  * an added `severity`: the docs distinguish hard-error keys (a typo or mis-site
  * must fail loudly) from advisory keys (an empty `quereus.lens.ack` rationale is
- * itself only a warning — `docs/lens.md:176`). Validation is **policy-free**: it
+ * itself only a warning — `docs/lens-prover.md` § Acknowledging advisories). Validation is **policy-free**: it
  * attaches severity and lets the caller decide whether a warning blocks.
  */
 export interface TagDiagnostic {
@@ -287,14 +287,14 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// presence/membership columns; default_for.<column> became the first-class
 	// `with defaults (col = expr, …)` body-select clause.)
 	{
-		// docs/lens.md:176, 190 — code is <code>[:<target>]; remainder captured whole.
+		// docs/lens-prover.md § Acknowledging advisories — code is <code>[:<target>]; remainder captured whole.
 		key: { template: 'quereus.lens.ack.<code>' },
 		sites: siteSet('logical-table', 'logical-constraint'),
 		valueSchema: 'required-nonempty-rationale',
 		description: 'Acknowledge a lens advisory; the value is a required rationale.',
 	},
 	{
-		// docs/lens.md:166, 176
+		// docs/lens-prover.md § Coverage checklist (lens.no-answering-structure)
 		key: { template: 'quereus.lens.access.<col>' },
 		sites: siteSet('logical-table'),
 		valueSchema: 'string',
@@ -333,7 +333,7 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// --- quereus.lens.decomp.* : module mapping-advertisement facts on basis tables ---
 	// A generic module (memory/store) assembles a MappingAdvertisement from these
 	// reserved tags on its basis tables via `buildAdvertisementsFromTags`
-	// (docs/lens.md § The Default Mapper). Each decomposition `<id>`'s facts are
+	// (docs/lens-default-mapper.md). Each decomposition `<id>`'s facts are
 	// distributed across its member basis tables. The facet leads the key so each
 	// is a single-placeholder template the registry validates (shape/site only —
 	// the builder does the id/facet sub-parsing and the resolver does structural
@@ -642,7 +642,7 @@ function validateCsvOfIdentifiers(
 
 /**
  * A `quereus.lens.ack.*` rationale. An empty / missing / whitespace / non-TEXT
- * value is a **warning** (docs/lens.md:176 — "an empty or missing rationale is
+ * value is a **warning** (docs/lens-prover.md § Acknowledging advisories — "an empty or missing rationale is
  * itself a warning"); the ack never hard-blocks a deploy.
  */
 function validateRationale(

@@ -1,5 +1,5 @@
--- Lens prover + constraint attachment (docs/lens.md §§ Constraint Attachment /
--- Coverage checklist; ticket `lens-prover-and-attachment`).
+-- Lens prover + constraint attachment (docs/lens-constraints.md;
+-- docs/lens-prover.md § Coverage checklist; ticket `lens-prover-and-attachment`).
 --
 -- Exercises the prover's user-visible contract through the full SQL pipeline:
 -- the deploy-blocking coverage-checklist errors, and the read-only mutation gate

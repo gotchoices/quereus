@@ -1,6 +1,6 @@
 /**
  * Lens constraint enforcement — live per-write firing of the prover's
- * `enforced-row-local` obligations (docs/lens.md § Constraint Attachment; ticket
+ * `enforced-row-local` obligations (docs/lens-constraints.md; ticket
  * `lens-constraint-enforcement-wiring`).
  *
  * The prover (`lens-prover-and-attachment`) classifies a scalar logical `check`

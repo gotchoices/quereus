@@ -49,7 +49,7 @@ const PASSTHROUGH_NODES: ReadonlySet<PlanNodeType> = new Set([
 	// A lens-boundary FD marker is row-preserving and single-source; tolerated so
 	// a lens-over-lens body walk can reach the base table through it. (The
 	// standard lens mutation walks the compiled body over basis tables, where
-	// this node never appears — see docs/lens.md § FD contribution.)
+	// this node never appears — see docs/lens-constraints.md § FD contribution to the optimizer.)
 	PlanNodeType.AssertedKeys,
 ]);
 

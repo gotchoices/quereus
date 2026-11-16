@@ -1,6 +1,6 @@
 /**
  * Engine-emitted backfill DDL for lens basis re-decompositions (ticket
- * `lens-re-decomposition-backfill-ddl`, docs/lens.md § The deployed basis
+ * `lens-re-decomposition-backfill-ddl`, docs/lens-deployment.md § The deployed basis
  * representation).
  *
  * Covers the persisted lens deployment snapshot (hash-coded, rotated), the

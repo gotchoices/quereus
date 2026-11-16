@@ -9,7 +9,7 @@ import { physicalSourceRows } from '../util/row-estimates.js';
  * A unary pass-through that contributes a set of **asserted** functional
  * dependencies onto its source's physical FD surface — the declared logical
  * key(s) a lens *proves* or *enforces* at the inlined-view boundary that the
- * compiled body alone may not surface (docs/lens.md § Constraint Attachment;
+ * compiled body alone may not surface (docs/lens-constraints.md § FD contribution to the optimizer;
  * docs/optimizer-fd.md).
  *
  * Pure planning-time marker, modeled on {@link AliasNode} / {@link RetrieveNode}:

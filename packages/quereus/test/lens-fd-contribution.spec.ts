@@ -1,6 +1,5 @@
 /**
- * Lens declared-key FD contribution to the optimizer (docs/lens.md § Constraint
- * Attachment — FD contribution; docs/optimizer-fd.md § Functional Dependency
+ * Lens declared-key FD contribution to the optimizer (docs/lens-constraints.md § FD contribution to the optimizer; docs/optimizer-fd.md § Functional Dependency
  * Tracking; ticket `lens-routed-constraint-fd-contribution`).
  *
  * The lens prover classifies each logical key into a `ConstraintObligation`;

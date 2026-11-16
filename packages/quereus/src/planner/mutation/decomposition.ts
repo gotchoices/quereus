@@ -28,7 +28,7 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * Advertisement-driven **put** fan-out for a logical table backed by an n-way
  * decomposition (columnar split / column-family / EAV), the write dual of the
  * `get` join `schema/lens-compiler.ts` synthesizes (`compileDecompositionBody`).
- * See `docs/lens.md` § The Default Mapper and `docs/view-updateability.md`
+ * See `docs/lens-default-mapper.md` and `docs/view-updateability.md`
  * § Decomposition put fan-out.
  *
  * A decomposition lens is registered as an ordinary view whose `selectAst` is the
@@ -128,7 +128,7 @@ import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-dia
  * shared backward-walk consumer (`analyzeBodyLineage`) — the same n-way reader the
  * multi-source join walk consumes — rather than a parallel AST scan of the
  * synthesized body's projection list (docs/vu-roundtrip.md § Round-Trip Laws
- * and the Derived Backward Walk, docs/lens.md § The Default Mapper).
+ * and the Derived Backward Walk, docs/lens-default-mapper.md).
  */
 export interface DecompShape {
 	readonly storage: StorageShape;
@@ -344,7 +344,7 @@ export interface DecompInsertOp {
  * column's declared `default` (`keyDefault`). Each member op reads its values back
  * out of that one materialized envelope, so the default is evaluated once per
  * produced row and the value threads across every member insert via the
- * equivalence class (docs/vu-mutation-context.md § Mutation Context, docs/lens.md § The Default Mapper).
+ * equivalence class (docs/vu-mutation-context.md § Mutation Context, docs/lens-default-mapper.md).
  */
 export interface DecompInsertAnalysis {
 	readonly suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[];

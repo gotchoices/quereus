@@ -1,6 +1,6 @@
 /**
  * Row-local logical CHECK enforcement when the written value is NULL
- * (docs/lens.md § Constraint Attachment; ticket
+ * (docs/lens-constraints.md; ticket
  * `lens-row-local-checks-skipped-when-value-is-null`).
  *
  * A logical row-local CHECK is a predicate over the LOGICAL row, but the write

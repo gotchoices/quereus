@@ -1,6 +1,6 @@
 /**
  * Tests for the optional `notifyLensDeployment` module hook fired by a logical
- * `apply schema X` (ticket `lens-deployment-export-and-notify`, docs/lens.md
+ * `apply schema X` (ticket `lens-deployment-export-and-notify`, docs/lens-deployment.md
  * § Module deployment notification).
  *
  * The hook hands every registered module the `LensDeploymentSnapshot`
