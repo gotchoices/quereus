@@ -14,6 +14,7 @@ import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { proveLens, collectColumnRefNames, type LensDeployReport, type LensDiagnostic, type ConstraintObligation } from './lens-prover.js';
 import { applyAckGovernance, resolveEscalationPolicy, type AcknowledgedAdvisory } from './lens-ack.js';
+import { unenforceableLogicalFkDiagnostics } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
 import type { MappingAdvertisement, DecompositionMember, StorageShape } from '../vtab/mapping-advertisement.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
@@ -231,6 +232,10 @@ export function deployLogicalSchema(
 		};
 		compiled.push({ slot, view });
 	}
+
+	// FK shape refusal (docs/lens-constraints.md § Foreign key) — after the loop, not in
+	// per-slot `proveLens`, because a same-schema parent may be declared after its child.
+	proveErrors.push(...unenforceableLogicalFkDiagnostics(compiled.map(c => c.slot), logicalSchema.name, schemaManager));
 
 	// Atomic block: any prover error aborts the deploy BEFORE the catalog mutation
 	// below, so a failed re-apply leaves the prior lens state untouched. Every

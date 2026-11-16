@@ -1290,9 +1290,11 @@ export function resolveReferencedColumns(
  * arity later. So the arity is only knowable at enforcement time, and every
  * enforcement site routes through here.
  *
- * Introspection / optimization callers (key-utils, ind-utils, lens FK
- * discovery, `foreign_key_info`) keep using {@link resolveReferencedColumns} —
- * a malformed FK must not make a read query fail.
+ * Introspection / optimization callers (key-utils, ind-utils,
+ * `foreign_key_info`) keep using {@link resolveReferencedColumns} — a malformed
+ * FK must not make a read query fail. Logical (lens) tables have their own
+ * counterpart in `schema/lens-fk-discovery.ts`, which shares the wording via
+ * {@link foreignKeyArityMismatchMessage}.
  */
 export function resolveReferencedColumnsForEnforcement(
 	fk: ForeignKeyConstraintSchema,
@@ -1301,17 +1303,57 @@ export function resolveReferencedColumnsForEnforcement(
 ): number[] {
 	const parentColIndices = resolveReferencedColumns(fk, parentSchema);
 	if (parentColIndices.length === fk.columns.length) return parentColIndices;
-
-	const fkName = fk.name ?? `_fk_${childSchema.name}`;
-	const child = `${childSchema.schemaName}.${childSchema.name}`;
-	const parent = `${parentSchema.schemaName}.${parentSchema.name}`;
-	const target = (fk.referencedColumnNames && fk.referencedColumnNames.length > 0)
-		? `${parentColIndices.length} column(s) of '${parent}'`
-		: `the primary key of '${parent}', which has ${parentColIndices.length} column(s)`;
 	throw new QuereusError(
-		`Foreign key '${fkName}' on table '${child}': ${fk.columns.length} column(s) reference ${target}.`,
+		foreignKeyArityMismatchMessage(fk, parentSchema, childSchema, parentColIndices.length),
 		StatusCode.ERROR,
 	);
+}
+
+/** The schema-qualified name pair a foreign-key message names its tables by. */
+type QualifiedTableName = Pick<TableSchema, 'schemaName' | 'name'>;
+
+/** `Foreign key '<name>' on table '<schema>.<child>'` — the subject every unenforceable-FK message opens with. */
+function foreignKeySubject(fk: ForeignKeyConstraintSchema, childSchema: QualifiedTableName): string {
+	return `Foreign key '${fk.name ?? `_fk_${childSchema.name}`}' on table '${childSchema.schemaName}.${childSchema.name}'`;
+}
+
+/**
+ * The one wording for a FK whose child column count does not match the parent key
+ * it resolves to. Shared by the physical enforcement sites (through
+ * {@link resolveReferencedColumnsForEnforcement}) and the logical-table (lens)
+ * deploy refusal + enforcement sites, so a malformed key reads the same wherever
+ * it is met.
+ */
+export function foreignKeyArityMismatchMessage(
+	fk: ForeignKeyConstraintSchema,
+	parentSchema: QualifiedTableName,
+	childSchema: QualifiedTableName,
+	parentColumnCount: number,
+): string {
+	const parent = `${parentSchema.schemaName}.${parentSchema.name}`;
+	const target = (fk.referencedColumnNames && fk.referencedColumnNames.length > 0)
+		? `${parentColumnCount} column(s) of '${parent}'`
+		: `the primary key of '${parent}', which has ${parentColumnCount} column(s)`;
+	return `${foreignKeySubject(fk, childSchema)}: ${fk.columns.length} column(s) reference ${target}.`;
+}
+
+/**
+ * The tail every absent-parent FK message carries. `parentQualified` is the
+ * `<schema>.<table>` the lookup actually used — naming the schema is what makes a
+ * cross-schema mistake (an unqualified parent binding to the child's own schema)
+ * diagnosable.
+ */
+export function foreignKeyMissingParentReason(parentQualified: string): string {
+	return `referenced table '${parentQualified}' does not exist`;
+}
+
+/** A whole-statement message for a FK whose parent table does not exist (the lens deploy refusal). */
+export function foreignKeyMissingParentMessage(
+	fk: ForeignKeyConstraintSchema,
+	childSchema: QualifiedTableName,
+	parentQualified: string,
+): string {
+	return `${foreignKeySubject(fk, childSchema)}: ${foreignKeyMissingParentReason(parentQualified)}.`;
 }
 
 /**

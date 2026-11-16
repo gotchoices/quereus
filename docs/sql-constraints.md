@@ -327,6 +327,8 @@ Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is w
 
 Neither case fires while `pragma foreign_keys = off` — no checks are built at all, on either side of the key.
 
+A foreign key declared on a logical table (`declare logical schema`) follows the same rule, with the same messages, and `apply schema` refuses it outright where the deploy can already tell — see [lens-constraints.md § Foreign key](lens-constraints.md#foreign-key).
+
 **Examples:**
 ```sql
 -- Column-level foreign key (no action clause = RESTRICT default)

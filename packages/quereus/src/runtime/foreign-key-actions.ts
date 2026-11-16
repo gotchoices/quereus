@@ -16,6 +16,7 @@ import {
 	logicalToBasisColumnMap,
 	matchingBasisFksForLensRef,
 	basisFksOverriddenByDivergentLensFk,
+	raiseUnenforceableLogicalParentFk,
 	type LogicalParentFkRef,
 } from '../schema/lens-fk-discovery.js';
 import type { BatchableRestrictFk } from '../planner/building/foreign-key-builder.js';
@@ -862,6 +863,14 @@ export async function executeLensForeignKeyActions(
 /** A non-RESTRICT parent-side action propagated by the lens cascade walker. */
 type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefault'>;
 
+function isPropagatingAction(action: ForeignKeyAction): action is LensFkAction {
+	return action === 'cascade' || action === 'setNull' || action === 'setDefault';
+}
+
+function isRestrictAction(action: ForeignKeyAction): boolean {
+	return action === 'restrict';
+}
+
 /**
  * Resolves a logical parent FK ref's referenced OLD (and, for UPDATE, NEW) values off the
  * basis parent write row — the extraction + skip logic shared by the lens cascade walker
@@ -930,7 +939,10 @@ async function executeLensFkActionsForParentSlot(
 	newRow: Row | undefined,
 ): Promise<void> {
 	const sm = db.schemaManager;
-	const refs = findLogicalParentFkRefs(parentSlot, sm);
+	const { refs, unenforceable } = findLogicalParentFkRefs(parentSlot, sm);
+	// A propagating key whose columns do not line up cannot be aimed at the child rows —
+	// raise rather than skip, which would leave orphans behind a CASCADE.
+	raiseUnenforceableLogicalParentFk(unenforceable, operation, isPropagatingAction);
 	if (refs.length === 0) return;
 
 	// Maps each logical parent referenced column → its basis column, so the OLD/NEW
@@ -940,7 +952,7 @@ async function executeLensFkActionsForParentSlot(
 	for (const ref of refs) {
 		const { fk } = ref;
 		const rawAction = operation === 'delete' ? fk.onDelete : fk.onUpdate;
-		if (rawAction !== 'cascade' && rawAction !== 'setNull' && rawAction !== 'setDefault') continue;
+		if (!isPropagatingAction(rawAction)) continue;
 		const action: LensFkAction = rawAction;
 
 		// Action-aware elision (compose with the physical walker): elide the lens cascade
@@ -1117,7 +1129,10 @@ async function assertLensRestrictsForParentSlot(
 	newRow: Row | undefined,
 ): Promise<void> {
 	const sm = db.schemaManager;
-	const refs = findLogicalParentFkRefs(parentSlot, sm);
+	const { refs, unenforceable } = findLogicalParentFkRefs(parentSlot, sm);
+	// A RESTRICT key whose columns do not line up cannot be probed — raise rather than
+	// skip, which would silently let the parent write through.
+	raiseUnenforceableLogicalParentFk(unenforceable, operation, isRestrictAction);
 	if (refs.length === 0) return;
 
 	// Maps each logical parent referenced column → its basis column, so the OLD referenced
@@ -1126,10 +1141,9 @@ async function assertLensRestrictsForParentSlot(
 
 	for (const ref of refs) {
 		const { fk } = ref;
-		const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
 		// Only RESTRICT is enforced here — the non-RESTRICT actions are *propagated* by the
 		// cascade walker (executeLensForeignKeyActions), not rejected.
-		if (action !== 'restrict') continue;
+		if (!isRestrictAction(operation === 'delete' ? fk.onDelete : fk.onUpdate)) continue;
 
 		const values = resolveLensFkParentReferencedValues(db, ref, parentSlot, parentMap, basisParentTable, operation, oldRow, newRow);
 		if (!values) continue;

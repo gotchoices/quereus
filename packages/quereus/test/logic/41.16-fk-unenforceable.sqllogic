@@ -362,3 +362,126 @@ insert into ok1_c values (2, 99);
 
 drop table ok1_c;
 drop table ok1_p;
+
+-- ===================================
+-- C. logical (lens) tables — the same two failures, on a foreign key declared in a
+--    `declare logical schema`. Both used to be skipped silently by the lens FK
+--    enforcement (orphans accepted, RESTRICT bypassed). What `apply schema` can
+--    already decide it refuses; what only goes wrong later fails the write.
+-- ===================================
+
+declare schema lfk_y {
+	table parent (px integer, py integer, name text, primary key (px, py));
+	table child (id integer primary key, pid integer null)
+}
+apply schema lfk_y;
+-- run
+
+-- C1. defaulted `references parent` against a two-column parent key in the SAME
+--     logical schema — decidable at deploy, so the deploy is refused
+declare logical schema lfk_x {
+	table parent (px integer, py integer, name text, primary key (px, py));
+	table child (id integer primary key, pid integer null,
+		constraint fk_pid foreign key (pid) references parent on delete restrict)
+}
+declare lens for lfk_x over lfk_y {}
+-- run
+
+apply schema lfk_x;
+-- error: [lens.unrealizable-constraint] Foreign key 'fk_pid' on table 'lfk_x.child': 1 column(s) reference the primary key of 'lfk_x.parent', which has 2 column(s).
+
+-- C3. a same-schema parent missing from the declaration can never appear without
+--     re-applying this same schema — refused at deploy, naming the table looked up
+declare logical schema lfk_x3 {
+	table child (id integer primary key, pid integer null,
+		constraint fk_pid foreign key (pid) references nothere)
+}
+declare lens for lfk_x3 over lfk_y {}
+-- run
+
+apply schema lfk_x3;
+-- error: [lens.unrealizable-constraint] Foreign key 'fk_pid' on table 'lfk_x3.child': referenced table 'lfk_x3.nothere' does not exist.
+
+-- C4. a parent in ANOTHER schema that is not deployed is a legal forward reference:
+--     the deploy succeeds and the write reports the missing table (MATCH SIMPLE still
+--     admits a NULL FK column)
+declare logical schema lfk_x4 {
+	table child (id integer primary key, pid integer null,
+		constraint fk_pid foreign key (pid) references lfk_ghost.parent)
+}
+declare lens for lfk_x4 over lfk_y {}
+-- run
+
+apply schema lfk_x4;
+-- run
+
+insert into lfk_x4.child values (1, null);
+-- run
+
+insert into lfk_x4.child values (2, 5);
+-- error: CHECK constraint failed: lens:fk:fk_pid — referenced table 'lfk_ghost.parent' does not exist
+
+select id, pid from lfk_x4.child order by id;
+→ [{"id":1,"pid":null}]
+
+-- C2. a cross-schema key that was well-formed at deploy and goes wrong when the
+--     PARENT's schema is re-applied with a wider key. Refusing that re-apply would
+--     deadlock a legitimate change (the child's fix cannot deploy against the old
+--     parent, nor the parent's against the old child), so the writes fail instead.
+declare schema lfk_yb {
+	table parent (px integer, py integer, primary key (px));
+	table child (id integer primary key, pid integer null)
+}
+apply schema lfk_yb;
+-- run
+
+declare logical schema lfk_b { table parent (px integer, py integer, primary key (px)) }
+declare lens for lfk_b over lfk_yb {}
+-- run
+
+apply schema lfk_b;
+-- run
+
+declare logical schema lfk_a {
+	table child (id integer primary key, pid integer null,
+		constraint fk_pid foreign key (pid) references lfk_b.parent on delete restrict on update cascade)
+}
+declare lens for lfk_a over lfk_yb {}
+-- run
+
+apply schema lfk_a;
+-- run
+
+insert into lfk_b.parent values (1, 1), (2, 2);
+insert into lfk_a.child values (10, 1);
+-- run
+
+-- well-formed: enforced on both sides
+insert into lfk_a.child values (12, 777);
+-- error: CHECK constraint failed: lens:fk:fk_pid
+
+delete from lfk_b.parent where px = 1;
+-- error: violates RESTRICT
+
+-- the parent's key becomes (px, py)
+declare logical schema lfk_b { table parent (px integer, py integer, primary key (px, py)) }
+apply schema lfk_b;
+-- run
+
+-- child side: the statement fails rather than accepting the orphan
+insert into lfk_a.child values (14, 888);
+-- error: Foreign key 'fk_pid' on table 'lfk_a.child': 1 column(s) reference the primary key of 'lfk_b.parent', which has 2 column(s).
+
+-- parent side, RESTRICT (plan-time check)
+delete from lfk_b.parent where px = 2;
+-- error: Foreign key 'fk_pid' on table 'lfk_a.child': 1 column(s) reference the primary key of 'lfk_b.parent', which has 2 column(s).
+
+-- parent side, CASCADE (the runtime cascade walker)
+update lfk_b.parent set py = 3 where px = 2;
+-- error: Foreign key 'fk_pid' on table 'lfk_a.child': 1 column(s) reference the primary key of 'lfk_b.parent', which has 2 column(s).
+
+select px, py from lfk_b.parent order by px;
+→ [{"px":1,"py":1},{"px":2,"py":2}]
+
+select id, pid from lfk_a.child order by id;
+→ [{"id":10,"pid":1}]

@@ -2587,15 +2587,15 @@ describe('lens FK discovery: findLogicalParentFkRefs + cascade elision predicate
 			await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade); table solo (id integer primary key, v integer) }');
 			await db.exec('apply schema x');
 
-			const parentRefs = findLogicalParentFkRefs(slot(db, 'parent'), db.schemaManager);
+			const parentRefs = findLogicalParentFkRefs(slot(db, 'parent'), db.schemaManager).refs;
 			expect(parentRefs.length, 'one child references parent').to.equal(1);
 			expect(parentRefs[0].childSlot.logicalTable.name).to.equal('child');
 			expect(parentRefs[0].childLogicalColumns).to.deep.equal(['pid']);
 			expect(parentRefs[0].parentLogicalColumns).to.deep.equal(['id']);
 
 			// `solo` is referenced by nothing, and `child` is not a referenced parent.
-			expect(findLogicalParentFkRefs(slot(db, 'solo'), db.schemaManager), 'solo unreferenced').to.deep.equal([]);
-			expect(findLogicalParentFkRefs(slot(db, 'child'), db.schemaManager), 'child is not a parent').to.deep.equal([]);
+			expect(findLogicalParentFkRefs(slot(db, 'solo'), db.schemaManager).refs, 'solo unreferenced').to.deep.equal([]);
+			expect(findLogicalParentFkRefs(slot(db, 'child'), db.schemaManager).refs, 'child is not a parent').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
@@ -2795,7 +2795,7 @@ describe('lens enforcement: parent-side FK divergent basis action', () => {
 			});
 			const parentSlot = slot(db, 'parent');
 			const basisParent = resolveSlotBasisSource(parentSlot, db.schemaManager)!;
-			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager);
+			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager).refs;
 			expect(refs.length, 'one logical FK references parent').to.equal(1);
 
 			// The match core finds the structurally-equivalent basis FK (action-agnostic).
@@ -2898,7 +2898,7 @@ describe('lens enforcement: parent-side FK divergent basis action', () => {
 			await db.exec('apply schema x');
 			const parentSlot = slot(db, 'parent');
 			const basisParent = resolveSlotBasisSource(parentSlot, db.schemaManager)!;
-			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager);
+			const refs = findLogicalParentFkRefs(parentSlot, db.schemaManager).refs;
 			expect(refs.length, 'one logical FK references parent').to.equal(1);
 			expect(matchingBasisFksForLensRef(refs[0], parentSlot, basisParent, db.schemaManager).length, 'permuted basis FK ⇒ no structural match').to.equal(0);
 			expect(basisFksOverriddenByDivergentLensFk(basisParent, 'delete', db.schemaManager).size, 'permuted ⇒ nothing suppressed').to.equal(0);

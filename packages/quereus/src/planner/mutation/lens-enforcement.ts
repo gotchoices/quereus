@@ -7,16 +7,27 @@ import type { BasisRelationRef } from '../../vtab/mapping-advertisement.js';
 import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap, type ConstraintObligation } from '../../schema/lens-prover.js';
 import {
 	logicalToBasisColumnMap,
-	resolveLogicalReferencedColumns,
+	enforcedLogicalFks,
+	resolveLogicalFkParent,
+	checkLogicalFkReferencedColumns,
+	logicalFkReferencedSchema,
 	mappedFkBasisPairs,
 	matchingBasisFks,
 	findLogicalParentFkRefs,
+	raiseUnenforceableLogicalParentFk,
 } from '../../schema/lens-fk-discovery.js';
 import { transformScopedExpr, transformExpr, type ScopeContext } from './scope-transform.js';
 import { captureKeyEquality, keyColumnInfo } from './capture-correlation.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { PlanningContext } from '../planning-context.js';
-import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
+import {
+	synthesizeFKExistsExpr,
+	synthesizeFKNotExistsExpr,
+	synthesizeFKAbsentParentExpr,
+	fkAbsentParentViolationMessage,
+} from '../building/foreign-key-builder.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('planner:lens-enforcement');
@@ -1082,6 +1093,11 @@ function lensParentSideForeignKeyRedundant(
  * exactly as sound as the physical `buildChildSideFKChecks`, which also reads the
  * basis FKs at plan time.
  *
+ * A FK that cannot be checked is never skipped, mirroring the physical
+ * `buildChildSideFKChecks`: a parent key whose column count differs from the FK's
+ * fails the statement here (plan time); an absent parent yields the MATCH SIMPLE
+ * null-guards-only check, whose failure names the missing table.
+ *
  * Gated by the caller on the `foreign_keys` pragma. Returns `[]` when the slot is
  * un-proved (`obligations` undefined) or carries no FK obligation — the common case.
  */
@@ -1089,32 +1105,10 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
 	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
-	const logicalSchemaName = slot.logicalTable.schemaName;
 	const constraints: RowConstraintSchema[] = [];
-	for (const obligation of slot.obligations) {
-		if (obligation.kind !== 'enforced-fk') continue;
-		if (obligation.constraint.kind !== 'foreignKey') continue;
-		const fk = obligation.constraint.constraint;
-		const referencedSchema = fk.referencedSchema ?? logicalSchemaName;
-		const parentColumns = resolveLogicalReferencedColumns(fk, referencedSchema, schemaManager);
-		// Parity with the physical child-side builder's count-mismatch guard: if the
-		// parent columns cannot be resolved to the same arity as the child columns
-		// (an unresolvable parent ⇒ `[]`, or a malformed FK the prover did not catch),
-		// skip rather than synthesize an `EXISTS` with `undefined` parent column names.
-		if (parentColumns.length !== fk.columns.length) {
-			log('lens FK %s: parent column count (%d) != child column count (%d); skipping',
-				fk.name ?? '<anon>', parentColumns.length, fk.columns.length);
-			continue;
-		}
-		// Elide the lens-level check when the basis child write provably already
-		// enforces an equivalent FK (every uncertain case still double-enforces).
-		const subsuming = lensForeignKeyRedundant(slot, fk, referencedSchema, parentColumns, schemaManager);
-		if (subsuming) {
-			log('lens FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (the re-planned basis write enforces it)',
-				fk.name ?? '<anon>', slot.logicalTable.name,
-				subsuming.name ?? '<anon>', subsuming.referencedTable);
-			continue;
-		}
+	for (const fk of enforcedLogicalFks(slot)) {
+		const referencedSchema = logicalFkReferencedSchema(fk, slot.logicalTable);
+		const name = fk.name ? `lens:fk:${fk.name}` : 'lens:fk';
 		// Rewrite each FK child column index → logical name → basis column. A column
 		// the prover proved reconstructible maps; otherwise it falls back to the logical
 		// name (the prover would have errored on a non-reconstructible FK child column).
@@ -1125,14 +1119,41 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 			return { logicalColumn: logicalName, basisColumns: [map.get(logicalName.toLowerCase()) ?? logicalName] };
 		});
 		const childColumns = writeRow.map(e => e.basisColumns[0]);
-		const expr = synthesizeFKExistsExpr(fk.referencedTable, parentColumns, childColumns, 'NEW', referencedSchema);
-		constraints.push({
-			name: fk.name ? `lens:fk:${fk.name}` : 'lens:fk',
-			expr,
+		const common = {
+			name,
 			// Child-side FK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+		};
+
+		const parent = resolveLogicalFkParent(fk, referencedSchema, schemaManager);
+		if (!parent) {
+			const parentQualified = `${referencedSchema}.${fk.referencedTable}`;
+			log('lens FK %s: parent table %s not found; emitting null-guards-only check', fk.name ?? '<anon>', parentQualified);
+			constraints.push({
+				...common,
+				expr: synthesizeFKAbsentParentExpr(childColumns),
+				violationMessage: fkAbsentParentViolationMessage(name, parentQualified),
+			});
+			continue;
+		}
+		const resolved = checkLogicalFkReferencedColumns(fk, parent, slot.logicalTable);
+		if ('arityMismatch' in resolved) throw new QuereusError(resolved.arityMismatch, StatusCode.ERROR);
+		const parentColumns = resolved.columns;
+
+		// Elide the lens-level check when the basis child write provably already
+		// enforces an equivalent FK (every uncertain case still double-enforces).
+		const subsuming = lensForeignKeyRedundant(slot, fk, referencedSchema, parentColumns, schemaManager);
+		if (subsuming) {
+			log('lens FK %s on %s: elided — provably subsumed by basis FK %s referencing %s (the re-planned basis write enforces it)',
+				fk.name ?? '<anon>', slot.logicalTable.name,
+				subsuming.name ?? '<anon>', subsuming.referencedTable);
+			continue;
+		}
+		constraints.push({
+			...common,
+			expr: synthesizeFKExistsExpr(fk.referencedTable, parentColumns, childColumns, 'NEW', referencedSchema),
 		});
 	}
 	return constraints;
@@ -1263,8 +1284,11 @@ export function collectLensParentSideForeignKeyConstraints(
 	const constraints: RowConstraintSchema[] = [];
 	// Cross-slot discovery (the shared `findLogicalParentFkRefs`): every logical FK on
 	// any slot that references this parent's logical table, with the child / parent
-	// column names + the count-mismatch guard already resolved.
-	for (const { childSlot, fk, childLogicalColumns, parentLogicalColumns } of findLogicalParentFkRefs(parentSlot, schemaManager)) {
+	// column names resolved. A RESTRICT key whose columns do not line up fails the
+	// statement here, as the physical `buildParentSideFKChecks` does.
+	const { refs, unenforceable } = findLogicalParentFkRefs(parentSlot, schemaManager);
+	raiseUnenforceableLogicalParentFk(unenforceable, operation === RowOpFlag.DELETE ? 'delete' : 'update', action => action === 'restrict');
+	for (const { childSlot, fk, childLogicalColumns, parentLogicalColumns } of refs) {
 		// Action gate — mirror buildParentSideFKChecks exactly: only RESTRICT
 		// synthesizes a parent-side check (cascades are propagated by the runtime
 		// cascade walker — `executeLensForeignKeyActions` — not here).

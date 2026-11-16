@@ -1,6 +1,6 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from '../../schema/table.js';
-import { RowOpFlag, type RowOpMask, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
+import { RowOpFlag, type RowOpMask, resolveReferencedColumnsForEnforcement, foreignKeyMissingParentReason } from '../../schema/table.js';
 import type { Database } from '../../core/database.js';
 import { ConflictResolution } from '../../common/constants.js';
 import type { Attribute, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -91,16 +91,40 @@ export function synthesizeFKExistsExpr(
 
 	// MATCH SIMPLE (SQL default): FK is satisfied when any referencing column is NULL.
 	// Wrap EXISTS with OR-chained IS NULL guards to skip the subquery in that case.
+	return orChainNullGuards(childColumns, qualifier, existsExpr);
+}
+
+/** `<q>.<c1> IS NULL OR … OR <q>.<cn> IS NULL OR <terminal>` — the MATCH SIMPLE guard chain. */
+function orChainNullGuards(childColumns: readonly string[], qualifier: 'NEW' | 'OLD', terminal: AST.Expression): AST.Expression {
 	const nullGuards: AST.UnaryExpr[] = childColumns.map((childCol) => ({
 		type: 'unary',
 		operator: 'IS NULL',
 		expr: { type: 'column', name: childCol, table: qualifier } as AST.ColumnExpr,
 	}));
-
 	return nullGuards.reduceRight<AST.Expression>(
 		(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
-		existsExpr,
+		terminal,
 	);
+}
+
+/**
+ * The child-side check for a FK whose parent table does not exist:
+ *
+ *   NEW.<child1> IS NULL OR … OR NEW.<childn> IS NULL OR 0
+ *
+ * MATCH SIMPLE still admits a row with any NULL FK column; every other row has no
+ * parent to match and fails. Pair it with {@link fkAbsentParentViolationMessage} —
+ * the expression is engine-synthesized, so quoting it back names nothing the user
+ * wrote. Shared by the physical builder and the lens FK collector (which passes
+ * basis-rewritten child column names).
+ */
+export function synthesizeFKAbsentParentExpr(childColumns: readonly string[]): AST.Expression {
+	return orChainNullGuards(childColumns, 'NEW', { type: 'literal', value: 0 } as AST.LiteralExpr);
+}
+
+/** The failure text for {@link synthesizeFKAbsentParentExpr}: names the missing table, schema-qualified. */
+export function fkAbsentParentViolationMessage(constraintName: string, parentQualified: string): string {
+	return `CHECK constraint failed: ${constraintName} — ${foreignKeyMissingParentReason(parentQualified)}`;
 }
 
 /**
@@ -229,20 +253,11 @@ export function buildChildSideFKChecks(
 		if (!parentSchema) {
 			const parentQualified = `${fk.referencedSchema ?? tableSchema.schemaName}.${fk.referencedTable}`;
 			log(`FK '${fk.name}': parent table '${parentQualified}' not found; emitting null-guards-only check`);
-			const nullGuards: AST.UnaryExpr[] = fk.columns.map((childColIdx) => ({
-				type: 'unary',
-				operator: 'IS NULL',
-				expr: { type: 'column', name: tableSchema.columns[childColIdx].name, table: 'NEW' } as AST.ColumnExpr,
-			}));
-			existsExpr = nullGuards.reduceRight<AST.Expression>(
-				(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
-				{ type: 'literal', value: 0 } as AST.LiteralExpr,
-			);
+			existsExpr = synthesizeFKAbsentParentExpr(fk.columns.map(childColIdx => tableSchema.columns[childColIdx].name));
 			// An unqualified parent name binds to the CHILD's own schema
 			// (docs/sql-constraints.md §7.6), so naming the schema is what makes a cross-schema mistake
 			// visible: the fix is to qualify the parent.
-			violationMessage = `CHECK constraint failed: ${constraintName} — referenced table `
-				+ `'${parentQualified}' does not exist`;
+			violationMessage = fkAbsentParentViolationMessage(constraintName, parentQualified);
 		} else {
 			// A count mismatch means the FK cannot be checked at all — raise rather
 			// than skip, so an unenforceable constraint never looks enforced.
