@@ -111,7 +111,7 @@ export const SYNC_EVICT_TAG = 'quereus.sync.evict';
  * engine-driven module) synthesizes and owns — not a user-declared object a
  * declarative schema can address. {@link collectSchemaCatalog} skips an
  * engine-managed table entirely, so the declarative differ never sees it as an
- * orphan to drop (nor as a declared object to create) and `export_schema` omits
+ * orphan to drop (nor as a declared object to create) and `exportSchemaDeclaration` omits
  * it; it stays fully resolvable via `getTable` / `getAllTables` for every other
  * path (compile, introspection, servicing).
  *
@@ -212,8 +212,9 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	},
 	// --- quereus.expose_implicit_index : catalog-visibility opt-in on a UNIQUE constraint ---
 	// A declared/inline UNIQUE constraint's enforcement BTree (its implicit covering
-	// structure) is hidden from the catalog / export_schema by default; this boolean tag
-	// surfaces it under the constraint name. Read by `catalog.ts`
+	// structure) is hidden from the catalog by default; this boolean tag surfaces it under
+	// the constraint name (`exportSchemaDeclaration` still omits it as an index, since the
+	// tagged constraint recreates it). Read by `catalog.ts`
 	// (`implicitCoveringIndexExposure`) and treated as real (compared) schema state by the
 	// differ (`schema-differ.ts` § RENAME_HINT_KEYS). It is a constraint-only physical tag,
 	// so it is legal solely at the physical-constraint site — the position shared by the
@@ -225,13 +226,13 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		key: 'quereus.expose_implicit_index',
 		sites: siteSet('physical-constraint'),
 		valueSchema: 'boolean',
-		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog / export_schema (boolean; default hidden).',
+		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog (boolean; default hidden).',
 	},
 	// --- quereus.engine_managed : engine-synthesized physical table excluded from the declarative diff ---
 	// `= true` marks a physical table the engine (or an engine-driven module) owns
 	// rather than a user-declared object. `collectSchemaCatalog` skips it entirely,
-	// so the declarative differ never emits a create/drop for it and `export_schema`
-	// omits it; it stays resolvable via `getTable` / `getAllTables` everywhere else.
+	// so the declarative differ never emits a create/drop for it and
+	// `exportSchemaDeclaration` omits it; it stays resolvable via `getTable` / `getAllTables` everywhere else.
 	// The motivating producer is Lamina's lens basis layer — its per-column
 	// `(rowId, value)` member relations register into the basis scope's Schema, and
 	// without this marker a bare in-place `apply schema <basis>` would diff them as
@@ -244,7 +245,7 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		key: ENGINE_MANAGED_TABLE_TAG,
 		sites: siteSet('physical-table'),
 		valueSchema: 'boolean',
-		description: 'Mark a physical table as engine-synthesized/owned; excluded from the declarative diff and export_schema (boolean; default absent).',
+		description: 'Mark a physical table as engine-synthesized/owned; excluded from the declarative diff and exportSchemaDeclaration (boolean; default absent).',
 	},
 	// --- quereus.sync.replicate : per-table maintenance-write change-log opt-in ---
 	// docs/migration.md § Synced vs. local derived tables. `= true` records a

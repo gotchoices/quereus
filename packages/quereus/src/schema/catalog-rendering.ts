@@ -66,10 +66,10 @@ export function renderCatalogForComparison(catalog: SchemaCatalog): string {
  *    appends — so `DROP CONSTRAINT a` + re-add on a table with constraints
  *    `[a, b]` comes back as `[b, a]` (the structured `namedConstraints` below are
  *    sorted, because the differ keys them by name);
- *  - a view's DDL is `ViewSchema.sql`, which `create view` stores verbatim and the
- *    rename propagation (`runtime/emit/alter-table.ts`) overwrites with the
- *    rewritten body alone, so a rename and its reverse leave the field spelled
- *    differently from the original statement.
+ *  - a view's DDL is rendered from its stored body, which the rename propagation
+ *    (`runtime/emit/alter-table.ts`) rewrites in place and can leave holding an
+ *    engine-written schema qualifier or FROM alias, so a rename and its reverse
+ *    can leave the field spelled differently from the original statement.
  *
  * Everything an undo statement can touch — columns and their attributes, the
  * primary key, tags, named constraints, the maintained derivation, the object

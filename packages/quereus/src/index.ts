@@ -245,6 +245,11 @@ export { isMaintainedTable } from './schema/derivation.js';
 export { generateTableDDL, generateIndexDDL, generateDropTableDDL, generateDropIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, isImplicitCoveringIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';
+// A live schema as a `declare schema` statement (render with `astToString`), and the
+// stable dependency sort the migration planner orders creates with — exported so a
+// downstream exporter orders tables parents-first the same way instead of re-deriving it.
+export { exportSchemaDeclaration } from './schema/schema-export.js';
+export { orderDependenciesFirst } from './schema/dependency-order.js';
 // Rename rewriters for the expression-bearing parts of a table's own definition.
 // A persisting module must rewrite these from inside its own `alterTable` /
 // `renameTable` hook — the engine's propagation pass runs only after the hook

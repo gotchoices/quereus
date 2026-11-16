@@ -50,7 +50,7 @@ describe('Schema Catalog', () => {
 			const catalog = collectSchemaCatalog(db, 'main');
 			// The plain table is present; the engine-managed table is skipped entirely,
 			// so the declarative differ never sees it as an orphan to drop / an object to
-			// create, and export_schema omits it. (Motivating case: Lamina's per-column
+			// create, and exportSchemaDeclaration omits it. (Motivating case: Lamina's per-column
 			// `(rowId, value)` basis member relations.)
 			expect(catalog.tables.find(t => t.name === 'plain_t'), 'plain table present').to.exist;
 			expect(catalog.tables.find(t => t.name === 'managed_t'), 'engine-managed table excluded').to.not.exist;

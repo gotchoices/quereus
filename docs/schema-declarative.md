@@ -256,6 +256,31 @@ explain schema main version '2.0';
 
 **The version hash and the reconciliation rendering are different strings, deliberately.** Both go through `renderDeclaredSchemaCanonical` (`schema/schema-hasher.ts`), but `computeSchemaHash` calls it on a **tag-stripped** copy first, because tags are non-behavioral metadata and must not move a schema's version. The differ, by contrast, *does* diff tags and emits `ALTER … SET TAGS` steps for them — so the [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path) uses the tags-**inclusive** rendering. Reusing the version hash there would silently skip a tag-only edit. Do not conflate the two.
 
+## Exporting a declaration
+
+`exportSchemaDeclaration(db, schemaName = 'main')` (`schema/schema-export.ts`, exported from the package root) returns a live physical schema as a `DeclareSchemaStmt`. Render it with `astToString` (`@quereus/quereus/emit`); running that text and then `apply schema` recreates the schema.
+
+```ts
+const text = astToString(exportSchemaDeclaration(db, 'main'));
+// declare schema main { table orders (…); view v (…) as …; index ix on orders (…); assertion a check (…); }
+```
+
+**What it contains.** Every object `collectSchemaCatalog` lists: tables (plain and maintained), views, indexes and assertions, each parsed from its catalog DDL and wrapped as a declaration item. A materialized view comes out as `table … maintained as …`, the form the catalog renders it in. The objects' own names are written without a schema qualifier; references inside bodies (view selects, CHECK expressions, a foreign key into another schema) are left as rendered, so a schema they name must exist before the apply.
+
+**What it leaves out.** Engine-managed tables and hidden implicit covering indexes, as the catalog does. Also an *exposed* implicit index (`quereus.expose_implicit_index`): the UNIQUE constraint in the table's DDL carries the tag and recreates it, so a separate `unique index` item would duplicate the constraint. No `version`, no `using (default_vtab_module …)` clause, and no `seed` items: data is not part of a schema export.
+
+**Order.** Tables, views, indexes, assertions, sorted by name within each group. Creation order is not used: `apply schema` creates in its own order (parents before children, maintained tables after plain ones), so a schema rebuilt from an export would otherwise export differently.
+
+**Refusals.**
+
+- A schema that does not exist: `no such schema: x`. The catalog of a missing schema is empty, and an empty declaration applied later would drop everything.
+- A logical schema: `logical schemas cannot be exported`. Lens declarations are out of scope.
+- An assertion whose CHECK expression is unavailable (its catalog entry fell back to the violation query; see the `NOTE:` in `assertionSchemaToCatalog`). That text never matches the live assertion.
+
+**Session settings.** Table DDL is the catalog's with-`db` form (see [schema.md](schema.md)): a table's `using` clause is omitted when it matches the exporting session's `default_vtab_module` / `default_vtab_args`, a column's `null` / `not null` annotation when it matches `default_column_nullability`, and a `BINARY` collation always. Applying the text resolves those omissions against the importing session. A table landing on the importer's default module is intended. Nullability and text-column collation following the importer's `default_column_nullability` / `default_collation` is not: a database that sets either option differently from the exporter gets different columns. Export and apply under the same settings.
+
+Two properties are pinned by `test/schema/schema-export.spec.ts`: declaring the export on the database it came from leaves `diff schema` empty, and applying it to a fresh database and exporting again reproduces the text byte for byte.
+
 ## DeclaredSchemaManager API
 
 The `DeclaredSchemaManager` (via `db.declaredSchemaManager`) stores declared schema ASTs and seed data between `declare schema` and `apply schema` calls.
@@ -273,5 +298,7 @@ The `DeclaredSchemaManager` (via `db.declaredSchemaManager`) stores declared sch
 | `getDeclaredRendering(schemaName)` | Canonical **tags-inclusive** rendering of the stored declaration (memoized), or `undefined` |
 | `getAppliedSnapshot(schemaName)` | The [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path), or `undefined` |
 | `setAppliedSnapshot(schemaName, snapshot)` | Records one — only valid after an apply that succeeded **and** produced an empty plan |
+
+The manager holds declarations; it does not produce them from a live schema. For that, see [Exporting a declaration](#exporting-a-declaration) (`exportSchemaDeclaration`).
 
 All name lookups are case-insensitive. The manager is stateful: re-declaring a schema clears its seed data and replaces earlier state. Re-declaring also drops the memoized rendering (it described the previous declaration) but **keeps** the applied snapshot, so a byte-identical redeclaration still takes the fast path; `removeDeclaredSchema` drops both.

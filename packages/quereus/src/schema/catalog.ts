@@ -9,7 +9,7 @@ import { createTableToString, createViewToString, createMaterializedViewToString
 import type * as AST from '../parser/ast.js';
 import { type SqlValue, StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
-import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL, schemaConstraintToTableConstraint } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, generateViewDDL, constraintToCanonicalDDL, indexToCanonicalDDL, schemaConstraintToTableConstraint } from './ddl-generator.js';
 import { applyViewSchemaDefault, applyAssertionSchemaDefault } from './schema-differ.js';
 import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
@@ -160,9 +160,7 @@ export interface CatalogView {
 	/**
 	 * The explicit column list of `create view v (a, b) as …`, when one was given.
 	 * Already folded into `definition`; surfaced so the migration planner can render
-	 * the `create view` that undoes a `DROP VIEW` from `select` + this list (the
-	 * `ddl` text is not a reliable source: after a rename propagation `ViewSchema.sql`
-	 * holds only the rewritten body).
+	 * the `create view` that undoes a `DROP VIEW` from `select` + this list.
 	 */
 	columns?: ReadonlyArray<string>;
 }
@@ -239,7 +237,7 @@ function isAutoConstraintName(name: string): boolean {
  * engine-driven module) synthesizes and owns, marked with the reserved
  * `quereus.engine_managed = true` tag. Such a table is excluded from the catalog
  * entirely (see {@link collectSchemaCatalog}), so the declarative differ never
- * emits a create/drop for it and `export_schema` omits it — while it stays
+ * emits a create/drop for it and `exportSchemaDeclaration` omits it — while it stays
  * resolvable via `getTable` / `getAllTables` for every other path. The motivating
  * case is Lamina's lens basis layer, whose per-column `(rowId, value)` member
  * relations register into the basis scope's `Schema`; without this exclusion a
@@ -283,10 +281,10 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		// Engine-managed tables (e.g. Lamina's per-column `(rowId, value)` basis
 		// member relations) are excluded from the catalog UNCONDITIONALLY — before
 		// the maintained / isView branches — so the declarative differ never sees
-		// them as orphans to drop nor as objects to create, and `export_schema`
-		// omits them. They remain resolvable via `getTable` / `getAllTables` for
-		// compile / introspection / servicing. Sibling of the implicit-covering-index
-		// exclusion (see `CatalogIndex.implicit`).
+		// them as orphans to drop nor as objects to create, and
+		// `exportSchemaDeclaration` omits them. They remain resolvable via `getTable` /
+		// `getAllTables` for compile / introspection / servicing. Sibling of the
+		// implicit-covering-index exclusion (see `CatalogIndex.implicit`).
 		if (isEngineManagedTable(tableSchema)) continue;
 		if (isMaintainedTable(tableSchema)) {
 			tables.push(tableSchemaToCatalog(tableSchema, db));
@@ -434,7 +432,10 @@ function maintainedDescriptor(table: MaintainedTableSchema): NonNullable<Catalog
 function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 	return {
 		name: viewSchema.name,
-		ddl: viewSchema.sql,
+		// Rendered from the live body, not `viewSchema.sql`: rename propagation
+		// overwrites that with the rewritten body alone, and `ALTER VIEW … SET TAGS`
+		// leaves it holding the old tags.
+		ddl: generateViewDDL(viewSchema),
 		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst),
 		tags: viewSchema.tags,
 		select: viewSchema.selectAst,
@@ -443,9 +444,11 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 }
 
 /**
- * Tag opting a UNIQUE constraint's implicit covering structure into catalog /
- * `export_schema` visibility. Off by default — the auto-built secondary BTree is
- * a backing detail of enforcement, not part of the user-visible schema shape.
+ * Tag opting a UNIQUE constraint's implicit covering structure into catalog
+ * visibility. Off by default — the auto-built secondary BTree is a backing detail
+ * of enforcement, not part of the user-visible schema shape.
+ * `exportSchemaDeclaration` omits even an exposed one: the constraint, which
+ * carries this tag, recreates it.
  */
 const EXPOSE_IMPLICIT_INDEX_TAG = 'quereus.expose_implicit_index';
 

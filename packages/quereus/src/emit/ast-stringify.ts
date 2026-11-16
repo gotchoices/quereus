@@ -1445,6 +1445,7 @@ function declaredIndexToString(it: AST.DeclaredIndex): string {
 	parts.push('index', quoteIdentifier(stmt.index.name));
 	parts.push('on', quoteIdentifier(stmt.table.name));
 	parts.push(`(${indexedColumnsToString(stmt.columns)})`);
+	if (stmt.where) parts.push('where', expressionToString(stmt.where));
 
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
