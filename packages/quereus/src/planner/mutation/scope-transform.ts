@@ -504,12 +504,20 @@ function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause, ctes: C
  */
 function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource, ctes: CteColumnScope): Set<string> | null {
 	const schemaName = src.table.schema;
-	// A `with`-clause definition met by the descent wins over the catalog, matching
-	// `buildFrom`, which checks its CTE map before the schema; never for a qualified name.
+	// Resolution order mirrors `buildFrom`: `with`-clause definitions met by the descent,
+	// then the statement's `cteNodes` (its own CTEs and injected eager-capture relations),
+	// then the catalog. Both CTE maps apply to unqualified names only. Resolving a
+	// context-backed source's columns lets it SHADOW (a clean local source) rather than
+	// taint the scope — e.g. a CTE-name DML target's self-read over its eager capture
+	// (docs/vu-operators.md § Common Table Expressions).
 	const lowerName = src.table.name.toLowerCase();
-	if (!schemaName && ctes.has(lowerName)) {
-		const cols = ctes.get(lowerName);
-		return cols ? new Set(cols) : null;
+	if (!schemaName) {
+		if (ctes.has(lowerName)) {
+			const cols = ctes.get(lowerName);
+			return cols ? new Set(cols) : null;
+		}
+		const cteNode = ctx.cteNodes?.get(lowerName);
+		if (cteNode) return new Set(cteNode.getType().columns.map(c => c.name.toLowerCase()));
 	}
 	const item = ctx.schemaManager.findSchemaItem(src.table.name, schemaName, ctx.schemaPath);
 	if (item && !isViewSchema(item)) return new Set(item.columns.map(c => c.name.toLowerCase()));
@@ -517,25 +525,6 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource, ctes
 		return item.columns && item.columns.length > 0
 			? new Set(item.columns.map(c => c.toLowerCase()))
 			: projectionOutputNames(item.selectAst);
-	}
-	// A CTE / context-backed source (a sibling CTE, or an injected eager-capture relation
-	// keyed under the CTE name) — never schema-qualified, so only an unqualified name can
-	// match. Resolve its columns from the planning context's `cteNodes` so the source
-	// SHADOWS (a clean local source) rather than tainting the scope. This is what lets a
-	// CTE-name DML target's user-predicate self-read (`from t`) over its eager capture
-	// resolve `t`'s bare columns as local instead of rejecting them as
-	// unprovable-correlation (docs/vu-operators.md § Common Table Expressions). A
-	// schema object of the same name was already resolved above, so this only fires for a
-	// genuine context-backed name. `buildFrom` agrees on the QUALIFIER dimension — it also
-	// skips its `cteNodes` lookup for a schema-qualified name — so a qualified source is
-	// never shadowed here or there. The two do NOT agree on PRECEDENCE: this function tries
-	// `findSchemaItem` first and falls back to `cteNodes`, whereas `buildFrom` checks
-	// `cteNodes` first, so a bare name matching BOTH a CTE and a real table gets the table's
-	// columns here and the CTE's relation at plan time. Tracked separately as
-	// `bug-cte-shadow-precedence-scope-transform`.
-	if (!schemaName && ctx.cteNodes) {
-		const cteNode = ctx.cteNodes.get(lowerName);
-		if (cteNode) return new Set(cteNode.getType().columns.map(c => c.name.toLowerCase()));
 	}
 	// Unknown name (a not-yet-resolvable source).
 	return null;

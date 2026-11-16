@@ -134,3 +134,24 @@ select count(*) as n from c;
 drop table p;
 drop table c;
 -- run
+
+-- ===== Bare name shadows a real table on the write path too =====
+-- A statement CTE `s` shadows the real table `s`; the update's subquery `from s` must
+-- read the CTE's `x` as local (exists true for every row), not as a correlation to t.x.
+
+create table other (id integer primary key, val integer);
+insert into other values (2, 20), (3, 30);
+create table s (a integer primary key, b integer);
+insert into s values (2, 200);
+-- run
+
+with s as (select id as x, val as y from other),
+     t as (select x, y from s)
+update t set y = 5 where exists (select 1 from s where x = 3);
+
+select id, val from other order by id;
+→ [{"id":2,"val":5},{"id":3,"val":5}]
+
+drop table other;
+drop table s;
+-- run
