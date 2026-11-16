@@ -287,6 +287,10 @@ export function deployLogicalSchema(
  * still has (case-insensitive name match), `lens_view_removed` for the rest. Fired
  * after the catalog mutation so listeners see the new views; the stored names of
  * the prior view are what readers recorded as their dependency.
+ *
+ * NOTE: every surviving view fires `lens_view_replaced`, so each logical apply
+ * re-plans every prepared statement touching the schema even when nothing changed;
+ * if logical applies become frequent, compare body + slot here and skip unchanged views.
  */
 function notifyLensViewsReplaced(
 	schemaManager: SchemaManager,
