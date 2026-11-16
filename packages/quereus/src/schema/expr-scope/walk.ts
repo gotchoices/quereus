@@ -20,13 +20,10 @@ import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, sealedScopeFrame, w
 // scope model. The two are deliberately NOT unified — this walk's frame stack
 // has no place in a generic visitor — but a change to the AST node shapes has
 // to be reflected in both. Grep either file's `NOTE:` to find the other. The two
-// are not equal in reach: this walk descends five expression-bearing subtrees
-// `traverseAst` does not — window frame bounds, `SelectStmt.defaults`, and a DML's
-// `returning` / `upsertClauses` / `contextValues`. Those gaps were left alone
-// deliberately (widening `traverseAst` changes what `../manager.ts` sees, which
-// needs its own blast-radius pass) and they are not inert there: `manager.ts`'s
-// declaration-time determinism gate misses a non-deterministic call inside any of
-// them. Owned by `bug-ast-traversal-misses-expression-subtrees`.
+// have the same expression reach — window frame bounds, `SelectStmt.defaults`, and
+// a DML's `returning` / `upsertClauses` / `contextValues` included. A new AST field
+// is caught by the per-field ledger in `test/visitor.spec.ts`, which covers
+// `traverseAst` only; check this walk by hand when that ledger forces a decision.
 //
 // Deliberately not descended, and why:
 //   - `InsertStmt.table` / `UpdateStmt.table` / `DeleteStmt.table` /

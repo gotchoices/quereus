@@ -162,3 +162,21 @@ CREATE TABLE t_randomblob_default (
 );
 -- error: Non-deterministic expression not allowed in DEFAULT
 
+-- === Test 8: non-deterministic calls in subtrees reached only through a nested subquery ===
+-- The gate walks every expression-bearing field: a DML statement's returning list and a
+-- window frame bound included.
+
+create table t_det_src (k integer primary key, v integer);
+
+create table t_det_returning (
+    id integer primary key,
+    g integer generated always as ((select r from (insert into t_det_src values (1, 1) returning random() as r) q limit 1))
+);
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+create table t_det_frame_bound (
+    id integer primary key,
+    n integer,
+    check (n > (select sum(v) over (rows between abs(random()) preceding and current row) from t_det_src limit 1))
+);
+-- error: Non-deterministic expression not allowed in CHECK

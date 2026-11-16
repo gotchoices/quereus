@@ -45,14 +45,16 @@ export interface AstVisitorCallbacks {
  * no place in a generic visitor. But a change to the AST node shapes has to be
  * reflected in both. Grep either file's `NOTE:` to find the other.
  *
- * Their reach is not identical, and this traversal is the narrower one: it skips
- * window frame bound expressions (the `TODO` at the `windowDefinition` arm below),
- * `SelectStmt.defaults`, and a DML's `returning` / `upsertClauses` /
- * `contextValues`. That is a live defect, not a shrug — `../schema/manager.ts`'s
- * declaration-time determinism gate walks with this traversal, so a
- * non-deterministic call hiding in any of those subtrees is accepted at
- * `CREATE TABLE`. Owned by `bug-ast-traversal-misses-expression-subtrees`; do not
- * widen piecemeal without pricing what the four `manager.ts` callers then see.
+ * The two have the same reach: every expression-bearing field of every node
+ * kind below is descended (window frame bounds, `with defaults`, and a DML's
+ * `returning` / upsert / `with context` included). `../schema/manager.ts`'s
+ * declaration-time gates depend on that — a subtree skipped here is a place a
+ * non-deterministic call or a bind parameter hides from `CREATE TABLE`. The
+ * guards: the `switch` below is exhaustive over `AstNode['type']`, so a new node
+ * kind does not compile until it is classified, and `test/visitor.spec.ts` holds
+ * a per-field ledger of every AST shape that owns an expression, so a new field
+ * does not compile until it is classified — and every field marked descended is
+ * checked at runtime to actually be reached.
  *
  * @param node The starting AST node.
  * @param callbacks An object containing visitor functions for different node types.
@@ -78,13 +80,11 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 	switch (node.type) {
 		case 'select': {
 			const stmt = node as AST.SelectStmt;
-			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
-			(stmt.columns ?? []).forEach(c => {
-				if (c.type === 'column') {
-					traverseAst(c.expr, callbacks);
-					c.inverse?.forEach(a => traverseAst(a.expr, callbacks));
-				}
-			});
+			traverseCteBodies(stmt.withClause, callbacks);
+			traverseResultColumns(stmt.columns, callbacks);
+			// View write-through metadata — inert inside a scalar subquery, but this is a
+			// generic every-node traversal and does not encode evaluation semantics.
+			stmt.defaults?.forEach(d => traverseAst(d.expr, callbacks));
 			(stmt.from ?? []).forEach(f => traverseAst(f, callbacks));
 			traverseAst(stmt.where, callbacks);
 			(stmt.groupBy ?? []).forEach(g => traverseAst(g, callbacks));
@@ -92,34 +92,47 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			(stmt.orderBy ?? []).forEach(o => traverseAst(o.expr, callbacks));
 			traverseAst(stmt.limit, callbacks);
 			traverseAst(stmt.offset, callbacks);
+			// The parser never sets `union` (compounds land on `compound`); descended for
+			// parity with the schema scope walk and the other readers of the field.
+			traverseAst(stmt.union, callbacks);
 			traverseAst(stmt.compound?.select, callbacks);
 			break;
 		}
 		case 'insert': {
 			const stmt = node as AST.InsertStmt;
-			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
+			traverseCteBodies(stmt.withClause, callbacks);
 			traverseAst(stmt.table, callbacks);
 			traverseAst(stmt.source, callbacks);
+			stmt.upsertClauses?.forEach(u => traverseAst(u, callbacks));
+			traverseDmlOutputs(stmt, callbacks);
 			break;
 		}
 		case 'update': {
 			const stmt = node as AST.UpdateStmt;
-			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
+			traverseCteBodies(stmt.withClause, callbacks);
 			traverseAst(stmt.table, callbacks);
 			// Inline subquery write target (`update (select …) as v …`): the real body
 			// hangs off `targetSource`; `table` is only a synthetic alias placeholder.
 			traverseAst(stmt.targetSource, callbacks);
 			stmt.assignments.forEach(a => traverseAst(a.value, callbacks));
 			traverseAst(stmt.where, callbacks);
+			traverseDmlOutputs(stmt, callbacks);
 			break;
 		}
 		case 'delete': {
 			const stmt = node as AST.DeleteStmt;
-			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
+			traverseCteBodies(stmt.withClause, callbacks);
 			traverseAst(stmt.table, callbacks);
 			// See `update` above — the inline subquery write target's body is on `targetSource`.
 			traverseAst(stmt.targetSource, callbacks);
 			traverseAst(stmt.where, callbacks);
+			traverseDmlOutputs(stmt, callbacks);
+			break;
+		}
+		case 'upsert': {
+			const upsert = node as AST.UpsertClause;
+			upsert.assignments?.forEach(a => traverseAst(a.value, callbacks));
+			traverseAst(upsert.where, callbacks);
 			break;
 		}
 		case 'values': {
@@ -127,9 +140,6 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			stmt.values.forEach(row => row.forEach(v => traverseAst(v, callbacks)));
 			break;
 		}
-		case 'table':
-			// Handled by specific visitor or enterNode
-			break;
 		case 'join': {
 			const join = node as AST.JoinClause;
 			traverseAst(join.left, callbacks);
@@ -180,7 +190,8 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			const winDef = node as AST.WindowDefinition;
 			(winDef.partitionBy ?? []).forEach(p => traverseAst(p, callbacks));
 			(winDef.orderBy ?? []).forEach(o => traverseAst(o.expr, callbacks));
-			// traverseAst(winDef.frame, callbacks); // TODO: Traverse frame bounds if needed
+			traverseFrameBound(winDef.frame?.start, callbacks);
+			traverseFrameBound(winDef.frame?.end, callbacks);
 			break;
 		}
 		case 'case': {
@@ -212,18 +223,49 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			traverseAst(betweenExpr.upper, callbacks);
 			break;
 		}
-		// Leaf nodes (literal, identifier, column, parameter) are handled by specific visitors or enterNode
+		// Leaf nodes — handled by specific visitors or enterNode. `table` is a FROM
+		// table source, whose only child is its name.
 		case 'literal':
 		case 'identifier':
 		case 'column':
 		case 'parameter':
+		case 'table':
 			break;
-		// DDL / Transaction statements - might need traversal depending on use case
-		// Currently not traversing into them
+		// Reached through their parents, never entered as nodes: the `select` / DML
+		// arms descend CTE bodies directly.
+		case 'with':
+		case 'commonTableExpr':
+			break;
+		// Not node shapes at all: a window frame and its bounds do not extend `AstNode`
+		// (the `windowDefinition` arm descends the bounds), and the column / table
+		// constraint kinds are reachable only under `createTable`.
+		case 'windowFrame':
+		case 'currentRow':
+		case 'unboundedPreceding':
+		case 'unboundedFollowing':
+		case 'preceding':
+		case 'following':
+		case 'primaryKey':
+		case 'notNull':
+		case 'null':
+		case 'unique':
+		case 'check':
+		case 'default':
+		case 'foreignKey':
+		case 'generated':
+			break;
+		// DDL, transaction-control and schema-management statements are not descended;
+		// no caller walks one.
 		case 'createTable':
 		case 'createIndex':
 		case 'createView':
+		case 'createMaterializedView':
+		case 'refreshMaterializedView':
+		case 'createAssertion':
 		case 'alterTable':
+		case 'alterView':
+		case 'alterMaterializedView':
+		case 'alterIndex':
 		case 'drop':
 		case 'begin':
 		case 'commit':
@@ -233,16 +275,53 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 		case 'pragma':
 		case 'analyze':
 		case 'declareSchema':
-		case 'with': // Usually handled separately before main traversal
-		case 'commonTableExpr': // Usually handled separately
+		case 'declareLens':
+		case 'diffSchema':
+		case 'applySchema':
+		case 'explainSchema':
+		case 'declaredTable':
+		case 'declaredIndex':
+		case 'declaredView':
+		case 'declaredMaterializedView':
+		case 'declaredSeed':
+		case 'declaredAssertion':
+		case 'declareIgnored':
 			break;
-		// Default case for unhandled node types
-		default:
-			warnLog(`AST Visitor: Unhandled node type: ${node.type}`);
+		default: {
+			// Compile-time exhaustiveness: a new `AstNode['type']` member must be
+			// classified above. The warn covers a malformed node at runtime.
+			const unhandled: never = node.type;
+			warnLog(`AST Visitor: Unhandled node type: ${String(unhandled)}`);
 			break;
+		}
 	}
 
 	if (callbacks.exitNode) {
 		callbacks.exitNode(node);
 	}
+}
+
+/** CTE bodies of a leading `with` clause; the `with` / CTE nodes themselves are not entered. */
+function traverseCteBodies(withClause: AST.WithClause | undefined, callbacks: AstVisitorCallbacks): void {
+	withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
+}
+
+/** Result columns of a select or of a DML `returning` list, including any `with inverse (…)` clause. */
+function traverseResultColumns(columns: ReadonlyArray<AST.ResultColumn> | undefined, callbacks: AstVisitorCallbacks): void {
+	columns?.forEach(c => {
+		if (c.type !== 'column') return;
+		traverseAst(c.expr, callbacks);
+		c.inverse?.forEach(inv => traverseAst(inv.expr, callbacks));
+	});
+}
+
+/** The clauses every DML statement shares: `returning` and `with context`. */
+function traverseDmlOutputs(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt, callbacks: AstVisitorCallbacks): void {
+	traverseResultColumns(stmt.returning, callbacks);
+	stmt.contextValues?.forEach(cv => traverseAst(cv.value, callbacks));
+}
+
+/** A frame bound is not an `AstNode`; only `<expr> preceding` / `<expr> following` carry an expression. */
+function traverseFrameBound(bound: AST.WindowFrameBound | null | undefined, callbacks: AstVisitorCallbacks): void {
+	if (bound?.type === 'preceding' || bound?.type === 'following') traverseAst(bound.value, callbacks);
 }
