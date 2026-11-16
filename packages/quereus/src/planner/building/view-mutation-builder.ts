@@ -170,12 +170,13 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 		return buildDecompositionInsert(ctx, view, req.stmt);
 	}
 
-	// Multi-source inner-join INSERT needs the plan-level shared-surrogate envelope
+	// Multi-source (join) INSERT needs the plan-level shared-surrogate envelope
 	// (a materialized augmented source the sibling base inserts fan out from), which
 	// the AST-level `BaseOp[]` model cannot express — build it directly. The lens
 	// constraints are the insert subset of the update path's list below: parent-side FKs
 	// are left out (an insert cannot orphan a child), and row-local checks keep the routed
-	// basis-term form, since every inner-join side insert runs and sees the written value.
+	// basis-term form, since a side insert that runs sees the written value (an outer-joined
+	// side's skipped rows are covered at the envelope — `buildAbsentSideRowChecks`).
 	if (req.op === 'insert' && isJoinBody(view.selectAst)) {
 		return buildMultiSourceInsert(ctx, view, req.stmt, {
 			rowLocal: lensRowLocalConstraints(ctx, view),

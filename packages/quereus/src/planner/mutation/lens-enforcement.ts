@@ -123,6 +123,11 @@ function makeOwningRelationResolver(
  * (`lens-compiler.ts` § `qualifyBasisSources`), so an unqualified FROM name is a CTE
  * and is not resolved as a basis table — the same rule {@link resolveSlotBasisSource}
  * applies to a single-source body.
+ *
+ * NOTE: a self-join body's two aliases attribute to the same relation, so the
+ * relation-identity gate rides a rule over one alias's column on both sides (each
+ * evaluating it against its own row); if self-join lens bodies with rules appear,
+ * carry the alias through the attribution and gate on it.
  */
 function joinBodyColumnOwners(slot: LensSlot, schemaManager: SchemaManager): Map<string, BasisRelationRef> {
 	const owners = new Map<string, BasisRelationRef>();

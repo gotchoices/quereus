@@ -22,6 +22,8 @@ files:
   - packages/quereus/src/planner/mutation/multi-source.ts    # 3,541 lines (`wc -l`, 2026-08-17) — second-largest non-test source file in the repo and never listed here
   - packages/quereus/src/planner/mutation/decomposition.ts   # 2,262 lines (`wc -l`, 2026-08-17) — the sibling half of the same folder
   - packages/quereus/src/planner/mutation/set-op.ts          # 2,058 lines (`wc -l`, 2026-08-17)
+  - packages/quereus/src/planner/building/view-mutation-builder.ts # 1,860 lines (`wc -l`, 2026-11-16, after bug-join-backed-logical-table-enforces-no-rules-on-insert) — noticed during that review; the dispatch, the decomposition and join insert envelopes, the set-op wiring and the per-op constraint gate are separable concerns in one file
+  - packages/quereus/src/planner/mutation/lens-enforcement.ts # 1,476 lines (`wc -l`, 2026-11-16, same review) — row-local, FK and set-level constraint synthesis plus owning-relation attribution in one file
   - packages/quereus/src/schema/rename/table-rename.ts       # 1,063 lines (`wc -l`, 2026-08-07) — the other half of the same split; crossed 1,000 when the qualifier-collision predicate landed
   - packages/quereus/src/schema/rename/column-rename.ts      # 1,370 lines (`wc -l`, 2026-08-06; 1,057 when this ticket was filed) — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over, and still growing
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)
