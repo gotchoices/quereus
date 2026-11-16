@@ -133,9 +133,8 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 	//    body-local block would have nothing to bind to (it errors `Table 'c' not found`,
 	//    or — worse — silently binds a same-named real table and the write affects no rows
 	//    while the read of the same view returns them).
-	// `rebuildSelect` clones a `with` clause without descending into it, so the definitions
-	// themselves are never stamped: their sub-selects are built under the home environment
-	// already, exactly as on the read path.
+	// `mapNestedSelects` clones a `with` clause's CTE bodies without stamping them: their
+	// sub-selects are built under the home environment already, exactly as on the read path.
 	const bodySelect = !viewIn.ephemeral && viewIn.selectAst.type === 'select' ? viewIn.selectAst : undefined;
 	if (bodySelect?.withClause) rejectDataModifyingBodyCTE(viewIn, bodySelect.withClause);
 	const storedBodyEnv: AST.StoredBodyEnv = {

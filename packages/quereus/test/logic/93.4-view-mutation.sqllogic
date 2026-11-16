@@ -4879,3 +4879,35 @@ update exv set av = 5 where aa = 2 returning aa, av, xv, bv;
 → [{"aa":2,"av":5,"xv":null,"bv":null}]
 update exv set av = 6 where aa = 1 returning aa, av, xv, bv;
 → [{"aa":1,"av":6,"xv":100,"bv":10}]
+
+-- --- a WITH body that reads the view's row ---
+-- A CTE body nested in a subquery correlates to the enclosing row like any other
+-- sub-select, so the lowering must rewrite references inside it too.
+
+-- In the view's own filter: `wq_b.x` inside the CTE body is re-pointed at the lowered
+-- target row (it named nothing in the lowered UPDATE before, failing "column not found").
+create table wq_u (id integer primary key);
+insert into wq_u values (1);
+create table wq_b (id integer primary key, x integer);
+insert into wq_b values (1, 5), (2, -5);
+create view wqv as select id, x from wq_b
+    where (with c as (select wq_b.x as y from wq_u) select max(y) from c) > 0;
+select id, x from wqv;
+→ [{"id":1,"x":5}]
+update wqv set x = 100;
+select id, x from wq_b order by id;
+→ [{"id":1,"x":100},{"id":2,"x":-5}]
+
+-- In the UPDATE's own WHERE: the renamed view column `x` (base `y`) inside the CTE body
+-- is replaced by its base term, not left to bind the base table's own `x` (which wrote
+-- row 1 instead of row 2).
+create table wr_u (id integer primary key);
+insert into wr_u values (1);
+create table wr_b (id integer primary key, x integer, y integer);
+insert into wr_b values (1, 5, -1), (2, -5, 1);
+create view wrv as select id, y as x from wr_b;
+select id from wrv where exists (with c as (select x as q from wr_u) select 1 from c where q > 0);
+→ [{"id":2}]
+update wrv set x = 100 where exists (with c as (select x as q from wr_u) select 1 from c where q > 0);
+select id, x, y from wr_b order by id;
+→ [{"id":1,"x":5,"y":-1},{"id":2,"x":-5,"y":100}]

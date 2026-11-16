@@ -166,9 +166,9 @@ export function cloneQueryExpr(query: AST.QueryExpr): AST.QueryExpr {
  * scope-aware. The substitution decides purely on the column's own qualifier
  * (e.g. {@link cloneQueryExpr}'s no-op, or the multi-source SET-value qualifier
  * strip), so the enclosing scope is irrelevant and the same `substitute` is
- * applied at every nesting depth. The `with` clause is cloned without
- * substitution — a CTE body cannot correlate to the enclosing query, so it
- * needs no rewrite, only severed sharing (see {@link cloneWithClause}).
+ * applied at every nesting depth — CTE bodies of a `with` clause included: a
+ * CTE body nested in a subquery CAN read the enclosing row (a `new.x` inside a
+ * WITH body of an authored inverse is substituted like any other).
  */
 export function mapQueryExprUniform(
 	query: AST.QueryExpr,
@@ -176,7 +176,7 @@ export function mapQueryExprUniform(
 ): AST.QueryExpr {
 	const descend = (q: AST.QueryExpr): AST.QueryExpr => mapQueryExprUniform(q, substitute);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
-	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend);
+	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend, descend);
 	if (query.type === 'values') return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	// INSERT/UPDATE/DELETE … RETURNING as a subquery — pure structural deep clone
 	// (no substitution threading; the view-mutation descent rejects DML subqueries).
@@ -208,9 +208,9 @@ export function mapQueryExprUniform(
  * No substitution is threaded — this is a pure clone plus the stamp. Marking a CLONE
  * is required: the schema's stored `selectAst` must never be mutated.
  *
- * NOTE: a `with` clause's CTE bodies are cloned unstamped (via {@link cloneWithClause}),
- * and that stays correct with the carry above: a definition's own sub-selects are built by
- * `buildStoredBodyCTEs` on the home context already, exactly as on the read path, so
+ * NOTE: a `with` clause's CTE bodies are cloned unstamped (the `cloneQueryExpr` passed
+ * as `onCte` below), and that stays correct with the carry above: a definition's own
+ * sub-selects are built by `buildStoredBodyCTEs` on the home context already, exactly as on the read path, so
  * stamping them would be redundant — and stamping the *carried* clause's members would make
  * the marker self-referential.
  */
@@ -228,7 +228,7 @@ export function mapNestedSelects(
 	// which the lowering copies into the base INSERT/UPDATE (`rewriteAuthoredViewInsert` /
 	// `collectAppendedDefaults` in `single-source.ts`). The default `cloneExpr` would not:
 	// its subquery descent is hard-wired to `cloneQueryExpr`.
-	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend, onExpr);
+	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend, cloneQueryExpr, onExpr);
 	if (query.type === 'values') return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	// A DML … RETURNING body is rejected as a view body at create time — pure clone.
 	return cloneDmlStmt(query);
@@ -240,9 +240,11 @@ export function mapNestedSelects(
  * `having`, `orderBy`, `limit`, `offset`, and join `ON` conditions), `onNested`
  * to a subquery nested in that scope (a FROM `SubquerySource`), and `onLeg` to a
  * sibling compound / union leg (which correlates to the SAME outer scope as this
- * select, not to this select's FROM). The `with` clause is cloned without
- * substitution — a CTE body cannot correlate to the enclosing query, so it needs
- * no rewrite, only severed sharing (see {@link cloneWithClause}).
+ * select, not to this select's FROM). `onCte` rebuilds each CTE body of the
+ * select's `with` clause; a scope-aware caller passes its `onLeg`, because a CTE
+ * body has a sibling leg's scope — it can read the enclosing query's row (a WITH
+ * nested in a subquery correlates like any other sub-select) but does not see
+ * this select's own FROM. It defaults to a pure {@link cloneQueryExpr}.
  *
  * `onMetaExpr` handles the two **write-through metadata** clauses — a result
  * column's `with inverse` and the select's `with defaults` — which default to a
@@ -256,11 +258,12 @@ function rebuildSelect(
 	onExpr: (e: AST.Expression) => AST.Expression,
 	onNested: (q: AST.QueryExpr) => AST.QueryExpr,
 	onLeg: (q: AST.QueryExpr) => AST.QueryExpr,
+	onCte: (q: AST.QueryExpr) => AST.QueryExpr = cloneQueryExpr,
 	onMetaExpr: (e: AST.Expression) => AST.Expression = cloneExpr,
 ): AST.SelectStmt {
 	return {
 		...sel,
-		withClause: cloneWithClause(sel.withClause),
+		withClause: cloneWithClause(sel.withClause, onCte),
 		columns: sel.columns.map(rc => rc.type === 'all'
 			? { ...rc }
 			: { ...rc, expr: onExpr(rc.expr), inverse: cloneInverseClause(rc.inverse, onMetaExpr) }),
@@ -311,19 +314,22 @@ function rebuildFrom(
 // reach must be rebuilt, never shared with the source AST.
 
 /**
- * Pure structural clone of a `with` clause. CTE bodies go through
- * {@link cloneQueryExpr}, NOT the substitution descend — a CTE body cannot
- * correlate to the enclosing query, so no rewrite applies; the clone only
- * severs reference sharing.
+ * Structural clone of a `with` clause, rebuilding each CTE body through `onCte`
+ * (default: the pure {@link cloneQueryExpr}). {@link rebuildSelect} threads its
+ * caller's CTE-body transformer here, so a substitution reaches a CTE body that
+ * reads the enclosing row.
  */
-function cloneWithClause(withClause: AST.WithClause | undefined): AST.WithClause | undefined {
+function cloneWithClause(
+	withClause: AST.WithClause | undefined,
+	onCte: (q: AST.QueryExpr) => AST.QueryExpr = cloneQueryExpr,
+): AST.WithClause | undefined {
 	if (!withClause) return undefined;
 	return {
 		...withClause,
 		ctes: withClause.ctes.map(cte => ({
 			...cte,
 			columns: cte.columns && [...cte.columns],
-			query: cloneQueryExpr(cte.query),
+			query: onCte(cte.query),
 		})),
 		options: withClause.options && { ...withClause.options },
 	};
@@ -733,7 +739,15 @@ export function transformScopedQuery(
 	// select's context, and the parser suppresses a leg's own `with schema` clause).
 	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, shadowed, tainted, aliasShadowed);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
-	return rebuildSelect(sel, onExpr, onNested, onLeg);
+	// A CTE body of this select's `with` clause takes the sibling-leg scope: it can read
+	// the enclosing row but not this select's FROM, and `buildSelectStmt` plans the `with`
+	// clause on this select's environment (`contextWithSchemaPath`, i.e. `fromCtx`).
+	// NOTE: a CTE body whose FROM names a sibling CTE (or itself, recursively) resolves to
+	// nothing in `collectFromColumnNames` and taints its scope, so a bare view-column-named
+	// reference there is rejected as unprovable correlation — as it already is in the select
+	// that reads the CTE. Resolving CTE names from the enclosing `with` clause (declared
+	// column list, else `projectionOutputNames`) would lift that rejection.
+	return rebuildSelect(sel, onExpr, onNested, onLeg, onLeg);
 }
 
 // --- alias-shadow-aware substitution (cross-source SET-value strip) --------
@@ -838,5 +852,6 @@ export function transformAliasScopedQuery(
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming set.
 	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, substitute, aliasShadow);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, sub, onNested);
-	return rebuildSelect(sel, onExpr, onNested, onLeg);
+	// A CTE body correlates like a sibling leg (enclosing scope, not this select's FROM).
+	return rebuildSelect(sel, onExpr, onNested, onLeg, onLeg);
 }
