@@ -3,7 +3,9 @@ import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
-import { collectSchemaCatalog, type CatalogAssertion } from './catalog.js';
+import { inferType } from '../types/registry.js';
+import { normalizeCollationName } from '../util/comparison.js';
+import { collectSchemaCatalog, type CatalogAssertion, type CatalogTable } from './catalog.js';
 
 /** The kinds of catalog entry an export turns into declaration items, as named in error messages. */
 type ExportedObjectKind = 'table' | 'view' | 'index' | 'assertion';
@@ -13,6 +15,9 @@ interface ExportableEntry {
 	readonly name: string;
 	readonly ddl: string;
 }
+
+/** A table's live column attributes, from which session-elided clauses are restored. */
+type CatalogColumn = CatalogTable['columns'][number];
 
 /**
  * The live physical schema `schemaName` as a `declare schema` statement: every table
@@ -33,7 +38,9 @@ interface ExportableEntry {
  *
  * The statement carries no `version`, no `using (default_vtab_module …)` clause and no
  * `seed` items: each table's DDL already names its module when that differs from the
- * session default, and data is not part of a schema export.
+ * session default, and data is not part of a schema export. Every column states its
+ * nullability, and a text column its collation, so the importer's
+ * `default_column_nullability` / `default_collation` cannot change them.
  *
  * @throws QuereusError when the schema does not exist (an empty declaration would drop
  *   everything when applied), when it is a logical schema, or when an assertion has no
@@ -50,7 +57,7 @@ export function exportSchemaDeclaration(db: Database, schemaName: string = 'main
 
 	const catalog = collectSchemaCatalog(db, schema.name);
 	const items: AST.DeclareItem[] = [
-		...sortedByName(catalog.tables).map(entry => declareItemFor(entry, 'table', schema.name)),
+		...sortedByName(catalog.tables).map(entry => withSessionDefaultsPinned(declareItemFor(entry, 'table', schema.name), entry)),
 		...sortedByName(catalog.views).map(entry => declareItemFor(entry, 'view', schema.name)),
 		...sortedByName(catalog.indexes.filter(index => !index.implicit)).map(entry => declareItemFor(entry, 'index', schema.name)),
 		...sortedByName(catalog.assertions).map(entry => declareItemFor(assertionWithCheck(entry), 'assertion', schema.name)),
@@ -113,8 +120,55 @@ function declareItemFor(entry: ExportableEntry, kind: ExportedObjectKind, schema
 	}
 }
 
+/**
+ * The catalog's table DDL leaves out a column's nullability when it matches the
+ * exporting session's `default_column_nullability`, and a BINARY collation always.
+ * Applying that text resolves both against the importing session, so each column
+ * gets them written out from its live attributes. A collation is written only for a
+ * type that can take a non-BINARY default (`resolveDefaultCollation` in `table.ts`).
+ */
+function withSessionDefaultsPinned(item: AST.DeclareItem, entry: CatalogTable): AST.DeclareItem {
+	if (item.type !== 'declaredTable') return item;
+	const columns = item.tableStmt.columns.map(def => withExplicitNullabilityAndCollation(def, catalogColumn(entry, def.name)));
+	return { ...item, tableStmt: { ...item.tableStmt, columns } };
+}
+
+function catalogColumn(entry: CatalogTable, name: string): CatalogColumn {
+	const column = entry.columns.find(c => c.name === name);
+	if (!column) {
+		throw new QuereusError(`Cannot export table '${entry.name}': its catalog DDL has column '${name}', which its catalog entry does not list`, StatusCode.INTERNAL);
+	}
+	return column;
+}
+
+/**
+ * Inserts each missing clause where the DDL generator writes it (nullability first,
+ * collation right after), so the text is the same whichever clauses the exporting
+ * session's defaults let the generator elide.
+ */
+function withExplicitNullabilityAndCollation(def: AST.ColumnDef, column: CatalogColumn): AST.ColumnDef {
+	const isNullability = (c: AST.ColumnConstraint) => c.type === 'notNull' || c.type === 'null';
+	let constraints = def.constraints;
+	if (!constraints.some(isNullability)) {
+		constraints = [{ type: column.notNull ? 'notNull' : 'null' }, ...constraints];
+	}
+	if (!constraints.some(c => c.type === 'collate') && canTakeNonBinaryDefault(def.dataType)) {
+		const at = constraints.findIndex(isNullability) + 1;
+		constraints = [...constraints.slice(0, at), { type: 'collate', collation: column.collation }, ...constraints.slice(at)];
+	}
+	return constraints === def.constraints ? def : { ...def, constraints };
+}
+
+function canTakeNonBinaryDefault(dataType: string | undefined): boolean {
+	return inferType(dataType).supportedCollations?.some(c => normalizeCollationName(c) !== 'BINARY') ?? false;
+}
+
 /** The single statement an entry's catalog DDL holds. Catalog DDL that fails to re-parse is an engine defect. */
 function parseCatalogDdl(entry: ExportableEntry, kind: ExportedObjectKind): AST.Statement {
+	// NOTE: the returned nodes keep `loc` positions into `entry.ddl`, not into any text the
+	// caller holds; `astToString` ignores them. If a caller ever hands the AST straight to
+	// `declaredSchemaManager.setDeclaredSchema`, strip `loc` first or apply errors point
+	// into the wrong string.
 	let statements: AST.Statement[];
 	try {
 		statements = new Parser().parseAll(entry.ddl);

@@ -10,7 +10,9 @@ import type { SqlValue } from '../../src/common/types.js';
  *  - Same-database fixpoint: declaring the export on the database it came from
  *    leaves `diff schema` with nothing to do.
  *  - Fresh-database round trip: applying the export to a new database and exporting
- *    again reproduces the same text byte for byte.
+ *    again reproduces the same text byte for byte. The new database runs under the
+ *    opposite `default_column_nullability` and a non-BINARY `default_collation`, so
+ *    this also pins that the text does not lean on either session default.
  */
 
 interface Scenario {
@@ -58,11 +60,11 @@ const scenarios: readonly Scenario[] = [
 		prepare: registerMem2,
 		schemas: ['main'],
 		ddl: `
-			create table src (id integer primary key, v integer);
-			create materialized view mv_default as select id, v from src where v > 0;
+			create table src (id integer primary key, v integer, s text);
+			create materialized view mv_default as select id, v, s from src where v > 0;
 			create materialized view mv_other using mem2 as select id, v * 2 as w from src;
 			create table plain_other (id integer primary key, note text) using mem2;
-			create table mt (id integer primary key, v integer) maintained as select id, v from src;
+			create table mt (id integer primary key, v integer, s text) maintained as select id, v, s from src;
 			create view v_over_mv as select id from mv_default;
 		`,
 	},
@@ -121,6 +123,8 @@ describe('exportSchemaDeclaration', () => {
 				}
 
 				scenario.prepare?.(fresh);
+				await fresh.exec(`pragma default_column_nullability = 'nullable'`);
+				await fresh.exec(`pragma default_collation = 'nocase'`);
 				for (const [name, text] of exported) {
 					await fresh.exec(text);
 					await fresh.exec(`apply schema ${quoteIdentifier(name)}`);
