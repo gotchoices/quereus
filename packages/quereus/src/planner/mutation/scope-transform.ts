@@ -2,6 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { isViewSchema } from '../../schema/view.js';
 import { storedBodyContext } from '../stored-body-context.js';
+import { isRecursiveCte } from '../building/with.js';
 
 /**
  * The one scope-aware column-substitution primitive the view-mutation backward
@@ -241,10 +242,10 @@ export function mapNestedSelects(
  * to a subquery nested in that scope (a FROM `SubquerySource`), and `onLeg` to a
  * sibling compound / union leg (which correlates to the SAME outer scope as this
  * select, not to this select's FROM). `onCte` rebuilds each CTE body of the
- * select's `with` clause; a scope-aware caller passes its `onLeg`, because a CTE
- * body has a sibling leg's scope — it can read the enclosing query's row (a WITH
- * nested in a subquery correlates like any other sub-select) but does not see
- * this select's own FROM. It defaults to a pure {@link cloneQueryExpr}.
+ * select's `with` clause (with its position in the clause); a scope-aware caller
+ * gives it a sibling leg's scope, because a CTE body can read the enclosing
+ * query's row (a WITH nested in a subquery correlates like any other sub-select)
+ * but does not see this select's own FROM. It defaults to a pure {@link cloneQueryExpr}.
  *
  * `onMetaExpr` handles the two **write-through metadata** clauses — a result
  * column's `with inverse` and the select's `with defaults` — which default to a
@@ -258,7 +259,7 @@ function rebuildSelect(
 	onExpr: (e: AST.Expression) => AST.Expression,
 	onNested: (q: AST.QueryExpr) => AST.QueryExpr,
 	onLeg: (q: AST.QueryExpr) => AST.QueryExpr,
-	onCte: (q: AST.QueryExpr) => AST.QueryExpr = cloneQueryExpr,
+	onCte: (q: AST.QueryExpr, index: number) => AST.QueryExpr = cloneQueryExpr,
 	onMetaExpr: (e: AST.Expression) => AST.Expression = cloneExpr,
 ): AST.SelectStmt {
 	return {
@@ -321,15 +322,15 @@ function rebuildFrom(
  */
 function cloneWithClause(
 	withClause: AST.WithClause | undefined,
-	onCte: (q: AST.QueryExpr) => AST.QueryExpr = cloneQueryExpr,
+	onCte: (q: AST.QueryExpr, index: number) => AST.QueryExpr = cloneQueryExpr,
 ): AST.WithClause | undefined {
 	if (!withClause) return undefined;
 	return {
 		...withClause,
-		ctes: withClause.ctes.map(cte => ({
+		ctes: withClause.ctes.map((cte, i) => ({
 			...cte,
 			columns: cte.columns && [...cte.columns],
-			query: onCte(cte.query),
+			query: onCte(cte.query, i),
 		})),
 		options: withClause.options && { ...withClause.options },
 	};
@@ -428,20 +429,24 @@ function cloneDmlStmt(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt): A
 /**
  * Resolve the lowercased set of column names a subquery's FROM sources introduce
  * into scope, or `null` when any source's columns cannot be resolved statically
- * (a TVF, a `select *` / unnamed-projection subquery source, or an unknown name
- * such as a CTE reference). A `null` marks the scope (and everything nested in
- * it) **tainted**: a descent can no longer prove an unqualified reference is
- * *not* a local column, so the {@link ScopeContext} decides whether to reject or
- * carry the taint forward.
+ * (a TVF, a `select *` / unnamed-projection subquery source, or an unknown name).
+ * A `null` marks the scope (and everything nested in it) **tainted**: a descent
+ * can no longer prove an unqualified reference is *not* a local column, so the
+ * {@link ScopeContext} decides whether to reject or carry the taint forward.
+ *
+ * `ctes` holds the `with`-clause definitions the descent has met that are visible
+ * here (see {@link withClauseCteScopes}); an unqualified FROM name matching one
+ * resolves to that definition's columns before the catalog is consulted.
  */
 export function collectFromColumnNames(
 	ctx: PlanningContext,
 	from: readonly AST.FromClause[] | undefined,
+	ctes: CteColumnScope = NO_CTES,
 ): Set<string> | null {
 	const acc = new Set<string>();
 	if (!from) return acc;
 	for (const fc of from) {
-		const names = fromSourceColumnNames(ctx, fc);
+		const names = fromSourceColumnNames(ctx, fc, ctes);
 		if (names === null) return null;
 		for (const n of names) acc.add(n);
 	}
@@ -449,14 +454,14 @@ export function collectFromColumnNames(
 }
 
 /** Lowercased column names a single FROM source introduces, or `null` if unresolvable. */
-function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause): Set<string> | null {
+function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause, ctes: CteColumnScope): Set<string> | null {
 	switch (fc.type) {
 		case 'table':
-			return tableSourceColumnNames(ctx, fc);
+			return tableSourceColumnNames(ctx, fc, ctes);
 		case 'join': {
-			const left = fromSourceColumnNames(ctx, fc.left);
+			const left = fromSourceColumnNames(ctx, fc.left, ctes);
 			if (left === null) return null;
-			const right = fromSourceColumnNames(ctx, fc.right);
+			const right = fromSourceColumnNames(ctx, fc.right, ctes);
 			if (right === null) return null;
 			for (const n of right) left.add(n);
 			return left;
@@ -497,8 +502,15 @@ function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause): Set<st
  * writes through a view whose subquery names a `committed.`-qualified source; if that
  * ever becomes reachable, strip the pseudo-schema here the way plan time does.
  */
-function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set<string> | null {
+function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource, ctes: CteColumnScope): Set<string> | null {
 	const schemaName = src.table.schema;
+	// A `with`-clause definition met by the descent wins over the catalog, matching
+	// `buildFrom`, which checks its CTE map before the schema; never for a qualified name.
+	const lowerName = src.table.name.toLowerCase();
+	if (!schemaName && ctes.has(lowerName)) {
+		const cols = ctes.get(lowerName);
+		return cols ? new Set(cols) : null;
+	}
 	const item = ctx.schemaManager.findSchemaItem(src.table.name, schemaName, ctx.schemaPath);
 	if (item && !isViewSchema(item)) return new Set(item.columns.map(c => c.name.toLowerCase()));
 	if (item) {
@@ -522,11 +534,46 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set
 	// columns here and the CTE's relation at plan time. Tracked separately as
 	// `bug-cte-shadow-precedence-scope-transform`.
 	if (!schemaName && ctx.cteNodes) {
-		const cteNode = ctx.cteNodes.get(src.table.name.toLowerCase());
+		const cteNode = ctx.cteNodes.get(lowerName);
 		if (cteNode) return new Set(cteNode.getType().columns.map(c => c.name.toLowerCase()));
 	}
 	// Unknown name (a not-yet-resolvable source).
 	return null;
+}
+
+/**
+ * The `with`-clause definitions visible at one point of the static descent: lowercased
+ * CTE name → that definition's lowercased output column names, or `null` when those are
+ * not statically known (a scope reading it is then tainted, as for any unresolvable source).
+ */
+type CteColumnScope = ReadonlyMap<string, ReadonlySet<string> | null>;
+
+const NO_CTES: CteColumnScope = new Map();
+
+/**
+ * The CTE scopes a select's `with` clause sets up — the static twin of `buildWithClause` /
+ * `buildCommonTableExpr` (`building/with.ts`), which must stay in step with it. The select
+ * itself (its FROM, nested sub-selects and compound legs) sees every member layered over
+ * the enclosing definitions; member `i`'s body sees the enclosing definitions plus members
+ * `0..i-1`, and itself when it is recursive ({@link isRecursiveCte}). A member's columns
+ * are its declared column list, else its body's {@link projectionOutputNames}.
+ */
+function withClauseCteScopes(
+	withClause: AST.WithClause | undefined,
+	outer: CteColumnScope,
+): { visible: CteColumnScope; bodies: CteColumnScope[] } {
+	if (!withClause) return { visible: outer, bodies: [] };
+	const visible = new Map(outer);
+	const bodies: CteColumnScope[] = [];
+	for (const cte of withClause.ctes) {
+		const name = cte.name.toLowerCase();
+		const columns = cte.columns && cte.columns.length > 0
+			? new Set(cte.columns.map(c => c.toLowerCase()))
+			: projectionOutputNames(cte.query);
+		bodies.push(isRecursiveCte(withClause.recursive, cte) ? new Map(visible).set(name, columns) : new Map(visible));
+		visible.set(name, columns);
+	}
+	return { visible, bodies };
 }
 
 /**
@@ -684,11 +731,12 @@ export function transformScopedQuery(
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
 	aliasShadowed: ReadonlySet<string> = NO_ALIAS_SHADOW,
+	ctes: CteColumnScope = NO_CTES,
 ): AST.QueryExpr {
 	if (query.type === 'values') {
 		// No FROM — the value rows correlate to the enclosing scope unchanged.
 		const substitute = scope.makeSubstitute(shadowed, tainted, aliasShadowed);
-		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted, aliasShadowed);
+		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted, aliasShadowed, ctes);
 		const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
 		return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	}
@@ -707,7 +755,11 @@ export function transformScopedQuery(
 	// inherits the enclosing clause's path. Only the FROM lookup consumes it; everything
 	// else below is scope bookkeeping over names already resolved.
 	const fromCtx = fromResolutionContext(ctx, sel);
-	const local = collectFromColumnNames(fromCtx, sel.from);
+	// Re-entering a stored body's environment clears the enclosing CTE namespace, as
+	// `storedBodyContext` clears `cteNodes` at plan time.
+	const enteredStoredBody = fromCtx.storedBodyOf !== ctx.storedBodyOf;
+	const cteScopes = withClauseCteScopes(sel.withClause, enteredStoredBody ? NO_CTES : ctes);
+	const local = collectFromColumnNames(fromCtx, sel.from, cteScopes.visible);
 	let innerShadow: ReadonlySet<string>;
 	let scopeTainted: boolean;
 	if (local === null) {
@@ -731,23 +783,20 @@ export function transformScopedQuery(
 	const substitute = scope.makeSubstitute(innerShadow, scopeTainted, innerAliasShadow);
 	// A subquery nested inside this select's clauses / FROM sees this select's FROM,
 	// so it inherits `innerShadow` / `scopeTainted` / `innerAliasShadow`.
-	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, innerShadow, scopeTainted, innerAliasShadow);
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, innerShadow, scopeTainted, innerAliasShadow, cteScopes.visible);
 	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming
 	// `shadowed` / `tainted` / `aliasShadowed`. It does share this select's naming
 	// ENVIRONMENT though (`buildCompoundSelect` builds every leg on the enclosing
 	// select's context, and the parser suppresses a leg's own `with schema` clause).
-	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, shadowed, tainted, aliasShadowed);
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, shadowed, tainted, aliasShadowed, cteScopes.visible);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
-	// A CTE body of this select's `with` clause takes the sibling-leg scope: it can read
-	// the enclosing row but not this select's FROM, and `buildSelectStmt` plans the `with`
-	// clause on this select's environment (`contextWithSchemaPath`, i.e. `fromCtx`).
-	// NOTE: a CTE body whose FROM names a sibling CTE (or itself, recursively) resolves to
-	// nothing in `collectFromColumnNames` and taints its scope, so a bare view-column-named
-	// reference there is rejected as unprovable correlation — as it already is in the select
-	// that reads the CTE. Resolving CTE names from the enclosing `with` clause (declared
-	// column list, else `projectionOutputNames`) would lift that rejection.
-	return rebuildSelect(sel, onExpr, onNested, onLeg, onLeg);
+	// A CTE body of this select's `with` clause takes the sibling-leg scope — it can read
+	// the enclosing row but not this select's FROM — on this select's environment
+	// (`buildSelectStmt` plans the `with` clause on `contextWithSchemaPath`, i.e. `fromCtx`),
+	// seeing only the definitions before it (see {@link withClauseCteScopes}).
+	const onCte = (q: AST.QueryExpr, i: number): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, shadowed, tainted, aliasShadowed, cteScopes.bodies[i]);
+	return rebuildSelect(sel, onExpr, onNested, onLeg, onCte);
 }
 
 // --- alias-shadow-aware substitution (cross-source SET-value strip) --------
