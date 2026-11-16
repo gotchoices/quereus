@@ -206,9 +206,16 @@ export interface TableAlterDiff {
 	 * Lowercased post-rename names of the tables and views this table's added columns refer to, plus
 	 * the views those views reach. The plan runs this table's column and key changes after their
 	 * changes or creates. Carried here because `diff schema` plans with no catalog. Omitted when there
-	 * are none.
+	 * are none. A table that only {@link addedColumnPreferredReads} would name is listed there instead.
 	 */
 	addedColumnReads?: string[];
+	/**
+	 * Lowercased post-rename names of the tables this table's added columns name only in inline
+	 * foreign keys whose listed columns that table already has. The plan prefers to run this table's
+	 * column and key changes after theirs, and gives way when another table's {@link addedColumnReads}
+	 * needs the other order. Omitted when there are none.
+	 */
+	addedColumnPreferredReads?: string[];
 	/**
 	 * Lowercased post-rename names of the tables its dropped columns' DEFAULT and generated
 	 * expressions read.
@@ -654,14 +661,20 @@ export function computeSchemaDiff(
 	// creates (no matched actual) contribute nothing. NOTE: this re-resolves the
 	// current table's renames a second time (once here, once in its own
 	// `computeTableAlterDiff`); see `resolveColumnRenames` for why that's accepted.
+	// The same pass records which declared columns each table already has
+	// (`existingColumnsByTable`), so an added column's inline foreign key naming only
+	// those can merely prefer to follow its parent (see `recordCrossTableReads`). A
+	// table the plan drops and recreates has none.
 	const columnRenamesByTable = new Map<string, ColumnRenameOp[]>();
+	const existingColumnsByTable = new Map<string, ReadonlySet<string>>();
 	for (const [name, declaredTable] of declaredTables) {
 		const matchedActual = tableRenames.pairs.get(name);
 		if (!matchedActual) continue;
-		const renames = resolveColumnRenames(declaredTable, matchedActual, policy).renames;
+		const { renames, pairs } = resolveColumnRenames(declaredTable, matchedActual, policy);
 		if (renames.length > 0) {
 			columnRenamesByTable.set(name, renames.map(r => ({ oldName: r.oldName, newName: r.newName })));
 		}
+		if (pairs.size > 0 && !movesBackingModule(declaredTable, matchedActual)) existingColumnsByTable.set(name, new Set(pairs.keys()));
 	}
 
 	// Declared-side column-existence resolver for the scope-aware seeded column
@@ -715,7 +728,7 @@ export function computeSchemaDiff(
 			// schema name, and the cross-table column-rename map so the constraint body
 			// comparison can reconcile a renamed local column / FK-parent-table /
 			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, resolveDeclaredColumn, defaultCollation);
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, existingColumnsByTable, resolveDeclaredColumn, defaultCollation);
 			if (alterDiff.maintainedModuleMigration) {
 				// Destructive backing-module move: drop the live incarnation (via the
 				// shared drop ordering) and recreate into the newly declared module
@@ -2328,6 +2341,8 @@ function computeTableAlterDiff(
 	 * cross-table FK referenced-parent-column reconcile in {@link reconciledDeclaredBody}.
 	 */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	/** Declared (new) table name (lowercased) → its declared columns (lowercased) that already exist. */
+	existingColumnsByTable: ReadonlyMap<string, ReadonlySet<string>>,
 	/** Declared-side column-existence resolver for the scope-aware CHECK reconcile (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 	/** Session `default_collation` for resolving an omitted COLLATE on the declared side. */
@@ -2413,7 +2428,7 @@ function computeTableAlterDiff(
 	}
 
 	const declaredContextVariables = contextVariableNames(declaredTable.tableStmt.contextDefinitions);
-	recordCrossTableReads(diff, addedColumnDefs, declaredContextVariables, actualTable, tableRenames, schemaName);
+	recordCrossTableReads(diff, addedColumnDefs, declaredContextVariables, actualTable, tableRenames, schemaName, existingColumnsByTable);
 
 	// Apply require-hint to columns within this table
 	if (policy === 'require-hint') {
@@ -2605,11 +2620,11 @@ function computeTableAlterDiff(
  * follows views to views only: an edge to `t` could close a cycle with an edge `t` has to this table,
  * and a cycle drops both. If this shows up, add those as a preferred dependency.
  *
- * NOTE: an edge is per table, not per column. `t.d references u(z)` needing a new `u.z`, beside
- * `u.z references t(id)` naming an existing `t.id`, reads as a cycle and keeps declaration order,
- * though `u` first would work. Skipping the edge whenever the parent already has the named column
- * is not enough: `add column z text default 'ABC' references t(d)` validates under `t.d`'s collation
- * as it stands, so it still has to follow `t`'s SET COLLATE.
+ * An inline foreign key naming only columns its parent already has makes a preferred edge
+ * ({@link recordForeignKeyParent}): `u.z references t(id)` beside `t.d references u(z)` needing the
+ * new `u.z` runs `u` first in either written order. Without that cycle the edge still holds, because
+ * `add column z text default 'ABC' references t(d)` validates under `t.d`'s collation as it stands,
+ * so it has to follow `t`'s SET COLLATE when it can.
  */
 function recordCrossTableReads(
 	diff: TableAlterDiff,
@@ -2618,10 +2633,13 @@ function recordCrossTableReads(
 	actualTable: CatalogTable,
 	tableRenames: ReadonlyArray<RenameOp>,
 	schemaName: string,
+	existingColumnsByTable: ReadonlyMap<string, ReadonlySet<string>>,
 ): void {
-	const added = new Set<string>();
-	for (const col of addedColumns) collectColumnDefReads(col, declaredContextVariables, schemaName, added);
-	if (added.size > 0) diff.addedColumnReads = [...added];
+	const added: AddedColumnReads = { required: new Set(), preferred: new Set() };
+	for (const col of addedColumns) collectColumnDefReads(col, declaredContextVariables, schemaName, existingColumnsByTable, added);
+	if (added.required.size > 0) diff.addedColumnReads = [...added.required];
+	const preferredOnly = [...added.preferred].filter(name => !added.required.has(name));
+	if (preferredOnly.length > 0) diff.addedColumnPreferredReads = preferredOnly;
 
 	const droppedColumns = new Set(diff.columnsToDrop.map(c => c.toLowerCase()));
 	const dropped = new Set<string>();
@@ -2806,17 +2824,57 @@ function objectsRulesReach(rules: readonly RuleExpression[], bodies: ViewBodies,
 	return reached;
 }
 
+/** What an added column's `ADD COLUMN` has to follow, and what it only prefers to follow. */
+interface AddedColumnReads {
+	required: Set<string>;
+	preferred: Set<string>;
+}
+
 /**
  * Adds the tables and views in `schemaName` that a column definition's foreign keys and expressions
  * name. `contextVariables` is the owning table's declared variables, in scope in its CHECKs and DEFAULT.
  */
-function collectColumnDefReads(col: AST.ColumnDef, contextVariables: ReadonlySet<string>, schemaName: string, into: Set<string>): void {
+function collectColumnDefReads(
+	col: AST.ColumnDef,
+	contextVariables: ReadonlySet<string>,
+	schemaName: string,
+	existingColumnsByTable: ReadonlyMap<string, ReadonlySet<string>>,
+	into: AddedColumnReads,
+): void {
 	for (const constraint of col.constraints) {
-		const fk = constraint.foreignKey;
-		if (fk && (!fk.schema || fk.schema.toLowerCase() === schemaName.toLowerCase())) into.add(fk.table.toLowerCase());
-		if (constraint.expr) collectExpressionReads(constraint.expr, contextVariables, schemaName, into);
-		if (constraint.generated) collectExpressionReads(constraint.generated.expr, NO_CONTEXT_VARIABLES, schemaName, into);
+		if (constraint.foreignKey) recordForeignKeyParent(constraint.foreignKey, schemaName, existingColumnsByTable, into);
+		if (constraint.expr) collectExpressionReads(constraint.expr, contextVariables, schemaName, into.required);
+		if (constraint.generated) collectExpressionReads(constraint.generated.expr, NO_CONTEXT_VARIABLES, schemaName, into.required);
 	}
+}
+
+/**
+ * Adds the parent an inline foreign key in `schemaName` names. A key listing only columns the parent
+ * already has does not need the parent's steps to exist, so it only prefers to follow them. A key with
+ * no column list checks the parent's primary key as it stands, which the parent's `ALTER PRIMARY KEY`
+ * may change, so it has to follow.
+ *
+ * NOTE: a preferred edge gives way to a cycle, and then the key validates the child's existing rows
+ * against the parent's columns before the parent's `SET COLLATE` or `SET DATA TYPE` runs. No order
+ * serves both there, short of splitting the parent's steps.
+ */
+function recordForeignKeyParent(
+	fk: AST.ForeignKeyClause,
+	schemaName: string,
+	existingColumnsByTable: ReadonlyMap<string, ReadonlySet<string>>,
+	into: AddedColumnReads,
+): void {
+	if (fk.schema && fk.schema.toLowerCase() !== schemaName.toLowerCase()) return;
+	const parent = fk.table.toLowerCase();
+	const existing = existingColumnsByTable.get(parent);
+	const namesOnlyExisting = !!fk.columns?.length && fk.columns.every(c => existing?.has(c.toLowerCase()));
+	(namesOnlyExisting ? into.preferred : into.required).add(parent);
+}
+
+/** Whether the plan drops `actual` and recreates it in the backing module `declaredTable` names. */
+function movesBackingModule(declaredTable: AST.DeclaredTable, actual: CatalogTable): boolean {
+	const stmt = declaredTable.tableStmt;
+	return backingModuleDrifted(stmt.maintained, actual.maintained, stmt.moduleName, stmt.moduleArgs) !== undefined;
 }
 
 /**
@@ -3628,7 +3686,9 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      A table follows the tables its new columns refer to: an inline foreign key or DEFAULT
  *      arrives inside `ADD COLUMN` and cannot wait for stage 3. These stay per table rather than
  *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
- *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`.
+ *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`. An inline foreign key listing
+ *      only columns its parent already has only prefers to follow the parent, and gives way when
+ *      the parent's own new columns need this table first ({@link TableAlterDiff.addedColumnPreferredReads}).
  *      New views and new maintained tables are sorted in here, because their creates plan the body
  *      as they run. Such a create follows every table's steps, unless a table's new column reads
  *      it, directly or through other declared views: then it goes ahead of that table. It is ordered
@@ -3657,7 +3717,7 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 	return {
 		key: alterKey(alter),
 		runsAfter: alter.addedColumnReads ?? [],
-		prefersToRunAfter: [],
+		prefersToRunAfter: alter.addedColumnPreferredReads ?? [],
 		alsoPrefersToRunAfter: [],
 		push: () => {
 			pushColumnAdds(alter, sink);

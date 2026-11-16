@@ -76,12 +76,12 @@ describe('apply schema: table alters run in stages across tables', () => {
 			}`);
 		});
 
-		// The two inline foreign keys read as a cycle, so declaration order holds and `u` adds its column
-		// first: only the rename running ahead of every `ADD COLUMN` gets `z` a `t.b2` to name.
+		// `t.x` needs the new `u.w`, so `u` adds its column first: only the rename running ahead of every
+		// `ADD COLUMN` gets `z` a `t.b2` to name.
 		it('applies an inline foreign key naming a renamed column when the tables also refer to each other', async () => {
 			await applies(`declare schema main {
-				table u { id integer primary key, y integer null, z integer null references t(b2) }
-				table t { id integer primary key, b2 integer null with tags ("quereus.previous_name" = 'b'), x integer null references u(id) }
+				table u { id integer primary key, y integer null, w integer null unique, z integer null references t(b2) }
+				table t { id integer primary key, b2 integer null with tags ("quereus.previous_name" = 'b'), x integer null references u(w) }
 			}`);
 		});
 
