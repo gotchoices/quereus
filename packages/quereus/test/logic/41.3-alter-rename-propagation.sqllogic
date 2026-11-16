@@ -673,6 +673,42 @@ select count(*) as cnt from t_chksub;
 drop table t_chksub;
 drop table t_chksub_u;
 
+-- 15b. The same like-named column, reached through a SUBQUERY SOURCE: the
+-- outer bare `v` binds `s.v` (i.e. `t_chksub_u.v`), so the seed must not
+-- capture it. Were it captured, the CHECK would test the new row's own `vv`
+-- and the second -1 insert would fail; it must keep testing `t_chksub_u`.
+
+create table t_chksub_u (id integer primary key, v integer);
+insert into t_chksub_u values (1, 5);
+
+create table t_chksub (id integer primary key, v integer,
+                       check ((select min(v) from (select v from t_chksub_u) s) > 0));
+insert into t_chksub values (1, -1);
+
+alter table t_chksub rename column v to vv;
+
+insert into t_chksub values (2, -1);
+
+select count(*) as cnt from t_chksub;
+→ [{"cnt":2}]
+
+drop table t_chksub;
+drop table t_chksub_u;
+
+-- 15c. A FUNCTION source's qualifier is bound too: `f.value` names the
+-- function source's column even when a real table named `f` is the one renamed.
+
+create table f (id integer primary key, value integer);
+create view v_fsrc as select f.value as n from json_each('[7]') f;
+
+alter table f rename column value to val;
+
+select n from v_fsrc;
+→ [{"n":7}]
+
+drop view v_fsrc;
+drop table f;
+
 -- ===================================
 -- 16. CHECK subquery with correlated outer ref — owner column legitimately captured
 -- ===================================

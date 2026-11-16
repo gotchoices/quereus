@@ -18,18 +18,12 @@
  * `table-rename-scope.spec.ts` and `row-image-context-matrix.spec.ts` drive
  * their matrices over the walker directly; this one cannot.
  *
- * The `pending` cells are all one residual — a subquery source's output columns
- * would need recursive inference on its inner body, so nothing binds through
- * one — tracked by `bug-column-verbs-blind-to-star-over-subquery-source`. It
- * lands per VERB, not per spelling: a body whose inner subquery spells the
- * column is seen by the DROP guard (the inner select is walked in its own
- * frame) but not followed by RENAME (the OUTER bare ref binds through the
- * subquery source, which contributes no qualifier), so that row is pending on
- * the rename arm only. There is no matching **function source** cell: a
- * function source never carries `t`'s columns at all, so it can neither bind a
- * bare `x` nor republish one — it sits beside the subquery source in the walk
- * only because both are equally unaskable, not because it has a reachable case
- * of its own.
+ * A subquery source is a spelling like any other: its output columns are
+ * inferred from its inner body, so an outer bare ref or a `*` over it binds the
+ * column exactly as it would over `t` itself. There is no matching **function
+ * source** cell: a function source never carries `t`'s columns at all, so it
+ * can neither bind a bare `x` nor republish one — the walk leaves it unaskable,
+ * and there is no reachable case to pin.
  *
  * Scope of the matrix: view bodies and assertion bodies. The same walk also
  * serves the expressions a *table* carries, but none of those can be authored
@@ -62,13 +56,7 @@ interface Spelling {
 	 * shape, with no view in between — the direct half of the drop arm.
 	 */
 	read: string;
-	/** Set when RENAME cannot follow this spelling yet (see the header). */
-	pendingRename?: boolean;
-	/** Set when the DROP guard cannot see this spelling yet (see the header). */
-	pendingDrop?: boolean;
 }
-
-const RESIDUAL = 'pending — bug-column-verbs-blind-to-star-over-subquery-source';
 
 const U_TABLE = ['create table u (id integer primary key, n integer)', 'insert into u values (1, 7)'];
 
@@ -145,22 +133,16 @@ const SPELLINGS: readonly Spelling[] = [
 		read: 'not exists (select 1 from t u where x < 0)',
 	},
 	{
-		// The inner select spells `x` in its own frame, so the DROP guard sees it.
-		// RENAME still cannot follow: it rewrites the inner `x` → `z` but leaves
-		// the OUTER bare `x` alone (bound through the subquery source, which
-		// contributes no qualifier), and the view is left naming a column its own
-		// source no longer publishes.
+		// The OUTER bare `x` binds through the subquery source, so RENAME must
+		// follow it as well as the inner one.
 		title: 'aliased subquery source whose inner body names the column',
 		body: 'select id, x from (select id, x from t) s',
 		read: 'not exists (select 1 from (select id, x from t) s where x < 0)',
-		pendingRename: true,
 	},
 	{
 		title: 'bare star over an aliased SUBQUERY source (nothing spells the column)',
 		body: 'select * from (select * from t) s',
 		read: 'not exists (select 1 from (select * from t) s where x < 0)',
-		pendingRename: true,
-		pendingDrop: true,
 	},
 ];
 
@@ -179,10 +161,6 @@ describe('column verbs: body spellings that reach one table\'s column', () => {
 
 	describe('RENAME COLUMN leaves every dependent body planable', () => {
 		for (const c of SPELLINGS) {
-			if (c.pendingRename) {
-				it(`${c.title} (${RESIDUAL})`);
-				continue;
-			}
 			it(c.title, async () => {
 				await applySetup(c);
 				await db.exec(`create view v as ${c.body}`);
@@ -226,11 +204,6 @@ describe('column verbs: body spellings that reach one table\'s column', () => {
 
 	describe('DROP COLUMN refuses whenever a live rule reads the column', () => {
 		for (const c of SPELLINGS) {
-			if (c.pendingDrop) {
-				it(`${c.title} (${RESIDUAL})`);
-				continue;
-			}
-
 			it(`${c.title} — read directly by an assertion`, async () => {
 				await applySetup(c);
 				await db.exec(`create assertion a1 check (${c.read})`);
@@ -249,9 +222,6 @@ describe('column verbs: body spellings that reach one table\'s column', () => {
 	});
 
 	describe('DROP COLUMN accepts when no rule reads the column', () => {
-		// Runs for every spelling INCLUDING the pending ones — they are accepted
-		// here for the right reason as well as the wrong one, and this arm is
-		// about the absence of a false refusal.
 		for (const c of SPELLINGS) {
 			it(c.title, async () => {
 				await applySetup(c);

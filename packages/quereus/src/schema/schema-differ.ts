@@ -695,7 +695,7 @@ export function computeSchemaDiff(
 	// the inverse walk's match target (`oldCol`) is the rename's NEW column
 	// name, and the question being answered is "in the declared world, does
 	// this inner FROM source expose that name (so the unqualified ref binds
-	// there, not to the owning seed)?". The walk's `realSources` carry OLD
+	// there, not to the owning seed)?". The walk's real-table sources carry OLD
 	// table names once the inverse table-rename pass has pre-normalized
 	// qualifiers, hence the old→new table-name mapping before the declared
 	// lookup: a table no rename touched misses the find and passes through.

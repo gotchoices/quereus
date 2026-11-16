@@ -164,6 +164,22 @@ drop table DcSub;
 drop table DcSrc;
 -- run
 
+-- The same, with the inner `v` reached through a SUBQUERY SOURCE: the outer bare
+-- `v` binds `s.v` (i.e. `DcSrc.v`), so it is no reference to the dropped column.
+create table DcSrc (uid integer primary key, v integer);
+insert into DcSrc values (1, 5);
+create table DcSubS (id integer primary key, v integer, w integer, check ((select min(v) from (select v from DcSrc) s) >= 0));
+insert into DcSubS values (1, 2, 3);
+-- run
+
+alter table DcSubS drop column v;
+select w from DcSubS;
+→ [{"w":3}]
+
+drop table DcSubS;
+drop table DcSrc;
+-- run
+
 -- ===================================================================
 -- 5. Escape hatch for a NAMED CHECK: drop the constraint, then the column.
 -- ===================================================================

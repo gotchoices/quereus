@@ -25,13 +25,18 @@ import {
 interface ScopeFrame {
 	/**
 	 * Lowercase qualifier → resolved object key, one entry per FROM source: the
-	 * source's alias when it carries one, its bare table / exposing-CTE name
-	 * otherwise. Every entry BINDS unqualified column names in this frame (an
-	 * alias adds a qualifier; it does not remove the source's columns from
-	 * scope — a bare `x` under `from t a` binds `t.x` exactly as it would under
-	 * `from t`) and every entry is usable AS a qualifier. Correspondingly, an
-	 * aliased source does NOT register its bare name: `select t.x from t a`
-	 * doesn't plan, so nothing here may claim it does.
+	 * source's alias when it carries one, its bare table / exposing-CTE /
+	 * function name otherwise. Every entry BINDS unqualified column names in
+	 * this frame (an alias adds a qualifier; it does not remove the source's
+	 * columns from scope — a bare `x` under `from t a` binds `t.x` exactly as it
+	 * would under `from t`) and every entry is usable AS a qualifier.
+	 * Correspondingly, an aliased source does NOT register its bare name:
+	 * `select t.x from t a` doesn't plan, so nothing here may claim it does.
+	 *
+	 * A subquery source binds its alias to the rename target when its body
+	 * re-exposes the renamed column, exactly as an exposing CTE does; any other
+	 * subquery or function source binds to a {@link derivedSourceKey}, which no
+	 * real object key can equal.
 	 */
 	qualifiers: Map<string, string>;
 	/** Lowercase CTE names declared in this WITH that re-expose the renamed column. */
@@ -46,17 +51,18 @@ interface ScopeFrame {
 	 */
 	ctesShadowingSource: Set<string>;
 	/**
-	 * Real-table sources in this frame's FROM, under their RESOLVED identity
-	 * (the object key plus its lowercase schema/name parts). Used by the
+	 * The FROM sources whose column set can be asked about: real tables (through
+	 * the catalog) and subquery sources (from the inner body). Used by the
 	 * unqualified-scope walk to ask whether an inner FROM source exposes the
-	 * renamed column — if it does, the unqualified ref binds there and an
-	 * outer seed binding to the renamed table must not capture it. Aliased and
-	 * unaliased real sources alike are recorded, in step with `qualifiers`
-	 * binding both. Subquery / function-source / CTE-shadowed sources are NOT
-	 * recorded (the rewriter can't ask the callback about those without
-	 * recursive analysis).
+	 * renamed column — if it does, the unqualified ref binds there and an outer
+	 * binding to the renamed table must not capture it — and by the published-name
+	 * probe to expand a `*`. Aliased and unaliased sources alike are recorded, in
+	 * step with `qualifiers` binding both. Function sources and CTE sources are
+	 * NOT recorded yet, so a bare ref binding only through one can still be
+	 * captured by an outer binding to the target
+	 * (`bug-column-verbs-capture-bare-ref-through-unaskable-source`).
 	 */
-	realSources: Array<{ key: string; schemaLower: string; nameLower: string }>;
+	sources: FrameSource[];
 	/**
 	 * Set only on the implicit binding to the owning table that
 	 * {@link renameColumnInCheckExpression} pushes — not a FROM binding. A bare name
@@ -64,6 +70,14 @@ interface ScopeFrame {
 	 * it never rebinds a qualifier (see {@link isQualifierReboundAboveSeed}).
 	 */
 	isSeed?: true;
+}
+
+/** One askable FROM source of a {@link ScopeFrame}. */
+interface FrameSource {
+	/** The key this source's qualifier is bound to: a real object key, the rename target, or a {@link derivedSourceKey}. */
+	key: string;
+	/** Whether this source publishes a column named `colLower` (lowercase). */
+	publishes(colLower: string): boolean;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -136,13 +150,14 @@ export function renameColumnInAst(
  * binds to a like-named column on the subquery's FROM (e.g.
  * `check ((select min(v) from u) > 0)` when `u` also has a `v` column).
  *
- * Limitation: subquery / function-source inner sources are not asked (the
- * rewriter would need recursive column-set inference on their bodies), so an
- * unqualified ref binding only through one of those falls through to the seed.
- * An ALIASED real source is asked like any other — an alias adds a qualifier,
- * it does not take the source's columns out of scope. `renameColumnInAst`
- * shares the same callback (passed by the view-body callers) and the same
- * residual.
+ * A subquery source is asked too, from its inner body's result columns
+ * (`check ((select min(v) from (select v from u) s) > 0)` binds `s.v`, so the
+ * seed never sees it). An ALIASED real source is asked like any other — an
+ * alias adds a qualifier, it does not take the source's columns out of scope.
+ * `renameColumnInAst` shares the same callback (passed by the view-body
+ * callers) and the same frame model. A function source or a non-exposing CTE
+ * source is the remaining residual: neither is asked yet, so a bare ref binding
+ * only through one falls through to the seed.
  *
  * The seed and the `new.` / `old.` **row-image** namespace are INDEPENDENT: the
  * seed answers how *unqualified* refs bind, while the explicit `rowImage`
@@ -502,7 +517,8 @@ const PROBE_TARGET_KEY = '\u0000.\u0000';
  * Whether `body`'s top-level result columns publish a column named
  * `columnName`, from ANY origin: an explicit alias, an unaliased bare
  * projection of a column so named (wherever it binds), or a `*` / `t.*` whose
- * bound real-table source exposes it (asked through `resolveColumnInSource`).
+ * bound source exposes it — a real table asked through `resolveColumnInSource`,
+ * a subquery source answered from its own body, recursively.
  *
  * The collision half of the rename-cascade pre-flight
  * (`runtime/emit/column-rename-cascade.ts`): run against the PRISTINE
@@ -510,10 +526,10 @@ const PROBE_TARGET_KEY = '\u0000.\u0000';
  * publish `newCol` before the rename, so anything found is necessarily a
  * DIFFERENT column the shifted name would collide with.
  *
- * Shares the walker's scope residual: a `*` over a subquery or function source
- * has no askable column set, so a publication arriving only that way is not
- * seen. A `*` over an aliased REAL source is seen — the alias binds like any
- * other qualifier.
+ * Shares the walker's remaining scope residual: a `*` over a function source
+ * or a non-exposing CTE source has no askable column set, so a publication
+ * arriving only that way is not seen. A `*` over an aliased REAL source is seen — the alias binds like
+ * any other qualifier.
  */
 export function bodyPublishesColumnNamed(
 	body: AST.QueryExpr | undefined,
@@ -521,9 +537,7 @@ export function bodyPublishesColumnNamed(
 	resolve: ResolveObjectRef,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
-	if (!body || body.type !== 'select') return false;
-	const select = body as AST.SelectStmt;
-	const nameLower = columnName.toLowerCase();
+	if (!body) return false;
 	const state: ColumnRewriteState = {
 		tableName: '\u0000',
 		oldCol: '\u0000',
@@ -535,35 +549,40 @@ export function bodyPublishesColumnNamed(
 		resolveColumnInSource,
 		rowImage: 'none',
 	};
+	return queryPublishesColumn(body, columnName.toLowerCase(), state);
+}
+
+/**
+ * The query-level core of {@link bodyPublishesColumnNamed}, run against
+ * `state`'s scope stack so the body still sees the CTEs enclosing it — which is
+ * what a subquery source's {@link FrameSource.publishes} needs. A non-select body
+ * (a `values` list, a DML `returning`) has no askable column set and answers
+ * false.
+ *
+ * NOTE: rebuilds the body's frames on every question, recursively through
+ * nested subquery sources; stored bodies nest shallowly. If this ever shows in
+ * profiles, memoize per `SubquerySource` node within one walk.
+ */
+function queryPublishesColumn(query: AST.QueryExpr, colLower: string, state: ColumnRewriteState): boolean {
+	if (query.type !== 'select') return false;
+	const select = query as AST.SelectStmt;
 	const withFrame = analyzeWithFrame(select.withClause, state);
 	state.scopeStack.push(withFrame);
 	try {
 		const frame = buildScopeFrame(select.from, state);
-		for (const col of select.columns ?? []) {
-			if (resultColumnPublishesName(col, frame, nameLower, resolveColumnInSource)) return true;
-		}
-		return false;
+		return (select.columns ?? []).some(col => resultColumnPublishesName(col, frame, colLower));
 	} finally {
 		state.scopeStack.pop();
 	}
 }
 
-/** One result column's published-name test for {@link bodyPublishesColumnNamed}. */
-function resultColumnPublishesName(
-	col: AST.ResultColumn,
-	frame: ScopeFrame,
-	nameLower: string,
-	resolveColumnInSource?: ResolveColumnInSource,
-): boolean {
+/** One result column's published-name test for {@link queryPublishesColumn}. */
+function resultColumnPublishesName(col: AST.ResultColumn, frame: ScopeFrame, nameLower: string): boolean {
 	if (col.type === 'all') {
-		if (!resolveColumnInSource) return false;
-		if (col.table === undefined) {
-			return frame.realSources.some(src => resolveColumnInSource(src.schemaLower, src.nameLower, nameLower));
-		}
+		if (col.table === undefined) return frame.sources.some(src => src.publishes(nameLower));
 		const key = frame.qualifiers.get(col.table.toLowerCase());
 		if (key === undefined) return false;
-		return frame.realSources.some(src => src.key === key
-			&& resolveColumnInSource(src.schemaLower, src.nameLower, nameLower));
+		return frame.sources.some(src => src.key === key && src.publishes(nameLower));
 	}
 	if (col.alias !== undefined) return col.alias.toLowerCase() === nameLower;
 	return col.expr.type === 'column' && (col.expr as AST.ColumnExpr).name.toLowerCase() === nameLower;
@@ -615,8 +634,21 @@ function emptyFrame(): ScopeFrame {
 		ctesExposingRenamed: new Set(),
 		ctesInScope: new Set(),
 		ctesShadowingSource: new Set(),
-		realSources: [],
+		sources: [],
 	};
+}
+
+/**
+ * The key a subquery or function source's qualifier binds to when it does not
+ * re-expose the rename target. Binding it at all (rather than leaving the
+ * qualifier unregistered) is what makes `s.x` resolve to "not the target"
+ * instead of falling through to a real table that happens to be named `s`, and
+ * what lets `isQualifierReboundAboveSeed` see `s` as rebound. Real object keys
+ * are `<schema>.<name>` built from identifiers, which never contain a NUL, so
+ * this can never equal one — the same trick as {@link PROBE_TARGET_KEY}.
+ */
+function derivedSourceKey(qualifierLower: string): string {
+	return `\u0000derived\u0000${qualifierLower}`;
 }
 
 function buildScopeFrame(from: AST.FromClause[] | undefined, state: ColumnRewriteState): ScopeFrame {
@@ -696,12 +728,17 @@ function collectFromBindings(
 			// an aliased source stops answering to its bare name (`select t.x
 			// from t a` does not plan, so `t` must not register).
 			bindQualifier(frame, ts.alias ? ts.alias.toLowerCase() : name, key);
-			// Record as a real-table source (under its RESOLVED schema) so the
+			// Record as an askable source (under its RESOLVED schema) so the
 			// unqualified-scope walk can ask whether this source exposes the
 			// renamed column. Both aliased and unaliased real sources are
 			// recorded — asking "does u expose col v" is the same question
-			// regardless of any alias.
-			frame.realSources.push({ key, schemaLower: objectRefKeySchema(key, name), nameLower: name });
+			// regardless of any alias. No callback means "not askable".
+			const schemaLower = objectRefKeySchema(key, name);
+			const inSource = state.resolveColumnInSource;
+			frame.sources.push({
+				key,
+				publishes: colLower => !!inSource?.(schemaLower, name, colLower),
+			});
 			break;
 		}
 		case 'join': {
@@ -711,13 +748,51 @@ function collectFromBindings(
 			break;
 		}
 		case 'subquerySource':
-		case 'functionSource':
-			// No askable column set without recursive inference on the inner
-			// body, so these register no qualifier and no real source — the
-			// residual tracked by
-			// `bug-column-verbs-blind-to-star-over-subquery-source`.
+			collectSubquerySource(item as AST.SubquerySource, state, frame);
 			break;
+		case 'functionSource': {
+			// Bound (a qualified `f.x` is not a reference to the target) but not
+			// askable: a bare ref binding only through a function source's
+			// like-named column can still be captured by an outer binding to the
+			// rename target (`bug-column-verbs-capture-bare-ref-through-unaskable-source`).
+			const fs = item as AST.FunctionSource;
+			const qualifier = (fs.alias ?? fs.name.name).toLowerCase();
+			bindQualifier(frame, qualifier, derivedSourceKey(qualifier));
+			break;
+		}
 	}
+}
+
+/**
+ * Bind an inline subquery source (`from (select …) s`) in `frame`, treating it
+ * the way a CTE source is treated plus giving it an askable column set. Expects
+ * its body ALREADY rewritten (the select arm of {@link visitColumnRename}
+ * visits FROM-source bodies before building the frame), because exposure is
+ * judged against the new name.
+ *
+ * - No column list and the body re-exposes the renamed column → the alias binds
+ *   the rename target, exactly like an exposing CTE: an outer bare / `s.`-qualified
+ *   ref follows the rename, and a `*` / `s.*` over it is a republication.
+ * - Otherwise (an explicit column list pins the published names, as
+ *   `cte.columns` does) → the alias binds a {@link derivedSourceKey}.
+ *
+ * Either way the source is askable: its `publishes` answers from the column list,
+ * or lazily from the body against the scope the body was bound in, so a body
+ * nobody asks about costs nothing.
+ */
+function collectSubquerySource(sq: AST.SubquerySource, state: ColumnRewriteState, frame: ScopeFrame): void {
+	const qualifier = sq.alias.toLowerCase();
+	const exposing = !sq.columns && queryExposesRenamedColumn(sq.subquery, state);
+	const key = exposing ? state.targetKey : derivedSourceKey(qualifier);
+	bindQualifier(frame, qualifier, key);
+	const columns = sq.columns?.map(c => c.toLowerCase());
+	const boundScope = [...state.scopeStack];
+	frame.sources.push({
+		key,
+		publishes: colLower => columns
+			? columns.includes(colLower)
+			: queryPublishesColumn(sq.subquery, colLower, { ...state, scopeStack: [...boundScope] }),
+	});
 }
 
 /**
@@ -746,13 +821,14 @@ function isCteInScope(state: ColumnRewriteState, name: string): boolean {
 /**
  * Whether a BARE (unqualified) column ref at the current position binds the
  * renamed table. Innermost-first: a closer same-name CTE shadows an outer
- * binding to the renamed real table. When a `resolveColumnInSource` callback is
- * configured, also stop at any inner FROM frame whose real sources expose
- * `oldCol` — the unqualified ref binds inside that frame and an outer seed
- * binding must not capture it.
+ * binding to the renamed real table. Also stop at any inner FROM frame with a
+ * source other than the target that publishes `oldCol` (a real table, when a
+ * `resolveColumnInSource` callback is configured; a subquery source, from its
+ * already-rewritten body) — the unqualified ref binds inside that frame and an
+ * outer binding must not capture it.
  *
  * Aliased and unaliased sources bind alike here, and the shadow scan over
- * `realSources` widens in step (it records both), so `from u b` still stops an
+ * `sources` widens in step (it records both), so `from u b` still stops an
  * outer capture of a bare `x` that `u` exposes.
  *
  * Answers WHERE it binds — `'seed'` for the implicit binding to the owning
@@ -767,14 +843,9 @@ function unqualifiedRefBinding(state: ColumnRewriteState): 'seed' | 'from' | und
 	for (let i = state.scopeStack.length - 1; i >= 0; i--) {
 		const frame = state.scopeStack[i];
 		if (frame.ctesInScope.has(state.tableName)) return undefined;
-		if (state.resolveColumnInSource && frame.realSources.length > 0) {
-			for (const src of frame.realSources) {
-				// The renamed table itself trivially exposes oldCol; defer to
-				// the binding check below so we don't double-capture.
-				if (src.key === state.targetKey) continue;
-				if (state.resolveColumnInSource(src.schemaLower, src.nameLower, state.oldCol)) return undefined;
-			}
-		}
+		// The renamed table itself (and a subquery source re-exposing it) trivially
+		// publishes oldCol; the binding check below decides those.
+		if (frame.sources.some(src => src.key !== state.targetKey && src.publishes(state.oldCol))) return undefined;
 		if (frame.isSeed && contextVariablesAt(state).has(state.oldCol)) return undefined;
 		if (frameBindsTarget(frame, state.targetKey)) return frame.isSeed ? 'seed' : 'from';
 	}
@@ -795,10 +866,11 @@ function frameBindsTarget(frame: ScopeFrame, targetKey: string): boolean {
  * source, or an exposing CTE), `null` when it binds something that is not the
  * renamed real table and can never be (a non-exposing shadowing CTE, or a CTE
  * merely in scope), or `undefined` when nothing in scope binds it. The
- * innermost binding decides — standard SQL shadowing. Subquery / function
- * sources are not recorded (pre-existing limitation, shared with the
- * unqualified capture walk), so a qualifier bound only by one of those falls
- * through to the caller's seedless fallback.
+ * innermost binding decides — standard SQL shadowing. A subquery or function
+ * source binds its qualifier too — to the target when it re-exposes the renamed
+ * column, to a {@link derivedSourceKey} otherwise — so `s.x` resolves here
+ * rather than falling through to the caller's seedless fallback, which would
+ * hit a real table that happens to be named `s`.
  *
  * A qualifier claimed TWICE inside one FROM (`from t join u as t`) is legal and
  * resolves to the FIRST such source; {@link bindQualifier} is what makes that
@@ -943,6 +1015,53 @@ function visitRowImageForeignSubtree(expr: AST.Expression, state: ColumnRewriteS
 	}
 }
 
+/**
+ * Visit what each FROM source evaluates in its OWN scope — a subquery source's
+ * body, a function source's arguments — BEFORE the enclosing select's FROM
+ * frame is pushed. The planner builds each source on the enclosing context
+ * (`buildFrom`), so a source cannot see its siblings: with the frame on the
+ * stack, an inner bare ref binding nothing inside could be captured by a
+ * sibling source. The exception is the right side of a `join lateral`, which
+ * sees its left side's columns, so the walk pushes a frame of exactly those
+ * while visiting it.
+ *
+ * NOTE: a lateral subquery's projection of a column it reads from its LEFT side
+ * is not judged as re-exposing it — exposure (`isResultColumnExposure`) asks
+ * only the body's own frame. If lateral bodies ever need that, the exposure
+ * check needs the left frame too.
+ */
+function visitFromSourceContents(item: AST.FromClause, state: ColumnRewriteState): void {
+	switch (item.type) {
+		case 'subquerySource':
+			visitColumnRename(item.subquery, state);
+			break;
+		case 'functionSource':
+			item.args.forEach(a => visitColumnRename(a, state));
+			break;
+		case 'join':
+			visitFromSourceContents(item.left, state);
+			if (!item.isLateral) {
+				visitFromSourceContents(item.right, state);
+				break;
+			}
+			state.scopeStack.push(buildScopeFrame([item.left], state));
+			try {
+				visitFromSourceContents(item.right, state);
+			} finally {
+				state.scopeStack.pop();
+			}
+			break;
+	}
+}
+
+/** Visit a FROM tree's join conditions, which evaluate in the select's FROM frame (pushed by the caller). */
+function visitJoinConditions(item: AST.FromClause, state: ColumnRewriteState): void {
+	if (item.type !== 'join') return;
+	visitJoinConditions(item.left, state);
+	visitJoinConditions(item.right, state);
+	visitColumnRename(item.condition, state);
+}
+
 function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteState): void {
 	if (!node) return;
 
@@ -951,6 +1070,9 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 			const stmt = node as AST.SelectStmt;
 			pushWithFrame(stmt.withClause, state);
 			try {
+				// FROM-source contents first: a subquery source's frame binding asks
+				// whether its ALREADY-rewritten body re-exposes the column.
+				(stmt.from ?? []).forEach(f => visitFromSourceContents(f, state));
 				const frame = buildScopeFrame(stmt.from, state);
 				state.scopeStack.push(frame);
 				try {
@@ -1045,7 +1167,7 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 							});
 						});
 					}
-					(stmt.from ?? []).forEach(f => visitColumnRename(f, state));
+					(stmt.from ?? []).forEach(f => visitJoinConditions(f, state));
 					visitColumnRename(stmt.where, state);
 					(stmt.groupBy ?? []).forEach(g => visitColumnRename(g, state));
 					visitColumnRename(stmt.having, state);
@@ -1184,21 +1306,6 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 		case 'values': {
 			const stmt = node as AST.ValuesStmt;
 			stmt.values.forEach(row => row.forEach(v => visitColumnRename(v, state)));
-			break;
-		}
-		case 'join': {
-			const join = node as AST.JoinClause;
-			visitColumnRename(join.left, state);
-			visitColumnRename(join.right, state);
-			visitColumnRename(join.condition, state);
-			break;
-		}
-		case 'functionSource': {
-			(node as AST.FunctionSource).args.forEach(a => visitColumnRename(a, state));
-			break;
-		}
-		case 'subquerySource': {
-			visitColumnRename((node as AST.SubquerySource).subquery, state);
 			break;
 		}
 		case 'binary': {
