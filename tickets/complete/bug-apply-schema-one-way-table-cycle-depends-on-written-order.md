@@ -1,0 +1,31 @@
+description: When two existing tables each gain a foreign key to the other, and only one of those keys needs a brand-new column, the schema now applies in either written order instead of failing when the tables are written in the wrong one.
+architecture: docs/schema-declarative.md#migration-order
+files:
+  - packages/quereus/src/schema/schema-differ.ts   # TableAlterDiff.addedColumnPreferredReads, computeSchemaDiff pre-pass (existingColumnsByTable), recordCrossTableReads, collectColumnDefReads, recordForeignKeyParent, movesBackingModule, alterStageTwoItem, pushTableAlters doc
+  - packages/quereus/src/schema/dependency-order.ts   # unchanged; its preferred tiers do the work
+  - packages/quereus/test/apply-schema-alter-order.spec.ts
+  - docs/schema-declarative.md   # Migration Order stage 2 text; removed the "A cycle that exists only between tables" known limit
+repro: verified
+----
+
+# Order a foreign key on an existing parent column as a preference, not a requirement
+
+## What landed
+
+`apply schema` sorts stage 2 of the table alters (per table: `ADD COLUMN`, `ALTER COLUMN`, constraint renames/drops, `ALTER PRIMARY KEY`) so a table follows the tables its added columns name. Every such name used to be a hard ordering edge, so `t.d references u(z)` (needs the new `u.z`) beside `u.z references t(id)` (names the existing `t.id`) read as a cycle, the sorter dropped both edges, and written order decided: `t` first failed with `Referenced column 'z' not found in table 'u'`.
+
+An added column's inline foreign key that lists its referenced columns, all of which the parent already has (by name or by a column rename hint, since `RENAME COLUMN` runs in stage 1), now makes a *preferred* edge (`TableAlterDiff.addedColumnPreferredReads`) instead of a required one. `orderDependenciesFirst` adds a preferred edge only when it closes no cycle, so the bug case runs `u` first in both written orders, while the collation case (child validated under the parent's `SET COLLATE`) still orders the parent first when nothing conflicts. A key with no column list, one whose parent is not a matched existing table, or one whose parent is dropped and recreated by a backing-module move stays required, as do DEFAULT, CHECK and generated expressions. The existing-columns map is built in the `computeSchemaDiff` pre-pass that already resolves column renames, because `diff schema` plans with no catalog.
+
+The review moved that preference from the first preferred tier to the second (`alsoPrefersToRunAfter`), below a new view's or maintained table's preference for the tables its body names — see findings.
+
+## Review findings
+
+Read the implement diff (`ticket(implement): bug-apply-schema-one-way-table-cycle-depends-on-written-order`) before the handoff, then the sorter (`dependency-order.ts`), `pushTableAlters` / `alterStageTwoItem` / `createStageTwoItems`, `resolveColumnRenames` / `resolveRenames` (pairs keyed by the declared column name, so rename hints count as existing), and `backingModuleDrifted`.
+
+- **Fixed — a foreign-key preference could block a new view's real need (major in effect, small in code; the implementer's flagged gap #2).** Alter preferences and create preferences shared the first tier, and alters are considered first, so the foreign-key preference won. Reproduced: `t` gains `d` and `x references u(id)` (existing), `u` gains `z default ((select m from w))`, new `view w as select max(d) as m from t`. `t → u` was kept, `w → t` then closed a cycle and was skipped, `w` ran first and failed with `Column not found: d` in every written order (it failed before this ticket too, when `t → u` was required). The foreign-key preference only matters when the parent re-collates or retypes the referenced column, while a create naming a table usually reads it, so the foreign-key preference now sits in the second tier (`alterStageTwoItem`). Pinned by the new test "applies a view reading a column its table gains while that table's foreign key names an existing column of the view's reader" in `apply-schema-alter-order.spec.ts`. The reverse trade (an unneeded view preference beating a foreign key over a re-collated parent column) is recorded as a tripwire in the `NOTE:` on `recordForeignKeyParent`. Updated the `addedColumnPreferredReads` doc, the `pushTableAlters` stage 2 comment and docs/schema-declarative.md stage 2 to say the preference also gives way through a new view or maintained table.
+- **Checked, no change — sorting semantics.** Bug case: required `t → u` plus preferred `u → t` → preference skipped. Collation case: preference only → kept. True cycle of two new columns → both required, still fails (documented known limit). Self-reference: `resolveEdges` ignores self edges. Two tables that only prefer each other: the first-considered preference wins, so the table written first runs second; both orders apply unless a referenced column is also re-collated, which the existing `NOTE:` covers.
+- **Checked, no change — what counts as "existing".** A declared materialized view (no declared columns) never enters the map, so a key naming it stays required — conservative. A backing-module move is excluded via `movesBackingModule`. The open `bug-declared-table-module-change-not-detected` ticket may add a plain-table recreate; such a recreate runs in the create step before stage 2, so it would not need excluding here.
+- **Checked, no change — tests.** The four reproduction cases from the fix stage pin the bug and the preference-not-removal; the reworked renamed-column test now needs the stage-1 rename again. No test restates the implementation. One test added for the defect above.
+- **Checked, no change — source hygiene.** `schema-differ.ts` is 4414 lines (`wc -l`); already tracked by `backlog/debt-oversized-source-files`. `movesBackingModule` repeats the `backingModuleDrifted` argument list used in `computeTableAlterDiff`, which needs the return value rather than a boolean — acceptable.
+- **Not considered (documented by the implementer):** whether the parent's referenced columns are UNIQUE/PK — `resolveReferencedColumns` resolves explicit lists by name only, so ordering does not depend on it.
+- **Validation:** `yarn workspace @quereus/quereus lint` exit 0; `yarn test` all workspaces green (quereus 11201 passing, 26 pending). `yarn test:store` not run — nothing store-specific changed.

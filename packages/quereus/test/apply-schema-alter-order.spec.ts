@@ -223,6 +223,16 @@ describe('apply schema: table alters run in stages across tables', () => {
 			});
 		}
 
+		// `t` only prefers to follow `u` (its key names the existing `u.id`); `w` needs `t.d`. That
+		// preference must not keep `w` from following `t`.
+		it('applies a view reading a column its table gains while that table\'s foreign key names an existing column of the view\'s reader', async () => {
+			await applies(`declare schema main {
+				table t { id integer primary key, b integer null, d integer null, x integer null references u(id) }
+				table u { id integer primary key, y integer null, z integer null default ((select m from w)) }
+				view w as select max(d) as m from t
+			}`);
+		});
+
 		it('applies a view reading a new materialized view', async () => {
 			await applies(`declare schema main {
 				table t { id integer primary key, b integer null }

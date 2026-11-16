@@ -212,8 +212,9 @@ export interface TableAlterDiff {
 	/**
 	 * Lowercased post-rename names of the tables this table's added columns name only in inline
 	 * foreign keys whose listed columns that table already has. The plan prefers to run this table's
-	 * column and key changes after theirs, and gives way when another table's {@link addedColumnReads}
-	 * needs the other order. Omitted when there are none.
+	 * column and key changes after theirs, and gives way when another table's {@link addedColumnReads},
+	 * or a new view or maintained table's preference for the tables its body names, needs the other
+	 * order. Omitted when there are none.
 	 */
 	addedColumnPreferredReads?: string[];
 	/**
@@ -2856,7 +2857,9 @@ function collectColumnDefReads(
  *
  * NOTE: a preferred edge gives way to a cycle, and then the key validates the child's existing rows
  * against the parent's columns before the parent's `SET COLLATE` or `SET DATA TYPE` runs. No order
- * serves both there, short of splitting the parent's steps.
+ * serves both there, short of splitting the parent's steps. It also gives way to a new view's or
+ * maintained table's preference for a table its body names, which is far more often a real read; if a
+ * key over a re-collated parent column shows up losing to an unneeded one, rank it above those.
  */
 function recordForeignKeyParent(
 	fk: AST.ForeignKeyClause,
@@ -3688,7 +3691,8 @@ const quotedAlterTable = (alter: TableAlterDiff, sink: AlterStepSink): string =>
  *      splitting further, because `ADD COLUMN … references t` checks `t`'s primary key as it
  *      stands, so it has to run after `t`'s own `ALTER PRIMARY KEY`. An inline foreign key listing
  *      only columns its parent already has only prefers to follow the parent, and gives way when
- *      the parent's own new columns need this table first ({@link TableAlterDiff.addedColumnPreferredReads}).
+ *      the parent's own new columns need this table first, directly or through a new view or
+ *      maintained table whose body names it ({@link TableAlterDiff.addedColumnPreferredReads}).
  *      New views and new maintained tables are sorted in here, because their creates plan the body
  *      as they run. Such a create follows every table's steps, unless a table's new column reads
  *      it, directly or through other declared views: then it goes ahead of that table. It is ordered
@@ -3717,8 +3721,9 @@ function alterStageTwoItem(alter: TableAlterDiff, sink: AlterStepSink): StageTwo
 	return {
 		key: alterKey(alter),
 		runsAfter: alter.addedColumnReads ?? [],
-		prefersToRunAfter: alter.addedColumnPreferredReads ?? [],
-		alsoPrefersToRunAfter: [],
+		prefersToRunAfter: [],
+		// Weaker than a create's preference for the tables its body names (see `recordForeignKeyParent`).
+		alsoPrefersToRunAfter: alter.addedColumnPreferredReads ?? [],
 		push: () => {
 			pushColumnAdds(alter, sink);
 			pushColumnAlters(alter, sink);
