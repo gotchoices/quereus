@@ -377,8 +377,8 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		});
 
 		it('restores a chain through another schema, recreating a view before the view it reads', async () => {
-			// The differ sees only schema s, so it drops V1 before V3, and the undo recreates V3
-			// while s.V1, which it reads through main.M, is still gone.
+			// The plan drops V1 before V3, so the undo recreates V3 while s.V1, which it reads
+			// through main.M, is still gone.
 			await db.exec('declare schema s { table T { Id integer primary key, N integer } view V1 as select Id, N as S from T }');
 			await db.exec('apply schema s');
 			await db.exec('insert into s.T values (1, 10)');

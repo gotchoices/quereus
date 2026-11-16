@@ -860,7 +860,6 @@ export function computeSchemaDiff(
 		if (viewRenames.consumedActuals.has(name)) continue;
 		if (!declaredViews.has(name)) diff.viewsToDrop.push(name);
 	}
-	diff.viewsToDrop = orderViewDropsDependentsFirst(diff.viewsToDrop, actualViews, targetSchemaName);
 	followDeclaredViewsInAddedColumnReads(diff.tablesToAlter, declaredViewBodies, targetSchemaName);
 
 	// (Maintained tables are no longer compared here. They are normalized into the
@@ -2704,20 +2703,6 @@ function withViewsReached(names: Iterable<string>, viewBodies: ViewBodies, schem
 		}
 	}
 	return reached;
-}
-
-/**
- * The undo of a view drop is a `create view`, which plans its body and every view body under it, and
- * the journal undoes in reverse. So a view has to be dropped ahead of each view it reaches, including
- * through a view that stays, or its undo runs before what it reads is back.
- *
- * NOTE: one AST walk per reached view per dropped view. If a plan dropping thousands of views shows
- * up in profiles, keep each body's names once instead of walking it again.
- */
-function orderViewDropsDependentsFirst(viewsToDrop: readonly string[], actualViews: ReadonlyMap<string, CatalogView>, schemaName: string): string[] {
-	const catalogBodies: ViewBodies = new Map([...actualViews].map(([name, view]) => [name, view.select]));
-	const key = (name: string): string => name.toLowerCase();
-	return orderDependentsFirst(viewsToDrop, key, name => withViewsReached([key(name)], catalogBodies, schemaName));
 }
 
 /**
