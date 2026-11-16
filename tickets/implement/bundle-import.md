@@ -92,3 +92,14 @@ Fill the import section of `docs/bundle.md`: options, the throw-vs-report rule, 
 - Tests above.
 - `docs/bundle.md` import section and README examples. `yarn docs:check`.
 - `yarn build`, `yarn typecheck`, `yarn test`.
+
+## Notes from the export ticket
+
+What `bundle-package-format-and-export` left for this one to use (read `src/value-codec.ts` and `src/format.ts`):
+
+- Parse each document with `PARSE_OPTIONS` (`version: '1.2'`, the package's own `!!binary` tag, `intAsBigInt`, `uniqueKeys`); use `TO_JS_OPTIONS` (`maxAliasCount: 0`) if calling `toJS` on the header or trailer. The package replaces `yaml`'s built-in `!!binary`, so do not pass `customTags: ['binary']`.
+- `decodeValue(node)` returns a `SqlValue` and throws a plain `TypeError` for anything a bundle never holds (an alias, a foreign tag such as `!!timestamp`, malformed base64, a non-scalar map key). Wrap it into a `row` `BundleError` with the document and row index.
+- Key names and the version are constants in `format.ts` (`HEADER_KEY`, `DATA_KEY`, `ROWS_KEY`, `TRAILER_KEY`, `BUNDLE_FORMAT_VERSION`). They and the codec are internal: `src/index.ts` exports only the format types, `BundleError` and the hook types, and `exportBundle`.
+- `hooks.ts` has `notifyProgress`, `notifyError` (answers `'abort'` when the hook asked to stop) and `cancellation(signal, phase)`.
+- `docs/bundle.md` § Import and the package README § Import currently say "Not implemented yet"; replace both. Misuse errors on the export side are `MisuseError`; use the same for invalid import options.
+- Tests: `register.mjs` sets `TS_NODE_PROJECT`, and `tsconfig.test.json` uses `module: ES2022` with `moduleResolution: bundler` (the `@quereus/quereus/emit` subpath needs `exports` support). New spec files under `test/` are picked up as they are.

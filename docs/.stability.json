@@ -3,6 +3,7 @@
 	"tiers": ["Stable", "Beta", "Experimental", "Internal"],
 	"docs": {
 		"docs/aggregate-algebra.md": "Beta",
+		"docs/bundle.md": "Experimental",
 		"docs/change-scope.md": "Beta",
 		"docs/coordinator.md": "Experimental",
 		"docs/datetime.md": "Stable",
@@ -113,6 +114,7 @@
 	"packagesNote": "Keys are package directories, not npm names. Every package `yarn pub` publishes must be listed here or in `packagesSpanning`; quoomb-web and the VS Code extension do not publish but carry a banner, so they are listed too. packages/sample-plugins has no README and is the one intended omission.",
 	"packages": {
 		"packages/plugin-loader": "Stable",
+		"packages/quereus-bundle": "Experimental",
 		"packages/quereus-isolation": "Beta",
 		"packages/quereus-plugin-indexeddb": "Beta",
 		"packages/quereus-plugin-leveldb": "Beta",

@@ -10,6 +10,7 @@
 		{ "path": "packages/quereus" },
 		{ "path": "packages/plugin-loader" },
 		{ "path": "packages/quereus-isolation" },
+		{ "path": "packages/quereus-bundle" },
 		{ "path": "packages/quereus-store" },
 		{ "path": "packages/quereus-sync" },
 		{ "path": "packages/quereus-sync-client" },

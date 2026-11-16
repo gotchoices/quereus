@@ -1888,6 +1888,24 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@quereus/bundle@workspace:packages/quereus-bundle":
+  version: 0.0.0-use.local
+  resolution: "@quereus/bundle@workspace:packages/quereus-bundle"
+  dependencies:
+    "@quereus/quereus": "workspace:^"
+    "@types/mocha": "npm:^10.0.10"
+    "@types/node": "npm:^25.9.3"
+    chai: "npm:^6.2.2"
+    mocha: "npm:^11.7.6"
+    rimraf: "npm:^6.1.3"
+    ts-node: "npm:^10.9.2"
+    typescript: "npm:^5.9.3"
+    yaml: "npm:^2.9.0"
+  peerDependencies:
+    "@quereus/quereus": "workspace:^"
+  languageName: unknown
+  linkType: soft
+
 "@quereus/isolation@npm:*, @quereus/isolation@workspace:^, @quereus/isolation@workspace:packages/quereus-isolation":
   version: 0.0.0-use.local
   resolution: "@quereus/isolation@workspace:packages/quereus-isolation"

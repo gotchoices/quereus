@@ -117,6 +117,7 @@ This repository contains multiple packages:
 
 ### Tools
 - **[`packages/plugin-loader/`](packages/plugin-loader/)** — Dynamic plugin loading system
+- **[`packages/quereus-bundle/`](packages/quereus-bundle/)** — Save and load a database's schema and data as one `bundle.yaml` file
 - **[`packages/quoomb-web/`](packages/quoomb-web/)** — Web-based query interface and visualizer
 - **[`packages/quoomb-cli/`](packages/quoomb-cli/)** — Command-line interface
 - **[`packages/sample-plugins/`](packages/sample-plugins/)** — Sample plugins for testing and development

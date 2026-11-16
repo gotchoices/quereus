@@ -41,6 +41,7 @@
     "build:engine": "cd packages/quereus && yarn build",
     "build:loader": "cd packages/plugin-loader && yarn build",
     "build:isolation": "cd packages/quereus-isolation && yarn build",
+    "build:bundle": "cd packages/quereus-bundle && yarn build",
     "build:store": "cd packages/quereus-store && yarn build",
     "build:plugin-leveldb": "cd packages/quereus-plugin-leveldb && yarn build",
     "build:plugin-indexeddb": "cd packages/quereus-plugin-indexeddb && yarn build",
@@ -57,6 +58,7 @@
     "pub:quereus": "node scripts/publish-package.js quereus",
     "pub:loader": "node scripts/publish-package.js plugin-loader",
     "pub:isolation": "node scripts/publish-package.js quereus-isolation",
+    "pub:bundle": "node scripts/publish-package.js quereus-bundle",
     "pub:store": "node scripts/publish-package.js quereus-store",
     "pub:sync": "node scripts/publish-package.js quereus-sync",
     "pub:sync-client": "node scripts/publish-package.js quereus-sync-client",
@@ -69,7 +71,7 @@
     "pub:cli": "node scripts/publish-package.js quoomb-cli",
     "pub:planviz": "node scripts/publish-package.js tools/planviz",
     "//pub": "NOTE: this publish order is still hand-maintained and is NO LONGER kept in lockstep with the build order — `build` now derives its order from tsconfig references (tsc -b), so adding/reordering a package updates the build automatically but NOT this chain. Keep this list in dependency order (a package must publish after everything it depends on) by hand; if you add a package to tsconfig.build.json, add its pub:* step here too. scripts/check-docs.mjs parses this chain (each step must call publish-package.js) to derive which packages need a stability banner, so a new step also needs an entry in docs/.stability.json.",
-    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli && yarn pub:planviz"
+    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:bundle && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli && yarn pub:planviz"
   },
   "devDependencies": {
     "bumpp": "^11.1.0",

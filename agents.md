@@ -46,6 +46,7 @@ quoomb-cli/                # CLI tool
 quoomb-web/                # Web UI
 quereus-store/             # Persistent key-value store abstraction
 quereus-isolation/         # Transaction isolation layer (read-your-own-writes; not snapshot isolation)
+quereus-bundle/            # bundle.yaml schema + data export/import
 quereus-sync/              # Sync engine
 quereus-sync-client/       # Sync client
 sync-coordinator/          # Sync server/coordinator

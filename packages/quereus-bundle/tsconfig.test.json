@@ -1,0 +1,14 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"module": "ES2022",
+		"moduleResolution": "bundler",
+		"noEmit": true
+	},
+	"ts-node": {
+		"esm": true,
+		"experimentalSpecifierResolution": "node"
+	},
+	"include": ["src", "test"],
+	"exclude": ["node_modules", "dist"]
+}
