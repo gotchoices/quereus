@@ -2799,7 +2799,14 @@ function objectsRemovedByDiff(diff: SchemaDiff, schemaName: string): string[] {
 	return [...diff.tablesToDrop, ...diff.viewsToDrop].filter(name => !recreated.has(objectRefKey(schemaName, name)));
 }
 
-/** {@link SchemaDiff.removalsStillReferenced}. Runs after {@link dropsReleasedByDeclaration}. */
+/**
+ * {@link SchemaDiff.removalsStillReferenced}. Runs after {@link dropsReleasedByDeclaration}.
+ *
+ * NOTE: plan-wide, so one declared rule whose walk reaches another schema holds every constraint
+ * drop, even for a removal that rule never touches: a foreign key removed together with its parent
+ * is then refused as before. If that shows up, hold only the drops whose constraint the plan re-adds
+ * with a body that may reach a removed object.
+ */
 function removalsStillReferenced(diff: SchemaDiff, declaredTables: ReadonlyMap<string, AST.DeclaredTable>, schemaName: string): boolean {
 	const removed = new Set(objectsRemovedByDiff(diff, schemaName).map(name => objectRefKey(schemaName, name)));
 	if (removed.size === 0) return false;
