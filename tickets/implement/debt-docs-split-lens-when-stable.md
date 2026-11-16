@@ -13,6 +13,8 @@ splitting its documentation now is worth doing, or does it keep its exemption?* 
 with visibility into the feature's roadmap can answer that; no amount of further research
 resolves it.
 
+NTA: Yes, it has settled enough.
+
 ## Background, for a reader with no context
 
 Quereus caps documentation files at 12,000 words, enforced by a build check

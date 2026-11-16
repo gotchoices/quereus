@@ -1,6 +1,6 @@
 # Lenses and Layered Schemas
 
-> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 ## Overview
 

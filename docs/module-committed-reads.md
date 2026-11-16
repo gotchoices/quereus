@@ -1,6 +1,6 @@
 # Committed-Snapshot Reads (`_readCommitted`)
 
-> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 The `readCommittedSnapshot` declaration a module makes when it can serve a consistent committed state to a read running concurrently with another connection's commit: the obligation that declaration takes on, the two implementation shapes that meet it, the consequences a wrapper module has to honor, and the conformance harness that proves it. A satellite of [Virtual Table Module Authoring Guide](module-authoring.md).
 

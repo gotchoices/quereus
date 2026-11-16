@@ -1,6 +1,6 @@
 # The Lens Prover
 
-> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 What `proveLens` checks when a logical schema is deployed against a basis: the two roles a logical constraint can play, the coverage checklist that discharges the lens laws, every `lens.*` diagnostic code with its severity, and the acknowledgment and escalation governance over the advisory ones. A satellite of [Lenses and Layered Schemas](lens.md).
 

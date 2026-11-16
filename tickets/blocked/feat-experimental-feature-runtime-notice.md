@@ -3,7 +3,7 @@ description: Someone can use one of the project's research-grade features withou
 files:
   - docs/stability.md (the tier definitions this notice would point at)
   - packages/quereus/src/common/logger.ts (the existing logging surface — see the caveat below)
-  - packages/quereus/src/schema/lens.ts, lens-compiler.ts (a candidate first-use site)
+  - packages/quereus-sync, packages/quereus-sync-client (candidate first-use sites)
   - packages/quereus/src/core/database.ts (where a per-database "already warned" flag would live)
 ----
 
@@ -11,6 +11,12 @@ files:
 someone answers this: *should the database emit a runtime warning the first time an
 Experimental feature is used, and if so, is it on or off by default?* Nothing else is
 missing — the design is worked out below and can be built as soon as that call is made.
+
+**Decided (human, 2026-11-16): lenses are no longer Experimental.** Lamina depends on them;
+they are now **Beta** in `docs/stability.md` / `docs/.stability.json`. That takes
+`declare logical schema`, `declare lens`, and lens deployment out of this ticket's scope.
+The question stands for the remaining user-chosen Experimental surfaces: sync and
+schema migration in a synced database.
 
 ## The question, plainly
 
@@ -20,13 +26,13 @@ anything already stored using them. That promise is published in `docs/stability
 every user-facing doc carries its tier.
 
 That works for someone who reads the docs before adopting a feature. It does nothing for
-someone who copies `create lens` out of an example, an AI completion, or a colleague's
+someone who copies a sync setup out of an example, an AI completion, or a colleague's
 branch, and ships it. They find out at the next upgrade.
 
 The proposal is a one-time message, printed once per database connection, the first time
 the user actually touches an Experimental feature. Roughly:
 
-> Lenses are an Experimental feature: the API and any stored artifacts may change or be
+> Sync is an Experimental feature: the API and any stored artifacts may change or be
 > removed in any release, including a patch. See https://…/docs/stability.md
 
 ## What happens if we do nothing
@@ -87,7 +93,7 @@ from the Experimental parallel track (`rule-fanout-lookup-join`,
 feature they cannot avoid using is a warning they cannot act on. The tier there covers
 plan-node shapes and internal APIs, never the correctness of returned rows — so there is
 nothing for the user to do and nothing to say. Warn only on surfaces the user *chose*:
-`create lens`, `declare logical schema`, lens deployment, sync.
+sync and synced-schema migration. (Lenses were on this list until they moved to Beta.)
 
 **Silenceable.** Whatever the default, offer a way to turn it off.
 

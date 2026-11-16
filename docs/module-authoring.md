@@ -517,7 +517,7 @@ The one exception is a module-listed seek (`moduleSeekFilters`, plan kind `modul
 
 ### 3. Concurrency Mode (Parallel Runtime)
 
-> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 When a parallel-runtime consumer (e.g. fan-out lookup join) wants to issue
 multiple vtab calls in flight on a single connection, it consults the

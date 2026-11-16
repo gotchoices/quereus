@@ -94,10 +94,12 @@ report the user-visible symptom, not the internal detail.
 | `SchemaManager` API and DDL generation | Beta | [schema.md](schema.md) |
 | Persistent store — `@quereus/store` and the LevelDB / IndexedDB / React-Native-LevelDB / NativeScript-SQLite plugins. Its on-disk key encoding is **not** frozen, carries no format-version marker, and has no in-place upgrade tooling today: a format change would be published with a documented migration procedure, not applied for you. | Beta | [store.md](store.md) |
 | Isolation layer — `@quereus/isolation` | Beta | [store.md](store.md#isolation-gap), [design-isolation-layer.md](design-isolation-layer.md) |
+| Module concurrency declaration — `VirtualTableModule.concurrencyMode` | Beta | [module-authoring.md](module-authoring.md) § Concurrency Mode (section banner) |
+| Committed-snapshot reads — the `readCommittedSnapshot` module declaration and its conformance harness | Beta | [module-committed-reads.md](module-committed-reads.md) |
 | Tooling — `quoomb-cli`, `quoomb-web`, `@quereus/planviz`, `@quereus/shared-ui`, the VS Code extension | Beta | [usage.md](usage.md) |
-| Lenses and layered schemas | Experimental | [lens.md](lens.md) |
+| Lenses and layered schemas — `declare logical schema`, `declare lens`, lens deployment and proving | Beta | [lens.md](lens.md), [lens-prover.md](lens-prover.md) |
 | Schema migration in a synced database | Experimental | [migration.md](migration.md) |
-| Parallel runtime — `ParallelDriver`, `EagerPrefetchNode`, `AsyncGatherNode`, `FanOutLookupJoinNode`, `VirtualTableModule.concurrencyMode` | Experimental | [runtime.md](runtime.md) § ParallelDriver (section banner), [module-authoring.md](module-authoring.md) § Concurrency Mode (section banner), [optimizer-parallel.md](optimizer-parallel.md) |
+| Parallel runtime — `ParallelDriver`, `EagerPrefetchNode`, `AsyncGatherNode`, `FanOutLookupJoinNode` | Experimental | [runtime-parallel.md](runtime-parallel.md), [optimizer-parallel.md](optimizer-parallel.md) |
 | Sync — `@quereus/sync`, `@quereus/sync-client`, `sync-coordinator`. The wire protocol **is** version-gated — `handshake` / `handshake_ack` both carry `PROTOCOL_VERSION` and a mismatch is refused on both sides, before authenticating, rather than silently misinterpreted (see [sync-protocol.md § Protocol version](sync-protocol.md#protocol-version)). That gate detects drift; it is not a compatibility promise. No mixed-version deployment is supported or tested, the wire version is bumped whenever a message shape or the codec breaks — in any release type, per this tier — and the on-disk sync metadata format carries no such gate at all. | Experimental | [sync.md](sync.md), [sync-coordinator.md](sync-coordinator.md), [coordinator.md](coordinator.md) |
 | Optimizer — rules, cost model, passes, framework | Internal | [optimizer.md](optimizer.md) and the `optimizer-*.md` topic docs |
 | Functional dependencies and equivalence classes | Internal | [optimizer-fd.md](optimizer-fd.md) |
@@ -129,7 +131,7 @@ carries a `docs` map for the per-doc banners and a `packages` map for the per-pa
 write-through path — is Beta. Calling it Stable would promise semantics for
 multi-source write routing that only just landed, and its acceptance boundary (which
 view bodies are writeable) is still widening. Materialized views, lenses, and
-migration all sit on it, so a Beta base under a Beta feature and an Experimental one
+migration all sit on it, so a Beta base under Beta features and an Experimental one
 is coherent; a Stable base would not have been.
 
 **Declarative schema is Beta, not Stable**, even though it is documented inside the
