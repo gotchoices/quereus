@@ -295,6 +295,43 @@ describe('apply schema: table alters run in stages across tables', () => {
 		});
 	});
 
+	// `t.d` needs the new `u.z`; `u.z` names only `t.id`, which `t` already has. Read per table the two
+	// refer to each other, but `u` first always works.
+	describe('two tables referring to each other where only one needs the other\'s new column', () => {
+		const tables = {
+			t: 'table t { id integer primary key, b integer null, d integer null references u(z) }',
+			u: 'table u { id integer primary key, y integer null, z integer null unique references t(id) }',
+		};
+
+		for (const first of ['t', 'u'] as const) {
+			it(`applies with ${first} written first`, async () => {
+				await applies(`declare schema main {
+					table t { id integer primary key, b integer null }
+					table u { id integer primary key, y integer null }
+				}`);
+				const [a, b] = first === 't' ? [tables.t, tables.u] : [tables.u, tables.t];
+				await applies(`declare schema main { ${a} ${b} }`);
+			});
+		}
+
+		// The foreign key's default fills `u`'s existing row and is checked under `t.d`'s collation as it
+		// stands, so `u` still has to follow `t`'s SET COLLATE although `t.d` already exists.
+		for (const first of ['t', 'u'] as const) {
+			it(`still runs the parent's SET COLLATE first, ${first} written first`, async () => {
+				await applies(`declare schema main {
+					table t { id integer primary key, d text null unique }
+					table u { id integer primary key }
+				}`);
+				await db.exec(`insert into t (id, d) values (1, 'abc')`);
+				await db.exec('insert into u (id) values (1)');
+				const t ='table t { id integer primary key, d text null collate nocase unique }';
+				const u = `table u { id integer primary key, z text null default 'ABC' references t(d) }`;
+				const [a, b] = first === 't' ? [t, u] : [u, t];
+				await applies(`declare schema main { ${a} ${b} }`);
+			});
+		}
+	});
+
 	it('a failure in a later stage reports its own error and restores the catalog', async () => {
 		await applies(`declare schema main {
 			table t { id integer primary key, b integer null }
