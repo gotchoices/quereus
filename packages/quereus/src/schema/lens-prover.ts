@@ -633,7 +633,7 @@ interface RoundTripAnalysis {
  * behaviour, the mutation-time and key-reconstructibility nets still govern. The
  * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
  * Project/Filter/TableReference operator tree threading `updateLineage` survives.
- * See `docs/lens-prover.md` § Round-trip and `docs/vu-roundtrip.md`
+ * See `docs/lens-prover.md` § Coverage checklist (round-trip row) and `docs/vu-roundtrip.md`
  * § The predicate-honest complement.
  */
 function analyzeRoundTrip(ctx: ProveContext): RoundTripAnalysis {

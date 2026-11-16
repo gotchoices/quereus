@@ -1134,11 +1134,12 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
  * materialized envelope, so the default is evaluated once per produced row and the
  * value threads identically across the fan-out.
  *
- * Lens constraint obligations (row-local CHECK / child-side FK / set-level uniqueness)
- * ride the member inserts under the SAME per-op resolvability gate the decomposition
- * UPDATE path uses (`constraintsForOp`): a single-member-resolvable obligation fires on
- * the member that owns its write-row columns; a cross-member one resolves on no single
- * member op and stays deferred. A plain (non-lens) decomposition collects none.
+ * Child-side FK / set-level lens obligations ride the member inserts under the SAME
+ * per-op resolvability gate the decomposition UPDATE path uses (`constraintsForOp`): a
+ * single-member-resolvable obligation fires on the member that owns its write-row
+ * columns; a cross-member one resolves on no single member op and is dropped. Row-local
+ * CHECK / NOT NULL is checked once per logical row instead (see the body). A plain
+ * (non-lens) decomposition collects none.
  */
 function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate

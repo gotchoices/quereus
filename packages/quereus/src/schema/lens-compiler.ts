@@ -617,10 +617,10 @@ export function validateLogicalDeclaration(
 }
 
 /**
- * Infers the default basis for a logical schema (MVP binding — there is no
- * `declare lens for X over Y` yet). The basis is the single registered
+ * Infers the default basis for a logical schema that has no
+ * `declare lens for X over Y`. The basis is the single registered
  * **physical** schema that contains ≥1 table, excluding the logical schema
- * itself and `temp`. See `docs/lens.md` § Default-basis inference.
+ * itself and `temp`. See `docs/lens.md` § Syntax.
  */
 export function inferDefaultBasis(
 	schemaManager: SchemaManager,
@@ -2041,8 +2041,9 @@ function annotateProvenanceWithAdvertisement(
 }
 
 /**
- * Override ⊕ advertisement conflict (docs/lens-default-mapper.md § Override composition with an advertisement): a *sparse* override (one that relies on gap-fill) may correct an
- * advertised column mapping, but must NOT re-anchor or reference basis relations
+ * Override ⊕ advertisement conflict (docs/lens-default-mapper.md § Override
+ * composition with an advertisement): a *sparse* override (one that relies on
+ * gap-fill) may correct an advertised column mapping, but must NOT re-anchor or reference basis relations
  * outside the advertised decomposition. Every introspectable basis-table source
  * in the override's FROM must be one of the advertisement's member relations;
  * otherwise the developer is silently re-anchoring and must instead author a full

@@ -74,8 +74,8 @@ export const EMPTY_ESCALATION_POLICY: EscalationPolicy = {
  * tags (`quereus.lens.policy.error-on` / `quereus.lens.policy.require-ack`, each a
  * CSV of advisory codes). Default-empty when neither tag is present — out of the
  * box no code is escalated; a project opts in per logical table. (A schema-wide
- * policy is expressed by tagging each table; see `docs/lens-prover.md` § Escalation
- * policy.)
+ * policy is expressed by tagging each table; see `docs/lens-prover.md` § Acknowledging
+ * advisories, "Escalation policy".)
  */
 export function resolveEscalationPolicy(logicalTable: TableSchema): EscalationPolicy {
 	return {
