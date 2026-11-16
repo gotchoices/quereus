@@ -51,3 +51,33 @@ New package `@quereus/bundle` (`packages/quereus-bundle`) with the bundle format
 `yarn build` clean; `yarn typecheck` clean; `yarn lint` clean; `yarn docs:check` OK; `yarn test` all workspaces pass (quereus 11189 passing / 26 pending, `@quereus/bundle` 5 passing, no failures elsewhere).
 
 Usage to try by hand: `for await (const s of exportBundle(db, { batchSize: 2 })) process.stdout.write(s)` on any database. Then try `{ data: false }` (no `tables`, trailer `tables: []`), `{ schema: false }` (no `schemas`), `{ tables: (_, t) => t !== 'x' }`, `{ batchSize: 0 }` (MisuseError at call), `{ schemas: ['nope'] }` (`schema` BundleError on first `next()`), and an `AbortController` aborted from `onProgress` (a `cancelled` error after the current document).
+
+## Review findings
+
+Reviewed the diff of `ticket(implement): bundle-package-format-and-export` against the original implement ticket, then built the package, ran its tests, and probed with a script against the built output: `skip-table`, default `abort`, `onError` returning `'abort'` under `skip-table`, cancellation through `signal` from `onProgress`, `data: false`, `schemas: []`, a missing schema, progress events, a table whose only column is generated, and a schema-only export inside a caller's transaction (left open, as documented). All behaved as the handoff describes except the items fixed below.
+
+**Fixed in this pass (minor):**
+
+- An empty sequence (`tables` in a data-less trailer) was written as `tables:` followed by `[]` on its own line. Still valid YAML, but it is now written `tables: []`: `seqNode` makes an empty sequence flow (`src/export.ts`).
+- `schemas: []` wrote a bundle with nothing in it. It is now a `MisuseError` at call time, the same treatment as "neither schema nor data". `docs/bundle.md` § Errors lists it.
+- `headerText` recomputed the table list `writeBundle` had already built (`schemas.flatMap(s => s.tables)`). It now takes that list as a parameter.
+- Added one test, *under skip-table, keeps the rows before an unencodable value, records the error in the trailer and moves on* (`test/export.spec.ts`). It pins the trailer `error` entry and the rows kept before the failure. Import will rely on both, and before this test only a manual probe had checked them. Cancellation, `onError` → `'abort'` and progress events stay without automated tests. I checked them by probe; each is a few lines with little branching.
+
+**Tripwires (recorded, not ticketed):**
+
+- A table whose every column is generated has no exportable columns, so its `select` is invalid and it fails as a `batch` error with a parser message. Contrived; `NOTE:` at `exportedTables` in `src/export.ts`.
+- The implementer's `NOTE:` at `encodeString` (raw DEL, C1 controls, U+FEFF and U+FFFE/U+FFFF break strict YAML readers) is still accurate; left as is.
+
+**Checked, no change needed:**
+
+- Transaction lifecycle: `return()` from a `break` runs `readTable`'s `finally` (finalizes the statement) and then `readTables`' `finally` (commits). A failure rolls back, and `endReadTransaction` skips the rollback when the engine has already ended the transaction. A rollback error is logged, so the original error is the one thrown.
+- Error delivery: every `BundleError` reaches `onError` exactly once (probe errors list). Invalid options throw synchronously from `exportBundle`.
+- Codec: the R1 int/float split, `-0`, exponent form past 2^53, NaN/±Infinity, bigint, lone surrogates, `subarray` blobs, and the `__proto__` key are all covered by the existing round-trip test. The two "refuses" codec tests pin real contracts (no lossy coercion; untrusted-input refusals import depends on), so I kept them.
+- Ordering: `orderDependenciesFirst` ignores a dependency on a table that the filter or the view/maintained/engine-managed rules removed. Parents-first order is pinned by the golden test.
+- Deviations listed in the handoff (`iterateRows` instead of `db.eval`, the custom `!!binary` tag, `1e+20` float spelling, the extra writer options, the one-line declaration, the test setup that differs from `quereus-isolation`): each is justified and documented in `docs/bundle.md` or the code. I agree with all of them.
+- Wiring: `package.json` dependency shape (peer and workspace) matches `quereus-isolation` and `quereus-store`. `scripts/publish-package.js` takes the package name as an argument and keeps no list to update. The stability registry, both READMEs, AGENTS.md and the `tsconfig.build.json` reference are all present.
+- Source hygiene: files are 18–406 lines, functions are small, and comments explain reasons rather than restating the code.
+
+**Major findings:** none. Nothing met the filing bar.
+
+**Validation:** `yarn build` (bundle), `yarn typecheck`, `yarn lint`, `yarn docs:check` all clean. `yarn test` passes in every workspace: quereus 11189 passing / 26 pending, `@quereus/bundle` 6 passing, no failures.

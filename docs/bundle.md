@@ -109,7 +109,7 @@ A table whose read fails (kind `batch`) or holds a value with no encoding (kind 
 - `errorPolicy: 'abort'` throws the error. The text yielded so far has no trailer, so a reader sees it as truncated.
 - `errorPolicy: 'skip-table'` reports it, writes the rows read before the failure, records the row count and `error` in the table's trailer entry, and moves on to the next table.
 
-Invalid options (`batchSize` below 1, neither `schema` nor `data`, a schema listed twice) throw `MisuseError` when `exportBundle` is called.
+Invalid options (`batchSize` below 1, neither `schema` nor `data`, an empty `schemas` list, a schema listed twice) throw `MisuseError` when `exportBundle` is called.
 
 ## Import
 

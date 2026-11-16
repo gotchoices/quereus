@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
+import { Database, type SqlValue } from '@quereus/quereus';
 import { exportBundle, type ExportOptions } from '../src/index.js';
 
 async function exportText(db: Database, options: ExportOptions): Promise<string> {
@@ -67,6 +67,26 @@ end:
     - {schema: main, table: order, rows: 3}
     - {schema: main, table: item, rows: 2}
 `);
+	});
+
+	it('under skip-table, keeps the rows before an unencodable value, records the error in the trailer and moves on', async () => {
+		db.createScalarFunction('date_at', { numArgs: 1 }, id => (id === 2 ? new Date(0) as unknown as SqlValue : id));
+		await db.exec(`create table odd (id integer primary key, v any null);
+			insert into odd select value, date_at(value) from generate_series(1, 3);`);
+		const errors: string[] = [];
+
+		const text = await exportText(db, {
+			schema: false, errorPolicy: 'skip-table', tables: (_s, t) => t !== 'item',
+			onError: e => { errors.push(`${e.kind} ${e.table} ${e.rowIndex}`); },
+		});
+
+		expect(errors).to.deep.equal(['value odd 1']);
+		expect(text).to.contain(`data: {schema: main, table: odd}
+rows:
+  - [1, 1]
+---`);
+		expect(text).to.match(/- \{schema: main, table: odd, rows: 1, error: "Cannot export column 'v' of row 1 in main\.odd: [^"]*"\}\n {4}- \{schema: main, table: order, rows: 3\}\n$/);
+		expect(db.getAutocommit()).to.equal(true);
 	});
 
 	it('ends the read transaction it opened when the consumer stops early', async () => {

@@ -108,6 +108,9 @@ function resolveSettings(options: ExportOptions): ExportSettings {
 		throw new MisuseError(`errorPolicy must be one of ${ERROR_POLICIES.join(', ')}, got ${String(errorPolicy)}`);
 	}
 	const schemaNames = options.schemas ?? ['main'];
+	if (schemaNames.length === 0) {
+		throw new MisuseError('An export needs at least one schema');
+	}
 	const seen = new Set<string>();
 	for (const name of schemaNames) {
 		if (seen.has(name.toLowerCase())) throw new MisuseError(`Schema '${name}' is listed twice`);
@@ -127,7 +130,7 @@ function resolveSettings(options: ExportOptions): ExportSettings {
 async function* writeBundle(db: Database, settings: ExportSettings): AsyncGenerator<string> {
 	const schemas = settings.schemaNames.map(name => exportedSchema(db, name, settings));
 	const tables = settings.data ? schemas.flatMap(s => s.tables) : [];
-	yield headerText(schemas, settings);
+	yield headerText(schemas, tables, settings);
 	const trailer = tables.length > 0 ? yield* readTables(db, tables, settings) : [];
 	yield DOCUMENT_SEPARATOR + documentText(trailerNode(trailer));
 }
@@ -171,6 +174,9 @@ function exportedTables(schema: Schema, includes: ExportSettings['includes']): B
 		schema: schema.name,
 		table: t.name,
 		// A generated column cannot be inserted; the importing table computes it.
+		// NOTE: a table whose every column is generated leaves no columns, so its select is
+		// invalid and the table fails as a `batch` error. The format has no way to carry such
+		// rows; if such tables become legitimate, give them a row count the importer replays.
 		columns: t.columns.filter(c => !c.generated).map(c => c.name),
 	}));
 }
@@ -322,7 +328,7 @@ function tableFailure(e: unknown, table: BundleTableEntry): BundleError {
 	});
 }
 
-function headerText(schemas: readonly ExportedSchema[], settings: ExportSettings): string {
+function headerText(schemas: readonly ExportedSchema[], tables: readonly BundleTableEntry[], settings: ExportSettings): string {
 	const entries: Array<[string, Node]> = [
 		[HEADER_KEY, new Scalar(BUNDLE_FORMAT_VERSION)],
 		['created', encodeString(new Date().toISOString())],
@@ -334,7 +340,7 @@ function headerText(schemas: readonly ExportedSchema[], settings: ExportSettings
 		])))]);
 	}
 	if (settings.data) {
-		entries.push(['tables', seqNode(schemas.flatMap(s => s.tables).map(t => mapNode([
+		entries.push(['tables', seqNode(tables.map(t => mapNode([
 			...tableRefEntries(t),
 			['columns', seqNode(t.columns.map(encodeString), true)],
 		])))]);
@@ -377,7 +383,8 @@ function mapNode(entries: ReadonlyArray<readonly [string, Node]>, flow = false):
 
 function seqNode(items: Node[], flow = false): YAMLSeq {
 	const seq = new YAMLSeq();
-	seq.flow = flow;
+	// An empty block sequence is written as `[]` on a line of its own; flow keeps it beside its key.
+	seq.flow = flow || items.length === 0;
 	seq.items = items;
 	return seq;
 }
