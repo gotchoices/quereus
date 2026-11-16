@@ -152,6 +152,18 @@ update t set y = 5 where exists (select 1 from s where x = 3);
 select id, val from other order by id;
 → [{"id":2,"val":5},{"id":3,"val":5}]
 
+-- The target CTE's own name also shadows a real table `t` when the predicate self-reads
+-- it: `from t` binds to the eager capture, so `id` is local and both rows update.
+create table t (q integer primary key, r integer);
+insert into t values (2, 200);
+-- run
+
+with t as (select id, val from other) update t set val = 7 where exists (select 1 from t where id = 3);
+
+select id, val from other order by id;
+→ [{"id":2,"val":7},{"id":3,"val":7}]
+
+drop table t;
 drop table other;
 drop table s;
 -- run
