@@ -3528,3 +3528,73 @@ describe('lens enforcement: parent-side FK is lens-routed-only (basis-direct DML
 		}
 	});
 });
+
+describe('lens enforcement: join-backed logical table (multi-source body)', () => {
+	const JOIN_BASIS = 'declare schema y { table Org (id integer primary key); table Core (id integer primary key, name text null, age integer null, org integer null); table Contact (id integer primary key references Core(id), mail text null) }';
+
+	it('insert enforces the check, renamed-column check, unique key and FK on the side that owns each', async () => {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(JOIN_BASIS);
+			await db.exec('apply schema y');
+			await db.exec(`declare logical schema x {
+				table Org (id integer primary key);
+				table Person (id integer primary key, name text null, age integer null, org integer null, email text null,
+					constraint agepos check (age >= 0), constraint emailfmt check (email like '%@%'),
+					constraint uemail unique (email), constraint fkorg foreign key (org) references Org(id)) }`);
+			await db.exec('declare lens for x over y { view Person as select c.id, c.name, c.age, c.org, k.mail as email from y.Core c join y.Contact k on c.id = k.id }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.Org values (1)');
+
+			await db.exec("insert into x.Person values (1, 'a', 1, 1, 'a@b')");
+			await expectThrows(() => db.exec("insert into x.Person values (2, 'b', -1, 1, 'b@b')"), /lens:agepos/);
+			await expectThrows(() => db.exec("insert into x.Person values (3, 'c', 1, 1, 'nope')"), /lens:emailfmt/);
+			await expectThrows(() => db.exec("insert into x.Person values (4, 'd', 1, 1, 'a@b')"), /lens:unique:uemail/);
+			await expectThrows(() => db.exec("insert into x.Person values (5, 'e', 1, 99, 'e@b')"), /lens:fk:fkorg/);
+			expect(await rows(db, 'select id from x.Person')).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a check over one side\'s column does not fire on the sibling side\'s same-named column', async () => {
+		// Both basis tables spell their column `name`; the check is over Contact's (`cname`).
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Core (id integer primary key, name text null); table Contact (id integer primary key, name text null) }');
+			await db.exec('apply schema y');
+			await db.exec(`declare logical schema x { table Person (id integer primary key, pname text null, cname text null, constraint cnameok check (cname <> 'bad')) }`);
+			await db.exec('declare lens for x over y { view Person as select c.id, c.name as pname, k.name as cname from y.Core c join y.Contact k on c.id = k.id }');
+			await db.exec('apply schema x');
+
+			await db.exec("insert into x.Person values (1, 'bad', 'ok')");
+			await expectThrows(() => db.exec("insert into x.Person values (2, 'ok', 'bad')"), /lens:cnameok/);
+			await db.exec("update x.Person set pname = 'bad' where id = 1");
+			await expectThrows(() => db.exec("update x.Person set cname = 'bad' where id = 1"), /lens:cnameok/);
+			expect(await rows(db, 'select pname, cname from x.Person')).to.deep.equal([{ pname: 'bad', cname: 'ok' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a check over a left-joined side fires when the insert writes no row to that side', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Core (id integer primary key, name text null); table Contact (id integer primary key references Core(id), mail text null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Person (id integer primary key, name text null, email text null, constraint emailset check (email is not null)) }');
+			await db.exec('declare lens for x over y { view Person as select c.id, c.name, k.mail as email from y.Core c left join y.Contact k on c.id = k.id }');
+			await db.exec('apply schema x');
+
+			// Contact column not supplied: the side is never inserted.
+			await expectThrows(() => db.exec("insert into x.Person (id, name) values (1, 'a')"), /lens:emailset/);
+			// Supplied as NULL: the side's presence gate skips its insert.
+			await expectThrows(() => db.exec("insert into x.Person (id, name, email) values (2, 'b', null)"), /lens:emailset/);
+			await db.exec("insert or ignore into x.Person (id, name, email) values (3, 'c', null), (4, 'd', 'd@e')");
+			expect(await rows(db, 'select id, email from x.Person')).to.deep.equal([{ id: 4, email: 'd@e' }]);
+		} finally {
+			await db.close();
+		}
+	});
+});

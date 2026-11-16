@@ -89,9 +89,10 @@ export interface MutationEnvelope {
 	 * (docs/lens-constraints.md): the envelope row IS the produced
 	 * logical row, so a check here fires regardless of which member ops the
 	 * fan-out plans (an omitted / explicit-NULL column suppresses the member
-	 * write, never the check). Subquery-free checks only — a subquery-bearing
+	 * write, never the check). Subquery-free checks only there — a subquery-bearing
 	 * row-local check rides the anchor op as a deferred logical-view constraint
-	 * instead (`buildDecompositionInsert`).
+	 * instead (`buildDecompositionInsert`). A join INSERT uses it for the rows an
+	 * outer-joined side's insert skips (`buildAbsentSideRowChecks`).
 	 */
 	readonly rowChecks?: ReadonlyArray<EnvelopeRowCheck>;
 	/**

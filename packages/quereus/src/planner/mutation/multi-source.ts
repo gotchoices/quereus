@@ -481,6 +481,12 @@ export interface MsInsertAnalysis {
 	/** Sides ordered FK-parent before FK-child (the FK-safe insert order). */
 	readonly orderedSides: readonly MsInsertSide[];
 	/**
+	 * The non-preserved (outer-joined) sides this insert writes no row to — none of
+	 * their columns supplied, or an existence flag set false. Every produced row reads
+	 * them back NULL-extended.
+	 */
+	readonly absentSides: readonly TableSchema[];
+	/**
 	 * The anchor key column's declared `default`, evaluated once per produced row at
 	 * the envelope (with `mutation_ordinal()` in scope) and threaded into every side's
 	 * key column via the equivalence class. Set only when the shared key is **not**
@@ -828,6 +834,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	return {
 		suppliedColumns: supplied.map(s => ({ name: s.name, type: s.type })),
 		orderedSides: order.map(i => specByIndex.get(i)!),
+		absentSides: sides.filter((_, i) => !isActive(i)).map(s => s.schema),
 		keyDefault,
 		keyDefaultSchemaName,
 	};

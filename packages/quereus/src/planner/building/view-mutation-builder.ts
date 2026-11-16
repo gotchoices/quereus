@@ -2,10 +2,10 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type TableDescriptor, type RowDescriptor } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
-import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
+import { RowOpFlag, type RowConstraintSchema, type TableSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, withKeyCapture, capturedSideIndices, isJoinBody, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, withKeyCapture, capturedSideIndices, isJoinBody, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue, type MsInsertAnalysis } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, isSetOpFlaglessWritableBody, buildSetOpWrite, buildFlaglessSetOpWrite, type SetOpWritePlan } from '../mutation/set-op.js';
 import { buildCteSelfCapture } from '../mutation/single-source.js';
@@ -28,7 +28,7 @@ import {
 } from '../mutation/lens-enforcement.js';
 import type { LensSlot } from '../../schema/lens.js';
 import type { StorageShape, BasisRelationRef } from '../../vtab/mapping-advertisement.js';
-import { cloneExpr, transformExpr } from '../mutation/scope-transform.js';
+import { cloneExpr, transformExpr, transformAliasScopedExpr } from '../mutation/scope-transform.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import type { EnvelopeRowCheck } from '../nodes/view-mutation-node.js';
 import { ConflictResolution } from '../../common/constants.js';
@@ -151,6 +151,17 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({ ...sel, storedBodyEnv })),
 		};
 
+	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
+	// covering structure) enforces via an O(n) deferred count scan, which cannot
+	// perform `or replace` / `or ignore`. Reject those up front so a write that would
+	// silently ABORT-at-commit instead of skipping/replacing is caught with a clear
+	// diagnostic. A row-time key (backed by a basis UNIQUE + covering MV) is NOT
+	// gated — its basis UC's covering-MV enforcement resolves the conflict action for
+	// free (`lens-set-level-rowtime-enforcement`, delivered). Placed above every insert
+	// dispatch: each insert fan-out (decomposition, join, single-source) threads the
+	// commit-time count CHECK.
+	rejectLensSetLevelConflictResolution(ctx, view, req);
+
 	// A decomposition INSERT fans out one insert per member off the same shared-
 	// surrogate envelope, materialized once and read back per member through an
 	// `EnvelopeScanNode` — the plan-level form the AST `BaseOp[]` model cannot
@@ -161,9 +172,15 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 
 	// Multi-source inner-join INSERT needs the plan-level shared-surrogate envelope
 	// (a materialized augmented source the sibling base inserts fan out from), which
-	// the AST-level `BaseOp[]` model cannot express — build it directly.
+	// the AST-level `BaseOp[]` model cannot express — build it directly. The lens
+	// constraints are the insert subset of the update path's list below: parent-side FKs
+	// are left out (an insert cannot orphan a child), and row-local checks keep the routed
+	// basis-term form, since every inner-join side insert runs and sees the written value.
 	if (req.op === 'insert' && isJoinBody(view.selectAst)) {
-		return buildMultiSourceInsert(ctx, view, req.stmt);
+		return buildMultiSourceInsert(ctx, view, req.stmt, {
+			rowLocal: lensRowLocalConstraints(ctx, view),
+			other: [...lensForeignKeyConstraints(ctx, view), ...lensSetLevelConstraints(ctx, view)],
+		});
 	}
 
 	// Set-operation membership write (binary, non-nested): the per-branch fan-out keyed
@@ -187,15 +204,6 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 	if (!view.ephemeral && isSetOpFlaglessWritableBody(view.selectAst)) {
 		return buildSetOpMutation(ctx, view, req, buildFlaglessSetOpWrite);
 	}
-
-	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
-	// covering structure) enforces via an O(n) deferred count scan, which cannot
-	// perform `or replace` / `or ignore`. Reject those up front so a write that would
-	// silently ABORT-at-commit instead of skipping/replacing is caught with a clear
-	// diagnostic. A row-time key (backed by a basis UNIQUE + covering MV) is NOT
-	// gated — its basis UC's covering-MV enforcement resolves the conflict action for
-	// free (`lens-set-level-rowtime-enforcement`, delivered).
-	rejectLensSetLevelConflictResolution(ctx, view, req);
 
 	// Multi-source inner-join UPDATE / DELETE: plan the join body ONCE here and thread
 	// the single analysis through decomposition, the identity capture, and the
@@ -351,7 +359,7 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 		// exclusive with the `__vmupd_keys` key-ref injection (single-source vs multi-source /
 		// decomposition / set-op); prefer it when present.
 		const opCtx = ctxSelfRead ?? (injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx);
-		const opConstraints = constraintsForOp(op, extraConstraints, riddenConstraints);
+		const opConstraints = constraintsForOp(op.table.tableSchema, extraConstraints, riddenConstraints);
 		return buildBaseOp(opCtx, op, opConstraints, isLensWrite);
 	});
 	// A lens-synthesized constraint that resolves on NO base op of the fan-out is silently
@@ -835,11 +843,9 @@ function buildDecompositionRowLocalChecks(
 	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
 	onConflict: ConflictResolution | undefined,
 ): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor; deferredConstraints: RowConstraintSchema[] } {
-	const rowCheckRowDescriptor: RowDescriptor = [];
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
-	if (!slot) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints: [] };
-	const checks = collectLensRowLocalLogicalChecks(slot);
-	if (checks.length === 0) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints: [] };
+	const checks = slot ? collectLensRowLocalLogicalChecks(slot) : [];
+	if (!slot || checks.length === 0) return { rowChecks: [], rowCheckRowDescriptor: [], deferredConstraints: [] };
 
 	const supplied = new Set(suppliedColumns.map(c => c.name.toLowerCase()));
 	const envelope: Array<{ check: LensRowLocalLogicalCheck; substituted: AST.Expression }> = [];
@@ -864,35 +870,61 @@ function buildDecompositionRowLocalChecks(
 		deferredConstraints.push(synthesizeLensRowLocalDeferredConstraint(
 			ctx, slot, deferredChecks, address, anchorRelation, anchorKeyColumn, 'NEW', RowOpFlag.INSERT));
 	}
-	if (envelope.length === 0) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints };
+	// The message hints the AUTHORED (logical-term) expression — the one the user wrote.
+	// A synthesized check (the NOT NULL obligation) carries its own verbatim text, so the
+	// failure reads as its real class, not an anonymous CHECK.
+	const compiled = compileEnvelopeRowChecks(ctx, view, suppliedColumns, envelope.map(({ check, substituted }) => ({
+		name: check.name,
+		expr: substituted,
+		message: check.violationMessage ?? checkFailedMessage(check.name, check.expr),
+	})));
+	return { ...compiled, deferredConstraints };
+}
 
-	// Fresh attributes over the supplied columns (self-contained, like the key
-	// default's) + a scope resolving each as `<col>` / `new.<col>`.
+/** One check to evaluate at the mutation envelope, over the supplied (logical / view) columns. */
+interface EnvelopeCheckSource {
+	readonly name: string;
+	readonly expr: AST.Expression;
+	readonly message: string;
+}
+
+/** The violation text `runtime/row-constraints.ts` derives for a CHECK, so both seams report alike. */
+function checkFailedMessage(name: string, expr: AST.Expression): string {
+	const exprText = expressionToString(expr);
+	const hint = exprText.length <= 60 ? ` (${exprText})` : '';
+	return `CHECK constraint failed: ${name}${hint}`;
+}
+
+/**
+ * Compile envelope checks over fresh attributes for the supplied columns (self-contained,
+ * like the key default's), each column resolvable as `<col>` / `new.<col>`. The returned
+ * descriptor is installed over each envelope row while its checks run.
+ */
+function compileEnvelopeRowChecks(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+	sources: readonly EnvelopeCheckSource[],
+): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor } {
+	const rowCheckRowDescriptor: RowDescriptor = [];
+	if (sources.length === 0) return { rowChecks: [], rowCheckRowDescriptor };
 	const attrs: Attribute[] = suppliedColumns.map(col => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,
 		type: col.type,
 		sourceRelation: 'envelope-row-check',
 	}));
-	const scope = buildRowDefaultScope(ctx.scope, suppliedColumns, attrs);
-	const checkCtx = { ...ctx, scope };
-	const rowChecks: EnvelopeRowCheck[] = envelope.map(({ check, substituted }) => {
-		const expression = buildExpression(checkCtx, substituted) as ScalarPlanNode;
+	const checkCtx = { ...ctx, scope: buildRowDefaultScope(ctx.scope, suppliedColumns, attrs) };
+	const rowChecks: EnvelopeRowCheck[] = sources.map(({ name, expr, message }) => {
+		const expression = buildExpression(checkCtx, expr) as ScalarPlanNode;
 		// Same determinism rule (and same opt-out) the constraint pipeline applies.
 		if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-			validateDeterministicConstraint(expression, check.name, view.name);
+			validateDeterministicConstraint(expression, name, view.name);
 		}
-		// Same message shape `runtime/row-constraints.ts` derives, hinting the
-		// AUTHORED (logical-term) expression — the one the user wrote. A synthesized
-		// check (the NOT NULL obligation) instead carries its own verbatim text, so
-		// the failure reads as its real class, not an anonymous CHECK.
-		const exprText = expressionToString(check.expr);
-		const hint = exprText.length <= 60 ? ` (${exprText})` : '';
-		const message = check.violationMessage ?? `CHECK constraint failed: ${check.name}${hint}`;
-		return { name: check.name, expression, message };
+		return { name, expression, message };
 	});
 	attrs.forEach((attr, index) => { rowCheckRowDescriptor[attr.id] = index; });
-	return { rowChecks, rowCheckRowDescriptor, deferredConstraints };
+	return { rowChecks, rowCheckRowDescriptor };
 }
 
 /**
@@ -987,7 +1019,9 @@ function buildSetOpMutation(
 	// `from __vmupd_keys` source resolves against the outer set-op capture (which the outer node
 	// materializes first). `buildMultiSourceInsert` records no view dependency (that happens once in
 	// `buildViewMutation` above), so building it on a synthetic branch view is safe.
-	for (const jli of joinLegInserts ?? []) children.push(buildMultiSourceInsert(opCtx, jli.view, jli.stmt));
+	// No lens rules: a set-op body cannot be a lens body (`declare lens` rejects compound
+	// selects), so a synthetic branch view never has a lens slot to collect from.
+	for (const jli of joinLegInserts ?? []) children.push(buildMultiSourceInsert(opCtx, jli.view, jli.stmt, NO_JOIN_INSERT_LENS_RULES));
 	const identityCapture = capture ? { source: capture.source, descriptor: capture.descriptor } : undefined;
 	// The inner per-branch captures ride the ORDERED `nestedCaptures` side input: materialized
 	// AFTER the primary outer capture, in fan order, so each inner's `memberExists` filter scans
@@ -1036,9 +1070,22 @@ function buildNoOpMutationSink(ctx: PlanningContext, op: string): PlanNode {
  * The sides are already FK-parent-before-FK-child ordered; the emitter drives them
  * in that order. Every side reads the same materialized envelope, so the shared key
  * is evaluated exactly once per produced row and threaded identically.
+ *
+ * `lensRules` are the rules of a join-backed logical table, gated onto each side by
+ * `constraintsForOp`: a rule rides the side whose table owns every write-row column it
+ * reads. A rule reading columns of more than one side rides none (traced), matching the
+ * join UPDATE path. A row-local check riding an outer-joined side also gets an envelope
+ * check for the rows that side's insert skips ({@link buildAbsentSideRowChecks}).
  */
-function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
+function buildMultiSourceInsert(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	stmt: AST.InsertStmt,
+	lensRules: JoinInsertLensRules,
+): PlanNode {
 	const plan = analyzeMultiSourceInsert(ctx, view, stmt);
+	const extraConstraints = [...lensRules.rowLocal, ...lensRules.other];
+	const riddenConstraints = new Set<RowConstraintSchema>();
 
 	const { envelopeAttrs, envelopeType, descriptor } = buildEnvelopeShape(plan.suppliedColumns, !!plan.keyDefault);
 
@@ -1104,8 +1151,15 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 		// single basis spine, so the runtime parent-side cascade reverse-map never matches
 		// it — the marker would have no effect. The single-source spine (`buildBaseOp`) is
 		// the only place it is load-bearing. Do not "fix" this omission.
-		return buildInsertStmt(ctx, sideInsert, [], source, false, sideNewRowScope);
+		const sideConstraints = constraintsForOp(side.schema, extraConstraints, riddenConstraints);
+		return buildInsertStmt(ctx, sideInsert, sideConstraints, source, false, sideNewRowScope);
 	});
+	for (const c of extraConstraints) {
+		if (!riddenConstraints.has(c)) {
+			log('lens constraint %s references write-row columns no side of the join insert carries; not enforced on this write', c.name ?? '<anon>');
+		}
+	}
+	const absentSide = buildAbsentSideRowChecks(ctx, view, plan, envelopeAttrs, lensRules.rowLocal);
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
 	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.keyDefaultSchemaName, plan.suppliedColumns);
@@ -1115,7 +1169,78 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 		descriptor,
 		keyDefault: keyDefault?.node,
 		keyDefaultRowDescriptor: keyDefault?.rowDescriptor,
+		rowChecks: absentSide.rowChecks.length > 0 ? absentSide.rowChecks : undefined,
+		rowCheckRowDescriptor: absentSide.rowChecks.length > 0 ? absentSide.rowCheckRowDescriptor : undefined,
+		rowCheckOnConflict: absentSide.rowChecks.length > 0 ? stmt.onConflict : undefined,
 	});
+}
+
+/** The lens rules a join insert threads onto its sides — see {@link buildMultiSourceInsert}. */
+interface JoinInsertLensRules {
+	/** Row-local checks in routed basis terms (`NEW.<basis column>`). */
+	readonly rowLocal: ReadonlyArray<RowConstraintSchema>;
+	/** Child-side FK and commit-time set-level rules. */
+	readonly other: ReadonlyArray<RowConstraintSchema>;
+}
+
+const NO_JOIN_INSERT_LENS_RULES: JoinInsertLensRules = { rowLocal: [], other: [] };
+
+/**
+ * Envelope checks for the rows an outer-joined side's insert skips. An outer-joined side
+ * inserts only when the row supplies a non-null value for one of its columns, and not at
+ * all when the statement supplies none of them, so a row-local check riding that side's
+ * insert never sees such a row — yet the logical row reads that side back as all NULL,
+ * and a check that NULL fails (`email is not null`) is violated.
+ *
+ * For each row-local check whose columns all belong to one such side, the envelope
+ * evaluates `<side present> or <check with that side's columns as NULL>`: true when the
+ * side's insert runs (its own check decides that row, against the values actually
+ * stored, basis defaults included), else the check over the NULL-extended row. Each row
+ * is therefore checked exactly once. FK and set-level rules need no such check: a NULL
+ * child column satisfies an FK, and a NULL key cannot duplicate.
+ *
+ * NOTE: a check holding a subquery is evaluated here at row time, before any side
+ * insert, while its routed form on a present row is deferred to commit. The two agree
+ * unless the subquery reads a table this same insert writes; if such checks appear,
+ * route the absent-side form through a deferred re-read instead.
+ */
+function buildAbsentSideRowChecks(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	plan: MsInsertAnalysis,
+	envelopeAttrs: Attribute[],
+	rowLocal: ReadonlyArray<RowConstraintSchema>,
+): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor } {
+	const sources: EnvelopeCheckSource[] = [];
+	for (const c of rowLocal) {
+		const presence = absentSidePresence(plan, c);
+		if (presence === undefined) continue;
+		const nullExtended = transformAliasScopedExpr(c.expr, (col, aliasShadow) =>
+			col.table?.toLowerCase() === 'new' && !aliasShadow.has('new')
+				? { type: 'literal', value: null } as AST.LiteralExpr
+				: undefined);
+		const expr: AST.Expression = presence.length === 0
+			? nullExtended
+			: { type: 'binary', operator: 'OR', left: parseExpressionString(presencePredicateSql(envelopeAttrs, presence)), right: nullExtended } as AST.BinaryExpr;
+		sources.push({ name: c.name ?? 'lens:check', expr, message: c.violationMessage ?? checkFailedMessage(c.name ?? 'lens:check', c.expr) });
+	}
+	return compileEnvelopeRowChecks(ctx, view, plan.suppliedColumns, sources);
+}
+
+/**
+ * The envelope indices whose non-null presence means `c`'s side inserts for a row (`[]`
+ * when the side never inserts on this statement), or `undefined` when `c` needs no
+ * absent-side check: its side always inserts, or its columns span sides / are not
+ * attributed (then it rides no side at all).
+ */
+function absentSidePresence(plan: MsInsertAnalysis, c: RowConstraintSchema): readonly number[] | undefined {
+	const rels = c.referencedWriteRowRelations;
+	if (!rels || rels.length === 0) return undefined;
+	const owns = (t: TableSchema): boolean => rels.every(r =>
+		r.schema.toLowerCase() === t.schemaName.toLowerCase() && r.table.toLowerCase() === t.name.toLowerCase());
+	const active = plan.orderedSides.find(s => owns(s.schema));
+	if (active) return active.presenceGateIndices.length > 0 ? active.presenceGateIndices : undefined;
+	return plan.absentSides.some(owns) ? [] : undefined;
 }
 
 /**
@@ -1143,14 +1268,6 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
  */
 function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, stmt: AST.InsertStmt): PlanNode {
 	const storage = decompositionStorage(ctx, view)!; // guaranteed by the caller's gate
-
-	// This path early-returns from `buildViewMutation` before its `rejectLensSetLevelConflictResolution`
-	// gate (the decomposition routing sits above it), so run the gate here too. Now that the fan-out
-	// threads the commit-time set-level count CHECK (below), an `insert or replace` / `or ignore` /
-	// upsert through a decomposition with a commit-time set-level key would otherwise silently
-	// ABORT-at-commit instead of getting the documented up-front diagnostic (docs/lens-constraints.md
-	// § Enforcement by constraint class). A plain insert / `or abort` is unaffected.
-	rejectLensSetLevelConflictResolution(ctx, view, { op: 'insert', stmt });
 
 	const plan = analyzeDecompositionInsert(ctx, view, storage, stmt);
 
@@ -1194,7 +1311,7 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	const baseOps = plan.ops.map(op =>
 		buildDecompositionMemberInsert(
 			ctx, stmt, descriptor, envelopeAttrs, envelopeType, op, memberNewRowScope,
-			constraintsForOp(op, extraConstraints, riddenConstraints)));
+			constraintsForOp(op.schema, extraConstraints, riddenConstraints)));
 
 	// A lens constraint that resolves on NO member op of the fan-out (a cross-member CHECK /
 	// FK / set-level key) is silently deferred — trace it so the non-enforcement is visible in
@@ -1537,22 +1654,20 @@ function quoteIdent(name: string): string {
  * added inside `buildConstraintChecks` from `tableSchema.checkConstraints`, never via
  * this seam), so gating every entry is safe.
  *
- * `op` is typed structurally on just its `table` so BOTH fan-out op shapes satisfy it: a
- * `BaseOp` (the single-source spine and the multi-source / decomposition UPDATE + DELETE
- * fan-out) and a `DecompInsertOp` (the decomposition INSERT fan-out, which routes per
- * member through {@link buildDecompositionInsert} — not via `buildBaseOp`). Both carry the
- * member's `TableReferenceNode`, so `op.table.tableSchema.columns` resolves the member's
- * columns directly for either.
+ * `target` is the op's target table, which every fan-out op shape can supply: a `BaseOp`
+ * (the single-source spine and the multi-source / decomposition UPDATE + DELETE fan-out),
+ * a `DecompInsertOp` (the decomposition INSERT fan-out) and an `MsInsertSide` (the join
+ * INSERT fan-out) — the last two route through their own insert builders, not `buildBaseOp`.
  */
 function constraintsForOp(
-	op: Pick<BaseOp, 'table'>,
+	target: TableSchema,
 	extraConstraints: ReadonlyArray<RowConstraintSchema>,
 	ridden: Set<RowConstraintSchema>,
 ): RowConstraintSchema[] {
 	if (extraConstraints.length === 0) return [];
-	const opSchema = op.table.tableSchema.schemaName.toLowerCase();
-	const opName = op.table.tableSchema.name.toLowerCase();
-	const opCols = new Set(op.table.tableSchema.columns.map(c => c.name.toLowerCase()));
+	const opSchema = target.schemaName.toLowerCase();
+	const opName = target.name.toLowerCase();
+	const opCols = new Set(target.columns.map(c => c.name.toLowerCase()));
 	const kept: RowConstraintSchema[] = [];
 	for (const c of extraConstraints) {
 		let resolvable: boolean;

@@ -84,9 +84,10 @@ export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
  * Sourced from `slot.advertisement.storage.members` (each member's `relation` +
  * the `logicalColumn`s it backs) when a decomposition backs the table; else from
  * {@link resolveSlotBasisSource} (the single basis relation answers for every
- * column). Returns `undefined` for a column it cannot attribute (an EAV-pivot
- * logical column, an opaque slot) — the caller then omits the relation metadata for
- * that constraint, so the gate falls back to its bare-name path.
+ * column); else, for a user-written join body, from {@link joinBodyColumnOwners}.
+ * Returns `undefined` for a column it cannot attribute (an EAV-pivot logical column,
+ * a computed join-body column, an opaque slot) — the caller then omits the relation
+ * metadata for that constraint, so the gate falls back to its bare-name path.
  */
 function makeOwningRelationResolver(
 	slot: LensSlot,
@@ -100,12 +101,66 @@ function makeOwningRelationResolver(
 		}
 		return (logicalColumn) => byLogical.get(logicalColumn.toLowerCase());
 	}
-	const basis = schemaManager ? resolveSlotBasisSource(slot, schemaManager) : undefined;
+	if (!schemaManager) return () => undefined;
+	const basis = resolveSlotBasisSource(slot, schemaManager);
 	if (basis) {
 		const ref: BasisRelationRef = { schema: basis.schemaName, table: basis.name };
 		return () => ref;
 	}
-	return () => undefined;
+	const byLogical = joinBodyColumnOwners(slot, schemaManager);
+	return (logicalColumn) => byLogical.get(logicalColumn.toLowerCase());
+}
+
+/**
+ * Attributes each logical column of a join body to the basis table its body output
+ * reads, keyed by lowercased logical name. A body output that is a column reference
+ * resolves through the body's FROM: a qualified ref (`k.mail`) by its qualifier (the
+ * source's alias, else its table name), a bare ref by the one source whose table has
+ * that column. A computed output, a ref no source (or more than one source) answers,
+ * and a ref to a non-basis source (a CTE, a subquery, a function) are left out.
+ *
+ * Reads only the catalog. A compiled body names every basis table schema-qualified
+ * (`lens-compiler.ts` § `qualifyBasisSources`), so an unqualified FROM name is a CTE
+ * and is not resolved as a basis table — the same rule {@link resolveSlotBasisSource}
+ * applies to a single-source body.
+ */
+function joinBodyColumnOwners(slot: LensSlot, schemaManager: SchemaManager): Map<string, BasisRelationRef> {
+	const owners = new Map<string, BasisRelationRef>();
+	const sources = joinBodyBasisSources(slot.compiledBody.from, schemaManager);
+	if (sources.length === 0) return owners;
+	slot.columnProvenance.forEach((p, outputIndex) => {
+		const rc = slot.compiledBody.columns[outputIndex];
+		if (!rc || rc.type !== 'column' || rc.expr.type !== 'column') return;
+		const ref = rc.expr as AST.ColumnExpr;
+		const name = ref.name.toLowerCase();
+		const candidates = ref.table
+			? sources.filter(s => s.qualifier === ref.table!.toLowerCase()
+				&& (ref.schema === undefined || ref.schema.toLowerCase() === s.table.schemaName.toLowerCase()))
+			: sources.filter(s => s.table.columnIndexMap.has(name));
+		if (candidates.length !== 1) return;
+		owners.set(p.logicalColumn.toLowerCase(), { schema: candidates[0].table.schemaName, table: candidates[0].table.name });
+	});
+	return owners;
+}
+
+/** The schema-qualified basis tables a body's FROM reads, each with the qualifier that names it. */
+function joinBodyBasisSources(
+	from: ReadonlyArray<AST.FromClause> | undefined,
+	schemaManager: SchemaManager,
+): Array<{ qualifier: string; table: TableSchema }> {
+	const out: Array<{ qualifier: string; table: TableSchema }> = [];
+	const walk = (node: AST.FromClause): void => {
+		if (node.type === 'join') {
+			walk(node.left);
+			walk(node.right);
+			return;
+		}
+		if (node.type !== 'table' || node.table.schema === undefined) return;
+		const table = schemaManager.getSchema(node.table.schema)?.getTable(node.table.name);
+		if (table) out.push({ qualifier: (node.alias ?? node.table.name).toLowerCase(), table });
+	};
+	for (const f of from ?? []) walk(f);
+	return out;
 }
 
 /**
