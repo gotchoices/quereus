@@ -2,7 +2,7 @@
 
 > **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
 
-A **bundle** is one YAML file, conventionally `bundle.yaml`, that carries one or more schemas of a Quereus database and the rows of their tables. The schema travels as `declare schema` text, which an importer applies with `apply schema`; the rows travel in batches, encoded so every `SqlValue` reads back with the same value and the same JavaScript type. `@quereus/bundle` (`packages/quereus-bundle`) defines the format and writes it. This document is the authoritative description of the format; the package [README](../packages/quereus-bundle/README.md) has usage examples.
+A **bundle** is one YAML file, conventionally `bundle.yaml`, that carries one or more schemas of a Quereus database and the rows of their tables. The schema travels as `declare schema` text, which an importer applies with `apply schema`; the rows travel in batches, encoded so every `SqlValue` reads back with the same value and the same JavaScript type. `@quereus/bundle` (`packages/quereus-bundle`) defines the format, writes it and reads it. This document is the authoritative description of the format; the package [README](../packages/quereus-bundle/README.md) has usage examples.
 
 ## Format (version 1)
 
@@ -113,11 +113,81 @@ Invalid options (`batchSize` below 1, neither `schema` nor `data`, an empty `sch
 
 ## Import
 
-Not implemented yet: `@quereus/bundle` currently writes bundles and does not read them.
+```ts
+import { createReadStream } from 'node:fs';
+import { importBundle } from '@quereus/bundle';
 
-### Rejected alternatives
+const report = await importBundle(db, createReadStream('bundle.yaml', 'utf8'), { errorPolicy: 'skip-row' });
+if (!report.ok) for (const error of report.errors) console.warn(error.kind, error.message);
+```
+
+`importBundle(db, source, options?)` reads `source` one YAML document at a time and resolves to an `ImportReport`. `source` is the whole text, or its chunks in order as an `Iterable<string>` or `AsyncIterable<string>`; a Node `fs.createReadStream(path, 'utf8')` and a browser `ReadableStream` piped through `TextDecoderStream` are both the latter. A chunk may end anywhere, even inside a line. Memory stays bounded by the largest document, not the file.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `schema` | `'apply'` | `'apply'` migrates each schema to the header's declaration; `'verify'` fails when the database differs from it; `'skip'` ignores it |
+| `allowDestructive` | `false` | Let `'apply'` run a plan with destructive statements (see [Schema phase](#schema-phase)) |
+| `renamePolicy` | the engine's (`'allow'`) | Passed to `apply schema … options (rename_policy = …)` |
+| `confirmSchemaPlan(plan)` | | Asked with the `SchemaPlan` (`schema`, `ddl`, `destructive`) before a non-empty plan runs; `false` stops the import |
+| `tables(schema, table)` | all | Which tables' rows to load. A table it rejects is left out of the report and the trailer check |
+| `onConflict` | `'abort'` | What a row whose key already exists does: `'abort'` fails it, `'skip'` keeps the stored row, `'update'` overwrites the stored row's non-key columns |
+| `errorPolicy` | `'abort'` | What a failed batch does: `'abort'`, `'skip-batch'` or `'skip-row'`; see [Data phase](#data-phase) |
+| `onProgress`, `onError`, `signal` | | Hooks; see [Progress, errors and cancelling](#progress-errors-and-cancelling) |
+
+**Throw or report.** `importBundle` throws `MisuseError` only for misuse: an invalid option, a database inside a transaction (the import runs its own transactions, so it refuses rather than commit the caller's work), or a source that yields something other than strings. Every problem with the bundle's content, or with applying it, is a `BundleError`, delivered to `onError` as it happens and listed in `report.errors`, and the promise resolves.
+
+**The report.** `ok` is true when no error was recorded and the run was not cancelled. `schemas` lists, per declaration handled, the DDL `apply schema` ran. `tables` lists, per manifest table the `tables` filter accepts: `rowsRead` (rows its data documents carry), `rowsApplied` (rows committed, including rows `onConflict: 'skip'` left as they were), `rowsFailed` (rows not applied because of an error), `batchesFailed` (documents that failed as a whole) and `expectedRows` (the trailer's count, once read).
+
+**Not all-or-nothing.** Each data document is its own transaction. A failure never takes back a document already committed: `rowsApplied` says what stayed. Do not run statements on the same database while an import runs: they would interleave between batches, and with `foreign_keys` off for the whole database.
+
+### Schema phase
+
+For each `schemas` entry, unless `schema: 'skip'`:
+
+1. **The declaration must be exactly one `declare schema` statement for the schema the entry names**, and not a logical schema. A bundle is untrusted input and its declaration runs as SQL; anything else is a fatal `schema` error, so a crafted file cannot run other statements.
+2. The import runs the declaration, collects the plan with `diff schema`, and afterwards puts the database's own declaration of that schema (and its seed rows) back, or removes the import's when there was none. An import does not replace the application's declared state.
+3. **Destructive statements** are any drop (including the drop half of a view or index recreate), and an `alter table` that drops a column or constraint or changes a column's type: the statements that lose data or break dependents. Under `renamePolicy: 'deny'` the engine turns every rename the plan shows into a drop and a create, so renames count too (`diff schema` always plans as `'allow'`).
+4. `'verify'`: a non-empty plan is a fatal `schema` error listing it. `'apply'`: a plan with destructive statements is a fatal `destructive` error listing them unless `allowDestructive` is set, and nothing has run; then `confirmSchemaPlan` is asked (a hook that throws counts as declining), and `apply schema` runs. A refused `apply schema` is fatal, with the engine's error as `cause`. It leaves the catalog as it was, except after a destructive step has run: see [Declarative Schema § Failure and restoration](schema-declarative.md#failure-and-restoration).
+
+`onProgress` reports phase `schema` once per schema.
+
+### Data phase
+
+**Foreign keys are off while rows load**, and restored afterwards on every exit path. Documents commit one by one and the engine judges a child's foreign key at commit, so a child row whose parent arrives in a later document (a self-referencing table, a cycle between tables) would fail although the bundle is consistent. Dump tools do the same; [verification](#verification) checks afterwards.
+
+For each data document:
+
+- The table must be in the header's `tables` manifest. The target table must exist, hold its own rows (not a maintained table), and have every manifest column, none of them generated; a target column the bundle does not carry takes its default. A table that fails these checks is reported once, and its documents are skipped.
+- Rows are inserted with one prepared statement per table. `onConflict: 'skip'` adds `on conflict do nothing`; `'update'` adds `on conflict (<primary key>) do update set c = excluded.c` for each non-key manifest column, and behaves as `'skip'` for a table with none. Not `insert or replace`, which deletes and re-inserts and so fires `on delete` cascades.
+- The document runs as one transaction. A row of the wrong arity, or with a value no bundle holds, is a failure like a statement error. On any failure the transaction rolls back, then:
+  - `'abort'`: a `batch` error naming the failing row, and the import stops.
+  - `'skip-batch'`: a `batch` error, and the import moves to the next document.
+  - `'skip-row'`: the document's rows are replayed one transaction each, and each failing row is a `row` error carrying its document index, row index, line and cause.
+- A document that is not valid YAML, or not shaped like a data document, costs its batch: a `format` error with its line and column, handled like a failed batch under the error policy. A syntax error that breaks the stream's document structure shows up as such errors followed by `truncated` or `count-mismatch`.
+- A failed rollback after a failure is a `batch` error with the original error as `cause`, and the import stops, since the transaction state is no longer known.
+
+`onProgress` reports phase `data` after each document. `signal` is checked between documents: when aborted the import stops, records a `cancelled` error and sets `report.cancelled`. `onError` returning `'abort'` stops after the current document.
+
+**The trailer.** Each table's trailer count is compared with the rows its documents carried (read, not applied: rows that failed are already reported); a difference is a `count-mismatch` error. A trailer entry with `error` (the export gave up on that table) is a `truncated` error naming the table. A table missing from the trailer, or a trailer entry for a table the manifest does not list, is a `format` error. A bundle that ends without a trailer is `truncated`, and a document after the trailer is a `format` error.
+
+### Verification
+
+When `foreign_keys` was on before the import, then once it is back on, every foreign key whose child **or** parent table received rows is checked with the engine's existing-row scan. The parent matters too: `onConflict: 'update'` can change a parent's unique non-key column and orphan rows in a table the bundle never touched. Each violation is a `foreign-key` error naming the child table and the constraint. Nothing is rolled back: the rows stay committed. Verification is skipped when the run was cancelled or `onError` answered `'abort'`, and `onProgress` reports phase `verify` per foreign key checked.
+
+**Fix a reported violation before relying on queries over that foreign key.** The optimizer treats a declared foreign key as holding, so while orphaned rows exist a query whose answer depends on them (`not exists (select … from parent …)`, or a join it can prove redundant) can leave them out.
+
+### Known limits
+
+- **Cross-table CHECKs and assertions are judged at each document's commit**: they are deferred to commit, and `foreign_keys` does not cover them. A bundle whose rows satisfy them only once every table has loaded fails document by document. The exporter's parents-first order makes this rarer.
+- **Maintained tables and materialized views** carry no data documents: `apply schema` creates them, and the rows loaded into their sources afterwards flow through normal maintenance.
+- **Importing the same bundle twice** fails on the first document under the default `onConflict: 'abort'`, and changes nothing under `'skip'`.
+
+## Rejected alternatives
 
 - **One YAML document for the whole file.** The reader would parse everything into memory before applying anything, and one corrupt byte would lose the file.
 - **Rows as maps keyed by column name.** Repeating every column name on every row multiplies the file size; the header states the column order once.
 - **The `yaml` library's own `!!binary`.** It encodes a typed array's whole backing buffer rather than its view, reads into a Node `Buffer`, and accepts malformed base64 silently. The package registers its own tag.
 - **Reading ints as JavaScript numbers.** An integer past 2^53−1 loses precision before the codec sees it.
+- **One transaction for the whole import.** A large bundle would hold every row in one transaction, and one bad row anywhere would lose the file. Per-document transactions keep each failure to its batch.
+- **Keeping foreign keys on and ordering rows parents-first.** Parents-first order cannot help a self-referencing table or a cycle between tables, and documents commit separately.
+- **`insert or replace` for `onConflict: 'update'`.** It deletes the stored row and inserts the new one, which fires `on delete` cascades and actions; `on conflict … do update` changes the row in place.

@@ -16,3 +16,6 @@ export {
 	type BundleProgress,
 } from './hooks.js';
 export { DEFAULT_BATCH_SIZE, exportBundle, type ExportOptions } from './export.js';
+export { importBundle } from './import.js';
+export type { ImportOptions, ImportReport, ImportTableReport, SchemaPlan } from './import-run.js';
+export type { BundleSource } from './read-documents.js';
