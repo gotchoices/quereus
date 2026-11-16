@@ -112,9 +112,29 @@ describe('apply schema: index creates run after the table-alter block', () => {
 		expect(at(/set maintained/i)).to.be.lessThan(at(/create index m_w/i));
 		await db.exec('apply schema main');
 
-		// Read the live table, not the catalog: the catalog omits every index on a maintained table (see backlog bug-declared-index-on-maintained-table-never-converges).
-		expect(db.schemaManager.getTable('main', 'm')?.indexes?.map(i => i.name)).to.deep.equal(['m_w']);
+		expect(indexNames(db, 'm')).to.deep.equal(['m_w']);
 		expect(await rows(db, 'select id from m where w = 100')).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('an index declared on a maintained table converges, and removing it plans DROP INDEX', async () => {
+		await db.exec(`declare schema main {
+			table src { id integer primary key, v integer }
+			table m { id integer primary key, v integer } maintained as select id, v from src
+			index m_v on m (v)
+		}`);
+		await db.exec('apply schema main');
+		expect(await rows(db, 'diff schema main')).to.deep.equal([]);
+		await db.exec('apply schema main');
+
+		await db.exec(`declare schema main {
+			table src { id integer primary key, v integer }
+			table m { id integer primary key, v integer } maintained as select id, v from src
+		}`);
+		const plan = (await rows(db, 'diff schema main')).map(r => String(r.ddl));
+		expect(plan).to.have.lengthOf(1);
+		expect(plan[0]).to.match(/^DROP INDEX IF EXISTS "?m_v"?$/);
+		await db.exec('apply schema main');
+		expect(indexNames(db, 'm')).to.deep.equal([]);
 	});
 
 	it('a version that drops an index together with its column still applies', async () => {

@@ -273,10 +273,11 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 	// round-trips in the TABLE category like any other table, carrying a
 	// `maintained` descriptor (body hash + backing module) so the declarative
 	// differ compares it per name in one category and recognizes attach / detach /
-	// re-attach transitions as non-destructive alter ops. Its internal covering
-	// indexes stay OUT of the catalog `indexes` set — they are a maintenance
-	// backing detail, not differ-managed objects. (Check maintained BEFORE isView:
-	// a maintained table may legacy-carry isView.)
+	// re-attach transitions as non-destructive alter ops. Its indexes are user
+	// objects like any table's: the engine builds none on a maintained table
+	// beyond the implicit UNIQUE structure every table gets, which
+	// `displayIndexesForTable` filters below. (A "covering MV" covers a SOURCE
+	// table's UNIQUE constraint; it adds no index to the maintained table.)
 	for (const tableSchema of schema.getAllTables()) {
 		// Engine-managed tables (e.g. Lamina's per-column `(rowId, value)` basis
 		// member relations) are excluded from the catalog UNCONDITIONALLY — before
@@ -286,11 +287,8 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		// `getAllTables` for compile / introspection / servicing. Sibling of the
 		// implicit-covering-index exclusion (see `CatalogIndex.implicit`).
 		if (isEngineManagedTable(tableSchema)) continue;
-		if (isMaintainedTable(tableSchema)) {
-			tables.push(tableSchemaToCatalog(tableSchema, db));
-			continue;
-		}
-		if (tableSchema.isView) continue;
+		// A maintained table may legacy-carry isView, so only a plain view is skipped.
+		if (tableSchema.isView && !isMaintainedTable(tableSchema)) continue;
 		tables.push(tableSchemaToCatalog(tableSchema, db));
 
 		// Collect indexes for this table. Implicit covering structures (the

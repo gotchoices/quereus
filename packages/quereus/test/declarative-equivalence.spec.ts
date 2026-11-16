@@ -1755,6 +1755,47 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
+	it('a backing-module move recreates the moved table\'s indexes on the new incarnation', async function () {
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+				index mv_x on mv (x)
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2() as select id, x from t
+				index mv_x on mv (x)
+			}`);
+			// The DROP TABLE takes the unchanged index with it, so it recreates — as a
+			// matched-object recreate, which the require-hint rename guard lets through.
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+				'require-hint',
+			);
+			expect(diff.indexesToDrop).to.deep.equal(['mv_x']);
+			const creates = diff.indexesToCreate.map(c => c.sql);
+			expect(creates).to.have.lengthOf(1);
+			expect(creates[0]).to.match(/\bmv_x\b/i);
+
+			await db.exec('apply schema main options (allow_destructive = true)');
+			expect(db.schemaManager.getTable('main', 'mv')?.indexes?.map(i => i.name)).to.deep.equal(['mv_x']);
+			const rediff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(rediff.indexesToCreate, 'no second index create').to.deep.equal([]);
+			expect(rediff.indexesToDrop, 'no second index drop').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a maintained-table RENAME + backing-module move in one apply cooperate (rename retargets, recreate-in-place under new name)', async function () {
 		// Regression: a maintained table that is BOTH renamed (via a
 		// `quereus.previous_name` hint) AND has its backing module moved in the same

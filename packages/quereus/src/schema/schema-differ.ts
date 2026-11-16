@@ -728,6 +728,9 @@ export function computeSchemaDiff(
 	// indexRecreates).
 	const dropSet = new Set<string>();
 	let maintainedModuleRecreates = 0;
+	// Declared (lowercased) names of the tables a module move recreates: their
+	// indexes go with the `DROP TABLE`, so the index loop recreates every matched one.
+	const tablesRecreatedByModuleMove = new Set<string>();
 	for (const [name, declaredTable] of declaredTables) {
 		const tableStmt = declaredTable.tableStmt;
 		const matchedActual = tableRenames.pairs.get(name);
@@ -758,6 +761,7 @@ export function computeSchemaDiff(
 				// two names are identical.
 				const dropName = matchedActual.name.toLowerCase() !== name ? name : matchedActual.name.toLowerCase();
 				dropSet.add(dropName);
+				tablesRecreatedByModuleMove.add(name);
 				diff.tablesToCreate.push(freshCreate(name, tableStmt));
 				diff.maintainedModuleMigrations.push({
 					name: tableStmt.table.name,
@@ -916,10 +920,14 @@ export function computeSchemaDiff(
 		// (pre-rename) name and the recreate carries the declared (post-rename) name, so
 		// a genuine body change on a rename-matched index resolves to a correct
 		// drop+recreate that supersedes the no-op rename op.
-		const declaredTableForIndex = declaredTables.get(declaredIndex.indexStmt.table.name.toLowerCase());
-		const indexColRenames = columnRenamesByTable.get(declaredIndex.indexStmt.table.name.toLowerCase()) ?? [];
+		const declaredTableKey = declaredIndex.indexStmt.table.name.toLowerCase();
+		const declaredTableForIndex = declaredTables.get(declaredTableKey);
+		const indexColRenames = columnRenamesByTable.get(declaredTableKey) ?? [];
 		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, tableRenames.renames, targetSchemaName, defaultCollation);
-		if (declaredBody !== matchedActual.definition) {
+		// A backing-module move drops the index's table and recreates it, so an
+		// unchanged index needs the same drop+recreate a body change gets — the
+		// `DROP INDEX IF EXISTS` is then a no-op behind the `DROP TABLE`.
+		if (declaredBody !== matchedActual.definition || tablesRecreatedByModuleMove.has(declaredTableKey)) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
 			diff.indexesToCreate.push(indexCreate(effectiveStmt));
