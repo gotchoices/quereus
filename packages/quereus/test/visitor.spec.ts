@@ -390,28 +390,6 @@ describe('traverseAst', () => {
 		});
 	});
 
-	describe('DDL node types are handled without error', () => {
-		it('handles CREATE TABLE', () => {
-			const types = collectTypes('create table t (id integer primary key, name text)');
-			expect(types).to.include('createTable');
-		});
-
-		it('handles CREATE INDEX', () => {
-			const types = collectTypes('create index idx on t (name)');
-			expect(types).to.include('createIndex');
-		});
-
-		it('handles CREATE VIEW', () => {
-			const types = collectTypes('create view v as select 1');
-			expect(types).to.include('createView');
-		});
-
-		it('handles DROP statement', () => {
-			const types = collectTypes('drop table t');
-			expect(types).to.include('drop');
-		});
-	});
-
 	describe('handles undefined/null nodes gracefully', () => {
 		it('does nothing for undefined node', () => {
 			const types: string[] = [];

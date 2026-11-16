@@ -2170,9 +2170,12 @@ export class SchemaManager {
 		// `coalesce((select max(rid) from t), 0) + mutation_ordinal()` (the
 		// shared-key-via-default surrogate recipe — docs/vu-mutation-context.md
 		// § Mutation Context). Parameters stay rejected at any depth.
+		// A nested DML statement (`x in (insert … returning v)`) is a boundary too: its
+		// `where` / `set` / `returning` bind the DML's own target table.
 		let subqueryDepth = 0;
 		const isQueryBoundary = (node: AST.AstNode): boolean =>
-			node.type === 'select' || node.type === 'subquery' || node.type === 'exists';
+			node.type === 'select' || node.type === 'subquery' || node.type === 'exists'
+			|| node.type === 'insert' || node.type === 'update' || node.type === 'delete';
 		traverseAst(expr, {
 			enterNode: (node: AST.AstNode) => {
 				if (offendingType) return false;
