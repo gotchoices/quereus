@@ -168,8 +168,7 @@ export function assertRowConforms(
 	columnNames?: readonly (string | undefined)[],
 ): void {
 	for (let i = 0; i < row.length; i++) {
-		const name = columnNames?.[i];
-		const at = name ? `${where} column ${i} (${name})` : `${where} column ${i}`;
+		const at = columnSite(where, i, columnNames);
 		const type = types[i];
 		if (type === undefined) {
 			assertCanonicalValue(row[i], at);
@@ -194,13 +193,18 @@ export function assertAnnouncedNonNull(
 ): void {
 	for (const i of nonNullIndices) {
 		if (row[i] !== null) continue;
-		const name = columnNames?.[i];
-		const at = name ? `${where} column ${i} (${name})` : `${where} column ${i}`;
 		throw new RepresentationError(
-			`repr-strict: null at ${at}, whose announced type is ${types[i].name} NOT NULL. Either the ` +
-			`value is wrong or the announcement is: a NOT NULL table column must not hold null, a ` +
-			`function declared not-null must not return it, and a computed column must be inferred ` +
+			`repr-strict: null at ${columnSite(where, i, columnNames)}, whose announced type is ` +
+			`${types[i].name} NOT NULL. Either the value is wrong or the announcement is: a NOT NULL ` +
+			`table column must not hold null, a function declared not-null (or a table-valued ` +
+			`function's NOT NULL column) must not produce it, and a computed column must be inferred ` +
 			`nullable when it can produce null. See docs/types.md § Enforcement: QUEREUS_REPR_STRICT.`,
 		);
 	}
+}
+
+/** `where` narrowed to column `i`, named when `columnNames` supplies one. */
+function columnSite(where: string, i: number, columnNames?: readonly (string | undefined)[]): string {
+	const name = columnNames?.[i];
+	return name ? `${where} column ${i} (${name})` : `${where} column ${i}`;
 }

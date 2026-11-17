@@ -230,13 +230,14 @@ convert before trusting", never a guess.
 
 The seam asserts that announcement, including its `nullable` flag — an axis R2 alone does
 not cover, since R2 admits null in every position. A result column announced NOT NULL that
-yields a NULL cell fails, because the planner and the lens prover rely on that flag (a
-`not null` lens column over a computed expression deploys only if the expression is
-announced non-null). For a module or UDF author this means: a virtual table whose declared
-NOT NULL column returns NULL from `query()`, or a function declared with a non-nullable
-return type (the `*_RETURN_NOT_NULL` constants in `func/builtins/return-types.ts`, or a
-`returnType` / `inferReturnType` with `nullable: false`) that returns NULL, fails strict-mode
-tests the moment such a value reaches a result row. Declare the column or return type
+yields a NULL cell fails, because the planner and the lens prover rely on that flag (the
+lens prover rejects a `not null` logical column with no default whose body expression is
+announced nullable, so a wrong non-null announcement lets an unsound lens deploy). For a
+module or UDF author this means: a virtual table whose declared NOT NULL column returns
+NULL from `query()`, or a function declared with a non-nullable return type (the
+`*_RETURN_NOT_NULL` constants in `func/builtins/return-types.ts`, or a `returnType` /
+`inferReturnType` with `nullable: false`) that returns NULL, fails strict-mode tests the
+moment such a value reaches a result row. Declare the column or return type
 nullable instead. The check reads the same per-statement column definitions as R1/R2, so it
 always compares against the plan that produced the rows.
 
