@@ -25,6 +25,10 @@ export interface KeyColumnInfo {
  * decomposition write fan-out and the lens read body cannot drift apart on the
  * gate that decides {@link captureKeyEquality}'s shape.
  */
+// NOTE: reads the declared `notNull`, not `columnNeverNullOnRead` — on a module declaring
+// `permitsGrandfatheredNotNullViolators` a declared-NOT-NULL key column could still hold a
+// grandfathered NULL that the plain `=` form cannot address; if such a module ever keys
+// rows on a column it grandfathered NOT NULL onto, route this through that helper.
 export function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo {
 	const col = schema.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
 	return { name, nullable: !col || !col.notNull };

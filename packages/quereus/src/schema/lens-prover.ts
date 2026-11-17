@@ -456,6 +456,9 @@ function familiesCompatible(a: AffinityFamily, b: AffinityFamily): boolean {
  * {@link resolveSingleBasisSource}), an unresolvable table, or any one
  * non-declaring module keeps the strict error.
  */
+// NOTE: the demotion is per body, so in a mixed-module body every `not null` logical column
+// sourced from a declaring module (its key included) is the strict error; if mixed bodies
+// over a declaring module show up in practice, demote per column by the source module.
 function basisPermitsGrandfatheredNotNull(ctx: ProveContext): boolean {
 	let sawAny = false;
 	const walk = (node: AST.FromClause): boolean => {
@@ -2105,7 +2108,10 @@ interface TransportProof {
  * guarded FD (`key → others [guard: key IS NOT NULL]`), which the unconditional
  * `proved` FD would unsoundly override. A nullable key column therefore defers to
  * row-time/commit-time rather than taking the transport shortcut, whatever made it
- * nullable.
+ * nullable. For the same reason a matched basis UNIQUE must be a real key on read:
+ * each of its columns must satisfy `columnNeverNullOnRead`, since a basis module
+ * declaring `permitsGrandfatheredNotNullViolators` may hold several NULL rows there
+ * despite the declaration (the logical NOT NULL is then only an advisory).
  *
  * NOTE: the NOT NULL gate below is deliberately blunter than it has to be. `primary
  * key` does not imply `not null` (docs/schema.md § Primary-key nullability), so a
@@ -2135,7 +2141,12 @@ function proveKeyByBijectionTransport(ctx: ProveContext, logicalColumns: readonl
 	const basisCols = mapLogicalKeyToBasisColumns(ctx, logicalColumns, bijectiveAuthored);
 	if (basisCols === undefined) return undefined;
 	const match = findDeclaredKey(basis, basisCols);
-	return match ? { basis, match } : undefined;
+	if (!match) return undefined;
+	// The logical NOT NULL gate above is not a fact about stored basis rows: a basis
+	// module grandfathering NULLs may hold several NULL rows under a NULL-skipping
+	// basis UNIQUE (a PK is not NULL-skipping, so it needs no such check).
+	if (match.kind === 'unique' && !basisCols.every(bc => columnNeverNullOnRead(basis, bc))) return undefined;
+	return { basis, match };
 }
 
 /**

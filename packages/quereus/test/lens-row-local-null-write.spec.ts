@@ -687,4 +687,19 @@ describe('lens logical NOT NULL on a write — single-source over a grandfathere
 			await db.close();
 		}
 	});
+
+	it('a logical UNIQUE over a basis UNIQUE on the grandfathering module is not `proved`: stored NULLs escape a NULL-skipping key', async () => {
+		const db = new Database();
+		try {
+			db.registerModule('gfmem', new GrandfatheredMemoryModule());
+			await db.exec('create table P (id integer primary key, tag text not null unique) using gfmem');
+			await db.exec('declare logical schema x { table P { id integer primary key, tag text not null, unique (tag) } }');
+			await db.exec('apply schema x');
+			const obligations = db.schemaManager.getSchema('x')!.getLensSlot('P')?.obligations ?? [];
+			const unique = obligations.find(o => o.constraint.kind === 'unique');
+			expect(unique?.kind, 'the UNIQUE is enforced, not proved').to.not.equal('proved');
+		} finally {
+			await db.close();
+		}
+	});
 });
