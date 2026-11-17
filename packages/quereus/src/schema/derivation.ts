@@ -41,7 +41,7 @@ export interface TableDerivation {
 	 * `primaryKeyDefinition` stays the physical (order-by-seeded) key.
 	 */
 	logicalKey: ReadonlyArray<{ index: number; desc: boolean }>;
-	/** Body ordering captured from the optimized body (for the materialized-index path). */
+	/** Body ordering captured from the optimized body; it leads the physical key (`computeBackingPrimaryKey`). */
 	ordering?: ReadonlyArray<{ index: number; desc: boolean }>;
 	/**
 	 * Present when the table's key is a collation-coarsened lineage key

@@ -87,7 +87,6 @@ import {
 	resolveBackingApplyTarget,
 	runScheduler,
 	validateDerivedChanges,
-	assertNoNullInNotNullSeededPkRowTime,
 	enforceParentSideReferentialActions,
 } from './database-materialized-views-apply.js';
 
@@ -782,8 +781,7 @@ export class MaterializedViewManager {
 
 	/**
 	 * The invariant pipeline every realized maintenance delta runs, in order: coarsening
-	 * collision telemetry (observe-only; gated on `coarseningWatch`), the NOT-NULL
-	 * ordering-seeded-PK guard (no-op unless the MV carries the skew), derived-row
+	 * collision telemetry (observe-only; gated on `coarseningWatch`), derived-row
 	 * CHECK/FK validation (no-op for a constraint-less table; BEFORE the cascade so a
 	 * consumer never consumes an invalid producer row), parent-side referential
 	 * enforcement (RESTRICT-walk then declared actions, after `M`'s own image is
@@ -805,7 +803,6 @@ export class MaterializedViewManager {
 	): Promise<void> {
 		if (backingChanges.length === 0) return;
 		this.detectAndReportCoarseningCollisions(plan, backingChanges);
-		assertNoNullInNotNullSeededPkRowTime(plan, backingChanges);
 		if (plan.derivedRowValidator) {
 			await validateDerivedChanges(this.ctx, plan, plan.derivedRowValidator, backingChanges, cache);
 		}
@@ -846,8 +843,7 @@ export class MaterializedViewManager {
 	 *
 	 * The front half of {@link postApplyBackingChanges} is skipped. Its per-row
 	 * validation: the refresh already checked every stored row, a superset of this diff
-	 * — the NOT-NULL seeded-PK guard over the recomputed rows, and the bulk declared
-	 * CHECK/FK scan over the reconciled contents. Re-checking would also be wrong on the
+	 * — the bulk declared CHECK/FK scan over the reconciled contents. Re-checking would also be wrong on the
 	 * reshape arm, whose diff images predate the post-reconcile retype. Its coarsening
 	 * collision telemetry: a refresh rejects colliding coarsened keys outright
 	 * (`assertRefreshRowsAreSet`), so an `update` in its diff is a row replaced over

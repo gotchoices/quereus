@@ -707,6 +707,29 @@ insert into par (id, x) values (5, -2);
 select id, x from par_ix order by id;
 → [{"id":1,"x":5},{"id":2,"x":8},{"id":4,"x":10}]
 
+-- 16f. Loosening an `order by` column that the backing's primary key leads with. `order by x`
+--      puts x first in the backing primary key ([x, id]); DROP NOT NULL on it marks the MV
+--      stale like any other column, and the refresh loosens the backing key column in place
+--      so it can hold NULL. Refresh used to fail here ("would store NULL in column 'x'").
+create table onx (id integer primary key, x integer not null);
+insert into onx values (1, 5);
+create materialized view onx_ix as select id, x from onx order by x;
+alter table onx alter column x drop not null;
+insert into onx (id, x) values (2, null);
+select id, x from onx_ix order by id;
+→ [{"id":1,"x":5}]
+refresh materialized view onx_ix;
+select id, x from onx_ix order by id;
+→ [{"id":1,"x":5},{"id":2,"x":null}]
+-- the backing now declares x nullable, and x is still a primary-key column
+select name, "notnull", pk from table_info('onx_ix') order by cid;
+→ [{"name":"id","notnull":1,"pk":1},{"name":"x","notnull":0,"pk":1}]
+-- maintenance resumed: a NULL insert and an update to NULL both reach the loosened key column
+insert into onx (id, x) values (3, null);
+update onx set x = null where id = 1;
+select id, x from onx_ix order by id;
+→ [{"id":1,"x":null},{"id":2,"x":null},{"id":3,"x":null}]
+
 -- dropping the SOURCE of a row-time MV makes a read a clean stale diagnostic, not a crash
 create table ds (id integer primary key, x integer);
 insert into ds values (1, 10);

@@ -63,38 +63,6 @@ export function materializedViewNotASetError(schemaName: string, viewName: strin
 	);
 }
 
-/**
- * Purpose-built diagnostic for a refresh that would store a NULL into a backing column
- * the schema declares NOT NULL *and* that is a physical-PK member. This is the exact
- * reachable contradiction: the view's `order by <col>` seeded the column into the
- * backing's **physical** primary key ({@link computeBackingPrimaryKey}), which keeps it
- * declared NOT NULL even after the source column loosened to nullable — the refresh reshape
- * masks the loosening of a physical-PK column rather than emitting it (see
- * {@link isPhysicalPkColumn}). Once the
- * source column becomes nullable and the recomputed body yields a NULL row, storing it
- * would leave the backing schema declaring NOT NULL while holding a NULL — a silent
- * contradiction. Both maintenance vectors raise this instead, naming the column, the cause,
- * and the remedy: the **refresh** rebuild (`rebuildBacking` → {@link assertNoNullInNotNullSeededPk})
- * and the **row-time** write-through (the primary vector — `assertNoNullInNotNullSeededPkRowTime`
- * in database-materialized-views-apply.ts, gated on the precomputed `plan.nullGuardColumns`).
- * The message is worded vector-neutrally ("maintaining …") so it reads correctly from both.
- *
- * NOTE: narrow loud-error guard, not the full fix. The lasting resolution stops
- * ordering-seeding the physical PK (expressing body order as a materialized secondary
- * index) — backlog `debt-mv-ordering-seed-to-materialized-index`. Until it lands the MV
- * rejects (rather than silently stores) a source NULL in the seeded column.
- */
-export function nullInNotNullSeededPkError(schemaName: string, viewName: string, columnName: string): QuereusError {
-	return new QuereusError(
-		`maintaining materialized view '${schemaName}.${viewName}' would store NULL in column '${columnName}', `
-			+ `which the backing declares NOT NULL because the view's \`order by\` seeded it into the physical `
-			+ `primary key; the source column became nullable and now produces a NULL row. Recreate the view `
-			+ `without \`order by ${columnName}\` (or excluding ${columnName} from the ordering) to allow `
-			+ `nullable values in it.`,
-		StatusCode.CONSTRAINT,
-	);
-}
-
 /** Backing-table column/PK/ordering shape derived from the optimized body relation. */
 export interface BackingShape {
 	columns: ColumnSchema[];
@@ -297,11 +265,18 @@ function collectSourceViews(deps: BuildTimeDependencyTracker): string[] {
  * `order by`, the ordering columns lead the key so the btree clusters (and scans)
  * in the body's order — "seeding the backing-table ordering" — with the logical
  * key (from `keysOf`) appended as a uniqueness-preserving tiebreaker. Without an
- * `order by`, the physical key is just the logical key.
+ * `order by`, the physical key is just the logical key. This diverges from
+ * `TableDerivation.logicalKey`, which keeps the logical `keysOf` identity. A seeded
+ * column keeps its derived nullability like any other backing column: NULL is an
+ * ordinary key value (docs/schema.md § Primary-key nullability), and the logical-key
+ * tiebreaker keeps rows that share a NULL ordering value distinct.
  *
- * NOTE: this diverges from `TableDerivation.logicalKey`, which keeps the
- * logical `keysOf` identity. The covering ticket replaces this seeding with a
- * proper materialized index.
+ * NOTE: accepted tradeoff — body ordering seeds the physical key on purpose: an MV with
+ * `order by` *is* a clustered index in the lens model (docs/lens.md), covering-UNIQUE
+ * enforcement's prefix seek needs the UNIQUE columns leading the backing key, and the
+ * lateral-TVF prefix-delete arm reads the seeded key. Moving ordering to a separate
+ * secondary index was considered and declined. Revisit if a body ordering ever needs to
+ * be non-unique on its own *and* nothing relies on the clustering any more.
  */
 export function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ index: number; desc: boolean }> {
 	if (!shape.ordering || shape.ordering.length === 0) {
@@ -516,10 +491,9 @@ function normalizeBackingShape(
  * second reading, so a difference in it is a genuine shape change for the comparison sites
  * to report — it says nothing about which reading of the rewritten attribute is live.
  * Testing all three attributes unconditionally instead would let an unrelated difference
- * decide the collation: a NOT NULL loosening on a physical-PK column — which
- * {@link describeBackingShapeMismatch} deliberately masks — would flip a declared
- * `collate binary` key over to the module's K and turn a data-only refresh into a
- * spurious "primary-key column 0 collation BINARY → NOCASE" inexpressible reshape.
+ * decide the collation: a NOT NULL loosening on a key column would flip a declared
+ * `collate binary` key over to the module's K and turn a plain `loosenNotNull` reshape
+ * into a spurious "primary-key column 0 collation BINARY → NOCASE" inexpressible one.
  */
 function rawReadingIsTheLiveOne(raw: ColumnSchema, normalized: ColumnSchema, live: ColumnSchema): boolean {
 	if (!backingTypeMatches(raw, normalized) && !backingTypeMatches(raw, live)) return false;
@@ -999,43 +973,6 @@ function assertRefreshRowsAreSet(
 	name: string,
 ): void {
 	assertDerivedRowsAreSet(rows, pk, collationResolver, schemaName, name, () => materializedViewNotASetError(schemaName, name));
-}
-
-/**
- * Refresh guard: reject a rebuild that would store a NULL into a backing column the
- * schema declares NOT NULL *and* that is a physical-PK member — the precise reachable
- * contradiction (a NOT-NULL column pinned into the PK by an `order by` seed whose source
- * loosened to nullable). Throws {@link nullInNotNullSeededPkError} naming the first
- * offending column. A non-PK NOT-NULL column is not at risk: refresh loosens it in the
- * backing when its source loosens (it is not physical-PK-pinned), so by the time this
- * runs a legitimately-loosened non-PK column already reads nullable. A physical-PK column
- * declared *nullable* (the permitted create-time nullable-source-ordering case) is not
- * guarded — it self-consistently stores NULL. Early-returns only when no backing column
- * is both NOT NULL and physical-PK; that set is otherwise non-empty for nearly every MV
- * (the logical-key PK column is normally the NOT-NULL source PK), so the common case
- * scans every row over the guarded set. Cheap here — the rows are already materialized on
- * the full-rebuild path — but this same shape is NOT cheap on the row-time hot path, which
- * needs a precomputed nullable-source skew flag instead (see
- * `fix/bug-mv-rowtime-null-into-notnull-seeded-pk`).
- */
-function assertNoNullInNotNullSeededPk(
-	backing: TableSchema,
-	rows: readonly Row[],
-	schemaName: string,
-	name: string,
-): void {
-	const pkIndices = new Set(backing.primaryKeyDefinition.map(d => d.index));
-	const guarded = backing.columns
-		.map((col, index) => ({ col, index }))
-		.filter(({ col, index }) => col.notNull === true && pkIndices.has(index));
-	if (guarded.length === 0) return;
-	for (const row of rows) {
-		for (const { col, index } of guarded) {
-			if (row[index] === null || row[index] === undefined) {
-				throw nullInNotNullSeededPkError(schemaName, name, col.name);
-			}
-		}
-	}
 }
 
 /**
@@ -1832,19 +1769,6 @@ export async function rebuildBacking(
 	}
 	const host = resolveBackingHost(db, backing);
 
-	// Loud-error guard (the swap below validates no column NOT NULL):
-	// a backing column declared NOT NULL that is also a physical-PK member cannot legally
-	// hold the recomputed NULL a nullable source now produces. The ordering-seeded physical
-	// PK (computeBackingPrimaryKey) pins such a column NOT NULL even after its source column
-	// dropped NOT NULL — the reshape masks the loosening of a physical-PK column rather than
-	// emitting it — so at this point the only still-NOT-NULL columns that can
-	// carry source-nullable data are the physical-PK ones. Storing the NULL would make the
-	// backing schema declare NOT NULL while holding a NULL; reject it before the swap.
-	// NOTE: narrow loud guard until `debt-mv-ordering-seed-to-materialized-index` replaces
-	// ordering-seeding with a materialized index. While a source NULL persists in the seeded
-	// column the MV stays un-refreshable (drop + recreate the view without `order by <col>`).
-	assertNoNullInNotNullSeededPk(backing, rows, mv.schemaName, mv.name);
-
 	// `shapePk` is the live backing's physical key — re-derived shape matches it on the
 	// fast path, and on the reshape arm the catalog was already re-registered with the
 	// post-reshape PK before this runs, so the live `primaryKeyDefinition` is the
@@ -1932,26 +1856,6 @@ function backingCollationMatches(a: ColumnSchema, b: ColumnSchema): boolean {
 	return (a.collation ?? 'BINARY') === (b.collation ?? 'BINARY');
 }
 
-/** Whether `columnNameLower` (already lowercased) names a column of `table`'s
- *  *physical* primary key ({@link TableSchema.primaryKeyDefinition} — which for an
- *  MV backing includes any ordering-seeded columns, {@link computeBackingPrimaryKey}).
- *  An MV backing keeps its physical-PK columns NOT NULL, so the refresh reshape must
- *  never try to loosen one — see the two callers below.
- *
- *  NOTE: that is now a POLICY of the MV backing, not an engine constraint. A primary key
- *  column may be nullable in general (docs/schema.md § Primary-key nullability) and
- *  `alter column … drop not null` on one is accepted by both backends; the backing keeps
- *  its seeded key columns NOT NULL because the ordering seed treats them as a total order
- *  and `assertNoNullInNotNullSeededPk` is the loud guard for the contradiction. If
- *  ordering-seeded backings ever need to carry NULLs in the seeded column, this mask and
- *  that guard are the pair to revisit together — `debt-mv-ordering-seed-to-materialized-index`
- *  removes the need for both. */
-function isPhysicalPkColumn(table: TableSchema, columnNameLower: string): boolean {
-	return table.primaryKeyDefinition.some(
-		def => table.columns[def.index]?.name.toLowerCase() === columnNameLower,
-	);
-}
-
 /** Names the first structural difference between the live backing and the derived
  *  shape (null when structurally identical) — the diagnostic half of
  *  {@link backingShapeMatchesStructurally}. Deliberately **positional** (column i
@@ -1970,21 +1874,7 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 			return `column ${i} type ${a.logicalType.name} → ${b.logicalType.name}`;
 		}
 		if (!backingNotNullMatches(a, b)) {
-			// A physical-PK column stays NOT NULL in the backing regardless of the
-			// re-derived logical nullability (an MV-backing policy — see
-			// {@link isPhysicalPkColumn}), so a NOT-NULL→nullable *loosening*
-			// of a PK column is NOT a shape difference. Masking it lets refresh keep the
-			// data-only rebuild path instead of emitting a doomed `loosenNotNull` op. Tight
-			// on purpose: only a loosening (`current` NOT NULL, derived nullable) of a
-			// current physical-PK column; a tighten, or any non-PK column, stays a real diff.
-			// NOTE: this pairs with the ordering-seeded physical PK (computeBackingPrimaryKey,
-			// ~line 236); the covering ticket that replaces ordering-seeding with a
-			// materialized index removes the need for this mask.
-			const looseningPkColumn = a.notNull === true && b.notNull !== true
-				&& isPhysicalPkColumn(current, a.name.toLowerCase());
-			if (!looseningPkColumn) {
-				return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
-			}
+			return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
 		}
 		if (!backingCollationMatches(a, b)) {
 			return `column ${i} collation ${a.collation ?? 'BINARY'} → ${b.collation ?? 'BINARY'}`;
@@ -2515,16 +2405,7 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 		if (!backingCollationMatches(from, to)) postReconcileOps.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
 		if (!backingNotNullMatches(from, to)) {
 			if (to.notNull === true) postReconcileOps.push({ kind: 'tightenNotNull', name });
-			// An MV backing keeps its physical-PK columns NOT NULL (a backing policy — see
-			// {@link isPhysicalPkColumn}), so skip the `loosenNotNull` op for a physical-PK
-			// column of `current` (matched by its pre-rename name) rather than emitting a
-			// loosening the backing must not take. Reached only when reshape is entered for SOME OTHER genuine
-			// shape change coexisting with a PK-column loosening in the same refresh;
-			// touch point #1 masks the loosening-only case before reshape. See the NOTE at
-			// describeBackingShapeMismatch / computeBackingPrimaryKey (~line 236).
-			else if (!isPhysicalPkColumn(current, from.name.toLowerCase())) {
-				loosens.push({ kind: 'loosenNotNull', name });
-			}
+			else loosens.push({ kind: 'loosenNotNull', name });
 		}
 	};
 

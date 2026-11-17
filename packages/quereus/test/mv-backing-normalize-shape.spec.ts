@@ -295,10 +295,9 @@ describe('mv backing shape: module create-time normalization', () => {
 		it('a NOT NULL loosening on the source does not drag the key over to the module K', async () => {
 			// The agreement test must weigh ONLY the attribute the hook rewrote. A source
 			// `drop not null` makes the re-derived key column nullable while the backing
-			// keeps it NOT NULL — a difference `describeBackingShapeMismatch` deliberately
-			// MASKS for a physical-PK column. Weighing it here instead flipped the declared
-			// `collate binary` key to the module's NOCASE, which is an inexpressible
-			// physical re-key: the view went stale and `refresh` errored on a no-op.
+			// still declares it NOT NULL. Weighing that difference here would flip the
+			// declared `collate binary` key to the module's NOCASE — an inexpressible physical
+			// re-key, so the refresh that should just loosen the column would error instead.
 			const db = freshDb();
 			try {
 				await seedDeclared(db);
@@ -308,11 +307,14 @@ describe('mv backing shape: module create-time normalization', () => {
 				const shape = deriveBackingShape(db, 'main', BODY, undefined, { moduleName: 'norm', against: live });
 				expect(shape.columns[0].notNull, 'the body really did loosen').to.equal(false);
 				expect(shape.columns[0].collation, 'the declared key collation survives the loosening').to.equal('BINARY');
-				expect(db.schemaManager.getMaintainedTable('main', 'mt')!.derivation.stale ?? false,
-					'the loosening did not strand the view stale').to.equal(false);
 
+				// The loosening is a real shape change (stale until refresh); refresh loosens the
+				// key column in place and keeps its declared collation.
 				await db.exec('refresh materialized view mt');
-				expect(db.schemaManager.getTable('main', 'mt'), 'still the data-only path').to.equal(live);
+				const after = db.schemaManager.getTable('main', 'mt')!;
+				expect(after.columns[0].notNull, 'the key column was loosened').to.equal(false);
+				expect(after.columns[0].collation, 'not re-keyed to the module K').to.equal('BINARY');
+				expect(db.schemaManager.getMaintainedTable('main', 'mt')!.derivation.stale ?? false).to.equal(false);
 				expect(await rows(db, 'select a, n from mt order by a'))
 					.to.deep.equal([{ a: 'x', n: 1 }, { a: 'y', n: 1 }]);
 			} finally {
