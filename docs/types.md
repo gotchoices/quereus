@@ -121,6 +121,15 @@ on read paths:
 - **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
   `sum()` narrow a result that lands back inside the safe range.
 
+  The `number` arm of binary `+ - *` widens instead: when both operands are safe integers
+  and the floating-point answer leaves the safe range, the operation is redone in bigint
+  (`numberArithmetic`, `runtime/emit/binary.ts`), so `9007199254740991 * 3` is exactly
+  `27021597764222973n` rather than a rounded double. For safe-integer operands the float
+  answer is unsafe exactly when the exact answer is, so the check costs one
+  `Number.isSafeInteger` per row and never fires needlessly. An expression announced REAL
+  (REAL × REAL) is exempt — REAL holds `number` only, and a REAL product past 2^53 is a
+  legitimately inexact double.
+
   `sum()` additionally **splits the two number domains** rather than deciding per
   addition which one the running total is in. A contribution joins the *exact* part iff
   it is a `bigint` or satisfies `Number.isSafeInteger`; every other numeric contribution
@@ -219,14 +228,9 @@ untyped parameters) names a type whose value space the column's values inhabit, 
 concrete type announces **ANY**, which is an honest "no representation constraint —
 convert before trusting", never a guess.
 
-The seam asserts that announcement. One known wrong-VALUE defect can still trip it, a
-runtime bug rather than inference imprecision: binary arithmetic over two safe-integer
-operands returns the raw double when the exact answer escapes the safe range
-(`9007199254740991 * 3`), which the announced INTEGER does not admit — tracked as
-`backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`. No suite site
-trips it today, but a boundary case added later would. The announced `nullable` flag is
-a further axis R2 does not cover (null is admissible in every position) — its violations
-are tracked as `backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
+The seam asserts that announcement. The announced `nullable` flag is a further axis R2
+does not cover (null is admissible in every position) — its violations are tracked as
+`backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
 
 **No capability flag, and why.** A `representationFidelity` declaration on
 `VirtualTableModule` (alongside `scanSnapshotIsolation`) was considered and rejected:

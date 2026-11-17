@@ -48,6 +48,20 @@ export function canonicalizeInteger(v: number | bigint): number | bigint {
 }
 
 /**
+ * Is this value an exact integer — one that may enter `bigint` arithmetic and come out
+ * with the exact answer? A `bigint`, or a `number` inside the safe-integer range.
+ *
+ * Deliberately `Number.isSafeInteger`, NOT `Number.isInteger`: `1e308` is a whole
+ * `number` that is not exact in the integer sense (R1 permits it as a `number`), and
+ * routing it into `bigint` arithmetic turns a REAL value into an arbitrary-precision
+ * integer — a `bigint` where REAL holds `number` only, violating R2. SUM's exact
+ * accumulator and binary `+ - *` route on it.
+ */
+export function isExactIntegerDomain(v: number | bigint): boolean {
+	return typeof v === 'bigint' || Number.isSafeInteger(v);
+}
+
+/**
  * The exact integer a digit string names, in canonical form. `digits` must match
  * `/^[+-]?\d+$/`. Past the safe range this rebuilds from the digits rather than the
  * rounded `Number()`; the explicit `+` is stripped because `BigInt()` rejects the sign

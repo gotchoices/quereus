@@ -652,12 +652,6 @@ export class Statement {
 		// R1 + R2, against each result column's announced type (a `ScalarType` inference,
 		// reachable via `getColumnDefs()`). An announced ANY imposes no R2 constraint.
 		//
-		// NOTE: binary arithmetic over two safe-integer operands returns the raw double
-		// when the exact answer escapes the safe range (`9007199254740991 * 3`), which the
-		// announced INTEGER does not admit —
-		// `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`. No suite
-		// site trips it today, but a boundary case added later would.
-		//
 		// The announced NULLABILITY flag is a separate axis this seam does not check:
 		// R2 admits null in every position. A measurement run asserting "announced
 		// non-nullable ⇒ no null cell" found ~28 violations across several classes

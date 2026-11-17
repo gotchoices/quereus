@@ -12,13 +12,13 @@ import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTru
 import type { LogicalType } from "../../types/logical-type.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
-import { canonicalizeInteger } from "../../util/numeric-canonical.js";
+import { canonicalizeInteger, isExactIntegerDomain } from "../../util/numeric-canonical.js";
 import { valueToText } from "../../util/value-text.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
 import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
-import { isRealStoredQuantity } from "../../types/builtin-types.js";
+import { isRealStoredQuantity, numericPromotionClass } from "../../types/builtin-types.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { classifyBinaryOperator } from "../../planner/analysis/binary-operator-class.js";
 import { literalValue } from "../../planner/analysis/predicate-shape.js";
@@ -66,6 +66,9 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
+type NumberOp = (v1: number, v2: number) => number;
+type BigIntOp = (v1: bigint, v2: bigint) => bigint;
+
 /** Handle arithmetic when at least one operand reads as bigint. Callers have already coerced
  *  both operands through SQL arithmetic affinity (string/bool/blob → number, or bigint for
  *  text past the safe range).
@@ -75,8 +78,8 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
  *    - fractional number → demote bigint to Number, use float arithmetic */
 function mixedBigIntArithmetic(
 	v1n: number | bigint, v2n: number | bigint,
-	inner: (v1: number, v2: number) => number,
-	innerBigInt: (v1: bigint, v2: bigint) => bigint
+	inner: NumberOp,
+	innerBigInt: BigIntOp
 ): SqlValue {
 	if (typeof v1n === 'bigint' && typeof v2n === 'bigint') {
 		try {
@@ -108,6 +111,33 @@ function mixedBigIntArithmetic(
 }
 
 /**
+ * Arithmetic over two plain `number`s: the floating-point answer, or null when it is not
+ * finite (division by zero) — except that, given `exactInner`, two exact-integer operands
+ * whose float answer left the safe-integer range get the operation redone in bigint.
+ *
+ * That test is exact, not a heuristic. For `+ - *` over two safe integers, an exact answer
+ * inside the safe range is representable as a double, so the float answer equals it; an
+ * exact answer outside rounds to a double outside (2^53 is representable and rounding is
+ * monotonic). So the float answer is unsafe exactly when the exact one is: the redo needs
+ * no R1 narrowing, never fires needlessly, and the in-range path costs one
+ * `Number.isSafeInteger` call. `addWithPromotion` (func/builtins/aggregate.ts) rests on
+ * the same argument.
+ *
+ * Callers pass `exactInner` only for `+ - *` (bigint `/` truncates) and only where the
+ * announced result type admits a `bigint` — see {@link buildNumericOpSpec}. Cannot throw,
+ * so callers need no try/catch: number arithmetic signals division by zero as a
+ * non-finite result, and the bigint redo runs only on safe integers.
+ */
+function numberArithmetic(n1: number, n2: number, inner: NumberOp, exactInner: BigIntOp | undefined): SqlValue {
+	const result = inner(n1, n2);
+	if (!Number.isFinite(result)) return null;
+	if (exactInner !== undefined && !Number.isSafeInteger(result) && isExactIntegerDomain(n1) && isExactIntegerDomain(n2)) {
+		return exactInner(BigInt(n1), BigInt(n2));
+	}
+	return result;
+}
+
+/**
  * The general arithmetic body: sniff the values for a temporal shape first, then fall back
  * to coercing numeric arithmetic.
  *
@@ -118,8 +148,9 @@ function mixedBigIntArithmetic(
  */
 function buildCoercingArithmeticRun(
 	operator: string,
-	inner: (v1: number, v2: number) => number,
-	innerBigInt: (v1: bigint, v2: bigint) => bigint,
+	inner: NumberOp,
+	innerBigInt: BigIntOp,
+	exactInner: BigIntOp | undefined,
 ): (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue {
 	return function runCoercingArithmetic(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 		const temporalResult = tryTemporalArithmetic(operator, v1, v2);
@@ -132,42 +163,36 @@ function buildCoercingArithmeticRun(
 			const n2 = coerceToNumberForArithmetic(v2);
 			if (typeof n1 === 'bigint' || typeof n2 === 'bigint') {
 				return mixedBigIntArithmetic(n1, n2, inner, innerBigInt);
-			} else {
-				try {
-					const result = inner(n1, n2);
-					if (!Number.isFinite(result)) return null;
-					// NOTE: the result is returned unchecked, so two safe-integer operands
-					// whose exact answer escapes the safe range yield an inexact double
-					// (`9007199254740991 * 3` is off by one) that also falls outside the
-					// INTEGER this shape is announced as. Fixing it means a boundary check
-					// (or exact retry) in this per-row loop — tracked as
-					// `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`.
-					return result;
-				} catch {
-					return null;
-				}
 			}
+			return numberArithmetic(n1, n2, inner, exactInner);
 		}
 		return null;
 	};
 }
 
 export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
-	let inner: (v1: number, v2: number) => number;
-	let innerBigInt: (v1: bigint, v2: bigint) => bigint;
+	let inner: NumberOp;
+	let innerBigInt: BigIntOp;
+	// Whether a float answer that leaves the safe-integer range may be redone in bigint
+	// (`numberArithmetic`). Only `+ - *`: `/` and `%` cannot leave the range from
+	// safe-integer operands, and bigint `/` truncates.
+	let exactCapable = false;
 
 	switch (plan.expression.operator) {
 		case '+':
 			inner = (v1, v2) => v1 + v2;
 			innerBigInt = (v1, v2) => v1 + v2;
+			exactCapable = true;
 			break;
 		case '-':
 			inner = (v1, v2) => v1 - v2;
 			innerBigInt = (v1, v2) => v1 - v2;
+			exactCapable = true;
 			break;
 		case '*':
 			inner = (v1, v2) => v1 * v2;
 			innerBigInt = (v1, v2) => v1 * v2;
+			exactCapable = true;
 			break;
 		case '/':
 			inner = (v1, v2) => v1 / v2;
@@ -181,6 +206,14 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 			quereusError(`Unsupported numeric operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}
 
+	// The bigint redo also needs an announced type that admits a `bigint`. JavaScript
+	// cannot tell `3.0` from `3`, so REAL × REAL reaches the same per-row body with two
+	// safe-integer `number`s — but REAL holds `number` only (R2), and a REAL product past
+	// 2^53 is legitimately an inexact double. INTEGER, NUMERIC (incl. mixed
+	// INTEGER × REAL) and ANY all admit a `bigint`.
+	const resultType = plan.getType().logicalType;
+	const exactInner = exactCapable && numericPromotionClass(resultType) !== 'REAL' ? innerBigInt : undefined;
+
 	// Use plan-time type info to select a specialized run function
 	const leftLogical = plan.left.getType().logicalType;
 	const rightLogical = plan.right.getType().logicalType;
@@ -188,7 +221,7 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let run: (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue;
 	let note: string;
 
-	if (isRealStoredQuantity(plan.getType().logicalType)) {
+	if (isRealStoredQuantity(resultType)) {
 		// Selected by the announced type, so it cannot disagree with `generateType`, which
 		// announces a REAL-stored quantity only over two numeric-class operands with no
 		// temporal case. Floating point on purpose, not `mixedBigIntArithmetic`: that keeps
@@ -248,7 +281,7 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 			// case. Runtime sniffing IS the defined semantics there (a TEXT column holding
 			// a duration string is a supported shape), so this arm is the generic body
 			// below under a different note — same function, so they cannot drift.
-			run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
+			run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt, exactInner);
 			note = `${plan.expression.operator}(temporal)`;
 		}
 	} else if (leftLogical.isNumeric && rightLogical.isNumeric) {
@@ -259,25 +292,19 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		// null/bigint handling behind a fallback. Measured at 1.19 ns vs 1.22 ns per
 		// operation (isolated microbench, see `compareSqlValuesFast` in
 		// util/comparison.ts) — no difference at all, so the guard would be pure noise.
-		run = function runNumericOnly(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+		run = function runNumericOnly(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 !== null && v2 !== null) {
 				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
 					return mixedBigIntArithmetic(coerceToNumberForArithmetic(v1), coerceToNumberForArithmetic(v2), inner, innerBigInt);
-				} else {
-					// No try/catch: `inner` over plain numbers cannot throw (division by
-					// zero yields Infinity/NaN, caught by the finite check below); only
-					// the bigint arm above can throw (handled inside mixedBigIntArithmetic).
-					const result = inner(v1 as number, v2 as number);
-					if (!Number.isFinite(result)) return null;
-					return result;
 				}
+				return numberArithmetic(v1 as number, v2 as number, inner, exactInner);
 			}
 			return null;
 		};
 		note = `${plan.expression.operator}(numeric-fast)`;
 	} else {
 		// Generic path: temporal check + coercion (for TEXT or mixed types)
-		run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
+		run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt, exactInner);
 		note = `${plan.expression.operator}(numeric)`;
 	}
 

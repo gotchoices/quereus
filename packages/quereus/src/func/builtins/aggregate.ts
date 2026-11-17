@@ -6,7 +6,7 @@ import { QuereusError } from '../../common/errors.js';
 import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer, ArgTypeValidator } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, getSqlDataTypeName, BINARY_COLLATION } from '../../util/comparison.js';
-import { canonicalizeInteger } from '../../util/numeric-canonical.js';
+import { canonicalizeInteger, isExactIntegerDomain } from '../../util/numeric-canonical.js';
 import { isRealStoredQuantity, isSummableType, quantityClass } from '../../types/builtin-types.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN, scalarReturn } from './return-types.js';
@@ -39,16 +39,6 @@ function addWithPromotion(a: number | bigint, b: number | bigint): number | bigi
 		return BigInt(a) + BigInt(b);
 	}
 	return sum;
-}
-
-/** SUM's routing rule: does this contribution belong to the exact-integer part?
- *
- *  Deliberately `Number.isSafeInteger`, NOT `Number.isInteger`: `1e308` is a whole
- *  `number` that is not exact in the integer sense (R1 permits it as a `number`), and
- *  routing it to the exact part is what turns a REAL fold's total into an
- *  arbitrary-precision integer — a `bigint` in a REAL-typed result, violating R2. */
-function isExactIntegerDomain(v: number | bigint): boolean {
-	return typeof v === 'bigint' || Number.isSafeInteger(v);
 }
 
 // --- count(*) ---
