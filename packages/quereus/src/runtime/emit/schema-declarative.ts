@@ -382,8 +382,11 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			const migrationStatements = generateMigrationPlan(diff, schemaName, actualCatalog);
 
 			// Acknowledgement gate. Runs before any DDL, so a refusal leaves nothing to undo.
-			// (`diff schema` does NOT gate — it is a read-only preview.)
-			if (!applyStmt.options?.allowDestructive) refuseUnacknowledgedDataLoss(schemaName, migrationStatements, diff);
+			// (`diff schema` does NOT gate — it is a read-only preview.) The policy is read
+			// here, at run time, so a pragma set after prepare governs the next run.
+			if (!applyStmt.options?.allowDestructive) {
+				refuseUnacknowledgedDataLoss(schemaName, migrationStatements, diff, isDestructiveApplyStrict(rctx.db));
+			}
 			await refuseModuleMoveLeavingDanglingRows(rctx.db, schemaName, diff);
 
 			// Run the migration loop. When there are no statements we keep the
@@ -572,14 +575,22 @@ function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: n
 	return true;
 }
 
+function isDestructiveApplyStrict(db: Database): boolean {
+	return db.options.getStringOption('destructive_apply_policy') === 'strict';
+}
+
 /**
- * Refuses a plan that destroys stored data — a step carrying `MigrationStep.destroys`, or a
- * module move (a drop + recreate; a maintained table re-materializes as a new incarnation, so
- * row identity changes for a replicated table). Decided from the plan, never from row counts:
- * an apply that passes against an empty database must not fail against a populated one.
+ * Refuses a plan that destroys stored data. A module move (a drop + recreate; a maintained table
+ * re-materializes as a new incarnation, so row identity changes for a replicated table) is refused
+ * under either `destructive_apply_policy`; `strict` also refuses every step carrying
+ * `MigrationStep.destroys`. Decided from the plan, never from row counts: an apply that passes
+ * against an empty database must not fail against a populated one.
  */
-function refuseUnacknowledgedDataLoss(schemaName: string, plan: readonly MigrationStep[], diff: SchemaDiff): void {
-	const destroyed = plan.flatMap(step => step.destroys ? [step.destroys] : []);
+function refuseUnacknowledgedDataLoss(schemaName: string, plan: readonly MigrationStep[], diff: SchemaDiff, strict: boolean): void {
+	// Under `permissive` only the moves are listed. A move's own `DROP TABLE` carries `destroys`
+	// too, but the refusal describes it as the move, so leaving out every `destroys` entry omits
+	// nothing the message would have named.
+	const destroyed = strict ? plan.flatMap(step => step.destroys ? [step.destroys] : []) : [];
 	if (destroyed.length === 0 && diff.moduleMigrations.length === 0) return;
 	throw new QuereusError(dataLossRefusal(schemaName, destroyed, diff), StatusCode.ERROR);
 }

@@ -219,6 +219,7 @@ apply schema main to version '1.0.0' options (
 **Migration Application:**
 - `apply schema` executes the migration DDL automatically.
 - Migrations are applied in safe order: drops first, then creates, then alters.
+- A migration that moves a table to another module needs `options (allow_destructive = true)`; under `pragma destructive_apply_policy = 'strict'` so does one that drops a table or column or changes a column's type (see Safety below).
 - Seed data application: `with seed` inserts each declared seed row as `INSERT … ON CONFLICT (<pk>) DO NOTHING`. It deletes nothing: a row already holding a seed row's primary key is left untouched (so user edits survive a re-seed), while a seed row that violates a CHECK, NOT NULL or foreign key still aborts the apply.
 
 **Versioning and Hashing:**
@@ -232,9 +233,14 @@ apply schema main to version '1.0.0' options (
 
 **Safety:**
 - Seeding deletes and overwrites nothing (see Migration Application above).
-- `allow_destructive` gates every step that destroys stored data. `apply schema` refuses, before any DDL runs, a plan that drops a table, drops a column, changes a column's type (a conversion can lose information) or moves a table to another module, unless re-run with `options (allow_destructive = true)`. The decision comes from the plan, never from row counts: dropping an empty table is refused too, so an apply that passes against an empty development database cannot start failing against a populated one. One error lists everything at risk:
+- `allow_destructive` acknowledges steps that destroy stored data. Which steps need it is set per database by the `destructive_apply_policy` option (also a `pragma`, read when the apply runs):
+  - `'permissive'` (**default**): only moving a table to another module (below) is refused without the acknowledgement. Dropping a table, dropping a column and changing a column's type run unacknowledged, so an embedder can evolve its schema by editing the declaration and re-applying it at start-up.
+  - `'strict'`: `apply schema` also refuses, before any DDL runs, a plan that drops a table, drops a column or changes a column's type (a conversion can lose information).
+
+  Under either policy, `options (allow_destructive = true)` lifts the refusal, and `allow_destructive = false` is the same as leaving it out. The decision comes from the plan, never from row counts: under `'strict'` dropping an empty table is refused too, so an apply that passes against an empty development database cannot start failing against a populated one. One error lists everything at risk:
 
   ```sql
+  pragma destructive_apply_policy = 'strict';
   -- Re-declared without column t.note; refused without the ack:
   apply schema main;
   -- Error: apply schema 'main': this migration destroys stored data: column(s) 't.note'
@@ -246,9 +252,9 @@ apply schema main to version '1.0.0' options (
   apply schema main options (allow_destructive = true);
   ```
 
-  When the drop is really a rename, add a rename hint instead (see "Rename detection" below); under `rename_policy = 'deny'` even a hinted rename becomes a drop + create and needs the acknowledgement. A widening type change that loses nothing (say `integer` → `real`) needs it as well, because the plan does not tell lossless conversions from lossy ones. `diff schema` is never gated: it is a read-only preview and lists the same DDL unconditionally.
+  When the drop is really a rename, add a rename hint instead (see "Rename detection" below); under `rename_policy = 'deny'` even a hinted rename becomes a drop + create and, under `'strict'`, needs the acknowledgement. A widening type change that loses nothing (say `integer` → `real`) needs it as well, because the plan does not tell lossless conversions from lossy ones. `diff schema` is never gated: it is a read-only preview and lists the same DDL unconditionally.
 
-  **Moving a table to another module** (see "What a declaration pins" below for when a declaration names a module) is one of the gated cases. There is no in-place primitive for it, so it is realized as a `DROP TABLE` + a recreate in the declared module (`create table … using <module>`, or `create materialized view … using <module>` for the sugar form). A **plain table loses its rows**. A **maintained table** (`materialized view …` / `table … maintained as`) is re-materialized from its body, which **mints a new incarnation** (changing row identity for a replicated/synced table). The refusal describes a move as a move:
+  **Moving a table to another module** (see "What a declaration pins" below for when a declaration names a module) is gated under both policies. There is no in-place primitive for it, so it is realized as a `DROP TABLE` + a recreate in the declared module (`create table … using <module>`, or `create materialized view … using <module>` for the sugar form). A **plain table loses its rows**. A **maintained table** (`materialized view …` / `table … maintained as`) is re-materialized from its body, which **mints a new incarnation** (changing row identity for a replicated/synced table). The refusal describes a move as a move:
 
   ```sql
   -- Re-declared with a different module; refused without the ack:

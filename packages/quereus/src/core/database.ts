@@ -425,6 +425,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			}
 		});
 
+		this.options.registerOption('destructive_apply_policy', {
+			type: 'string',
+			defaultValue: 'permissive',
+			description: 'Which data-destroying steps `apply schema` refuses without options (allow_destructive = true): "permissive" (default; only moving a table to another module) or "strict" (also dropping a table, dropping a column, or changing a column\'s type).',
+			onChange: (event) => {
+				const value = event.newValue as string;
+				if (value !== 'permissive' && value !== 'strict') {
+					throw new QuereusError(`Invalid destructive_apply_policy value: ${value}. Must be "permissive" or "strict"`, StatusCode.ERROR);
+				}
+				log('Destructive apply policy changed to: %s', value);
+			}
+		});
+
 		this.options.registerOption('default_collation', {
 			type: 'string',
 			defaultValue: 'BINARY',

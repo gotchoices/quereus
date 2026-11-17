@@ -412,6 +412,7 @@ pragma default_column_nullability;
 | `default_vtab_module` | string | `'memory'` | Default virtual table module used for `create table` without `using` clause |
 | `default_vtab_args` | object | `{}` | Default arguments passed to the default virtual table module |
 | `foreign_keys` | boolean | `true` | Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT. Alias: `fk_enforcement` |
+| `destructive_apply_policy` | string | `'permissive'` | Which data-destroying steps `apply schema` refuses without `options (allow_destructive = true)`: `'permissive'` refuses only moving a table to another module; `'strict'` also refuses dropping a table, dropping a column and changing a column's type. Read when the apply runs. See `docs/sql-ddl.md` § Semantics and Features |
 | `strict_type_names` | boolean | `true` | A column, context variable, `ALTER … SET DATA TYPE`, `declare schema` table or `cast` whose type name (ignoring any `(…)` parameter list) names no registered type or alias is an error. When `false`, such a name falls back to SQLite's affinity rules and then BLOB. Also checked when a stored table is reopened. See `docs/types.md` § Design Decisions |
 | `runtime_stats` | boolean | `false` | Enable runtime execution statistics collection. Alias: `runtime_metrics` |
 | `validate_plan` | boolean | `false` | Enable plan validation before execution. Alias: `plan_validation` |

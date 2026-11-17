@@ -2043,10 +2043,50 @@ apply schema main options (allow_destructive = true, rename_policy = 'deny');
 drop table opt_probe;
 
 -- ===================================
--- A plan that destroys stored data — a dropped table, a dropped column, a
--- changed column type — is refused before anything runs, unless acknowledged
--- with allow_destructive.
+-- Under the default destructive_apply_policy ('permissive') a dropped column
+-- needs no acknowledgement. (A module move still does; that refusal is pinned
+-- by declarative-equivalence.spec.ts, since it needs a second module.)
 -- ===================================
+
+declare schema destr_default {
+	table t {
+		id integer primary key,
+		a text null
+	}
+}
+
+-- run
+
+apply schema destr_default;
+
+-- run
+
+insert into destr_default.t values (1, 'x');
+
+declare schema destr_default {
+	table t {
+		id integer primary key
+	}
+}
+
+-- run
+
+apply schema destr_default;
+
+-- run
+
+select * from destr_default.t;
+→ [{"id": 1}]
+
+-- ===================================
+-- Under destructive_apply_policy = 'strict', a plan that destroys stored
+-- data — a dropped table, a dropped column, a changed column type — is
+-- refused before anything runs, unless acknowledged with allow_destructive.
+-- ===================================
+
+pragma destructive_apply_policy = 'strict';
+
+-- run
 
 declare schema destr_gate {
 	table keep {
@@ -2095,6 +2135,10 @@ select id from destr_gate.gone;
 
 select id, b from destr_gate.keep;
 → [{"id": 1, "b": 7}]
+
+pragma destructive_apply_policy = 'permissive';
+
+-- run
 
 -- ===================================================================
 -- Unnamed CHECK / UNIQUE / FOREIGN KEY constraints are diffed by body
