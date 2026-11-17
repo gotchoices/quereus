@@ -27,6 +27,7 @@ import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
 import { traverseAst } from '../parser/visitor.js';
+import { findUnbuildableCall, isQueryBoundary, resolveCallSchema } from './declaration-calls.js';
 import { FunctionFlags } from '../common/constants.js';
 import { SchemaChangeNotifier } from './change-events.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
@@ -2245,9 +2246,6 @@ export class SchemaManager {
 		// A nested DML statement (`x in (insert … returning v)`) is a boundary too: its
 		// `where` / `set` / `returning` bind the DML's own target table.
 		let subqueryDepth = 0;
-		const isQueryBoundary = (node: AST.AstNode): boolean =>
-			node.type === 'select' || node.type === 'subquery' || node.type === 'exists'
-			|| node.type === 'insert' || node.type === 'update' || node.type === 'delete';
 		traverseAst(expr, {
 			enterNode: (node: AST.AstNode) => {
 				if (offendingType) return false;
@@ -2494,11 +2492,11 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Validates that CHECK constraint expressions don't call non-deterministic
-	 * functions and don't reference bind parameters. Walks the AST and looks
-	 * up each function call against the registry; raises if any function
-	 * lacks the DETERMINISTIC flag. Avoids the full planning pipeline because
-	 * CHECK expressions reference table columns whose scope is not yet
+	 * Validates CHECK constraint expressions: bind parameters are rejected, every
+	 * function call must resolve ({@link rejectUnbuildableCalls}) — both regardless
+	 * of `allowNonDeterministic` — and, unless allowed, every call must be
+	 * DETERMINISTIC. Walks the AST rather than running the full planning pipeline
+	 * because CHECK expressions reference table columns whose scope is not yet
 	 * established at CREATE TABLE time.
 	 */
 	private validateCheckConstraintDeterminism(
@@ -2508,21 +2506,19 @@ export class SchemaManager {
 	): void {
 		for (const cc of checkConstraints) {
 			const constraintName = cc.name ?? `_check_${tableName}`;
+			const site = `CHECK constraint '${constraintName}' on table '${tableName}'`;
 
 			this.rejectIllegalReferences(cc.expr as AST.AstNode, {
 				rejectColumns: false,
-				formatParamError: () =>
-					`CHECK constraint '${constraintName}' on table '${tableName}' may not reference bind parameters.`,
+				formatParamError: () => `${site} may not reference bind parameters.`,
 			});
+			this.rejectUnbuildableCalls(cc.expr as AST.AstNode, site);
 
 			if (allowNonDeterministic) continue;
 
 			const offendingExpr = this.findNonDeterministicCall(cc.expr as AST.AstNode);
 			if (offendingExpr) {
-				throw nonDeterministicDeclarationError(
-					`CHECK constraint '${constraintName}' on table '${tableName}'`,
-					offendingExpr,
-				);
+				throw nonDeterministicDeclarationError(site, offendingExpr);
 			}
 		}
 	}
@@ -2547,32 +2543,62 @@ export class SchemaManager {
 	 * legitimately writable whenever the pragma is on, so rejecting it on reload would
 	 * close a database this same build opened. Revisit both together if reload ever
 	 * gains a general "refuse schemas no write can satisfy" pass.
+	 *
+	 * Every call must also resolve ({@link rejectUnbuildableCalls}); that check runs
+	 * whatever `allowNonDeterministic` says, and is likewise skipped on reload.
 	 */
 	private validateGeneratedColumnDeterminism(
 		columns: ReadonlyArray<ColumnSchema>,
 		tableName: string,
 		allowNonDeterministic: boolean = false
 	): void {
-		if (allowNonDeterministic) return;
-
 		for (const col of columns) {
 			if (!col.generated || !col.generatedExpr) continue;
+			const site = `GENERATED ALWAYS AS for column '${col.name}' in table '${tableName}'`;
+
+			this.rejectUnbuildableCalls(col.generatedExpr as AST.AstNode, site);
+
+			if (allowNonDeterministic) continue;
 
 			const offendingExpr = this.findNonDeterministicCall(col.generatedExpr as AST.AstNode);
 			if (offendingExpr) {
-				throw nonDeterministicDeclarationError(
-					`GENERATED ALWAYS AS for column '${col.name}' in table '${tableName}'`,
-					offendingExpr,
-				);
+				throw nonDeterministicDeclarationError(site, offendingExpr);
 			}
 		}
 	}
 
 	/**
+	 * Rejects a CHECK / GENERATED body containing a call the write-time build is
+	 * certain to refuse ({@link findUnbuildableCall}: an unknown function or wrong
+	 * argument count, an unknown window function, an aggregate outside any subquery),
+	 * so the table is refused where it is written rather than on every later write.
+	 * A resolution check like the bind-parameter pre-walk, not a determinism check,
+	 * so `nondeterministic_schema` does not lift it.
+	 *
+	 * NOTE: quereus-sync replays a remote `create table` through `db.exec`, so a peer
+	 * lacking a plugin function refuses the replicated table here — the same exposure
+	 * it already has when that function sits in a DEFAULT or in `alter table … add
+	 * constraint … check`. Catalog reload never reaches this gate.
+	 *
+	 * @param site Where the body sits, e.g. `CHECK constraint 'c' on table 't'`.
+	 */
+	private rejectUnbuildableCalls(expr: AST.AstNode, site: string): void {
+		const unbuildable = findUnbuildableCall(expr, (name, nArg) => this.findFunction(name, nArg));
+		if (!unbuildable) return;
+		throw new QuereusError(
+			`${site} is invalid: ${unbuildable.reason}`,
+			StatusCode.ERROR,
+			undefined,
+			unbuildable.node.loc?.start.line,
+			unbuildable.node.loc?.start.column,
+		);
+	}
+
+	/**
 	 * The first function call under `expr` whose registry entry lacks
 	 * `FunctionFlags.DETERMINISTIC`, or undefined if every call is deterministic.
-	 * A name the registry cannot resolve is skipped — an unknown function still
-	 * surfaces at write time, not here.
+	 * A name the registry cannot resolve is skipped; the gates run
+	 * {@link rejectUnbuildableCalls} first, so no such name reaches here from them.
 	 *
 	 * Shared by the CHECK and GENERATED declaration-time gates. Both walk the raw
 	 * AST rather than building the expression the way {@link validateDefaultDeterminism}
@@ -2581,14 +2607,13 @@ export class SchemaManager {
 	 */
 	private findNonDeterministicCall(expr: AST.AstNode): AST.FunctionExpr | undefined {
 		let offendingExpr: AST.FunctionExpr | undefined;
+		const findFunction = (name: string, nArg: number) => this.findFunction(name, nArg);
 		traverseAst(expr, {
 			enterNode: (node: AST.AstNode) => {
 				if (offendingExpr) return false;
 				if (node.type !== 'function') return;
 				const fnNode = node as AST.FunctionExpr;
-				const argCount = fnNode.args?.length ?? 0;
-				const funcSchema = this.findFunction(fnNode.name, argCount)
-					?? this.findFunction(fnNode.name, -1);
+				const funcSchema = resolveCallSchema(findFunction, fnNode);
 				if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
 					offendingExpr = fnNode;
 					return false;
@@ -3068,8 +3093,9 @@ export class SchemaManager {
 		// The captured artifact at the vtab.update() frontier is fully resolved per row, so
 		// defaults / CHECKs / generated columns containing non-determinism remain replay-safe
 		// (see docs/architecture.md § Constraints and docs/module-authoring.md § Mutation Statements).
-		// The bind-parameter / column-reference pre-walks inside the validators still run
-		// in both modes — those are scope checks, not determinism checks.
+		// The bind-parameter / column-reference pre-walks and the CHECK / GENERATED
+		// function-resolution walk inside the validators still run in both modes — those
+		// are scope checks, not determinism checks.
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
 		this.validateDefaultDeterminism(baseTableSchema, allowNonDet);
 		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);

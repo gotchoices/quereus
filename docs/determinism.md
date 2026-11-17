@@ -136,7 +136,8 @@ db.createScalarFunction("my_upper",
 
 All determinism rejection sites described below are skipped when
 `nondeterministic_schema = true`. The bind-parameter / column-reference
-pre-walks remain active in both modes (those are scope checks, not
+pre-walks and the CHECK / generated-column function-resolution walk remain
+active in both modes (those are scope and resolution checks, not
 determinism checks).
 
 **CREATE TABLE:**
@@ -154,10 +155,18 @@ determinism checks).
   variable) — neither can resolve at INSERT time.
 - DEFAULT expressions are then built and rejected if their physical
   `deterministic` property is false (e.g. `random()`).
-- CHECK constraints are walked at DDL time: any function call is rejected
-  unless the registry marks it `DETERMINISTIC`, and bind parameters
-  (`?`, `:name`) are rejected too. Column references inside CHECK predicates
-  are validated at INSERT/UPDATE time, when the row scope exists.
+- CHECK constraints are walked at DDL time. Every function call must
+  resolve in the registry the way the write-time build resolves it (by name
+  and argument count, falling back to a variadic registration; a window call
+  against the window-function registry), and an aggregate call is rejected
+  outside a subquery, since the body is evaluated per row — these hold in
+  both `nondeterministic_schema` modes, so `check (nosuchfn(a) > 0)` or
+  `check (abs(a, a) > 0)` is refused at CREATE TABLE instead of failing
+  every later write. In strict mode each call must additionally be marked
+  `DETERMINISTIC`. Bind parameters (`?`, `:name`) are rejected too. Column
+  and table references inside CHECK predicates are validated at
+  INSERT/UPDATE time, when the row scope exists — so a subquery naming a
+  table created later is accepted.
 - `GENERATED ALWAYS AS` expressions are walked the same way CHECK constraints
   are — an AST pass over function calls, not a build through the full
   expression pipeline, since a generated body is written in terms of the

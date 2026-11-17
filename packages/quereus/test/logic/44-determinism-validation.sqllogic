@@ -180,3 +180,28 @@ create table t_det_frame_bound (
     check (n > (select sum(v) over (rows between abs(random()) preceding and current row) from t_det_src limit 1))
 );
 -- error: Non-deterministic expression not allowed in CHECK
+
+-- === Test 9: a call no write could ever build is refused at declaration ===
+-- An unknown function, or a known one with the wrong argument count, used to be accepted
+-- here and then fail every INSERT with "Function not found". This is a resolution check,
+-- not a determinism check, so nondeterministic_schema does not lift it.
+
+create table t_unknown_check (id integer primary key, a integer check (nosuchfn(a) > 0));
+-- error: CHECK constraint '_check_a' on table 't_unknown_check' is invalid: Function not found: nosuchfn/1
+
+create table t_unknown_gen (id integer primary key, a integer, x integer generated always as (nosuchfn(a)) stored);
+-- error: GENERATED ALWAYS AS for column 'x' in table 't_unknown_gen' is invalid: Function not found: nosuchfn/1
+
+create table t_wrong_arity (id integer primary key, a integer, check (exists (select abs(a, a))));
+-- error: Function not found: abs/2
+
+-- An aggregate is evaluated per row here, so only one inside a subquery can build.
+create table t_row_aggregate (id integer primary key, a integer check (sum(a) > 0));
+-- error: Aggregate function sum not allowed in this context
+
+pragma nondeterministic_schema = true;
+
+create table t_unknown_nondet (id integer primary key, a integer check (nosuchfn(a) > 0));
+-- error: Function not found: nosuchfn/1
+
+pragma nondeterministic_schema = false;
