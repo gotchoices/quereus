@@ -67,8 +67,8 @@ import {
  * Everything above is about a drop a user issued. The undo journal of a failed
  * `apply schema` issues drops too, and there all four guards stand down
  * (`Database._areDropReferenceGuardsWaived`, which also covers the internal-drop scope, though
- * nothing issues a DROP COLUMN inside it today): the unwind is returning to the pre-apply catalog, so the
- * reference it breaks belongs to an object a later undo removes, was already dangling before
+ * nothing issues a DROP COLUMN inside it today): the unwind is returning to the pre-apply
+ * catalog, so the reference it breaks belongs to an object a later undo removes, was already dangling before
  * the apply, or goes back to the object it named before the apply. An assertion can hold
  * that last kind without being edited: an added column can capture a bare name in its body,
  * or widen a `*` under a view it reads.

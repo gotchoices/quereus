@@ -2968,8 +2968,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Marks that the DDL re-entering the executor is the undo journal of a
 	 *  failed `apply schema`. While set, the reference guards on DROP COLUMN, DROP TABLE and
-	 *  DROP VIEW stand down (through {@link _areDropReferenceGuardsWaived}): they keep a user's drop from breaking a working reference, and
-	 *  an unwind is returning to the pre-apply catalog, so a reference it breaks belongs to
+	 *  DROP VIEW stand down (through {@link _areDropReferenceGuardsWaived}): they keep a user's
+	 *  drop from breaking a working reference, and an unwind is returning to the pre-apply
+	 *  catalog, so a reference it breaks belongs to
 	 *  an object a later undo removes, was already dangling before the apply, or goes back
 	 *  to what it named before the apply. ADD CONSTRAINT also stops judging the constraint
 	 *  against the rows and its parent table, and tells the module through the `restoring`

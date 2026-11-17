@@ -2354,6 +2354,8 @@ async function reportedOnUserTable(shadowName: string, tableName: string, steps:
 	try {
 		await steps();
 	} catch (e) {
+		// NOTE: exact-case match; a module that re-cases table names in its messages would leave the
+		// shadow name in place. No rebuilding module does; match case-insensitively if one appears.
 		if (e instanceof Error) replaceInError(e, shadowName, tableName);
 		throw e;
 	}
@@ -2362,6 +2364,9 @@ async function reportedOnUserTable(shadowName: string, tableName: string, steps:
 /** Replaces `from` with `to` in an error's message and in the stack text, which repeats it. */
 function replaceInError(e: Error, from: string, to: string): void {
 	e.message = e.message.split(from).join(to);
+	// NOTE: assigning `stack` is not specified by ECMAScript; it is writable in V8, SpiderMonkey and
+	// JavaScriptCore. If a target runtime (Hermes untested) makes it read-only, the strict-mode
+	// assignment throws and replaces the user's error — guard it with a writability check then.
 	if (typeof e.stack === 'string') e.stack = e.stack.split(from).join(to);
 }
 
