@@ -1011,5 +1011,23 @@ declare schema main {
 diff schema main;
 -- error: Rename conflict for table 'b29'
 
+-- A named constraint inline on an ADDED column claims the old name too, though ADD COLUMN (not the
+-- named-constraint lifecycle) creates it; unguarded, the ADD ran before the RENAME and failed mid-apply.
+create table c29 (id integer primary key, x integer constraint chk_old check (x > 0));
+
+declare schema main {
+	table c29 {
+		id integer primary key,
+		x integer constraint chk_new check (x > 0) with tags ("quereus.previous_name" = 'chk_old'),
+		z integer null constraint chk_old check (z > 0)
+	}
+}
+
+-- run
+
+diff schema main;
+-- error: Rename conflict for constraint 'chk_new'
+
+drop table c29;
 drop table a29;
 drop table t29;

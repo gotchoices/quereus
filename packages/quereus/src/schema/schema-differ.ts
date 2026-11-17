@@ -1103,6 +1103,12 @@ function resolveRenames<D, A>(args: {
 	/** Object noun for error messages; defaults to `kind`. */
 	noun?: string;
 	declared: Map<string, D>;
+	/**
+	 * Lowercased names declared outside `declared` that still claim its namespace
+	 * (a named constraint inline on an added column); a rename source among them
+	 * conflicts just as one in `declared` does.
+	 */
+	alsoDeclared?: ReadonlySet<string>;
 	actual: Map<string, A>;
 	getDeclaredName: (d: D) => string;
 	getActualName: (a: A) => string;
@@ -1201,7 +1207,7 @@ function resolveRenames<D, A>(args: {
 			// honoured (rename, then create under the freed name): a hint left beside a
 			// reused old name makes every later diff throw the conflict above, and the
 			// reconcile passes rely on no old name being declared.
-			if (declared.has(hintMatchKey!)) {
+			if (declared.has(hintMatchKey!) || args.alsoDeclared?.has(hintMatchKey!)) {
 				throw new QuereusError(
 					`Rename conflict for ${noun} '${getDeclaredName(d)}': its rename source '${getActualName(hintMatch)}' is also declared as a new ${noun}; apply the rename first, then remove the quereus.previous_name/id hint and declare '${getActualName(hintMatch)}' in a later apply`,
 					StatusCode.ERROR,
@@ -1900,8 +1906,10 @@ function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnCon
  *
  * A column-level clause on a column `isAddedColumn` reports is skipped: `ADD
  * COLUMN` renders the column's clauses inline (`columnDefToString`), so collecting
- * it here would ADD the constraint a second time. A TABLE-level constraint over a
- * new column is not carried by `ADD COLUMN` and is collected as usual.
+ * it here would ADD the constraint a second time. Its user name still claims the
+ * table's constraint namespace, so it is reported in `onAddedColumns` (see the
+ * `alsoDeclared` argument of {@link resolveRenames}). A TABLE-level constraint over
+ * a new column is not carried by `ADD COLUMN` and is collected as usual.
  *
  * `schemaName` is the schema this table is being diffed under (the differ runs
  * per schema — it is the CHILD schema for any FK declared here). It is threaded
@@ -1914,12 +1922,13 @@ function collectDeclaredConstraints(
 	declaredTable: AST.DeclaredTable,
 	schemaName: string,
 	isAddedColumn: (lowerName: string) => boolean,
-): { named: Map<string, DeclaredNamedConstraint>; unnamed: DeclaredUnnamedConstraint[] } {
+): { named: Map<string, DeclaredNamedConstraint>; unnamed: DeclaredUnnamedConstraint[]; onAddedColumns: Set<string> } {
 	const named = new Map<string, DeclaredNamedConstraint>();
 	const unnamed: DeclaredUnnamedConstraint[] = [];
+	const onAddedColumns = new Set<string>();
 	const add = (tc: AST.TableConstraint, column?: string): void => {
 		const definition = constraintBodyToCanonicalString(tc, schemaName);
-		if (!tc.name || tc.name.startsWith('_')) {
+		if (!isUserConstraintName(tc.name)) {
 			unnamed.push({ name: tc.name, column, definition, bodyAst: tc });
 			return;
 		}
@@ -1931,13 +1940,20 @@ function collectDeclaredConstraints(
 		if (c.type !== 'primaryKey') add(c);
 	}
 	for (const col of declaredTable.tableStmt.columns) {
-		if (isAddedColumn(col.name.toLowerCase())) continue;
+		const added = isAddedColumn(col.name.toLowerCase());
 		for (const cc of col.constraints ?? []) {
 			const tc = columnConstraintToTableConstraint(col.name, cc);
-			if (tc) add(tc, col.name);
+			if (!tc) continue;
+			if (!added) add(tc, col.name);
+			else if (isUserConstraintName(tc.name)) onAddedColumns.add(tc.name.toLowerCase());
 		}
 	}
-	return { named, unnamed };
+	return { named, unnamed, onAddedColumns };
+}
+
+/** A user-chosen constraint name — present and not a reserved `_`-prefixed auto name. */
+function isUserConstraintName(name: string | undefined): name is string {
+	return !!name && !name.startsWith('_');
 }
 
 /**
@@ -2458,6 +2474,7 @@ function computeTableAlterDiff(
 	const constraintRenames = resolveRenames<DeclaredNamedConstraint, CatalogTable['namedConstraints'][number]>({
 		kind: 'constraint',
 		declared: declaredNamedConstraints,
+		alsoDeclared: declaredConstraints.onAddedColumns,
 		actual: actualNamedConstraints,
 		getDeclaredName: d => d.name,
 		getActualName: a => a.name,
