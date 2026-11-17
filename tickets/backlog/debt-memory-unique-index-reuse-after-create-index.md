@@ -99,3 +99,5 @@ but only addresses the live-index case.
 Care needed: the key is also rewritten by the column-rename path
 (`planImplicitCoveringIndexRenames` / `applyImplicitCoveringStructureRenames`) and the
 constraint-drop path, so any re-keying has to move with those.
+
+*Note from planning `create-table-names-every-unnamed-constraint`:* that ticket stores every unnamed UNIQUE under its `_uc_<column names>` name, so the reuse arm records the structure under the constraint's own name (`uc.name ?? matchingUniqueIndex.name` takes `uc.name`), which is the key the reader derives. Once it lands, the per-write lookup miss described above no longer happens for an unnamed constraint; the dropped-reused-index half is unaffected.
