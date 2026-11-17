@@ -842,9 +842,9 @@ export class MaterializedViewManager {
 	 * the plan binds the live (possibly reshaped) record.
 	 *
 	 * The front half of {@link postApplyBackingChanges} is skipped. Its per-row
-	 * validation: the refresh already checked every stored row, a superset of this diff
-	 * — the bulk declared CHECK/FK scan over the reconciled contents. Re-checking would also be wrong on the
-	 * reshape arm, whose diff images predate the post-reconcile retype. Its coarsening
+	 * validation: the refresh's bulk declared CHECK/FK scan over the reconciled contents
+	 * already checked every stored row, a superset of this diff. Re-checking would also be
+	 * wrong on the reshape arm, whose diff images predate the post-reconcile retype. Its coarsening
 	 * collision telemetry: a refresh rejects colliding coarsened keys outright
 	 * (`assertRefreshRowsAreSet`), so an `update` in its diff is a row replaced over
 	 * time, not two source identities merged — reporting it would be a false collision
