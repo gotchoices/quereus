@@ -264,6 +264,8 @@ describe('Announced result-column types match produced values', () => {
 			expect(await announcedNullable('select (select count(*) from t) as v')).to.equal(false);
 			// A grouped aggregate yields no row over an empty input.
 			expect(await announcedNullable('select (select count(*) from t group by i) as v')).to.equal(true);
+			// HAVING filters the one ungrouped row away.
+			expect(await announcedNullable('select (select count(*) from t having count(*) > 5) as v')).to.equal(true);
 			// `id` is NOT NULL, but the filter may leave no row.
 			expect(await announcedNullable('select (select id from t where i = 1) as v')).to.equal(true);
 		});

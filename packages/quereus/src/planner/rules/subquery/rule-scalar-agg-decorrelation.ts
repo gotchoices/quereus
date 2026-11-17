@@ -549,6 +549,10 @@ function decorrelateOne(
 
 	const leftWidth = leftSource.getAttributes().length;
 	const nullable = (t: ScalarType): ScalarType => (t.nullable ? t : { ...t, nullable: true });
+	// NOTE: in the CASE form below the ELSE read happens only on a match, yet it is typed
+	// nullable, so a correlated `(select count(*) …)` announces nullable after this rewrite
+	// though `ScalarSubqueryNode` announced it non-null before (sound, just loose). If a
+	// consumer needs the tighter post-optimization type, type the ELSE read from `valueAttr.type`.
 	const valueColRef = new ColumnReferenceNode(
 		cand.scope,
 		{ type: 'column', name: valueAttr.name },
