@@ -879,8 +879,13 @@ interface ExposedSource {
 
 /**
  * The names a FROM source exposes, as written: a table or function source's alias, else
- * its own (unqualified) name; a subquery's alias — the parser generates a unique one when
- * none is written, so an unaliased subquery never collides; a join's names from both sides.
+ * its own (unqualified) name; a subquery's alias — the parser generates one from the
+ * subquery's source offset when none is written, so two unaliased subqueries never collide;
+ * a join's names from both sides.
+ *
+ * NOTE: a generated alias (`subquery_<offset>` / `mutating_subquery_<offset>`) can collide
+ * with a user table of that literal name and be rejected; contrived, so left as is. If it
+ * ever matters, mark generated aliases on the AST and skip them here.
  */
 function exposedSources(source: AST.FromClause): ExposedSource[] {
 	switch (source.type) {
