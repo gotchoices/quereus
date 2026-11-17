@@ -182,6 +182,17 @@ SELECT y FROM t_sub WHERE id = 1;
 
 DROP TABLE t_sub;
 
+-- A sibling read through the table's own name never resolves at INSERT time, so it is
+-- refused at CREATE — including from inside a subquery whose FROM does not bind it.
+CREATE TABLE t_corr_peer (k INTEGER PRIMARY KEY);
+CREATE TABLE t_corr (
+  id INTEGER PRIMARY KEY,
+  b INTEGER,
+  c INTEGER DEFAULT ((SELECT max(k) FROM t_corr_peer WHERE k = t_corr.b))
+);
+-- error: may not reference 't_corr.b'; use 'new.<column>'
+DROP TABLE t_corr_peer;
+
 -- ===================================
 -- new.<column> alongside GENERATED columns
 -- A `new.` default coexists with generated columns (the two-pass expansion is

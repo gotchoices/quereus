@@ -22,6 +22,10 @@ import { walkSchemaExpressionScope } from './expr-scope/walk.js';
 // reject `'unbound'` at declaration time rather than deferring to a write-time
 // failure — see `unboundQualifierError` in `./table.ts`.
 //
+// The column-DEFAULT declaration gate (`rejectUnresolvableQualifiedDefaultRefs`
+// in `./manager.ts`) reuses the same classification for qualified references
+// only, rejecting `'unbound'` and every `'own'` spelling except `new.`.
+//
 // NOTE: residual — a reference to an own-column NAME reachable only through
 // an opaque source (e.g. a CTE shadowing the owning table) classifies as
 // 'unknown', and the consumers record a dependency edge for it. That edge is

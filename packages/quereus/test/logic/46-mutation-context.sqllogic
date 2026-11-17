@@ -962,3 +962,27 @@ insert into context with context who = 5, w = 0 values (1, -1, 0);
 insert into context with context who = 5, w = 0 values (1, 1, 20);
 -- error: CHECK constraint failed
 insert into context with context who = -5, w = 20 values (2, 1, 0);
+
+-- Test 31: a DEFAULT reads a sibling only as `new.<column>`. A reference to the row through the
+-- table's own name, or a qualifier nothing binds, never resolves at INSERT time, so it is refused
+-- where the DEFAULT is declared, although a bare name on this table may be a context variable.
+create table DqSelf (a integer primary key, b integer null, c integer null default (DqSelf.b)) with context (who integer null);
+-- error: may not reference 'DqSelf.b'; use 'new.<column>'
+create table DqSchema (a integer primary key, who integer null, c integer null default (main.DqSchema.who)) with context (who integer null);
+-- error: may not reference 'main.DqSchema.who'; use 'new.<column>'
+create table DqUnbound (a integer primary key, c integer null default (zz.x)) with context (who integer null);
+-- error: references 'zz.x', which binds nothing
+create table DqUndeclared (a integer primary key, c integer null default (context.whom)) with context (who integer null);
+-- error: references 'context.whom', which binds nothing
+create table DqAlter (a integer primary key, b integer null, c integer null) with context (who integer null);
+alter table DqAlter alter column c set default (DqAlter.b);
+-- error: may not reference 'DqAlter.b'; use 'new.<column>'
+
+-- On a table named `context`, `context.<name>` is still the variable; three parts name the row.
+drop table context;
+create table context (a integer primary key, who integer null, c integer null default (context.who)) with context (who integer null);
+insert into context (a, who) with context who = 6 values (1, -1);
+select a, who, c from context;
+→ [{"a":1,"who":-1,"c":6}]
+alter table context alter column c set default (main.context.who);
+-- error: may not reference 'main.context.who'; use 'new.<column>'

@@ -15,6 +15,8 @@ import { requireRegisteredTypeName } from '../types/registry.js';
 import { buildColumnIndexMap, columnDefToSchema, columnTypeSubject, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
+import type { ResolveColumnInSource } from './rename-rewriter.js';
+import { collectGeneratedColumnRefs } from './generated-column-refs.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
@@ -237,6 +239,61 @@ function nonDeterministicDeclarationError(site: string, offendingExpr: AST.Funct
 		`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
 		StatusCode.ERROR
 	);
+}
+
+/** True when the table declares at least one mutation-context variable. */
+function declaresMutationContext(tableSchema: TableSchema): boolean {
+	return !!tableSchema.mutationContext && tableSchema.mutationContext.length > 0;
+}
+
+/**
+ * The column-source resolver handed to the DEFAULT reference gate. The gate acts only on
+ * qualified references, and the classifier consults the resolver only for unqualified
+ * ones, so a constant answer is never read — it just spares the catalog lookups.
+ */
+const unconsultedColumnResolver: ResolveColumnInSource = () => false;
+
+/**
+ * Refuses a qualified reference in a column DEFAULT that no INSERT can ever resolve. At
+ * INSERT time a DEFAULT sees `new.<column>` (values the INSERT supplies), the table's
+ * mutation-context variables, and the sources a FROM inside the DEFAULT selects from —
+ * never the row through its own table name. So `<table>.<column>` (with or without the
+ * schema), a qualifier nothing binds (`zz.x`, `old.x`), and `context.<name>` of an
+ * undeclared variable would fail every insert that uses the default. The classifier is the generated-column one, which tracks the FROM
+ * frames of subqueries, so a correlated `t.b` inside one is caught as well; a reference
+ * it cannot decide (an opaque source intervenes) is left for INSERT to judge.
+ *
+ * Unqualified names are the caller's concern: a bare name may be a context variable.
+ */
+function rejectUnresolvableQualifiedDefaultRefs(
+	defaultValue: AST.Expression,
+	columnName: string,
+	tableSchema: TableSchema,
+): void {
+	const contextVariables = new Set((tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase()));
+	const site = `DEFAULT for column '${columnName}' in table '${tableSchema.name}'`;
+	const refs = collectGeneratedColumnRefs(defaultValue, tableSchema.name, tableSchema.schemaName, unconsultedColumnResolver);
+	for (const ref of refs) {
+		if (ref.shape !== 'column' || ref.originalQualifier === undefined) continue;
+		const qualifier = ref.originalQualifier.toLowerCase();
+		// Checked before the binding: on a table named `context` the classifier calls
+		// `context.<name>` an own-row reference, but it reaches the declared variable.
+		// An undeclared `context.<name>` resolves to nothing and falls through.
+		if (qualifier === 'context' && contextVariables.has(ref.name)) continue;
+		const spelled = `${ref.originalQualifier}.${ref.originalName}`;
+		if (ref.binding === 'own' && qualifier !== 'new') {
+			throw new QuereusError(
+				`${site} may not reference '${spelled}'; use 'new.<column>' to read a value supplied by the INSERT, or a generated column instead.`,
+				StatusCode.ERROR,
+			);
+		}
+		if (ref.binding === 'unbound') {
+			throw new QuereusError(
+				`${site} references '${spelled}', which binds nothing: a DEFAULT may read only 'new.<column>', a mutation context variable, or a column of a source it selects from.`,
+				StatusCode.ERROR,
+			);
+		}
+	}
 }
 
 /**
@@ -2159,9 +2216,11 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Walks an expression AST and rejects bind-parameter and (optionally)
+	 * Walks an expression AST and rejects bind-parameter and (optionally) bare
 	 * column-reference nodes. Used by DDL-time DEFAULT/CHECK validators where
 	 * such references are illegal even though they may otherwise build cleanly.
+	 * Qualified column references are not judged here — the DEFAULT gate
+	 * classifies those by scope ({@link rejectUnresolvableQualifiedDefaultRefs}).
 	 *
 	 * Throws a QuereusError on the first offending node, with a message
 	 * produced by the supplied formatters.
@@ -2195,15 +2254,10 @@ export class SchemaManager {
 					offendingType = 'parameter';
 					return false;
 				}
-				if (options.rejectColumns && node.type === 'column' && subqueryDepth === 0) {
-					// `new.<column>` is an explicit, legal read of a value the INSERT
-					// supplies for a sibling column (resolved against the row scope at
-					// INSERT time); only a bare (unqualified) column is the illegal
-					// sibling reference rejected here.
-					if ((node as AST.ColumnExpr).table?.toLowerCase() !== 'new') {
-						offendingType = 'column';
-						return false;
-					}
+				if (options.rejectColumns && node.type === 'column' && subqueryDepth === 0
+					&& (node as AST.ColumnExpr).table === undefined) {
+					offendingType = 'column';
+					return false;
 				}
 				if (isQueryBoundary(node)) subqueryDepth += 1;
 			},
@@ -2219,20 +2273,6 @@ export class SchemaManager {
 		}
 	}
 
-	/**
-	 * Validates that all DEFAULT expressions in the column schemas are
-	 * deterministic and free of bind parameters or (when no mutation
-	 * context is defined) column references. Bind parameters and column
-	 * references are rejected up-front via an AST pre-walk so the error
-	 * messages stay specific (rather than degrading into "column not
-	 * found" during expression building).
-	 *
-	 * When `hasMutationContext` is true, column-style identifiers are
-	 * preserved because they may resolve to mutation-context variables at
-	 * INSERT time (the AST cannot distinguish a real column from a
-	 * context variable, and the build attempt is permitted to fail —
-	 * scope resolution is deferred to row-time).
-	 */
 	/** True when a DEFAULT expression embeds a subquery (scalar subquery / EXISTS / SELECT). */
 	private defaultEmbedsSubquery(expr: AST.AstNode): boolean {
 		let found = false;
@@ -2287,23 +2327,34 @@ export class SchemaManager {
 
 	/**
 	 * Validate a single DEFAULT expression — the per-default core of
-	 * {@link validateDefaultDeterminism}, factored out so the ALTER COLUMN SET DEFAULT
-	 * path ({@link validateAlterColumnDefault}) routes through the identical checks:
-	 * bind parameters and (absent a mutation context) bare columns rejected up front,
-	 * non-determinism rejected unless `allowNonDeterministic`, and a `new.<column>` /
-	 * subquery / mutation-context default deferred to INSERT time (it cannot build
-	 * here without the row/table scope; determinism is re-checked when the row scope
-	 * is established).
+	 * {@link validateDefaultDeterminism}, shared with the ALTER paths
+	 * ({@link validateAlterColumnDefault}, {@link validateAddColumnDefault}) so every
+	 * authoring surface applies the identical checks:
+	 *
+	 * - bind parameters rejected at any depth;
+	 * - a bare column outside any subquery rejected unless the table declares a
+	 *   mutation context (a bare name may then be a context variable);
+	 * - a qualified reference to the row through its own table name (`t.b`,
+	 *   `main.t.b`), or one whose qualifier nothing binds, rejected regardless of
+	 *   context and at any depth ({@link rejectUnresolvableQualifiedDefaultRefs});
+	 * - non-determinism rejected unless `allowNonDeterministic`;
+	 * - a `new.<column>` / subquery / mutation-context default deferred to INSERT time
+	 *   (it cannot build here without the row/table scope; determinism is re-checked
+	 *   when the row scope is established).
+	 *
+	 * The pre-walks run before the build so the error names the offending reference
+	 * rather than degrading into "column not found".
 	 */
 	private validateOneDefault(
 		planningCtx: PlanningContext,
 		defaultValue: AST.Expression,
 		columnName: string,
-		tableName: string,
-		hasMutationContext: boolean,
+		tableSchema: TableSchema,
 		allowNonDeterministic: boolean,
 		ddlPhase: string,
 	): void {
+		const tableName = tableSchema.name;
+		const hasMutationContext = declaresMutationContext(tableSchema);
 		this.rejectIllegalReferences(defaultValue as AST.AstNode, {
 			rejectColumns: !hasMutationContext,
 			formatParamError: () =>
@@ -2311,6 +2362,7 @@ export class SchemaManager {
 			formatColumnError: () =>
 				`DEFAULT for column '${columnName}' in table '${tableName}' may not reference a bare column; use 'new.<column>' to read a value supplied by the INSERT, or a generated column instead.`,
 		});
+		rejectUnresolvableQualifiedDefaultRefs(defaultValue, columnName, tableSchema);
 
 		let defaultExpr: ScalarPlanNode | undefined;
 		// A DEFAULT that embeds a subquery may forward-reference the table being
@@ -2364,15 +2416,17 @@ export class SchemaManager {
 		}
 	}
 
+	/**
+	 * Validates every DEFAULT expression of a table being created, through
+	 * {@link validateOneDefault} — the rules are listed there.
+	 */
 	private validateDefaultDeterminism(
-		columns: ReadonlyArray<ColumnSchema>,
-		tableName: string,
-		hasMutationContext: boolean,
+		tableSchema: TableSchema,
 		allowNonDeterministic: boolean = false
 	): void {
 		const planningCtx = this.makeDdlValidationContext();
 
-		for (const col of columns) {
+		for (const col of tableSchema.columns) {
 			if (!col.defaultValue || typeof col.defaultValue !== 'object' || col.defaultValue === null || !('type' in col.defaultValue)) {
 				continue;
 			}
@@ -2380,8 +2434,7 @@ export class SchemaManager {
 				planningCtx,
 				col.defaultValue as AST.Expression,
 				col.name,
-				tableName,
-				hasMutationContext,
+				tableSchema,
 				allowNonDeterministic,
 				'CREATE TABLE',
 			);
@@ -2389,48 +2442,43 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Validate a DEFAULT expression supplied by an `ALTER COLUMN … SET DEFAULT`,
-	 * routing it through the same checks CREATE TABLE applies so the stored default is
-	 * consistent with what INSERT will accept: bind parameters and (absent a mutation
-	 * context) bare columns are rejected, non-determinism is rejected unless the
-	 * `nondeterministic_schema` option is set, and a `new.<column>` default is accepted
-	 * with the build/determinism check deferred to INSERT time. DROP DEFAULT (a null
-	 * expression) never reaches here. Called from the ALTER TABLE runtime emitter.
+	 * Validate a DEFAULT expression supplied by an `ALTER COLUMN … SET DEFAULT` on
+	 * `tableSchema`, through the same checks CREATE TABLE applies
+	 * ({@link validateOneDefault}) so the stored default is consistent with what INSERT
+	 * will accept; non-determinism is allowed only under the `nondeterministic_schema`
+	 * option. DROP DEFAULT (a null expression) never reaches here. Called from the ALTER
+	 * TABLE runtime emitter.
 	 */
 	validateAlterColumnDefault(
 		defaultExpr: AST.Expression,
 		columnName: string,
-		tableName: string,
-		hasMutationContext: boolean,
+		tableSchema: TableSchema,
 	): void {
-		this.validateDdlDefault(defaultExpr, columnName, tableName, hasMutationContext, 'ALTER COLUMN SET DEFAULT');
+		this.validateDdlDefault(defaultExpr, columnName, tableSchema, 'ALTER COLUMN SET DEFAULT');
 	}
 
 	/**
-	 * Validate a DEFAULT supplied by `ALTER TABLE ADD COLUMN`, routing it through the
-	 * same checks CREATE TABLE / ALTER COLUMN apply so the stored default is consistent
-	 * with what INSERT (and the per-row backfill) will accept: bind parameters and
-	 * (absent a mutation context) bare columns are rejected, non-determinism is rejected
-	 * unless `nondeterministic_schema` is set, and a `new.<column>` default is accepted
-	 * with its build deferred — it reads the existing row's sibling during backfill and
-	 * the INSERT-supplied sibling for future inserts. Called from the ALTER TABLE
-	 * statement builder (`buildAlterTableStmt`) at plan-build time.
+	 * Validate a DEFAULT supplied by `ALTER TABLE ADD COLUMN` on `tableSchema` (the table
+	 * before the column is added), through the same checks CREATE TABLE / ALTER COLUMN
+	 * apply ({@link validateOneDefault}) so the stored default is consistent with what
+	 * INSERT (and the per-row backfill) will accept. A `new.<column>` default has its
+	 * build deferred — it reads the existing row's sibling during backfill and the
+	 * INSERT-supplied sibling for future inserts. Called from the ALTER TABLE statement
+	 * builder (`buildAlterTableStmt`) at plan-build time.
 	 */
 	validateAddColumnDefault(
 		defaultExpr: AST.Expression,
 		columnName: string,
-		tableName: string,
-		hasMutationContext: boolean,
+		tableSchema: TableSchema,
 	): void {
-		this.validateDdlDefault(defaultExpr, columnName, tableName, hasMutationContext, 'ALTER TABLE ADD COLUMN');
+		this.validateDdlDefault(defaultExpr, columnName, tableSchema, 'ALTER TABLE ADD COLUMN');
 	}
 
 	/** Shared body for the ALTER-time DEFAULT validators (ALTER COLUMN SET DEFAULT / ADD COLUMN). */
 	private validateDdlDefault(
 		defaultExpr: AST.Expression,
 		columnName: string,
-		tableName: string,
-		hasMutationContext: boolean,
+		tableSchema: TableSchema,
 		ddlPhase: string,
 	): void {
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
@@ -2438,8 +2486,7 @@ export class SchemaManager {
 			this.makeDdlValidationContext(),
 			defaultExpr,
 			columnName,
-			tableName,
-			hasMutationContext,
+			tableSchema,
 			allowNonDet,
 			ddlPhase,
 		);
@@ -3016,7 +3063,6 @@ export class SchemaManager {
 		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
 		const baseTableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, defaultCollation);
 
-		const hasMutationContext = !!baseTableSchema.mutationContext && baseTableSchema.mutationContext.length > 0;
 		// `nondeterministic_schema = true` lifts the strict-rejection gate at CREATE TABLE.
 		// The captured artifact at the vtab.update() frontier is fully resolved per row, so
 		// defaults / CHECKs / generated columns containing non-determinism remain replay-safe
@@ -3024,7 +3070,7 @@ export class SchemaManager {
 		// The bind-parameter / column-reference pre-walks inside the validators still run
 		// in both modes — those are scope checks, not determinism checks.
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
-		this.validateDefaultDeterminism(baseTableSchema.columns, tableName, hasMutationContext, allowNonDet);
+		this.validateDefaultDeterminism(baseTableSchema, allowNonDet);
 		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);
 		this.validateGeneratedColumnDeterminism(baseTableSchema.columns, tableName, allowNonDet);
 

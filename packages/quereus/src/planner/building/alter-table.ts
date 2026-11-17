@@ -109,20 +109,16 @@ export function buildAlterTableStmt(
       // (`columnTagDiagnostics`) so the two authoring surfaces can't drift.
       raiseStmtTagDiagnostics(columnTagDiagnostics(column), stmt);
       // Validate the DEFAULT through the shared DDL validator (bind params / bare
-      // columns / non-determinism rejected; `new.<column>` accepted with its build
-      // deferred). This runs before building the backfill so a bare-column default
-      // is rejected here rather than silently resolving against the existing columns
-      // the backfill scope exposes. DEFAULT only: a GENERATED ALWAYS AS expression is
-      // written with bare column references by definition, so this validator would
-      // reject every legal one. Its determinism is checked inside
+      // columns / `<table>.<column>` / non-determinism rejected; `new.<column>`
+      // accepted with its build deferred). This runs before building the backfill so a
+      // bare-column default is rejected here rather than silently resolving against the
+      // existing columns the backfill scope exposes. DEFAULT only: a GENERATED ALWAYS AS
+      // expression is written with bare column references by definition, so this
+      // validator would reject every legal one. Its determinism is checked inside
       // `buildAddColumnBackfill` instead, with the generated-flavoured validator.
       const defaultConstraint = column.constraints?.find(c => c.type === 'default');
       if (defaultConstraint?.expr) {
-        const hasMutationContext = !!tableReference.tableSchema.mutationContext
-          && tableReference.tableSchema.mutationContext.length > 0;
-        ctx.schemaManager.validateAddColumnDefault(
-          defaultConstraint.expr, column.name, tableReference.tableSchema.name, hasMutationContext,
-        );
+        ctx.schemaManager.validateAddColumnDefault(defaultConstraint.expr, column.name, tableReference.tableSchema);
       }
       const backfill = buildAddColumnBackfill(ctx, tableReference, column);
       // For the per-row (evaluator) path — a non-foldable DEFAULT or a GENERATED ALWAYS AS
