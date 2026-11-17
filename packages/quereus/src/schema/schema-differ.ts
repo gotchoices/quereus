@@ -4128,6 +4128,7 @@ class UndoRenderer {
 		};
 	}
 
+	// NOTE: accepted tradeoff — every retype counts as data loss, so a lossless widening (integer → real) also needs allow_destructive and is not undone on failure; one rule weighed over a per-type-pair conversion table; revisit if users ask to retype without the flag (refine here, and the gate follows).
 	retypedColumn(table: string, column: string): StepUndo {
 		if (!this.columnNow(table, column)) return NOTHING_TO_UNDO;
 		return {

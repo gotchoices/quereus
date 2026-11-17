@@ -20,6 +20,7 @@ import { renderCatalogForRestoreCheck } from '../../src/schema/catalog-rendering
 import type { SchemaCatalog, CatalogTable, CatalogView } from '../../src/schema/catalog.js';
 import type * as AST from '../../src/parser/ast.js';
 import { viewDefinitionToCanonicalString } from '../../src/emit/ast-stringify.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 
 function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	const stmt = new Parser().parse(sql);
@@ -167,6 +168,17 @@ describe('generateMigrationPlan undo', () => {
 			const db = await databaseWith(['create table gone (id integer primary key)']);
 			const plan = planFor(db, '');
 			expectIrreversible(plan, 'DROP TABLE IF EXISTS gone', /dropping table "gone".*rows/);
+		});
+
+		// The rename runs first, so the move's drop names the new table; a lookup by the
+		// pre-apply name alone found nothing, called the drop a no-op, and let the unwind
+		// try to rename a table the drop had already destroyed.
+		it('a table renamed and moved to another module in one plan: the drop under the new name destroys the rows', async () => {
+			const db = await databaseWith(['create table a (id integer primary key)']);
+			db.registerModule('mem2', new MemoryTableModule());
+			const plan = planFor(db, `table b using mem2() { id integer primary key } with tags ("quereus.previous_name" = 'a')`);
+			expectIrreversible(plan, 'DROP TABLE IF EXISTS b', /dropping table "b".*rows/);
+			expect(stepStarting(plan, 'DROP TABLE IF EXISTS b').destroys).to.deep.equal({ kind: 'table', table: 'b' });
 		});
 
 		it('creates undo to a DROP … IF EXISTS of what they made (table, materialized-view sugar, view, index, assertion)', async () => {
@@ -574,6 +586,8 @@ describe('generateMigrationPlan undo', () => {
 			const plan = generateMigrationPlan(diff, 'main', actual);
 			expectIrreversible(plan, 'DROP INDEX IF EXISTS ix', /DROP INDEX ix cannot be undone: its recorded DDL does not parse/);
 			expectIrreversible(plan, 'ALTER TABLE t DROP CONSTRAINT ck', /DROP CONSTRAINT ck cannot be undone: the pre-apply catalog carries no body/);
+			// Nothing stored is lost, so the allow_destructive gate must not see these.
+			for (const step of plan) expect(step.destroys, step.sql).to.be.undefined;
 		});
 
 		it('a view or a derivation without a body AST is reported irreversible with the reason, not thrown', () => {
