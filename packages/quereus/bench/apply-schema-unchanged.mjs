@@ -1,6 +1,6 @@
 /**
  * Acceptance harness for the `apply schema` applied-state fast path
- * (docs/schema.md § Applied-state snapshot).
+ * (docs/schema-declarative.md § Applied-state snapshot).
  *
  * Times a NO-OP re-apply — `apply schema main` when the catalog already matches
  * the declaration — in both of its shapes, on one machine in one run:
@@ -29,7 +29,7 @@
  * runs so the pre-fast-path shape is measured warm and in-process. The bench framework
  * times exactly one `fn` per benchmark and cannot express that: forcing it in would keep
  * one number and lose the five that make it useful. Its figures are quoted in
- * `docs/schema.md` as a one-off measurement, not as a tracked series.
+ * `docs/schema-declarative.md` as a one-off measurement, not as a tracked series.
  *
  * Giving the fast path a STANDING, ratio-guarded benchmark is a different and larger
  * piece of work — a fast-pathed apply against a forced full-diff apply, guarded by their

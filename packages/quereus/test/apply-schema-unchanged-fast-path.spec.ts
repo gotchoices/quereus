@@ -492,6 +492,25 @@ describe('APPLY SCHEMA unchanged fast path', () => {
 		});
 	});
 
+	describe('rendering encoding', () => {
+		it('free text that imitates item separators cannot make two catalogs render alike', async () => {
+			db = new Database();
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('create view v1 as select id from t');
+			await db.exec('create view v2 as select id from t');
+			const twoViews = collectSchemaCatalog(db, 'main');
+			const v1 = twoViews.views.find(v => v.name === 'v1')!;
+			const v2 = twoViews.views.find(v => v.name === 'v2')!;
+			// One view whose definition spells out v2 in the old space/newline-joined
+			// format; that format rendered these two catalogs identically.
+			const oneView = {
+				...twoViews,
+				views: [{ ...v1, definition: `${v1.definition}\n\ttags -\nview ${v2.name}\n\tddl ${v2.ddl}\n\tdef ${v2.definition}` }],
+			};
+			expect(renderCatalogForComparison(oneView)).to.not.equal(renderCatalogForComparison(twoViews));
+		});
+	});
+
 	describe('exposed implicit indexes', () => {
 		// The secondary BTree behind a UNIQUE constraint tagged
 		// `quereus.expose_implicit_index` reaches the catalog as a `CatalogIndex` with
@@ -509,9 +528,10 @@ describe('APPLY SCHEMA unchanged fast path', () => {
 
 		it('renders the implicit marker', async () => {
 			db = await settledDb(EXPOSED);
-			const rendering = renderCatalogForComparison(collectSchemaCatalog(db, 'main'));
-			expect(rendering, 'the exposed implicit index reaches the rendering')
-				.to.match(/^index .* on vehicles implicit$/m);
+			// Index section is position 3; an index tuple is [name, tableName, implicit, ddl, definition, tags].
+			const indexes = (JSON.parse(renderCatalogForComparison(collectSchemaCatalog(db, 'main'))) as unknown[][])[3] as unknown[][];
+			expect(indexes.some(x => x[1] === 'vehicles' && x[2] === true),
+				'the exposed implicit index reaches the rendering').to.equal(true);
 		});
 
 		it('takes the fast path — an implicit index is not spurious drift', async () => {

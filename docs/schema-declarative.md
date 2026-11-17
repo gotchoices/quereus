@@ -30,7 +30,7 @@ On the next apply the physical branch collects the catalog as before, re-renders
 | | rendered by | includes |
 |---|---|---|
 | declared side | `renderDeclaredSchemaCanonical` (`schema/schema-hasher.ts`) | the `isLogical` kind prefix + the schema's `using (default_vtab_module …)` defaults (they pin the module of tables declared without `using`) + `generateDeclaredDDL`, **tags included** |
-| catalog side | `renderCatalogForComparison` (`schema/catalog-rendering.ts`) | every field of every `Catalog*` interface, each category sorted so live `Map` insertion order cannot matter |
+| catalog side | `renderCatalogForComparison` (`schema/catalog-rendering.ts`) | every field of every `Catalog*` interface, each category sorted so live `Map` insertion order cannot matter, encoded as one JSON text so no value can imitate the separators |
 
 **Why skipping is sound.** `computeSchemaDiff(declared, catalog, renamePolicy, defaultCollation)` reads nothing but its four arguments. On a hit, two of them render identically to the recorded strings and the third is compared directly; the remaining one, `renamePolicy`, is inert when there are no differences — there are no name-change pairs for a policy to police. (`allow_destructive` likewise only gates a non-empty `diff.moduleMigrations`.) So the diff would again be empty.
 
@@ -63,11 +63,13 @@ Measured on the synthetic 54-table / 14-view declaration of `bench/apply-schema-
 
 | declaration | full-diff no-op | fast-pathed no-op | |
 |---|---|---|---|
-| 20.4 KB | 1.52 ms | 0.64 ms | 58% off |
-| 62.9 KB | 3.13 ms | 1.14 ms | 64% off |
-| 112.7 KB | 5.64 ms | 1.52 ms | 73% off |
+| 20.4 KB | 1.73 ms | 0.75 ms | 57% off |
+| 62.9 KB | 3.48 ms | 1.20 ms | 65% off |
+| 112.7 KB | 5.79 ms | 1.69 ms | 71% off |
 
-The fast path removes `computeSchemaDiff` (0.86 / 2.30 / 4.35 ms) and adds a catalog render plus a string compare (0.17 / 0.40 / 0.56 ms and 0.004 / 0.012 / 0.017 ms); `collectSchemaCatalog` (0.26 / 0.46 / 0.67 ms) is still paid on both paths. Storing the rendered strings rather than hashing them is what removes hash-collision risk from the comparison — the cost is memory proportional to the schema's DDL (309 KB catalog + 109 KB declaration at the top size measured). The *encoding* is still separator-delimited rather than uniquely decodable: a tag value or string `DEFAULT` containing a raw newline reaches the rendering verbatim, so text crafted to imitate another item's rendering can in principle make two different catalogs render alike. See the `NOTE:` on `renderCatalogForComparison` and `tickets/backlog/debt-catalog-rendering-injective-encoding`.
+The fast path removes `computeSchemaDiff` (1.01 / 2.44 / 4.03 ms) and adds a catalog render plus a string compare (0.21 / 0.51 / 0.77 ms and 0.004 / 0.010 / 0.017 ms); `collectSchemaCatalog` (0.39 / 0.48 / 0.62 ms) is still paid on both paths. The smallest declaration varies most between runs: 52–61% off across three. Storing the rendered strings rather than hashing them is what removes hash-collision risk from the comparison — the cost is memory proportional to the schema's DDL (275 KB catalog + 109 KB declaration at the top size measured).
+
+The catalog rendering is a single JSON text in which every object is a fixed-arity positional tuple and an absent value is `null`. `JSON.stringify` escapes every name, DDL text, `DEFAULT` and tag value, so none can imitate the punctuation between fields or items, and a JSON text parses back to exactly one value: two catalogs render alike only if they agree field for field, apart from the orderings and the absent-vs-empty tag distinction the differ ignores anyway. The rendering is built with a single `join` rather than wrapped as `'[' + … + ']'`, because the wrapped form leaves a V8 rope that the compare has to copy flat on every apply (0.057 ms vs 0.009 ms at 234 KB). Compared with the earlier space- and newline-joined text, the JSON framing costs about 0.15 ms of render time at the top size (0.60 → 0.77 ms on the same machine) and shrinks the rendering from 310 KB to 275 KB.
 
 ## Logical schemas and lenses
 

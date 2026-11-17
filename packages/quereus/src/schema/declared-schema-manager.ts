@@ -26,8 +26,8 @@ export interface LensSnapshotPair {
  * `docs/schema-declarative.md` § Applied-state snapshot.
  *
  * NOTE: the two renderings are retained per schema for as long as the declaration
- * lives — measured at 309 KB + 109 KB for the 112.7 KB / 54-table declaration of
- * `bench/apply-schema-unchanged.mjs`, i.e. roughly 4× the declaration's own DDL
+ * lives — measured at 275 KB + 109 KB for the 112.7 KB / 54-table declaration of
+ * `bench/apply-schema-unchanged.mjs`, i.e. roughly 3.5× the declaration's own DDL
  * text. Storing them (rather than hashing) is what makes the comparison exact.
  * If a host ever declares many large schemas and this shows up in a heap profile,
  * the trade to revisit is hashing the catalog rendering instead — FNV-1a over

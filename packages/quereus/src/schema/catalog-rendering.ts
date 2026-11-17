@@ -4,6 +4,18 @@ import { sqlValueToLiteral } from '../util/sql-literal.js';
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAssertion } from './catalog.js';
 
 /**
+ * A JSON value built from the catalog. Positional: every tuple a renderer
+ * returns has a fixed arity and a fixed field order, and an absent value is
+ * `null` (never a sentinel string a real value could equal).
+ *
+ * Leaves are strings, booleans and `null` only. Numbers are left out of the type
+ * on purpose, so a raw `SqlValue` cannot be put in a frame: `JSON.stringify` maps
+ * `NaN`/`Infinity` to `null` and throws on a bigint. Tag values go through
+ * {@link renderTagValue} instead.
+ */
+type Frame = string | boolean | null | readonly Frame[];
+
+/**
  * Canonical text rendering of a {@link SchemaCatalog}, for the `apply schema`
  * applied-state snapshot (see `docs/schema-declarative.md` § Applied-state snapshot).
  *
@@ -15,18 +27,15 @@ import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAss
  * 1.46 ms to FNV-1a hash 119 KB of rendered text) and carries no hash-collision
  * risk.
  *
- * NOTE: the *encoding* is not provably injective, though. Fields and items are
- * separated by literal spaces / tabs / newlines, and a leaf value can contain
- * any of them — a tag value or a DEFAULT holding a raw newline reaches the
- * output verbatim (via `sqlValueToLiteral` / `expressionToString`, and via the
- * `ddl` text that embeds the same literal). So a value crafted to imitate the
- * rendering of a *different* catalog item makes two distinct catalogs render
- * alike, and an out-of-band change between exactly those two catalogs would be
- * skipped. It takes deliberately hostile tag/DEFAULT text to build one, so it is
- * left open; the fix that retires the class is a uniquely-decodable encoding
- * (JSON-frame each part instead of joining on separators — measured ~+0.25 ms on
- * the 308.8 KB rendering of `bench/apply-schema-unchanged.mjs 30`, against a
- * 1.50 ms fast-pathed apply). See `tickets/backlog/debt-catalog-rendering-injective-encoding`.
+ * The encoding is injective by construction. The output is one JSON text: each
+ * item is a fixed-arity positional tuple ({@link Frame}), and `JSON.stringify`
+ * escapes quotes, backslashes and control characters inside every string leaf,
+ * so no name, DDL text, DEFAULT or tag value can imitate the punctuation that
+ * separates fields or items. A JSON text parses back to exactly one value, so
+ * equal renderings mean equal trees, and equal trees mean equal field values.
+ * The only things the tree drops are orderings the differ ignores (sections and
+ * constraint lists are sorted), the absent-vs-empty tag distinction the differ
+ * also ignores, and an index's absent-vs-`false` `implicit` flag.
  *
  * It is also NOT the schema *version* hash. `computeSchemaHash` strips tags
  * before hashing, because tags must not affect versioning; the differ, by
@@ -41,15 +50,17 @@ import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAss
 export function renderCatalogForComparison(catalog: SchemaCatalog): string {
 	const { schemaName, tables, views, indexes, assertions, ...rest } = catalog;
 	assertEveryFieldConsidered(rest);
-	return [
+	// [schemaName, tables[], views[], indexes[], assertions[]] — assembled from
+	// already-encoded items so each item is stringified exactly once.
+	return jsonArrayText([
 		// Lowercased: the snapshot is keyed by lowercased schema name, so
 		// `apply schema MyApp` and `apply schema myapp` must render alike.
-		`schema ${schemaName.toLowerCase()}`,
-		...sortedRenderings(tables, renderTable),
-		...sortedRenderings(views, renderView),
-		...sortedRenderings(indexes, renderIndex),
-		...sortedRenderings(assertions, renderAssertion),
-	].join('\n');
+		JSON.stringify(schemaName.toLowerCase()),
+		encodedSection(tables, renderTable),
+		encodedSection(views, renderView),
+		encodedSection(indexes, renderIndex),
+		encodedSection(assertions, renderAssertion),
+	]);
 }
 
 /**
@@ -94,68 +105,104 @@ export function renderCatalogForRestoreCheck(catalog: SchemaCatalog): string {
 function assertEveryFieldConsidered(_leftover: Record<string, never>): void { /* type-level only */ }
 
 /**
- * Renders every item and sorts the RESULTS, so a drop+recreate that only changes
- * the live `Map` insertion order produces no spurious mismatch. Sorting the
- * rendered strings (rather than the items by name) also keeps two objects that
- * legitimately share a name — an index name is unique per *table*, not per
- * schema — in a stable order without needing a composite sort key.
+ * `[enc1,enc2,…]`: each item JSON-encoded once, and the ENCODINGS sorted, so a
+ * drop+recreate that only changes the live `Map` insertion order produces no
+ * spurious mismatch. Sorting the encodings (rather than the items by name) also
+ * keeps two objects that legitimately share a name — an index name is unique per
+ * *table*, not per schema — in a stable order without needing a composite sort key.
  */
-function sortedRenderings<T>(items: readonly T[], render: (item: T) => string): string[] {
-	return items.map(render).sort();
+function encodedSection<T>(items: readonly T[], render: (item: T) => Frame): string {
+	return jsonArrayText(items.map(i => JSON.stringify(render(i))).sort());
 }
 
-function renderTable(t: CatalogTable): string {
+/**
+ * `[a,b,…]` from already-encoded JSON elements, built by ONE `join` so the result
+ * is a flat string. `'[' + s + ']'` would leave a V8 rope (a concatenation node
+ * over `s`) that the snapshot compare must copy flat first on every apply —
+ * measured 0.057 ms vs 0.009 ms to compare a 234 KB rendering.
+ */
+function jsonArrayText(encoded: readonly string[]): string {
+	const pieces = ['['];
+	for (const e of encoded) pieces.push(e, ',');
+	if (encoded.length > 0) pieces.pop();
+	pieces.push(']');
+	return pieces.join('');
+}
+
+/**
+ * The frames themselves, ordered by their encoding — for lists nested inside an
+ * item. The frames (not the encodings) are returned, because embedding an
+ * encoded string in the enclosing item would escape it a second time.
+ */
+function sortedFrames<T>(items: readonly T[], render: (item: T) => Frame): Frame[] {
+	return items
+		.map(i => { const frame = render(i); return { frame, key: JSON.stringify(frame) }; })
+		.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+		.map(e => e.frame);
+}
+
+// [name, ddl, module, columns[], pk[], refs[], tags, named[], unnamed[], maintained]
+function renderTable(t: CatalogTable): Frame {
 	// `contextVariables` omitted: the table's `ddl` already renders the `with context` clause.
 	const { name, ddl, columns, primaryKey, referencedTables, contextVariables: _contextVariables, tags, module, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
 	assertEveryFieldConsidered(rest);
 	return [
-		`table ${name}`,
+		name,
 		// `ddl` is deliberately redundant with the structured fields below: it costs
 		// nothing extra (it is already computed by `collectSchemaCatalog`) and removes
 		// any need to argue about what `generateTableDDL` does or does not render.
-		`\tddl ${ddl}`,
+		ddl,
 		// Rendered on its own: the collected `ddl` elides a `using` clause that matches
 		// the session default, so a table moved by direct DDL could leave it unchanged.
-		`\tmodule ${module?.name ?? '-'} args ${renderTags(module?.args)}`,
+		module ? [module.name, renderTags(module.args)] : null,
 		// Column ORDER is behavioural — never sorted.
-		...columns.map(c => `\t${renderColumn(c)}`),
-		`\tpk ${primaryKey.map(pk => `${pk.columnName} ${pk.desc ? 'desc' : 'asc'}`).join(', ')}`,
+		columns.map(renderColumn),
+		primaryKey.map(pk => [pk.columnName, pk.desc]),
 		// Sorted: only feeds the differ's drop ORDERING, which is inert on an empty diff.
-		`\trefs ${[...referencedTables].sort().join(', ')}`,
-		`\ttags ${renderTags(tags)}`,
+		[...referencedTables].sort(),
+		renderTags(tags),
 		// Sorted: the differ keys named constraints by name, so their order carries no meaning.
-		...sortedRenderings(namedConstraints, renderNamedConstraint).map(s => `\t${s}`),
+		sortedFrames(namedConstraints, renderNamedConstraint),
 		// Sorted: the differ matches unnamed constraints as a body multiset.
-		...sortedRenderings(unnamedConstraints, renderUnnamedConstraint).map(s => `\t${s}`),
-		`\tmaintained ${maintained ? renderMaintained(maintained) : '-'}`,
-	].join('\n');
+		sortedFrames(unnamedConstraints, renderUnnamedConstraint),
+		maintained ? renderMaintained(maintained) : null,
+	];
 }
 
-function renderColumn(c: CatalogTable['columns'][number]): string {
+// [name, type, notNull, primaryKey, default, collation, tags]
+function renderColumn(c: CatalogTable['columns'][number]): Frame {
 	// `generatedExpr` omitted: the table's `ddl` already renders it, and no undo statement changes it.
 	const { name, type, notNull, primaryKey, defaultValue, generatedExpr: _generatedExpr, collation, tags, ...rest } = c;
 	assertEveryFieldConsidered(rest);
-	return `column ${name} ${type} ${notNull ? 'not null' : 'null'} ${primaryKey ? 'pk' : '-'}`
+	return [
+		name,
+		type,
+		notNull,
+		primaryKey,
 		// `defaultValue` is an `AST.Expression`; rendered with the same
 		// `expressionToString` the catalog itself uses for DEFAULT text. Measured at
 		// 0.140 ms of a 0.871 ms whole-catalog render on the 112.7 KB / 54-table ×
 		// 38-column declaration of `bench/apply-schema-unchanged.mjs` (median of 15),
 		// against the 4.35 ms `computeSchemaDiff` the whole render replaces — so
 		// keeping it costs nothing worth trading for leaning on `ddl` alone.
-		+ ` default ${defaultValue ? expressionToString(defaultValue) : '-'}`
-		+ ` collate ${collation} tags ${renderTags(tags)}`;
+		defaultValue ? expressionToString(defaultValue) : null,
+		collation,
+		renderTags(tags),
+	];
 }
 
-function renderNamedConstraint(c: CatalogTable['namedConstraints'][number]): string {
+// [name, definition, tags]
+function renderNamedConstraint(c: CatalogTable['namedConstraints'][number]): Frame {
 	// `bodyAst` omitted: it is the lift `definition` was rendered from (plus the
 	// deferrability `definition` drops, which is not a differ channel), so the
 	// canonical string already decides equality.
 	const { name, tags, definition, bodyAst: _bodyAst, ...rest } = c;
 	assertEveryFieldConsidered(rest);
-	return `constraint ${name} ${definition} tags ${renderTags(tags)}`;
+	return [name, definition, renderTags(tags)];
 }
 
-function renderUnnamedConstraint(c: CatalogTable['unnamedConstraints'][number]): string {
+// [kind, definition, tags]
+function renderUnnamedConstraint(c: CatalogTable['unnamedConstraints'][number]): Frame {
 	// `name` omitted: an unnamed constraint's identity is its body, and the stored
 	// auto-name only decides how a DROP is spelled — inert on an empty diff. `bodyAst`
 	// omitted as for `renderNamedConstraint`. `tags` are not a differ channel for an
@@ -163,10 +210,11 @@ function renderUnnamedConstraint(c: CatalogTable['unnamedConstraints'][number]):
 	// re-adds one without them; on the fast path that only costs a full reconcile.
 	const { kind, name: _name, tags, definition, bodyAst: _bodyAst, ...rest } = c;
 	assertEveryFieldConsidered(rest);
-	return `unnamed ${kind} ${definition} tags ${renderTags(tags)}`;
+	return [kind, definition, renderTags(tags)];
 }
 
-function renderMaintained(m: NonNullable<CatalogTable['maintained']>): string {
+// bodyHash (a bare string, not a tuple)
+function renderMaintained(m: NonNullable<CatalogTable['maintained']>): Frame {
 	// `select` (the live derivation body AST) is deliberately NOT rendered: the
 	// differ compares `bodyHash` first and only walks the AST when that comparison
 	// FAILS, to tolerate rename artifacts (schema-differ.ts § maintained-table
@@ -176,46 +224,48 @@ function renderMaintained(m: NonNullable<CatalogTable['maintained']>): string {
 	// `columns` omitted: it is folded into `bodyHash` (see `CatalogTable.maintained`).
 	const { bodyHash, select: _select, columns: _columns, ...rest } = m;
 	assertEveryFieldConsidered(rest);
-	return `body ${bodyHash}`;
+	return bodyHash;
 }
 
-function renderView(v: CatalogView): string {
+// [name, ddl, definition, tags]
+function renderView(v: CatalogView): Frame {
 	// `select` omitted for the same reason as `CatalogTable.maintained.select`:
 	// the differ consults it only when `definition` already differs. `columns` is
 	// folded into `definition`.
 	const { name, ddl, definition, tags, select: _select, columns: _columns, ...rest } = v;
 	assertEveryFieldConsidered(rest);
-	return `view ${name}\n\tddl ${ddl}\n\tdef ${definition}\n\ttags ${renderTags(tags)}`;
+	return [name, ddl, definition, renderTags(tags)];
 }
 
-function renderIndex(x: CatalogIndex): string {
+// [name, tableName, implicit, ddl, definition, tags]
+function renderIndex(x: CatalogIndex): Frame {
 	const { name, tableName, ddl, definition, tags, implicit, ...rest } = x;
 	assertEveryFieldConsidered(rest);
-	return `index ${name} on ${tableName}${implicit ? ' implicit' : ''}\n\tddl ${ddl}\n\tdef ${definition}\n\ttags ${renderTags(tags)}`;
+	// `implicit === true`: an absent flag and `false` mean the same thing.
+	return [name, tableName, implicit === true, ddl, definition, renderTags(tags)];
 }
 
-function renderAssertion(a: CatalogAssertion): string {
+// [name, ddl, definition]
+function renderAssertion(a: CatalogAssertion): Frame {
 	// `check` omitted for the same reason as `CatalogView.select`.
 	const { name, ddl, definition, check: _check, ...rest } = a;
 	assertEveryFieldConsidered(rest);
-	return `assertion ${name}\n\tddl ${ddl}\n\tdef ${definition}`;
+	return [name, ddl, definition];
 }
 
 /**
- * Order-independent rendering of a tag set. Keys are sorted and an empty set
- * renders as an absent one, matching the differ's own tag comparison
- * (`tagsDrifted`, which stable-stringifies both sides).
+ * Order-independent rendering of a tag set: `[[key, value], …]` sorted by key.
+ * An empty set renders as an absent one (`[]`), matching the differ's own tag
+ * comparison (`tagsDrifted`, which stable-stringifies both sides).
  *
  * The rename-hint keys (`quereus.id` / `quereus.previous_name`) that the differ
  * excludes from drift comparison ARE rendered here. A hint-only change therefore
  * costs one extra full reconcile — the safe direction, and cheaper than keeping
  * a second copy of the differ's exclusion list in sync.
  */
-function renderTags(tags: Readonly<Record<string, SqlValue>> | undefined): string {
-	if (!tags) return '-';
-	const keys = Object.keys(tags).sort();
-	if (keys.length === 0) return '-';
-	return `(${keys.map(k => `${JSON.stringify(k)}=${renderTagValue(tags[k])}`).join(', ')})`;
+function renderTags(tags: Readonly<Record<string, SqlValue>> | undefined): Frame {
+	if (!tags) return [];
+	return Object.keys(tags).sort().map(k => [k, renderTagValue(tags[k])]);
 }
 
 /**
