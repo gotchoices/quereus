@@ -6,6 +6,7 @@ import type { RuntimeContext } from './types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { createLogger } from '../common/logger.js';
 import type { RowDescriptor, Attribute } from '../planner/nodes/plan-node.js';
+import { assertCatalogMatchesModule } from './stale-catalog-guard.js';
 
 const log = createLogger('runtime:utils');
 const errorLog = log.extend('error');
@@ -142,6 +143,7 @@ export async function getVTable(ctx: RuntimeContext, tableSchema: TableSchema): 
 	const vtabArgs = tableSchema.vtabArgs || {};
 	// Pass the full tableSchema to connect() so modules can use the primaryKeyDefinition
 	const vtabInstance = await module.connect(ctx.db, moduleInfo.auxData, tableSchema.vtabModuleName, tableSchema.schemaName, tableSchema.name, vtabArgs, tableSchema);
+	await assertCatalogMatchesModule(ctx.db, module, tableSchema.schemaName, tableSchema.name, vtabInstance);
 
 	// If a connection for this table is already registered, offer it to the fresh instance
 	// via the module-neutral adoptConnection hook. The module owns the accept/reject

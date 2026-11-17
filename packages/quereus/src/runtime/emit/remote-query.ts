@@ -6,6 +6,7 @@ import { StatusCode } from '../../common/types.js';
 import type { RemoteQueryNode } from '../../planner/nodes/remote-query-node.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { disconnectVTable } from '../utils.js';
+import { assertCatalogMatchesModule } from '../stale-catalog-guard.js';
 
 /**
  * Emitter for RemoteQueryNode.
@@ -33,6 +34,7 @@ export function emitRemoteQuery(plan: RemoteQueryNode, _ctx: EmissionContext): I
 			// transaction, so the option has to reach a pushdown module too.
 			(tableRef.readCommitted || rctx.readCommitted) ? { _readCommitted: true } : {}
 		);
+		await assertCatalogMatchesModule(rctx.db, vtabModule, tableSchema.schemaName, tableSchema.name, table);
 
 		if (!table.executePlan) {
 			throw new QuereusError(

@@ -425,9 +425,11 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 	//
 	// `create table` on the second `Database` would build a SECOND underlying, so mirror the
 	// first connection's catalog entry instead: `dbB` then resolves `t` to the SAME underlying
-	// via `IsolationModule.connect`. `dbB`'s catalog does not learn about `dbA`'s ALTER (a
-	// separate, tracked gap — see `bug-schema-change-not-propagated-to-other-connections-catalog`
-	// in `tickets/backlog/`), so this does not assert on `dbB`'s post-ALTER column names.
+	// via `IsolationModule.connect`. `dbB`'s catalog does not learn about `dbA`'s ALTER — catalogs
+	// are per `Database` — so the engine's stale-catalog guard fails `dbB`'s next statement that
+	// connects to `t` with SCHEMA (docs/schema.md § "Catalogs are per connection"). The overlay
+	// poison is what still protects the data: `dbB`'s commit flushes through the isolation layer
+	// without an engine connect, so it must throw CONSTRAINT on its own.
 	for (const spelling of ['not null', 'integer'] as const) {
 		const label = spelling === 'not null'
 			? 'explicit NOT NULL'
@@ -450,22 +452,25 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 				// A's ALTER succeeds and A sees no rows — B's staged row is invisible to A.
 				expect(await rows(dbA, 'select * from t')).to.deep.equal([]);
 
-				// B is poisoned: its next read and its commit both throw CONSTRAINT rather than
-				// silently landing a NULL in the new mandatory column. `db.exec` on a bare SELECT
-				// does not drain the cursor (see the "register the IsolatedConnection" comment
-				// elsewhere in this test suite), so the read must go through `rows()` (`db.eval`
-				// iterated to completion) to actually reach the poison check.
+				// B's next read hits the stale-catalog guard (its catalog still lists two columns)
+				// rather than returning the staged row. `db.exec` on a bare SELECT does not drain
+				// the cursor (see the "register the IsolatedConnection" comment elsewhere in this
+				// test suite), so the read must go through `rows()` (`db.eval` iterated to
+				// completion) to actually connect.
 				let readErr: QuereusError | null = null;
 				try { await rows(dbB, 'select * from t'); } catch (e) {
 					if (!(e instanceof QuereusError)) throw e;
 					readErr = e;
 				}
-				expect(readErr, "B's next read must throw, not return the staged row with a NULL").to.be.instanceOf(QuereusError);
-				expect(readErr!.code).to.equal(StatusCode.CONSTRAINT);
+				expect(readErr, "B's next read must throw, not return rows under its stale column list").to.be.instanceOf(QuereusError);
+				expect(readErr!.code).to.equal(StatusCode.SCHEMA);
 
+				// B's overlay is poisoned: its commit throws CONSTRAINT rather than silently
+				// landing a NULL in the new mandatory column.
 				const commitErr = await attemptAlter(dbB, 'commit');
 				expect(commitErr, "B's commit must throw, not silently persist the NULL").to.be.instanceOf(QuereusError);
 				expect(commitErr!.code).to.equal(StatusCode.CONSTRAINT);
+				expect(await attemptAlter(dbB, 'rollback'), 'B can still roll back').to.equal(null);
 
 				// The committed table holds no row afterwards — B's row never lands with a NULL.
 				expect(await rows(dbA, 'select * from t'), 'no row committed').to.deep.equal([]);

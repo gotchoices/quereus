@@ -11,6 +11,7 @@ import { asRun } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
 import { createValidatedInstruction, emitPlanNode } from "../emitters.js";
 import { disconnectVTable } from "../utils.js";
+import { assertCatalogMatchesModule } from "../stale-catalog-guard.js";
 import { buildRowDescriptor } from "../../util/row-descriptor.js";
 import { createRowSlot } from "../context-helpers.js";
 import { COLUMNS_STRICT, REPR_STRICT } from "../strict-flags.js";
@@ -156,6 +157,7 @@ export function emitSeqScan(
 				const message = e instanceof Error ? e.message : String(e);
 				throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${effectiveName}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 			}
+			await assertCatalogMatchesModule(runtimeCtx.db, module, schema.schemaName, effectiveName, vtabInstance);
 
 			if (connectionCache) {
 				connectionCache.set(scanConnectionKey, vtabInstance);

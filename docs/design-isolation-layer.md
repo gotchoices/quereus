@@ -121,7 +121,7 @@ IsolationModule
 **Key properties:**
 
 1. **Underlying tables are shared** — All connections read from the same committed data
-2. **Overlays are per-connection** — Each database instance gets its own overlay per table
+2. **Overlays are per-connection** — Each database instance gets its own overlay per table. Catalogs are per-connection too: when one connection ALTERs a shared table, the others' next connect to it fails with `SCHEMA` (see [schema.md § Catalogs are per connection](schema.md#catalogs-are-per-connection)); a foreign overlay stranded by the ALTER is poisoned separately, so its commit still throws `CONSTRAINT`
 3. **Overlays are created lazily** — No memory overhead until first write in a transaction
 4. **Schema is discovered lazily** — Supports modules that load schema from persistent storage
 

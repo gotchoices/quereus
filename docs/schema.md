@@ -291,6 +291,27 @@ Clears all tables, functions, and views from all schemas. Does not call module d
 | `setDefaultVTabArgs(args)` | Sets default module arguments (key-value) |
 | `getDefaultVTabModule()` | Returns `{ name, args }` for the default module |
 
+### Catalogs are per connection
+
+Each `Database` keeps its own catalog. Two `Database`s that register one module instance share that module's tables — the isolation layer relies on this shape for its per-connection overlays — but an `ALTER TABLE` run through one updates only that `Database`'s catalog. The other keeps planning against its old entry while the module stores rows in the new layout.
+
+To keep that from reading values under the wrong names or writing them into the wrong columns, every runtime path that connects to a table (scan, DML, remote-query pushdown, `ANALYZE`) compares the connecting `Database`'s **current** catalog entry with the `tableSchema` the connected instance reports (`runtime/stale-catalog-guard.ts`). When they disagree it disconnects the instance and throws `StatusCode.SCHEMA` (`Table main.t was altered outside this connection (…); … re-open the connection`). Re-opening means building a new `Database` whose catalog is read fresh; automatically adopting the other connection's change is not implemented.
+
+What is compared is what places a value: the column count, column names in order (case-insensitive), whether each column is generated, and the primary-key definition (column indexes and direction). Not compared, because one `Database` legitimately lets its catalog and the module disagree on them — so another connection's change to them goes unnoticed:
+
+- tags, statistics, aux data;
+- constraints: CHECK, FOREIGN KEY, UNIQUE, and column NOT NULL (a module may present a NOT NULL it enforces outside its instance's `tableSchema`);
+- column type and collation (a materialized-view reshape briefly registers a catalog preview of the types and collations it is about to apply);
+- column DEFAULT.
+
+Not covered:
+
+- a module whose instances do not report `tableSchema` (it is optional), and a module without `alterTable` (no ALTER reaches its layout; RENAME COLUMN is applied to the engine catalog alone, so its instances keep the create-time names by design);
+- a statement already running when the other connection alters the table — the check runs at connect only;
+- separate processes, or separate module instances over one persistent store (two `StoreModule`s on one LevelDB path): there the other side's module instance is as stale as its catalog, so the two agree and nothing fires.
+
+Within one `Database` the guard is silent: the same ALTER updates the module and the catalog. A caller that drives a module's `alterTable` directly must register the returned schema itself (`schema.addTable(...)`), as the engine does, or its next connect fails with `SCHEMA`.
+
 ### Catalog Import
 
 #### `importCatalog(ddlStatements, options?): Promise<{ tables: string[]; indexes: string[]; views: string[]; materializedViews: string[] }>`
@@ -479,6 +500,7 @@ Schema operations throw `QuereusError` with these common status codes:
 | `StatusCode.NOTFOUND` | Table not found during `dropTable` (without `ifExists`) |
 | `StatusCode.INTERNAL` | Module did not return a `tableSchema` after create, unexpected removal failure |
 | `StatusCode.MISUSE` | Invalid argument format (e.g. non-object JSON for default vtab args) |
+| `StatusCode.SCHEMA` | Connecting to a table whose module reports a row layout this connection's catalog does not describe — another `Database` sharing the module altered it (see [Catalogs are per connection](#catalogs-are-per-connection)) |
 
 Errors carry source location (`line`, `column`) when the AST node has it. See [Error Handling](errors.md) for the full error model.
 

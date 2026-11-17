@@ -7927,6 +7927,9 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 
 		const updated = await memIso.alterTable(dbM, 'main', 'm', alterPkToX);
 		expect(updated.primaryKeyDefinition.map(d => d.index), 'PK moved to x').to.deep.equal([1]);
+		// Register the module's answer as the engine's ALTER would; a catalog still keyed by `id`
+		// fails the read's connect with SCHEMA (docs/schema.md § "Catalogs are per connection").
+		dbM.schemaManager.getMainSchema().addTable(updated);
 
 		const rows: unknown[] = [];
 		for await (const row of dbM.eval('select * from m order by x')) rows.push(row);

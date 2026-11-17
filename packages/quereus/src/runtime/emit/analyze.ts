@@ -16,6 +16,7 @@ import type { TableStatistics } from '../../planner/stats/catalog-stats.js';
 import { createLogger } from '../../common/logger.js';
 import { collectStatisticsFromScan } from '../../planner/stats/analyze.js';
 import { ArrayRowIterable } from '../../util/array-row-iterable.js';
+import { assertCatalogMatchesModule } from '../stale-catalog-guard.js';
 
 const log = createLogger('runtime:emit:analyze');
 
@@ -127,6 +128,9 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 					tableSchema.name,
 					options,
 				);
+				// A stale catalog entry would record statistics against the wrong columns; the
+				// SCHEMA error lands in the per-table catch below like any other failure.
+				await assertCatalogMatchesModule(rctx.db, module, tableSchema.schemaName, tableSchema.name, vtab);
 
 				try {
 					const stats = await collectTableStatistics(vtab, tableSchema);
