@@ -76,6 +76,11 @@ export function buildUniqueConstraintSchema(
  * constraint's structure keeps the name (and, store-backed, the store key) it has
  * always had. Disambiguated against — and registered into — `takenNames` when given
  * (see {@link disambiguateAutoConstraintName}).
+ *
+ * NOTE: `takenNames` holds constraint names only, so a plain (non-UNIQUE) user index
+ * already named `_uc_<cols>` is not skipped — the ALTER paths then refuse loudly via
+ * `assertUniqueConstraintIndexNameFree`. If that refusal ever bites a real schema, seed
+ * the set with the table's index names too.
  */
 export function mintUniqueConstraintName(columnNames: ReadonlyArray<string>, takenNames?: Set<string>): string {
 	const base = implicitIndexNameForColumns(undefined, columnNames);

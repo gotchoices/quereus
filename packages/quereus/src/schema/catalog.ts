@@ -642,11 +642,14 @@ function findIndexShadowedByUniqueConstraint(
  * the one a constraint declared as `constraintName` over `columnNames` would take —
  * or undefined when no other constraint holds it.
  *
- * The constraint-side twin of {@link findIndexShadowedByUniqueConstraint}. Two
- * spellings reach it: a constraint name carrying the engine's reserved `_uc_` prefix
- * (`constraint _uc_z unique (b)` beside `unique (z)`), and the `_`-joined auto-name
- * colliding on ordinary column names (`unique (a_b)` beside `unique (a, b)` — both
- * derive `_uc_a_b`). Left unguarded the second constraint adopts the first's
+ * The constraint-side twin of {@link findIndexShadowedByUniqueConstraint}. Reachable
+ * only through a UNIQUE a module stored with no name: the engine stores every unnamed
+ * UNIQUE under a disambiguated `_uc_<cols>` mint, and two equal stored names are refused
+ * by `assertConstraintNameFree` first (debt-constraint-schema-name-required removes the
+ * nameless state). The spellings it guards are a constraint name carrying the reserved
+ * `_uc_` prefix (`constraint _uc_z unique (b)` beside a nameless UNIQUE on `z`), and the
+ * `_`-joined derived name colliding on ordinary column names (`unique (a_b)` beside a
+ * nameless one on `(a, b)`). Left unguarded the second constraint adopts the first's
  * structure and is then enforced by one keyed on the OTHER constraint's columns, so
  * it silently stops rejecting duplicates.
  *
@@ -734,7 +737,8 @@ export function assertUniqueConstraintIndexNameFree(
 }
 
 /* ─────────────── duplicate UNIQUE constraints ───────────────
- * An unnamed UNIQUE has no name to compare, so nothing but the derived structure
+ * An unnamed UNIQUE has no user-written name to compare (its `_uc_<cols>` auto-name is
+ * disambiguated, so two repeats get two names), so nothing but the derived structure
  * name ever noticed a repeat — and that name is only materialized by SOME backends,
  * so the same statement got different answers on memory and store. The two helpers
  * below compare what actually makes two UNIQUEs the same (their column set), which

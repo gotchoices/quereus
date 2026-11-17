@@ -444,9 +444,11 @@ function copyTags(tags: Readonly<Record<string, SqlValue>> | undefined): Record<
  * UNIQUE constraints synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex`)
  * are skipped: they round-trip via their index, not as a table constraint, so
  * emitting them here would make the declarative differ churn a spurious
- * DROP CONSTRAINT. All CHECKs (including the engine's auto `_check_<col>` names)
- * and every FK are emitted — `_`-prefixed auto-names re-parse stably and stay
- * excluded from the differ's user-addressable `namedConstraints`.
+ * DROP CONSTRAINT. Every CHECK, every other UNIQUE and every FK is emitted with its
+ * stored name, engine auto-names (`_check_*`, `_uc_*`, `_fk_*`) included — they
+ * re-parse stably (so a reopen keeps a positional `_check_<n>` even after an earlier
+ * CHECK was dropped) and stay excluded from the differ's user-addressable
+ * `namedConstraints`.
  */
 function emitTableConstraints(tableSchema: TableSchema): string {
 	const constraints: AST.TableConstraint[] = [];

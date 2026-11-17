@@ -1073,8 +1073,7 @@ async function runAddColumn(
  * The CHECKs must go before the column: neither built-in module prunes a CHECK over a
  * dropped column, so a stranded one would keep naming a column the table no longer has.
  * Both modules do prune a UNIQUE or FK over it (`shiftSchemaIndicesForDrop`), so an inline
- * UNIQUE needs no explicit drop, and an unnamed one has no name to drop by. The FK's drop
- * by name is redundant and harmless.
+ * UNIQUE needs no explicit drop. The FK's drop by name is redundant and harmless.
  *
  * Best-effort on the module half: a revert failure is logged, never thrown, so it cannot
  * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed

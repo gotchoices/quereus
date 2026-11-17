@@ -2282,14 +2282,15 @@ function countActualChecks(actualTable: CatalogTable): number {
  * of the table — see the stage order in `pushTableAlters`): the live names
  * minus the dropped ones, plus every declared user name (each exists by then),
  * plus — over-approximated — what `ADD COLUMN` mints for an inline clause on a new
- * column. An unnamed UNIQUE's backing-structure name (`_uc_<cols>`) is included:
- * a UNIQUE added under the same name would collide with that structure.
+ * column. A UNIQUE stored with no name at all (only a hand-built module schema — the
+ * engine stores every unnamed one as `_uc_<cols>`) contributes its derived
+ * backing-structure name instead: a UNIQUE added under that name would collide with it.
  *
- * NOTE: that backing name is derived from the PRE-rename column names, but a RENAME
- * COLUMN in the same diff moves it to `_uc_<new cols>` before the ADDs run. A mint can
- * only hit the moved name through a `_`-joined spelling clash (`unique (a_b)` beside a
- * renamed `unique (a, b)`), and the engine refuses that ADD loudly; if it ever bites,
- * derive the name over the post-rename columns.
+ * NOTE: that derived name uses the PRE-rename column names, but a RENAME COLUMN in the
+ * same diff moves a nameless UNIQUE's structure to `_uc_<new cols>` before the ADDs run.
+ * A mint can only hit the moved name through a `_`-joined spelling clash, and the engine
+ * refuses that ADD loudly; the arm goes away with the nameless state
+ * (debt-constraint-schema-name-required).
  */
 function constraintNamesAtAddTime(actualTable: CatalogTable, ctx: UnnamedConstraintDiffContext, unnamedDrops: readonly string[]): Set<string> {
 	const taken = new Set<string>();
