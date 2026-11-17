@@ -2076,6 +2076,43 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
+	it('a module move is refused up front only while a referencing row would survive to the DROP TABLE', async function () {
+		// Regression: the up-front refusal ignored that constraint drops run before table
+		// drops, so a declaration removing the child's foreign key was refused although its
+		// plan would have succeeded.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		const declare = (parentUsing: string, childFk: string) => db.exec(`declare schema main {
+			table p (id integer primary key) ${parentUsing}
+			table c (id integer primary key, pid integer null${childFk})
+		}`);
+		try {
+			await db.exec('pragma foreign_keys = true');
+			const fk = ', constraint fk_p foreign key (pid) references p(id)';
+			await declare('', fk);
+			await db.exec('apply schema main');
+			await db.exec('insert into p values (1)');
+			await db.exec('insert into c values (1, 1)');
+
+			await declare('using mem2', fk);
+			let refused: Error | undefined;
+			try {
+				await db.exec('apply schema main options (allow_destructive = true)');
+			} catch (e) {
+				refused = e as Error;
+			}
+			expect(refused?.message).to.match(/cannot move table 'p'/).and.to.match(/table 'c' has rows referencing it/);
+			expect(collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'p')!.module, 'p untouched').to.be.undefined;
+
+			await declare('using mem2', '');
+			await db.exec('apply schema main options (allow_destructive = true)');
+			expect(collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'p')!.module?.name).to.equal('mem2');
+			expect(await db.get('select count(*) as n from c'), 'child rows kept').to.deep.equal({ n: 1 });
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('tables declared without `using` are unpinned, so a session default module does not read as a move', async function () {
 		// Regression: a `table … maintained as` with no `using` was compared as if it
 		// pinned memory, so under a non-memory session default every re-apply reported a

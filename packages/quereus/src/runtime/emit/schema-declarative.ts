@@ -16,7 +16,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanNode } from '../../planner/nodes/plan-node.js';
 import type { Database } from '../../core/database.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
-import { columnTypeSubject, type TableSchema } from '../../schema/table.js';
+import { columnTypeSubject, type ForeignKeyConstraintSchema, type TableSchema } from '../../schema/table.js';
 import { requireRegisteredTypeName } from '../../types/registry.js';
 import { quoteIdentifier } from '../../emit/ast-stringify.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
@@ -596,19 +596,17 @@ function moduleMigrationRefusal(schemaName: string, migrations: SchemaDiff['modu
 /**
  * Refuses, before any step runs, a module move whose `DROP TABLE` the foreign-key check would
  * refuse because another table's rows reference the moved table. Without this the apply fails at
- * that step, after earlier steps ran. A child the same plan drops is dropped first (see
- * `orderDropsByFKDependency`), so it does not count.
+ * that step, after earlier steps ran.
  *
- * `move.name` is the declared name; under a hinted rename the table is still under its old one here.
+ * Runs before the plan's table renames, so live tables carry their old names here while the diff
+ * names them as declared; {@link referenceGoneBeforeDrops} bridges the two.
  */
 async function refuseModuleMoveLeavingDanglingRows(db: Database, schemaName: string, diff: SchemaDiff): Promise<void> {
 	if (diff.moduleMigrations.length === 0) return;
-	const ownSchema = schemaName.toLowerCase();
-	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
-	const droppedFirst = (child: TableSchema): boolean => child.schemaName.toLowerCase() === ownSchema && dropped.has(child.name.toLowerCase());
+	const goneFirst = referenceGoneBeforeDrops(schemaName, diff);
 	for (const move of diff.moduleMigrations) {
 		const rename = diff.renames.find(r => r.kind === 'table' && r.newName.toLowerCase() === move.name.toLowerCase());
-		const child = await db.schemaManager.findChildBlockingDrop(schemaName, rename?.oldName ?? move.name, droppedFirst);
+		const child = await db.schemaManager.findChildBlockingDrop(schemaName, rename?.oldName ?? move.name, goneFirst);
 		if (!child) continue;
 		throw new QuereusError(
 			`apply schema '${schemaName}': cannot move table '${move.name}' to module ${move.toModule}: `
@@ -617,6 +615,25 @@ async function refuseModuleMoveLeavingDanglingRows(db: Database, schemaName: str
 			StatusCode.CONSTRAINT,
 		);
 	}
+}
+
+/**
+ * Whether the plan removes a live foreign key before its `DROP TABLE` steps run: its child table
+ * is itself dropped (children first, see `orderDropsByFKDependency`), or the constraint is dropped
+ * and constraint drops run first (see `SchemaDiff.removalsStillReferenced`).
+ */
+function referenceGoneBeforeDrops(schemaName: string, diff: SchemaDiff): (child: TableSchema, fk: ForeignKeyConstraintSchema) => boolean {
+	const ownSchema = schemaName.toLowerCase();
+	const declaredName = new Map(diff.renames.filter(r => r.kind === 'table').map(r => [r.oldName.toLowerCase(), r.newName.toLowerCase()]));
+	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
+	const constraintDrops = new Map(diff.removalsStillReferenced ? [] : diff.tablesToAlter.map(alter =>
+		[alter.tableName.toLowerCase(), new Set((alter.constraintsToDrop ?? []).map(name => name.toLowerCase()))]));
+	return (child, fk) => {
+		if (child.schemaName.toLowerCase() !== ownSchema) return false;
+		const liveName = child.name.toLowerCase();
+		const name = declaredName.get(liveName) ?? liveName;
+		return dropped.has(name) || (fk.name !== undefined && constraintDrops.get(name)?.has(fk.name.toLowerCase()) === true);
+	};
 }
 
 /**

@@ -1566,14 +1566,14 @@ export class SchemaManager {
 	 * The first other table holding a row whose foreign key references the given
 	 * table — what makes `DROP TABLE` of it fail — or `undefined`. Always
 	 * `undefined` when the drop would not check (foreign_keys off, or one of the
-	 * suppressed scopes below). `skipChild` leaves out children the caller drops
-	 * first. Exposed so `apply schema` can refuse a migration up front rather than
-	 * at the failing `DROP TABLE`.
+	 * suppressed scopes below). `skipReference` leaves out references the caller
+	 * removes first. Exposed so `apply schema` can refuse a migration up front
+	 * rather than at the failing `DROP TABLE`.
 	 */
 	async findChildBlockingDrop(
 		parentSchemaName: string,
 		parentTableName: string,
-		skipChild?: (childTable: TableSchema) => boolean,
+		skipReference?: (childTable: TableSchema, fk: ForeignKeyConstraintSchema) => boolean,
 	): Promise<TableSchema | undefined> {
 		if (!this.db.options.getBooleanOption('foreign_keys')) return undefined;
 		// Suppressed scope (see Database._setFkRestrictSuppressed). Its one drop-issuing
@@ -1599,7 +1599,7 @@ export class SchemaManager {
 			// Skip the table being dropped itself — self-FK rows are going away with it.
 			if (childTable.schemaName.toLowerCase() === parentSchemaLower &&
 				childTable.name.toLowerCase() === parentTableLower) continue;
-			if (skipChild?.(childTable)) continue;
+			if (skipReference?.(childTable, fk)) continue;
 
 			// MATCH SIMPLE: row is referencing iff every FK column is non-NULL.
 			const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
