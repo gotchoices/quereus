@@ -298,8 +298,9 @@ returns a context that replaces the committed one wholesale. Since `moduleCtx` â
 the request is seeded with the committed `originalConstraints` (de-duplicated on
 `(sourceExpression, columnIndex, op)`, so a `BETWEEN`'s two bounds survive), the committed
 `residualPredicate` is folded into the new residual, and an equipped `providesOrdering` is
-re-requested. Growing a `Sort` or `LimitOffset` swallows it, so those arms additionally
-require the plan to provide the requested ordering.
+re-requested. Growing a `Sort` swallows it, so that arm additionally requires the plan to
+provide the requested ordering; a `LimitOffset` is never grown, since nothing makes losing
+it sound.
 
 ### OPT-030 â€” Uniqueness is read through one surface
 

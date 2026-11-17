@@ -114,14 +114,10 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 		return null;
 	}
 
-	// NOTE: the absent OFFSET is load-bearing, not cosmetic. `ruleGrowRetrieve`'s
-	// LimitOffset arm (`buildRequest`, rule-grow-retrieve.ts) would otherwise swallow this
-	// node into `Retrieve.source`, where the index-style branch of `ruleSelectAccessPath`
-	// never executes it — the early stop would silently vanish and the scan would run to
-	// completion. That arm refuses every LIMIT whose OFFSET is absent, which is exactly this
-	// shape. (Writing `literal(scope, 0)` here would be swallowed.) If that refusal is ever
-	// widened, this rewrite needs its own guard, and test/optimizer/minmax-index-boundary.spec.ts
-	// pins the LIMITOFFSET still being present above the access leaf.
+	// This LimitOffset must stay above the access leaf: growing it into `Retrieve.source`
+	// would lose it, since the index-style branch of `ruleSelectAccessPath` never executes
+	// that. `ruleGrowRetrieve` never grows a LimitOffset (`canTranslateToIndexConstraints`);
+	// test/optimizer/minmax-index-boundary.spec.ts pins the LIMITOFFSET in place.
 	const limited = new LimitOffsetNode(
 		scope,
 		absorbed as RelationalPlanNode,

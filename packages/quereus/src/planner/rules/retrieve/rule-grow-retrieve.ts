@@ -36,8 +36,6 @@ import { AliasNode } from '../../nodes/alias-node.js';
 import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
 import { LimitOffsetNode, constantNumber } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
-import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
-import { LiteralNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineResidualExpressions, orderingClaimSurvivesCollation } from '../access/rule-select-access-path.js';
@@ -266,9 +264,11 @@ function canTranslateToIndexConstraints(node: PlanNode): boolean {
 		case PlanNodeType.Sort:
 			// Sort can be translated to ordering requirements
 			return true;
-		case PlanNodeType.LimitOffset:
-			// Limit can be passed to index access
-			return true;
+		// A LimitOffset is never grown. Growing SWALLOWS the node into `Retrieve.source`,
+		// which the index-style branch of `ruleSelectAccessPath` never executes, so the
+		// LIMIT would be lost outright — unlike a Sort, no plan property makes that sound.
+		// A plan-time LIMIT reaches the module through `tryLimitedSortAbsorb` and the
+		// min/max boundary read instead, both of which keep the LimitOffset above.
 		default:
 			// Other operations (Project, Aggregate, etc.) can't be
 			// meaningfully translated to index constraints
@@ -438,65 +438,14 @@ function fallbackIndexSupports(
 		request.requiredOrdering = ordering.map(o => ({ columnIndex: o.column, desc: o.desc }));
 		log('Extracted ordering requirement of length %d', request.requiredOrdering.length);
 
-	} else if (node.nodeType === PlanNodeType.LimitOffset) {
-		// Extract limit + offset from LimitOffset when both are constants. We
-		// surface OFFSET to the module via `request.offset` so modules pushing
-		// LIMIT into the scan can stamp `scan-side limit = limit + offset` and
-		// avoid underproducing the runtime LimitOffsetNode (which still applies
-		// the OFFSET skip above whatever the scan emits).
-		const lim = node as unknown as LimitOffsetNode;
-		let limitVal: number | undefined;
-		let offsetVal = 0;
-		if (lim.limit && lim.limit.nodeType === _PlanNodeType.Literal) {
-			const v = (lim.limit as unknown as LiteralNode).expression.value;
-			if (typeof v === 'number') limitVal = Math.max(0, Math.floor(v));
-		}
-		if (lim.offset === undefined) {
-			// NOTE: a bare `LIMIT n` (absent OFFSET) is refused here, so no module sees
-			// `request.limit` by this route unless an explicit numeric OFFSET was written.
-			//
-			// This refusal is load-bearing: `rule-minmax-index-boundary` puts a
-			// `LimitOffset(1)` with an absent OFFSET directly above an ordering-equipped
-			// Retrieve, and refusing is what keeps it there. Reading an absent OFFSET as 0
-			// would let the grow SWALLOW that node into `Retrieve.source`, which the
-			// index-style branch of `ruleSelectAccessPath` never executes — the boundary
-			// read's early stop would silently vanish and the scan would drain the table
-			// (answers unchanged, cost restored to a full scan). Widen this only alongside
-			// a guard for that rewrite; the "LIMITOFFSET survives directly above the access
-			// leaf" case in test/optimizer/minmax-index-boundary.spec.ts is what catches it.
-			limitVal = undefined;
-		} else if (lim.offset.nodeType === _PlanNodeType.Literal) {
-			const v = (lim.offset as unknown as LiteralNode).expression.value;
-			if (typeof v === 'number') {
-				offsetVal = Math.max(0, Math.floor(v));
-			} else {
-				// Non-numeric literal OFFSET — refuse to push the LIMIT, because we cannot
-				// soundly compute `limit + offset`.
-				limitVal = undefined;
-			}
-		} else {
-			// Non-literal OFFSET (e.g. parameter) — refuse to push the LIMIT.
-			limitVal = undefined;
-		}
-		if (limitVal === undefined) {
-			log('No usable constant LIMIT (or absent / non-literal OFFSET)');
-			return undefined;
-		}
-		// Reached by an explicit numeric OFFSET only (`limit 5 offset 0` gets here;
-		// a bare `limit 5` is refused above). The probe below sends this through
-		// `probeAccessPlan`, which strips it again unless truncation is provably safe.
-		request.limit = limitVal;
-		request.offset = offsetVal;
-		log('Extracted limit=%d offset=%d', limitVal, offsetVal);
-
 	} else {
 		log('Node type %s not supported by index-style fallback', node.nodeType);
 		return undefined;
 	}
 
 	// Every arm requests at least the committed context's constraints: the Filter arm
-	// unions them with its own extraction, the Sort / LimitOffset arms inherit them from
-	// the initializer. `handledFilters` is positional against this array, so it must be
+	// unions them with its own extraction, the Sort arm inherits them from the
+	// initializer. `handledFilters` is positional against this array, so it must be
 	// the same object the residual assembly below walks.
 	request.filters = plannerConstraints;
 
@@ -507,10 +456,9 @@ function fallbackIndexSupports(
 		request.requiredOrdering = equippedOrdering.map(o => ({ columnIndex: o.columnIndex, desc: o.desc }));
 	}
 
-	log('Built access plan request: %d filters, ordering: %s, limit: %s',
+	log('Built access plan request: %d filters, ordering: %s',
 		request.filters.length,
-		request.requiredOrdering ? 'yes' : 'no',
-		request.limit ?? 'none');
+		request.requiredOrdering ? 'yes' : 'no');
 
 	// One binding of "ask THIS module about THIS table", shared by the plan probe and the
 	// baseline probe below. Both sides of the seek-versus-scan comparison being answered by
@@ -518,13 +466,9 @@ function fallbackIndexSupports(
 	const ask = (req: BestAccessPlanRequest): BestAccessPlanResult =>
 		vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult;
 
-	// Get access plan from module. The LimitOffset arm above is the other site that can
-	// populate `request.limit`, so it goes through the same funnel: the region that could
-	// still discard a row is everything below `node` (the swallowed LimitOffset's own
-	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
-	// this is a plain single probe for them.
-	const probed = probeAccessPlan(ask, request, plannerConstraints, node);
-	const accessPlan = probed.plan;
+	// No arm here asks with a limit (a LimitOffset is never grown — see
+	// `canTranslateToIndexConstraints`), so this is a plain probe, not `probeAccessPlan`.
+	const accessPlan = ask(request);
 
 	// No-clobber guard: never replace an equipped ordering plan with one that does
 	// not provide the same ordering (same column indexes + directions). Declining
@@ -631,14 +575,13 @@ function fallbackIndexSupports(
 		originalConstraints: [...plannerConstraints],
 		...(isIndexStyleContext(existingCtx) && existingCtx.orderingLoadBearing
 			? { orderingLoadBearing: true } : {}),
-		// Never carried from `existingCtx`: the bound belongs to the plan it was granted
-		// with, and only the LimitOffset arm above asks with one.
+		// No `rowBound`: it belongs to the plan it was granted with, and this probe asks
+		// with no limit, so `existingCtx.rowBound` is not carried either.
 		// NOTE: so a Filter re-grow over an absorbed `order by … limit n` drops the run-time
 		// stop even when the new plan claims every filter and keeps the equipped ordering —
 		// answers are unaffected, the scan just reads until the LIMIT stops pulling. Carrying
 		// `existingCtx.rowBound` under exactly those two conditions would be sound; do it if a
 		// batching backend's early stop shows up missing for that shape.
-		...grantedRowBound(probed, residualPredicate),
 	};
 
 	return {
@@ -800,7 +743,7 @@ interface ProbedPlan {
  * The bound a context built from `probed` may carry: none when a residual Filter will sit
  * above the leaf, since that Filter can reject rows the module counted toward the bound.
  * `truncationIsSafe` already implies an empty residual for every kept plan; this keeps
- * the context honest when a committed residual is carried in that the check never saw.
+ * the context honest if residual assembly ever draws on something that check never saw.
  */
 function grantedRowBound(probed: ProbedPlan, residualPredicate: ScalarPlanNode | undefined): { rowBound?: number } {
 	return probed.rowBound !== undefined && !residualPredicate ? { rowBound: probed.rowBound } : {};

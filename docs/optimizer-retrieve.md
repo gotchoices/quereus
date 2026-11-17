@@ -64,7 +64,7 @@ consequence: do not write into `source`. This section is the second, in the oppo
 direction: do not **replace** `moduleCtx` with less than it held.
 
 `ruleGrowRetrieve` can fire more than once on the same `Retrieve` — a later rule drops a
-fresh `Filter` (or `Sort`, or `LimitOffset`) on top of one that is already equipped — and
+fresh `Filter` (or `Sort`) on top of one that is already equipped — and
 `fallbackIndexSupports` returns a brand-new context that replaces the committed one
 wholesale. So the re-probe seeds its `BestAccessPlanRequest` with the union of the
 committed context's `originalConstraints` and whatever it extracts from the incoming node,
@@ -83,9 +83,12 @@ Three details are load-bearing:
 - **The ordering channel has the same rule.** An equipped `providesOrdering` is
   re-requested and a plan that does not provide it is declined, so a re-probe cannot
   clobber a plan whose emission order a dropped `Sort` now depends on.
-- **Growing a `Sort` or a `LimitOffset` swallows it** — the node lands in `source`, which
-  never executes — so those arms are accepted only when the plan provides the requested
-  ordering. A handled filter is not a licence to drop an `ORDER BY`.
+- **Growing a `Sort` swallows it** — the node lands in `source`, which never executes — so
+  that arm is accepted only when the plan provides the requested ordering. A handled filter
+  is not a licence to drop an `ORDER BY`. A `LimitOffset` is never grown at all: no plan
+  property stands in for a LIMIT that does not run (`canTranslateToIndexConstraints`). A
+  plan-time LIMIT reaches the module through `tryLimitedSortAbsorb` and the `min` / `max`
+  boundary read, which keep the `LimitOffset` above the leaf.
 - **A module's ordering claim is not enough to drop a `Sort` when collations disagree.** A
   module that ignores `PredicateConstraint.collation` (both bundled modules, memory and store,
   read it) treats any equality as pinning its column to one value and skips that column
@@ -318,8 +321,8 @@ So `IndexSeekNode` also carries `pushedConstraints`: the exact `PredicateConstra
 
 `BestAccessPlanRequest.limit` licenses a module to price against a bound; the stop itself travels as a run-time instruction on the scan, `FilterInfo.limit`, so that a layer between the engine and the module can withhold it. The isolation layer is that layer: its overlay merge drops committed rows the open transaction deleted or re-keyed, which no plan-time proof can see, and plans are cached across transactions ([Isolation layer § Run-time row window](design-isolation-layer.md#run-time-row-window)).
 
-- **Granted in one place.** `probeAccessPlan` is the only site that sends `request.limit`. When it keeps the plan it asked with a limit, it returns `rowBound = limit + offset` with it, and the context built from that plan (`buildAbsorbed`, or `fallbackIndexSupports`' LimitOffset arm) records it as `IndexStyleContext.rowBound` — unless a residual predicate will sit above the leaf.
-- **Owned by its plan.** A re-grow that replaces the context builds it from its own probe, which carries no limit, so the bound is dropped. That is conservative: the Filter visit that re-grows `where … order by … limit n` after the Sort was absorbed leaves the module without a stop even when the new plan claims every filter and keeps the ordering.
+- **Granted in one place.** `probeAccessPlan` is the only site that sends `request.limit`. When it keeps the plan it asked with a limit, it returns `rowBound = limit + offset` with it, and the context built from that plan (`buildAbsorbed`) records it as `IndexStyleContext.rowBound` — unless a residual predicate will sit above the leaf.
+- **Owned by its plan.** A re-grow (`fallbackIndexSupports`) that replaces the context builds it from its own probe, which carries no limit, so the bound is dropped. That is conservative: the Filter visit that re-grows `where … order by … limit n` after the Sort was absorbed leaves the module without a stop even when the new plan claims every filter and keeps the ordering.
 - **Stamped on a bare leaf only.** `ruleSelectAccessPath` stamps it (`stampRowBound`) when `selectPhysicalNode` returned a plain `SeqScan` / `IndexScan` / `IndexSeek`. A collation residual or a reattached claimed filter between the leaf and the LIMIT could reject rows the module counted, so a wrapped leaf gets no stamp; the plan still runs as priced and stops when the `LimitOffset` above stops pulling.
 - **Replaced by `OrdinalSlice`.** The slice's run-time override writes the user's LIMIT and OFFSET over whatever the leaf was planned with.
 - **Read by rules as a pushed limit.** `rule-key-set-seek` and `index-nested-loop` decline a leaf carrying one, `equalitySeekKeyColumns` stops treating its seek as rows-per-key feedback, and the scan emitter stops counting it as a whole-table pass — all correct for a scan that may stop early.

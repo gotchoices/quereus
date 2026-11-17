@@ -232,11 +232,9 @@ describe('minmax-index-boundary', () => {
 		});
 
 		it('the LIMITOFFSET survives directly above the access leaf', async () => {
-			// `ruleGrowRetrieve`'s LimitOffset arm would swallow this node into
-			// `Retrieve.source`, where the index-style branch of `ruleSelectAccessPath`
-			// never executes it — the early stop would silently vanish. Today that arm
-			// refuses a LIMIT whose OFFSET is absent, which is exactly the shape the
-			// rewrite constructs. This pins that it stays.
+			// Grown into `Retrieve.source`, this node would never execute — the index-style
+			// branch of `ruleSelectAccessPath` does not read it — and the early stop would
+			// silently vanish. `ruleGrowRetrieve` never grows a LimitOffset; this pins that.
 			await createTable();
 			await db.exec('create index t_c on t(c)');
 
