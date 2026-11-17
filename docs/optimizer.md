@@ -463,9 +463,11 @@ module's stream and checks them only against `FilterInfo.constraints`.
 
 Such a claim still affects the module's pricing and the LIMIT licence. `truncationIsSafe`
 in `rule-grow-retrieve` treats a claimed filter as unable to reject a row the module
-produced, so a plan that stops at `request.limit` can run with the reattached `Filter` above
-its scan. That is sound for a module that applies the filter. A module that claims a filter
-it does not apply and also stops at `limit + offset` returns too few rows.
+produced, so a plan asked with `request.limit` is kept with the reattached `Filter` above
+its scan. The run-time stop is not: `ruleSelectAccessPath` stamps the granted bound as
+`FilterInfo.limit` only on a bare leaf, so a module whose scan carries a reattached `Filter`
+reads until the LIMIT above stops pulling, and an over-claim cannot return too few rows
+([Retrieve § The granted row bound](optimizer-retrieve.md#the-granted-row-bound)).
 
 #### The access-path seam: `FilterInfo.accessPath`
 

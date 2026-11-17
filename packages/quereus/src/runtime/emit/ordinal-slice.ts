@@ -9,6 +9,7 @@ import type { Row, SqlValue, MaybePromise } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { toRowCount } from '../../util/row-count.js';
+import type { FilterInfo } from '../../vtab/filter-info.js';
 
 interface SliceBounds {
 	offset: number;
@@ -51,7 +52,10 @@ export function emitOrdinalSlice(plan: OrdinalSliceNode, ctx: EmissionContext): 
 				StatusCode.INTERNAL,
 			);
 		}
-		const augmented = { ...baseFilterInfo };
+		// The slice restates the whole run-time window from the same LIMIT / OFFSET the
+		// planner granted a bound under, so any `limit` the leaf was planned with is replaced.
+		const { limit: _plannedBound, offset: _plannedOffset, ...window } = baseFilterInfo;
+		const augmented: FilterInfo = window;
 		if (bounds.offset > 0) augmented.offset = bounds.offset;
 		if (Number.isFinite(bounds.limit)) augmented.limit = bounds.limit;
 		return augmented;

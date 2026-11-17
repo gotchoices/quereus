@@ -811,6 +811,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Delegates access plan selection to the underlying module.
 	 * This ensures the query planner knows about indexes and can generate
 	 * appropriate FilterInfo for index scans.
+	 *
+	 * `request.limit` / `offset` are forwarded unchanged even though the merged read can
+	 * discard committed rows the overlay shadows. The underlying may only PRICE against
+	 * them and pick a plan that needs them (the store's `rowsToProduce`, an ordered arm
+	 * that exists only under a bound); the stop itself arrives as `FilterInfo.limit` at
+	 * `query()` time, which `IsolatedTable` withholds from both sides of a merged read and
+	 * applies to the merged stream instead. A read with no staged rows for the table keeps
+	 * the underlying's early stop.
 	 */
 	getBestAccessPlan(
 		db: Database,

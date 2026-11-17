@@ -186,9 +186,11 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 		log('Using index-style context provided by grow-retrieve');
 		const accessPlan = retrieveNode.moduleCtx.accessPlan;
 		const originalConstraints = retrieveNode.moduleCtx.originalConstraints;
-		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(
-			retrieveNode.tableRef, accessPlan, originalConstraints,
-			retrieveNode.moduleCtx.orderingLoadBearing === true);
+		const physicalLeaf: RelationalPlanNode = stampRowBound(
+			selectPhysicalNode(
+				retrieveNode.tableRef, accessPlan, originalConstraints,
+				retrieveNode.moduleCtx.orderingLoadBearing === true),
+			retrieveNode.moduleCtx.rowBound);
 		if (retrieveNode.moduleCtx.residualPredicate) {
 			return new FilterNode(retrieveNode.scope, physicalLeaf, retrieveNode.moduleCtx.residualPredicate);
 		}
@@ -242,6 +244,27 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 		return seqScan;
 	}
 	return rebuildPipelineWithNewLeaf(retrieveNode.source, retrieveNode.tableRef, seqScan as unknown as RelationalPlanNode);
+}
+
+/**
+ * Hand the module the stop it was granted at plan time (`IndexStyleContext.rowBound`) as
+ * `FilterInfo.limit` on the access leaf — the run-time instruction a module truncates to,
+ * and one a wrapping module can withhold.
+ *
+ * Only a bare scan or seek leaf gets it. When physical selection wrapped the leaf in a
+ * `Filter` — a collation residual over a coarser index, or a claimed filter it did not
+ * consume — that `Filter` can reject rows the module counted toward the bound: the seek
+ * over-fetches by design, and under the isolation layer staged rows reach the `Filter`
+ * unchecked against a constraint the leaf's `FilterInfo` does not carry. The plan stays
+ * as priced; the module just reads until the `LIMIT` above stops pulling.
+ */
+function stampRowBound(physical: RelationalPlanNode, rowBound: number | undefined): RelationalPlanNode {
+	if (rowBound === undefined) return physical;
+	if (physical instanceof SeqScanNode || physical instanceof IndexScanNode || physical instanceof IndexSeekNode) {
+		return physical.withRowBound(rowBound);
+	}
+	log('Leaving the granted row bound off: physical selection put %s above the leaf', physical.nodeType);
+	return physical;
 }
 
 /**

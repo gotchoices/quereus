@@ -150,7 +150,7 @@ LimitOffsetNode
 
 `OrdinalSliceNode` slots in directly above the leaf, preserving the original `Project`/`Alias` chain above it. The `Sort` is dropped — the slice's source already emits in the requested order, and re-sorting would be wasted work.
 
-**Required vtab capabilities**: the leaf's access plan must advertise both `monotonicOn` and `supportsOrdinalSeek`. The vtab's `query()` implementation must honor `FilterInfo.offset` (positioning its iterator at the kth monotonic row) and `FilterInfo.limit` (capping output). Modules that advertise `supportsOrdinalSeek` but ignore the directives degrade silently to a streaming `LIMIT` (the slice still enforces the row cap as a guard above the leaf).
+**Required vtab capabilities**: the leaf's access plan must advertise both `monotonicOn` and `supportsOrdinalSeek`. The vtab's `query()` implementation must honor `FilterInfo.offset` (positioning its iterator at the kth monotonic row) and `FilterInfo.limit` (capping output). The slice enforces the row cap as a guard above the leaf, so ignoring `FilterInfo.limit` only costs work; it does not re-apply the skip, so a module that ignores `FilterInfo.offset` returns the wrong rows. The slice's override replaces any `FilterInfo.limit` the planner stamped on the leaf.
 
 **Bail conditions**: the rule does not fire when
 

@@ -123,6 +123,15 @@ export abstract class TableAccessNode extends PlanNode implements UnaryRelationa
 		return this.withFilterInfo(requiredColumns ? { ...filterInfo, requiredColumns } : filterInfo);
 	}
 
+	/**
+	 * Clone whose `FilterInfo.limit` is `rowBound`: the run-time instruction that the
+	 * module may stop after that many rows (see `FilterInfo.limit`). The clone keeps this
+	 * node's self-cost and every other field.
+	 */
+	withRowBound(rowBound: number): TableAccessNode {
+		return this.withFilterInfo({ ...this.filterInfo, limit: rowBound });
+	}
+
 	/** Same node with a different `FilterInfo` (and this node's self-cost). */
 	protected abstract withFilterInfo(filterInfo: FilterInfo): TableAccessNode;
 

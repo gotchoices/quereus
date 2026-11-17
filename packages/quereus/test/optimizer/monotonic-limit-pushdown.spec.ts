@@ -239,7 +239,9 @@ describe('Monotonic LIMIT/OFFSET pushdown rule', () => {
 			module.lastObservedLimit = undefined;
 			await evalRows(db, 'SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 100');
 			expect(module.lastObservedOffset).to.equal(undefined);
-			expect(module.lastObservedLimit).to.equal(undefined);
+			// No slice directive — only the bound the planner granted the absorbed ORDER BY,
+			// `limit + offset`, with the OFFSET still skipped by the LIMIT above.
+			expect(module.lastObservedLimit).to.equal(105);
 		});
 	});
 

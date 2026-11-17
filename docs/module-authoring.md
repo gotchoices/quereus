@@ -153,7 +153,7 @@ interface BestAccessPlanRequest {
   columns: readonly ColumnMeta[];
   filters: readonly PredicateConstraint[];
   requiredOrdering?: OrderingSpec;
-  limit?: number | null;   // present ONLY when stopping early is provably safe — see below
+  limit?: number | null;   // present ONLY when stopping early is provably safe — price against it; stop on FilterInfo.limit
   offset?: number | null;  // travels with `limit`; the bound is `limit + offset`
   estimatedRows?: number;
 }
@@ -196,19 +196,31 @@ A module that cannot answer cheaply should memoize its own answer; the engine do
 you.
 
 **`limit` is a licence, not a hint.** When it is present the engine has already proven
-that nothing between your scan and the `LIMIT` can discard a row, so you may both price
-against it and truncate to it. When it cannot prove that, the field is *absent* rather
-than advisory — there is no "limit you should ignore". It arrives with `requiredOrdering`
+that nothing between your scan and the `LIMIT` can discard a row, so you may price
+against it and return a plan that is only worth it under that bound. When it cannot prove
+that, the field is *absent* rather than advisory — there is no "limit you should ignore".
+It arrives with `requiredOrdering`
 for a LIMIT the user wrote above an `ORDER BY` when the LIMIT and OFFSET are both
 constants (`order by date limit 20 offset 40` sends `limit: 20, offset: 40`), and for
 the one-row boundary read the engine synthesizes for `min` / `max`. A placeholder LIMIT
 (`limit ?`) reaches you as the **largest bound the engine will ever run that plan under**: it
 keeps the ordered plan you returned for `limit: N, offset: 0` and runs it only on executions
 whose actual `limit + offset` is at most `N`, falling back to scan-then-sort above that, so
-truncating to `N` never underproduces. Two rules follow:
+truncating to `N` never underproduces. Three rules follow:
 
+- **Stop on `FilterInfo.limit`, never on what the request said.** When the engine keeps a
+  plan it asked with a limit, it stamps the granted bound on the scan as `FilterInfo.limit`,
+  and your `query()` truncates to that — not to a bound remembered from `getBestAccessPlan`.
+  The stop has to be visible at run time because only then can a layer above withhold it:
+  the isolation layer drops rows your scan produced (committed rows the open transaction
+  deleted or re-keyed), something no plan-time proof can see, and plans are cached across
+  transactions. The engine also withholds the stamp when physical selection puts a
+  `Filter` above your scan (a collation re-check over a coarser index, or a claimed filter
+  it did not turn into a seek); your plan still runs as priced and simply reads until the
+  `LIMIT` above stops pulling.
 - The bound is `limit + offset`, never `limit` alone. The engine's `LimitOffsetNode` still
   discards `offset` rows above whatever you emit, so stopping at `limit` underproduces.
+  `FilterInfo.limit` already carries the sum.
 - Apply it only to a candidate that **provides the requested ordering**, and only when
   that candidate **claims every filter**. A plan that provides no ordering gets a Sort
   above it, which drains its input before emitting anything; a plan that leaves a filter
@@ -255,7 +267,7 @@ interface BestAccessPlanResult {
   - Gate **every** claim, not only the one a `requiredOrdering` asked for: a bare advertisement made with no request is read by the merge-join rule under the same NULLs-first rule, and a `monotonicOn` `direction: 'desc'` (plus `supportsAsofRight`, which implies it) asserts the same physical order.
 - **`providesOrdering` and `monotonicOn` are read under each table column's declared collation,** whatever collation your key is stored under. `ORDER BY` and merge join both compare under the column's own, so a key on `(k collate nocase)` over a BINARY `k` claims nothing on `k`: it emits `'a'` before `'B'` and they want the reverse. The engine also checks the opposite direction, a predicate whose collation differs from your index, as a backstop for modules that do not read `PredicateConstraint.collation`. See `orderingClaimSurvivesCollation`.
 - `monotonicOn` is the leaf's natural emit order (storage property, not request-dependent). Stronger than `providesOrdering` — implies a total order with no gaps in coverage.
-- `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
+- `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). The rule's slice operator enforces the row cap above the leaf, so ignoring `FilterInfo.limit` only costs work; it does not re-apply the skip, so a module that advertises `supportsOrdinalSeek` must honour `FilterInfo.offset`.
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.
 
 **Row counts — `rows` is an estimate, with no exception**:
@@ -339,10 +351,11 @@ row can fail. The re-check does not mean your scan is distrusted: under the isol
 it is what removes staged rows, which your scan never sees.
 
 Such a claim still does two things. It feeds your own pricing, and it counts toward the
-licence to truncate: the engine keeps a plan that stops at `request.limit` only when that
-plan claimed every filter. So claim a non-seek filter only if your scan applies it. If you
-claim one you do not apply and stop at `limit + offset`, the re-check discards some of the
-rows you counted and the query returns too few.
+licence to price against `request.limit`: the engine keeps a plan asked with a limit only
+when that plan claimed every filter. Claim a non-seek filter only if your scan applies it.
+The re-check `Filter` it leaves above your scan means the engine stamps no
+`FilterInfo.limit` there, so the claim cannot make the query return too few rows, but a
+plan priced against a bound it will not be stopped at is priced wrong.
 
 Three corollaries worth spelling out:
 
@@ -785,7 +798,7 @@ The module receives individual constraints and returns matching rows.
 
 The analysis lives in `planner/analysis/required-columns.ts` (optimizer pass `required-columns`, which runs after materialization and before final estimates). The `QUEREUS_COLUMNS_STRICT=1` harness (`yarn workspace @quereus/quereus test:columns-strict`) nulls every unlisted column at the scan boundary for every module, which turns a consumer the analysis missed into a wrong answer the test corpus catches.
 
-**Pushdown directives**: `FilterInfo.limit` is a *runtime* row cap and — unlike the plan-time `BestAccessPlanRequest.limit` above — genuinely soft: a streaming guard above the leaf enforces the count either way, so ignoring it costs work, never answers. Modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query — modules without ordinal-seek support can ignore both fields safely (a streaming guard above the leaf still enforces correctness).
+**Pushdown directives**: `FilterInfo.limit` is the *run-time* row cap and the only place a module may take its stop from. The planner stamps the bound it granted through the plan-time `BestAccessPlanRequest.limit` above (`limit + offset`; for `limit ?`, the largest bound the plan runs under), and `OrdinalSlice` replaces it with the user's LIMIT when it seeks. It is soft: a `LIMIT` operator above the leaf enforces the count either way, so ignoring it costs work, never answers. Modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query; nothing above the leaf re-applies the skip, so a module that advertises the seek must honour it. A module that wraps another and can drop rows the wrapped one emits must strip both fields before forwarding and apply them to its own output — the isolation layer does this whenever the transaction has staged rows for the table.
 
 ## Optimization Integration Points
 

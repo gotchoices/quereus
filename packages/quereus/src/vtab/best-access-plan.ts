@@ -294,19 +294,23 @@ export interface BestAccessPlanRequest {
 	/** Required ordering that ancestor nodes need (ORDER BY) */
 	requiredOrdering?: readonly OrderingSpec[];
 	/**
-	 * LIMIT value known at plan time, and a licence to stop early.
+	 * LIMIT value known at plan time: a licence to PRICE against `limit + offset` rows and
+	 * to choose a plan that is only worth it under that bound. It is not the place to stop.
 	 *
 	 * The engine populates this ONLY when it can prove that nothing between this
-	 * module's scan and the LIMIT can discard a row — so a module may both price
-	 * against it and truncate to it. When the engine cannot prove that, the field is
-	 * absent rather than advisory: a module that stopped early under a filter it did
-	 * not claim would underproduce, and `min(c)` over a scan stopped at one row that
-	 * is then filtered out would answer NULL instead of the minimum.
+	 * module's scan and the LIMIT can discard a row. When the engine cannot prove that,
+	 * the field is absent rather than advisory: a scan stopped early under a filter it did
+	 * not claim would underproduce, and `min(c)` over a scan stopped at one row that is
+	 * then filtered out would answer NULL instead of the minimum.
 	 *
-	 * A `Filter` the engine reattaches for a filter this module claimed (OPT-024 in
-	 * docs/invariants.md) does not count as discarding: it can only reject rows the claim
-	 * says the module does not produce, so claiming a filter the scan does not apply and
-	 * then truncating to this limit underproduces.
+	 * When the engine keeps the plan it hands the bound back at run time as
+	 * `FilterInfo.limit`, and that is the only stop a module may apply — never one saved
+	 * from this request. Plans are cached across transactions, and a module that wraps
+	 * another (the isolation layer) discards rows the engine cannot see at plan time; it
+	 * has to be able to withhold the stop at `query()` time, which it cannot do to state
+	 * the wrapped module kept privately. The engine also withholds it when physical
+	 * selection puts a `Filter` above the scan, even one re-checking a filter this module
+	 * claimed (OPT-024 in docs/invariants.md).
 	 *
 	 * A module pricing against this must still charge the full row count for any plan
 	 * that does NOT provide the requested ordering — a Sort above it drains every row
@@ -315,15 +319,16 @@ export interface BestAccessPlanRequest {
 	 */
 	limit?: number | null;
 	/**
-	 * OFFSET value known at plan time. Modules pushing LIMIT into the scan
-	 * must read this and stamp `scan-side limit = limit + offset`, because the
-	 * runtime LimitOffsetNode still applies the OFFSET skip above whatever the
-	 * scan emits — pushing only `limit` would underproduce by `offset` rows.
+	 * OFFSET value known at plan time. It travels with `limit`: the bound a module prices
+	 * against, and the `FilterInfo.limit` the engine stamps at run time, is
+	 * `limit + offset`, because the runtime LimitOffsetNode still applies the OFFSET skip
+	 * above whatever the scan emits — a bound of `limit` alone would underproduce by
+	 * `offset` rows.
 	 *
-	 * If the module advertises `supportsOrdinalSeek` on its result, the runtime
-	 * may instead consume this `offset` directly as a seek-to-kth-row directive
-	 * (no buffer-and-discard); in that case the scan emits exactly `limit` rows
-	 * starting at the `offset`-th monotonic position.
+	 * If the module advertises `supportsOrdinalSeek` on its result, the runtime may
+	 * instead hand the OFFSET over at run time as `FilterInfo.offset`, a
+	 * seek-to-kth-row directive (no buffer-and-discard); the scan then emits at most
+	 * `FilterInfo.limit` rows starting at the `offset`-th monotonic position.
 	 */
 	offset?: number | null;
 	/**

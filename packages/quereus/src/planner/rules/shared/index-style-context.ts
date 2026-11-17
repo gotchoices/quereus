@@ -58,6 +58,18 @@ export interface IndexStyleContext {
 	 * false ⇒ any advertised ordering is vacuous — nothing consumed it.
 	 */
 	orderingLoadBearing?: boolean;
+	/**
+	 * `limit + offset` when `accessPlan` was asked WITH a plan-time limit and kept
+	 * (`probeAccessPlan`'s truncation-safety check passed) and nothing is left in
+	 * `residualPredicate`: the module may stop after this many rows. `ruleSelectAccessPath`
+	 * stamps it as `FilterInfo.limit` on the physical leaf, which is the only place a
+	 * module may read its stop from — a wrapping module (the isolation layer) has to be
+	 * able to see the stop at run time to withhold it.
+	 *
+	 * Belongs to `accessPlan` alone: a re-grow that replaces this context with a plan
+	 * asked without a limit leaves it absent.
+	 */
+	rowBound?: number;
 }
 
 /**

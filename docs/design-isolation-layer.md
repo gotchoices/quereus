@@ -289,6 +289,15 @@ For each insert in overlay not yet emitted:
 
 This is analogous to LSM-tree merge or 3-way merge in version control.
 
+### Run-time row window
+
+`FilterInfo.limit` and `FilterInfo.offset` count rows of the stream the plan sees, which on a merged read is the merged stream, not either input. So a merged read strips both before querying the underlying and the overlay, and applies them to the merged output itself (`IsolatedTable.mergedQueryWithConnection`): skip `offset` rows, then stop after `limit`.
+
+- **`limit`** is the row bound the planner granted on a plan asked with `BestAccessPlanRequest.limit` (`limit + offset` of a LIMIT above an absorbed ORDER BY, the one-row `min` / `max` boundary read). The planner's proof that nothing between the scan and the LIMIT discards a row cannot see the merge, which drops committed rows the transaction deleted or re-keyed. Forwarded, it would let those rows fill the bound and stop the underlying before the rows that replace them are read (`select min(id)` after `delete … where id = 1` answering NULL).
+- **`offset`** is `OrdinalSlice`'s seek-to-kth-row directive, set only for an underlying that advertises `supportsOrdinalSeek`. Forwarded, the underlying would seek to the kth *committed* row, while staged inserts and deletes shift every position; nothing above the leaf re-applies the skip.
+
+`getBestAccessPlan` still forwards `request.limit` / `offset` unchanged, so the underlying keeps its limit-aware pricing (the store's `rowsToProduce`) and any plan that only exists under a bound. That is safe because a module may only take its stop from `FilterInfo.limit`, never from the request ([Module authoring](module-authoring.md)). The no-overlay fast path — no staged rows for the table, or a committed-snapshot read — forwards `FilterInfo` untouched, so the underlying keeps its early stop there.
+
 ---
 
 ## Transaction Lifecycle

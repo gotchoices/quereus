@@ -523,7 +523,8 @@ function fallbackIndexSupports(
 	// still discard a row is everything below `node` (the swallowed LimitOffset's own
 	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
 	// this is a plain single probe for them.
-	const accessPlan = probeAccessPlan(ask, request, plannerConstraints, node);
+	const probed = probeAccessPlan(ask, request, plannerConstraints, node);
+	const accessPlan = probed.plan;
 
 	// No-clobber guard: never replace an equipped ordering plan with one that does
 	// not provide the same ordering (same column indexes + directions). Declining
@@ -630,6 +631,14 @@ function fallbackIndexSupports(
 		originalConstraints: [...plannerConstraints],
 		...(isIndexStyleContext(existingCtx) && existingCtx.orderingLoadBearing
 			? { orderingLoadBearing: true } : {}),
+		// Never carried from `existingCtx`: the bound belongs to the plan it was granted
+		// with, and only the LimitOffset arm above asks with one.
+		// NOTE: so a Filter re-grow over an absorbed `order by … limit n` drops the run-time
+		// stop even when the new plan claims every filter and keeps the equipped ordering —
+		// answers are unaffected, the scan just reads until the LIMIT stops pulling. Carrying
+		// `existingCtx.rowBound` under exactly those two conditions would be sound; do it if a
+		// batching backend's early stop shows up missing for that shape.
+		...grantedRowBound(probed, residualPredicate),
 	};
 
 	return {
@@ -686,10 +695,11 @@ export interface RowsWanted {
 /**
  * Whether a module may stop producing after `limit + offset` rows.
  *
- * `BestAccessPlanRequest.limit` is a truncation contract, not a pricing hint — its
- * sibling `offset` explicitly invites a module to stamp `scan-side limit = limit +
- * offset` — so it may only be sent when nothing between the module's scan and the
- * LimitOffset can discard a row. Filtering above a truncated scan UNDERPRODUCES:
+ * `BestAccessPlanRequest.limit` licenses a module to price against `limit + offset` rows
+ * and pick a plan that only pays off under that bound, and a plan kept under it carries
+ * that bound to its scan as `FilterInfo.limit`, where the module may stop — so it may only
+ * be sent when nothing between the module's scan and the LimitOffset can discard a row.
+ * Filtering above a truncated scan UNDERPRODUCES:
  * `min(c)` over a scan stopped at one row whose `c` is then filtered out returns NULL
  * rather than the minimum.
  *
@@ -748,7 +758,9 @@ function truncationIsSafe(
  * what keeps the field's documented "licence, not a hint" contract true. A request
  * carrying a limit is probed WITH it, and the plan that comes back is kept only when
  * {@link truncationIsSafe} holds for the constraints that plan actually claimed;
- * otherwise the limit is stripped and the module is asked again.
+ * otherwise the limit is stripped and the module is asked again. A plan kept with its
+ * limit comes back with the `limit + offset` bound it was granted, which the caller
+ * records on the context it builds so `ruleSelectAccessPath` can stamp it on the scan.
  *
  * Probing limit-free first cannot work: a module that vetoes its ordered arm on
  * whole-table pricing answers with an unordered plan, the caller's ordering check fails,
@@ -767,12 +779,31 @@ function probeAccessPlan(
 	request: BestAccessPlanRequest,
 	constraints: readonly PredicateConstraint[],
 	subtree: PlanNode,
-): BestAccessPlanResult {
+): ProbedPlan {
 	const plan = ask(request);
-	if (request.limit === undefined || request.limit === null) return plan;
-	if (truncationIsSafe(subtree, constraints, plan.handledFilters)) return plan;
+	if (request.limit === undefined || request.limit === null) return { plan };
+	if (truncationIsSafe(subtree, constraints, plan.handledFilters)) {
+		return { plan, rowBound: request.limit + (request.offset ?? 0) };
+	}
 	log('Limit is not truncation-safe for this subtree; re-probing without it');
-	return ask({ ...request, limit: undefined, offset: undefined });
+	return { plan: ask({ ...request, limit: undefined, offset: undefined }) };
+}
+
+/** A plan `probeAccessPlan` kept, with the bound it was granted under, if any. */
+interface ProbedPlan {
+	readonly plan: BestAccessPlanResult;
+	/** `limit + offset` when the plan was asked with a limit and kept — see {@link IndexStyleContext.rowBound}. */
+	readonly rowBound?: number;
+}
+
+/**
+ * The bound a context built from `probed` may carry: none when a residual Filter will sit
+ * above the leaf, since that Filter can reject rows the module counted toward the bound.
+ * `truncationIsSafe` already implies an empty residual for every kept plan; this keeps
+ * the context honest when a committed residual is carried in that the check never saw.
+ */
+function grantedRowBound(probed: ProbedPlan, residualPredicate: ScalarPlanNode | undefined): { rowBound?: number } {
+	return probed.rowBound !== undefined && !residualPredicate ? { rowBound: probed.rowBound } : {};
 }
 
 /**
@@ -867,12 +898,12 @@ export function trySortAbsorbViaIndexOrdering(
 	const prepared = prepareSortAbsorb(sort, context);
 	if (!prepared) return null;
 
-	const accessPlan = orderedPlanFor(prepared, rowsWanted);
-	if (!accessPlan) {
+	const probed = orderedPlanFor(prepared, rowsWanted);
+	if (!probed) {
 		log('Access plan does not satisfy required ordering; leaving Sort in place');
 		return null;
 	}
-	return buildAbsorbed(prepared, accessPlan);
+	return buildAbsorbed(prepared, probed);
 }
 
 /**
@@ -998,22 +1029,23 @@ function sortKeysAsTableOrdering(sort: SortNode, tableRef: TableReferenceNode): 
  * not merely matched on length: a length-only check would let an ascending
  * providesOrdering of equal length wrongly drop a DESC Sort.
  */
-function orderedPlanFor(prepared: PreparedSortAbsorb, rowsWanted?: RowsWanted): BestAccessPlanResult | undefined {
+function orderedPlanFor(prepared: PreparedSortAbsorb, rowsWanted?: RowsWanted): ProbedPlan | undefined {
 	const request = rowsWanted
 		? { ...prepared.request, limit: rowsWanted.limit, offset: rowsWanted.offset }
 		: prepared.request;
-	const plan = probeAccessPlan(prepared.ask, request, prepared.constraints, prepared.subtree);
-	return planDeliversOrdering(prepared.tableSchema, plan, prepared.requiredOrdering, prepared.constraints)
-		? plan
+	const probed = probeAccessPlan(prepared.ask, request, prepared.constraints, prepared.subtree);
+	return planDeliversOrdering(prepared.tableSchema, probed.plan, prepared.requiredOrdering, prepared.constraints)
+		? probed
 		: undefined;
 }
 
 /**
- * The Sort's subtree with the Sort dropped and the Retrieve equipped with `accessPlan`,
- * which must be a plan {@link orderedPlanFor} returned for `prepared`.
+ * The Sort's subtree with the Sort dropped and the Retrieve equipped with `probed`'s plan,
+ * which must be one {@link orderedPlanFor} returned for `prepared`.
  */
-function buildAbsorbed(prepared: PreparedSortAbsorb, accessPlan: BestAccessPlanResult): RelationalPlanNode {
+function buildAbsorbed(prepared: PreparedSortAbsorb, probed: ProbedPlan): RelationalPlanNode {
 	const { chain, retrieveNode, constraints } = prepared;
+	const accessPlan = probed.plan;
 
 	// Build residual predicate from any constraints the access plan didn't handle.
 	// rule-select-access-path's index-style branch trusts moduleCtx.residualPredicate
@@ -1032,6 +1064,7 @@ function buildAbsorbed(prepared: PreparedSortAbsorb, accessPlan: BestAccessPlanR
 		residualPredicate,
 		originalConstraints: [...constraints],
 		orderingLoadBearing: true,
+		...grantedRowBound(probed, residualPredicate),
 	};
 	const newRetrieve = retrieveNode.withPipeline(retrieveNode.source, indexCtx, retrieveNode.bindings);
 
@@ -1174,7 +1207,7 @@ const ORDERED_BOUND_CAP = 2 ** 30;
 /** A row bound and the ordered plan the module returned for it. */
 interface OrderedBound {
 	readonly rows: number;
-	readonly plan: BestAccessPlanResult;
+	readonly plan: ProbedPlan;
 }
 
 /**
@@ -1189,8 +1222,8 @@ interface OrderedBound {
  *
  * The plan kept is the one at the boundary: below it every ordered plan is cheap, and at
  * it picking the wrong one would cost the most. It is also the licence the emitter keeps:
- * that plan may stop after `rows` rows, so the ordered branch runs only when
- * `limit + offset <= rows`.
+ * that plan may stop after `rows` rows (its leaf carries `rows` as `FilterInfo.limit`), so
+ * the ordered branch runs only when `limit + offset <= rows`.
  *
  * NOTE: about `2 * log2(rows) + 2` probes — around 40 for a million-row table. If a
  * module's `getBestAccessPlan` is expensive enough to show up at prepare time, memoize

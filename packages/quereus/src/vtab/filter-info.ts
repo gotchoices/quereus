@@ -36,10 +36,21 @@ export interface FilterInfo {
 	readonly accessPath?: AccessPath;
 
 	/**
-	 * If set, the access plan honors a soft row cap — the vtab should stop
-	 * emitting after this many rows. Pushed down by OrdinalSlice / future
-	 * limit-pushdown rules. Modules without limit-pushdown support may ignore
-	 * this; a downstream slice operator will still enforce the cap.
+	 * If set, the module may stop emitting after this many rows (counted after any
+	 * `offset`). This is the ONLY stop a module may apply: `BestAccessPlanRequest.limit`
+	 * licenses pricing and plan choice, never truncation from state saved at plan time.
+	 *
+	 * Two writers. The planner stamps the `limit + offset` bound it granted on a plan
+	 * probed with `BestAccessPlanRequest.limit` (a LIMIT above an absorbed ORDER BY, the
+	 * `min`/`max` boundary read; for a placeholder `limit ?` the largest bound that plan
+	 * ever runs under) — only on a bare scan or seek leaf with nothing between it and the
+	 * LIMIT that could discard a row. `OrdinalSlice` replaces it at run time with the
+	 * user's LIMIT, alongside `offset`. Either way an operator above enforces the count,
+	 * so ignoring the field costs work, never answers.
+	 *
+	 * A module that wraps another and can itself discard rows the wrapped module emits
+	 * (the isolation layer's overlay merge) must not forward it while it might: it strips
+	 * the field and applies the stop to its own output.
 	 */
 	limit?: number;
 
@@ -47,7 +58,9 @@ export interface FilterInfo {
 	 * If set, the access plan walks its monotonic index and seeks directly
 	 * to the kth row in monotonic order before emitting. Only honored when
 	 * the chosen access plan advertised `supportsOrdinalSeek`; otherwise the
-	 * field must be ignored (a slice operator above will buffer-and-discard).
+	 * field must be ignored. Only `OrdinalSlice` sets it, and it does not re-apply the
+	 * skip above the leaf, so a wrapping module that withholds it (as for `limit`) must
+	 * apply it to its own output.
 	 */
 	offset?: number;
 

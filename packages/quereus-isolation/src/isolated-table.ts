@@ -471,11 +471,19 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Wrapper that ensures connection before merging.
+	 * Wrapper that ensures connection before merging, and owns the run-time row window.
+	 *
+	 * `FilterInfo.limit` / `offset` count rows of the stream the plan sees, which here is the
+	 * merged one. Neither side may apply them: the underlying would stop or seek among
+	 * committed rows the overlay then shadows (a row this transaction deleted or re-keyed
+	 * fills the limit, and the rows that should replace it are never read), and staged
+	 * inserts and deletes shift every ordinal position. So both sides get the window
+	 * stripped and it is applied here, to the merged output.
 	 */
 	private async *mergedQueryWithConnection(filterInfo: FilterInfo): AsyncGenerator<Row> {
 		await this.ensureConnection();
-		yield* this.mergedQuery(filterInfo);
+		const { limit, offset, ...unwindowed } = filterInfo;
+		yield* applyRowWindow(this.mergedQuery(unwindowed), offset ?? 0, limit);
 	}
 
 	/**
@@ -2251,6 +2259,24 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			}
 		}
 		// If overlay's registered connection has this savepoint, it handles rollback
+	}
+}
+
+/**
+ * `rows` with the first `offset` skipped and at most `limit` (absent: all) emitted after
+ * them. Stops pulling `rows` once the limit is met, so the merge beneath stops reading.
+ */
+async function* applyRowWindow(rows: AsyncIterable<Row>, offset: number, limit: number | undefined): AsyncGenerator<Row> {
+	if (limit !== undefined && limit <= 0) return;
+	let skipped = 0;
+	let emitted = 0;
+	for await (const row of rows) {
+		if (skipped < offset) {
+			skipped++;
+			continue;
+		}
+		yield row;
+		if (limit !== undefined && ++emitted >= limit) return;
 	}
 }
 
