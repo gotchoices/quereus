@@ -1565,8 +1565,8 @@ export class SchemaManager {
 	/**
 	 * The first other table holding a row whose foreign key references the given
 	 * table — what makes `DROP TABLE` of it fail — or `undefined`. Always
-	 * `undefined` when the drop would not check (foreign_keys off, or one of the
-	 * suppressed scopes below). `skipReference` leaves out references the caller
+	 * `undefined` when the drop would not check (foreign_keys off, or the drop
+	 * reference guards waived). `skipReference` leaves out references the caller
 	 * removes first. Exposed so `apply schema` can refuse a migration up front
 	 * rather than at the failing `DROP TABLE`.
 	 */
@@ -1576,18 +1576,11 @@ export class SchemaManager {
 		skipReference?: (childTable: TableSchema, fk: ForeignKeyConstraintSchema) => boolean,
 	): Promise<TableSchema | undefined> {
 		if (!this.db.options.getBooleanOption('foreign_keys')) return undefined;
-		// Suppressed scope (see Database._setFkRestrictSuppressed). Its one drop-issuing
-		// caller is the ALTER PRIMARY KEY shadow rebuild, which drops a table whose rows are
-		// moments from being renamed back over it under the same name — re-checking
-		// referencing children there would wedge a drop that breaks no reference. The other
-		// caller, the external-row apply batch, issues DML only (no path from it reaches
-		// `dropTable`), so this arm is inert for it today; were that to change, its
-		// trust-the-origin posture — the origin enforced the drop at its own commit — is the
-		// same reason it skips the row-level RESTRICT pre-checks.
-		if (this.db._isFkRestrictSuppressed()) return undefined;
-		// A failed apply's unwind (see Database._setSchemaUnwinding) drops a table this apply
-		// created. Rows pointing at it were left dangling before the apply and go back to that.
-		if (this.db._isSchemaUnwinding()) return undefined;
+		// See Database._areDropReferenceGuardsWaived. A failed apply's unwind drops a table this
+		// apply created, and rows pointing at it were left dangling before the apply and go back
+		// to that. The ALTER PRIMARY KEY rebuild's internal drop removes a table whose rows are
+		// renamed back over it under the same name, so no referencing row is ever orphaned.
+		if (this.db._areDropReferenceGuardsWaived()) return undefined;
 
 		const parentSchemaLower = parentSchemaName.toLowerCase();
 		const parentTableLower = parentTableName.toLowerCase();

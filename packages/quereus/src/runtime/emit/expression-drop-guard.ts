@@ -60,9 +60,11 @@ import type { TableSchema } from '../../schema/table.js';
  * told to fix a constraint whose body does not mention the dropped object has nothing to
  * act on otherwise.
  *
- * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`). That
- * drop is not a user's: it returns to the pre-apply catalog, where the referring table either
- * does not exist yet or was already dangling.
+ * Stands down while `Database._areDropReferenceGuardsWaived` holds. A failed `apply schema`'s
+ * unwind returns to the pre-apply catalog, where the referring table either does not exist yet or
+ * was already dangling. An internal drop (the ALTER PRIMARY KEY rebuild's) removes a table that
+ * comes back under its own name with the same rows before the statement ends; the referring
+ * table may be the rebuild's own hidden copy, whose CHECK names the original.
  *
  * Also passes a forward `apply schema` drop of an object the same plan creates again under the
  * same name (`Database._setSchemaRecreatedObjects`): the reference is only broken until the
@@ -84,7 +86,7 @@ export function assertNoExpressionDependsOn(
 	objectName: string,
 	objectKind: DroppableObjectKind,
 ): void {
-	if (db._isSchemaUnwinding()) return;
+	if (db._areDropReferenceGuardsWaived()) return;
 	const key = objectRefKey(schemaName, objectName);
 	if (db._getSchemaRecreatedObjects().has(key)) return;
 	// NOTE: a released object's readers on this schema's tables name a missing object until their

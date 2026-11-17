@@ -2942,21 +2942,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Parent-side RESTRICT suppression. While set, the parent-side FK
 	 *  RESTRICT pre-checks ({@link assertTransitiveRestrictsForParentMutation} and its
-	 *  callees) early-return, as does the DROP TABLE referencing-children guard
-	 *  (`SchemaManager.assertNoReferencingChildrenForDrop`). Cascade / set-null /
-	 *  set-default propagation is unaffected. Returns the prior value so the caller
-	 *  restores it in a `finally` (supports nesting).
+	 *  callees) early-return. Cascade / set-null / set-default propagation is unaffected.
+	 *  Returns the prior value so the caller restores it in a `finally` (supports nesting).
 	 *
-	 *  Two callers, both "the referential outcome is already accounted for elsewhere":
-	 *   - the trust-the-origin external-row apply path — the origin already enforced
-	 *     RESTRICT at its own commit, so re-enforcing it on the receiver would wedge the
-	 *     sync stream. Set for the duration of an apply batch (mutex held, so no
-	 *     concurrent statement observes it) and honored by every nested cascade DML and
-	 *     MV-maintenance FK pass;
-	 *   - the ALTER PRIMARY KEY shadow rebuild (runtime/emit/alter-table.ts), around its
-	 *     own internal `DROP TABLE` only — that table's rows are moments from being
-	 *     renamed back over it with the same name and contents, so a child's references
-	 *     are never actually broken. */
+	 *  Its one caller is the trust-the-origin external-row apply path: the origin already
+	 *  enforced RESTRICT at its own commit, so re-enforcing it on the receiver would wedge
+	 *  the sync stream. Set for the duration of an apply batch (mutex held, so no concurrent
+	 *  statement observes it) and honored by every nested cascade DML and MV-maintenance FK
+	 *  pass. The batch issues DML only, so the DROP TABLE referencing-children guard does not
+	 *  read this flag; it asks {@link _areDropReferenceGuardsWaived}. */
 	public _setFkRestrictSuppressed(value: boolean): boolean {
 		const prior = this._fkRestrictSuppressed;
 		this._fkRestrictSuppressed = value;
@@ -2974,7 +2968,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Marks that the DDL re-entering the executor is the undo journal of a
 	 *  failed `apply schema`. While set, the reference guards on DROP COLUMN, DROP TABLE and
-	 *  DROP VIEW stand down: they keep a user's drop from breaking a working reference, and
+	 *  DROP VIEW stand down (through {@link _areDropReferenceGuardsWaived}): they keep a user's drop from breaking a working reference, and
 	 *  an unwind is returning to the pre-apply catalog, so a reference it breaks belongs to
 	 *  an object a later undo removes, was already dangling before the apply, or goes back
 	 *  to what it named before the apply. ADD CONSTRAINT also stops judging the constraint
@@ -2997,6 +2991,36 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  {@link _setSchemaUnwinding}. */
 	public _isSchemaUnwinding(): boolean {
 		return this._schemaUnwinding;
+	}
+
+	/** @internal Internal-drop flag — see {@link _setInternalDrop}. */
+	private _internalDrop = false;
+
+	/** @internal Marks that the DDL re-entering the executor is engine scaffolding: the object
+	 *  it drops comes back under the same name, with the same rows, before the statement ends.
+	 *  Its one caller is the ALTER PRIMARY KEY shadow rebuild (`rebuildViaShadowTable`), around
+	 *  its own `DROP TABLE` of the original. While set, the drop path's reference guards stand
+	 *  down (see {@link _areDropReferenceGuardsWaived}); nothing else changes, unlike
+	 *  {@link _setSchemaUnwinding}. Set only with the statement mutex held, so no other
+	 *  statement observes it. Returns the prior value so the caller restores it in a `finally`.
+	 *  Docs: `docs/sql-alter.md` § ALTER PRIMARY KEY. */
+	public _setInternalDrop(value: boolean): boolean {
+		const prior = this._internalDrop;
+		this._internalDrop = value;
+		return prior;
+	}
+
+	/** @internal Whether the guards that refuse a drop because another object still refers to
+	 *  what it removes stand down: the foreign-key row check on DROP TABLE, the assertion and
+	 *  CHECK / DEFAULT / generated-body guards on DROP TABLE / VIEW / MATERIALIZED VIEW, and the
+	 *  DROP COLUMN reference guards. Those guards keep a user's drop from breaking a working
+	 *  reference, and two scopes issue drops that break none: an `apply schema` unwind
+	 *  ({@link _setSchemaUnwinding}) and an internal drop ({@link _setInternalDrop}). Every
+	 *  drop-path reference guard asks this rather than either flag, so a guard added later stands
+	 *  down in both scopes. Structural checks (the primary-key column, the last column, the DDL
+	 *  transaction policy, module capabilities) never ask it. */
+	public _areDropReferenceGuardsWaived(): boolean {
+		return this._schemaUnwinding || this._internalDrop;
 	}
 
 	/** @internal Apply-schema recreated objects — see {@link _setSchemaRecreatedObjects}. */

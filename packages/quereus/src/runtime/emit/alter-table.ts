@@ -2343,6 +2343,29 @@ function indexesMissingError(tableSchema: TableSchema, missing: IndexSchema[], c
 }
 
 /**
+ * Runs the rebuild's steps before the original is dropped, so that an error from them names the
+ * user's table rather than the hidden shadow: the module reports the table it was handed, and a key
+ * collision in the copy would otherwise read `UNIQUE constraint failed: t__rekey_1794883007255 PK`.
+ * The shadow name is engine-generated and unique, so substituting it is exact. The error is the
+ * same object, so its class and `code` are kept. Errors after the DROP keep the shadow name on
+ * purpose — the shadow then holds the rows, and the user needs its name to recover them.
+ */
+async function reportedOnUserTable(shadowName: string, tableName: string, steps: () => Promise<void>): Promise<void> {
+	try {
+		await steps();
+	} catch (e) {
+		if (e instanceof Error) replaceInError(e, shadowName, tableName);
+		throw e;
+	}
+}
+
+/** Replaces `from` with `to` in an error's message and in the stack text, which repeats it. */
+function replaceInError(e: Error, from: string, to: string): void {
+	e.message = e.message.split(from).join(to);
+	if (typeof e.stack === 'string') e.stack = e.stack.split(from).join(to);
+}
+
+/**
  * Generic rebuild via shadow table SQL, for a module without a native
  * `alterPrimaryKey`.
  *
@@ -2373,7 +2396,8 @@ function indexesMissingError(tableSchema: TableSchema, missing: IndexSchema[], c
  * The row copy commits before the original is dropped, because the DROP and RENAME survive a
  * rollback and an uncommitted copy does not. What a failure leaves depends on where it lands:
  *
- *  - up to and including the DROP: the original is intact and the shadow is dropped;
+ *  - up to and including the DROP: the original is intact and the shadow is dropped, and an
+ *    error before the DROP names the user's table (see {@link reportedOnUserTable});
  *  - the RENAME: the table is gone, the shadow holds the rows, and the error says so;
  *  - re-creating an index: the new key and the rows, with that index and the later ones missing,
  *    and the error names them;
@@ -2425,75 +2449,70 @@ async function rebuildViaShadowTable(
 	await rctx.db._getEventEmitter().withPublicEventsSuppressed(async () => {
 		let shadowHoldsTheRows = false;
 		try {
-			await rctx.db._execWithinTransaction(createDdl);
-			// `or abort` is load-bearing, not decoration. The shadow now declares the table's
-			// own conflict actions (the whole point of rendering it through the canonical
-			// writer), so a row-set that COLLIDES under the new key — the case the in-place
-			// re-key path refuses with CONSTRAINT — would otherwise be resolved by the
-			// declared action instead of reported: `primary key (a) on conflict replace`
-			// re-keyed onto a non-unique column silently keeps the last row and reports
-			// success. The copy is engine scaffolding, not a user INSERT, so it takes the
-			// statement-level clause that outranks every declared default
-			// (see row-constraints.ts: statement OR clause > per-constraint default > ABORT)
-			// and surfaces the collision the way every other re-key path does.
-			//
-			// `skipRowChecks` because a re-key changes no row: it must not fail on a violation
-			// already standing (an orphan, a subquery CHECK whose subject has moved), and it has
-			// no values for the `with context` variables the shadow declares. Uniqueness is the
-			// module's to enforce, so the collision above is still refused.
-			const [rowCopy] = rctx.db._parseSql(
-				`insert or abort into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
-			) as [AST.InsertStmt];
-			rowCopy.skipRowChecks = true;
-			await rctx.db._execAstWithinTransaction([rowCopy]);
-			// Before the DROP, while the original and the shadow are both whole: the DROP and
-			// RENAME survive a rollback and an uncommitted copy does not, so any failure from
-			// here on would otherwise leave the table empty.
-			//
-			// NOTE: commits the whole implicit transaction. Safe because the rebuild is refused
-			// wherever anything else could be in it (explicit transaction, apply with other
-			// effects); if a new path ever issues ALTER PRIMARY KEY nested inside a statement that
-			// has written, this commit carries those writes and the path needs its own refusal.
-			//
-			// NOTE: accepted tradeoff — the statement's own commit still follows the swap. With
-			// nothing staged only a module failing an empty commit can fail it, and then the
-			// statement reports an error although the key changed, and the discarded batch
-			// delivers no `alter` event; a failed index re-creation below discards it the same way.
-			// The rows are safe, so this stands. Re-issuing the statement runs another rebuild,
-			// which delivers the event, but with the new key as `oldKeyColumns` because the catalog
-			// has already changed, so a syncing peer does not re-file its bookkeeping for those
-			// rows; revisit if such a module appears behind a syncing peer.
-			await rctx.db._commitTransaction();
+			// The user never named the shadow, so a failure up to the commit — a key collision
+			// during the copy above all — is reported against their table.
+			await reportedOnUserTable(shadowName, tableName, async () => {
+				await rctx.db._execWithinTransaction(createDdl);
+				// `or abort` is load-bearing, not decoration. The shadow now declares the table's
+				// own conflict actions (the whole point of rendering it through the canonical
+				// writer), so a row-set that COLLIDES under the new key — the case the in-place
+				// re-key path refuses with CONSTRAINT — would otherwise be resolved by the
+				// declared action instead of reported: `primary key (a) on conflict replace`
+				// re-keyed onto a non-unique column silently keeps the last row and reports
+				// success. The copy is engine scaffolding, not a user INSERT, so it takes the
+				// statement-level clause that outranks every declared default
+				// (see row-constraints.ts: statement OR clause > per-constraint default > ABORT)
+				// and surfaces the collision the way every other re-key path does.
+				//
+				// `skipRowChecks` because a re-key changes no row: it must not fail on a violation
+				// already standing (an orphan, a subquery CHECK whose subject has moved), and it has
+				// no values for the `with context` variables the shadow declares. Uniqueness is the
+				// module's to enforce, so the collision above is still refused.
+				const [rowCopy] = rctx.db._parseSql(
+					`insert or abort into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
+				) as [AST.InsertStmt];
+				rowCopy.skipRowChecks = true;
+				await rctx.db._execAstWithinTransaction([rowCopy]);
+				// Before the DROP, while the original and the shadow are both whole: the DROP and
+				// RENAME survive a rollback and an uncommitted copy does not, so any failure from
+				// here on would otherwise leave the table empty.
+				//
+				// NOTE: commits the whole implicit transaction. Safe because the rebuild is refused
+				// wherever anything else could be in it (explicit transaction, apply with other
+				// effects); if a new path ever issues ALTER PRIMARY KEY nested inside a statement that
+				// has written, this commit carries those writes and the path needs its own refusal.
+				//
+				// NOTE: accepted tradeoff — the statement's own commit still follows the swap. With
+				// nothing staged only a module failing an empty commit can fail it, and then the
+				// statement reports an error although the key changed, and the discarded batch
+				// delivers no `alter` event; a failed index re-creation below discards it the same way.
+				// The rows are safe, so this stands. Re-issuing the statement runs another rebuild,
+				// which delivers the event, but with the new key as `oldKeyColumns` because the catalog
+				// has already changed, so a syncing peer does not re-file its bookkeeping for those
+				// rows; revisit if such a module appears behind a syncing peer.
+				await rctx.db._commitTransaction();
+			});
 			await rctx.db._ensureTransaction();
-			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from
-			// being renamed back over it. Two FK situations would otherwise refuse it:
-			//  - a SELF-referencing FK — the shadow's copy references the ORIGINAL by name
-			//    (correct for the copy: the per-row EXISTS checks run against the intact
-			//    original), so the drop guard sees the shadow as a referencing child;
-			//  - another table's FK into this one with rows present — the referencing rows
-			//    stay satisfied because the rename restores the name with identical rows,
-			//    matching the in-place re-key path (which never breaks such children).
-			// Suppress the parent-side RESTRICT guard for exactly this statement; restored
-			// in the finally so a failing drop cannot latch it.
-			//
-			// NOTE: two OTHER drop-refusal shapes are not handled here, and both are
-			// reachable rather than hypothetical (verified against a stub module with no
-			// `alterTable`) — see backlog `bug-rebuild-drop-refused-by-user-facing-guards`.
-			// `emitDropTable` also runs `assertNoAssertionDependsOn` and
-			// `assertNoExpressionDependsOn`, so an assertion over this table — or ANOTHER
-			// table's CHECK / DEFAULT / generated body whose subquery names it — refuses the
-			// internal DROP, and the whole ALTER fails with `cannot drop table '<name>'`,
-			// naming a drop the user never asked for. The rebuild unwinds cleanly (the shadow
-			// is dropped in the catch below, the table is untouched), so this costs a
-			// confusing refusal, not data. The fix is a scaffolding-drop scope those guards
-			// honor too, not a wider FK flag.
-			const priorSuppress = rctx.db._setFkRestrictSuppressed(true);
+			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from being
+			// renamed back over it, so no reference to the table is ever broken. The guards that
+			// protect a user's drop from breaking one would otherwise refuse it:
+			//  - a foreign key into this table with rows present — another table's (matching the
+			//    in-place re-key path, which never breaks such children) or this table's own;
+			//  - an assertion whose body reads this table;
+			//  - a CHECK / DEFAULT / generated body whose subquery reads it — another table's or
+			//    this table's own.
+			// "This table's own" refuses because the shadow carries the same definition, which names
+			// the ORIGINAL (correct for the copy, whose checks ran against the intact original), so
+			// the guards see the shadow as a dependent; the rename below rewrites those references
+			// onto the restored name. Waived for exactly this statement; restored in the finally so
+			// a failing drop cannot latch it.
+			const priorInternalDrop = rctx.db._setInternalDrop(true);
 			try {
 				await rctx.db._execWithinTransaction(
 					`drop table ${qualifiedTable}`
 				);
 			} finally {
-				rctx.db._setFkRestrictSuppressed(priorSuppress);
+				rctx.db._setInternalDrop(priorInternalDrop);
 			}
 			shadowHoldsTheRows = true;
 			// The rename's propagate pass rewrites the shadow's dangling references to the

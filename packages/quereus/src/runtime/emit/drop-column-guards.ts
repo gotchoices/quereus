@@ -66,7 +66,8 @@ import {
  *
  * Everything above is about a drop a user issued. The undo journal of a failed
  * `apply schema` issues drops too, and there all four guards stand down
- * (`Database._setSchemaUnwinding`): the unwind is returning to the pre-apply catalog, so the
+ * (`Database._areDropReferenceGuardsWaived`, which also covers the internal-drop scope, though
+ * nothing issues a DROP COLUMN inside it today): the unwind is returning to the pre-apply catalog, so the
  * reference it breaks belongs to an object a later undo removes, was already dangling before
  * the apply, or goes back to the object it named before the apply. An assertion can hold
  * that last kind without being edited: an added column can capture a bare name in its body,
@@ -152,7 +153,7 @@ function refuseColumnExpressionDependent(
 	columnName: string,
 	arm: ColumnExpressionArm,
 ): void {
-	if (db._isSchemaUnwinding()) return;
+	if (db._areDropReferenceGuardsWaived()) return;
 	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
 	if (!dependent) return;
 	if (dependent.breaksEntirely) {
@@ -235,7 +236,7 @@ export function assertNoAssertionNamesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	if (db._isSchemaUnwinding()) return;
+	if (db._areDropReferenceGuardsWaived()) return;
 	const resolveColumnInSource = buildColumnSourceResolver(db);
 	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	const republication = collectColumnRepublication(db,
@@ -314,7 +315,7 @@ export function assertNoForeignKeyReferencesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	if (db._isSchemaUnwinding()) return;
+	if (db._areDropReferenceGuardsWaived()) return;
 	const lowerColumn = columnName.toLowerCase();
 	const droppedIndex = tableSchema.columnIndexMap.get(lowerColumn);
 

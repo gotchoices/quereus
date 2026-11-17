@@ -54,9 +54,11 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * skipped, one walk per assertion — is
  * {@link assertionReachesHomeSchemaFirst}, shared with the DROP COLUMN verb.
  *
- * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`). That
- * drop is not a user's: an assertion it appears to break was written against the pre-apply
- * catalog, and a bare name the plan's new object captured binds back once it is gone.
+ * Stands down while `Database._areDropReferenceGuardsWaived` holds. In a failed `apply schema`'s
+ * unwind the drop is not a user's: an assertion it appears to break was written against the
+ * pre-apply catalog, and a bare name the plan's new object captured binds back once it is gone.
+ * In an internal drop (the ALTER PRIMARY KEY rebuild's) the table comes back under its own name
+ * with the same rows before the statement ends, so the assertion is never broken.
  */
 export function assertNoAssertionDependsOn(
 	db: Database,
@@ -64,7 +66,7 @@ export function assertNoAssertionDependsOn(
 	objectName: string,
 	objectKind: DroppableObjectKind,
 ): void {
-	if (db._isSchemaUnwinding()) return;
+	if (db._areDropReferenceGuardsWaived()) return;
 	const schema = db.schemaManager.getSchema(schemaName);
 	if (!schema) return;
 	const targetKey = objectRefKey(schema.name, objectName);

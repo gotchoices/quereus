@@ -862,7 +862,7 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 		expect(err, 'the collision is reported').to.be.instanceOf(QuereusError);
 		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
 		expect(err!.message, 'no machine-generated name').to.not.match(/__rekey_/);
-		expect(err!.message, 'names the table').to.match(/t/);
+		expect(err!.message, 'names the table').to.match(/\bt\b/);
 	});
 
 	// The rebuild's internal DROP is scaffolding: the table comes back under its own name with the
