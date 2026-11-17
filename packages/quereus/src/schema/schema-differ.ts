@@ -1100,6 +1100,8 @@ function computeLogicalSchemaDiff(
  */
 function resolveRenames<D, A>(args: {
 	kind: RenameKind;
+	/** Object noun for error messages; defaults to `kind`. */
+	noun?: string;
 	declared: Map<string, D>;
 	actual: Map<string, A>;
 	getDeclaredName: (d: D) => string;
@@ -1113,6 +1115,7 @@ function resolveRenames<D, A>(args: {
 	consumedActuals: Set<string>;
 } {
 	const { kind, declared, actual, getDeclaredName, getActualName, getDeclaredTags, getActualTags, policy } = args;
+	const noun = args.noun ?? kind;
 
 	const renames: RenameOp[] = [];
 	const pairs = new Map<string, A>();
@@ -1134,7 +1137,7 @@ function resolveRenames<D, A>(args: {
 		if (id) {
 			if (actualById.has(id)) {
 				throw new QuereusError(
-					`Duplicate quereus.id '${id}' on ${kind}s in actual catalog`,
+					`Duplicate quereus.id '${id}' on ${noun}s in actual catalog`,
 					StatusCode.ERROR,
 				);
 			}
@@ -1183,7 +1186,7 @@ function resolveRenames<D, A>(args: {
 		// Conflict: declared name AND hint each resolve to *distinct* existing actuals.
 		if (nameMatch && hintMatch && !hintIsSelf) {
 			throw new QuereusError(
-				`Rename conflict for ${kind} '${getDeclaredName(d)}': declared name and quereus.previous_name/id resolve to different existing objects ('${dn}' vs '${hintMatchKey}')`,
+				`Rename conflict for ${noun} '${getDeclaredName(d)}': declared name and quereus.previous_name/id resolve to different existing objects ('${dn}' vs '${hintMatchKey}')`,
 				StatusCode.ERROR,
 			);
 		}
@@ -1193,9 +1196,20 @@ function resolveRenames<D, A>(args: {
 			continue;
 		}
 		if (hintMatch && !hintIsSelf) {
+			// The rename source's name is also declared, so that declared object
+			// name-matches the very actual this rename moves away. Refused rather than
+			// honoured (rename, then create under the freed name): a hint left beside a
+			// reused old name makes every later diff throw the conflict above, and the
+			// reconcile passes rely on no old name being declared.
+			if (declared.has(hintMatchKey!)) {
+				throw new QuereusError(
+					`Rename conflict for ${noun} '${getDeclaredName(d)}': its rename source '${getActualName(hintMatch)}' is also declared as a new ${noun}; apply the rename first, then remove the quereus.previous_name/id hint and declare '${getActualName(hintMatch)}' in a later apply`,
+					StatusCode.ERROR,
+				);
+			}
 			if (consumedActuals.has(hintMatchKey!)) {
 				throw new QuereusError(
-					`Rename conflict for ${kind} '${getDeclaredName(d)}': old object '${hintMatchKey}' already consumed by another rename`,
+					`Rename conflict for ${noun} '${getDeclaredName(d)}': old object '${hintMatchKey}' already consumed by another rename`,
 					StatusCode.ERROR,
 				);
 			}
@@ -2323,6 +2337,7 @@ function resolveColumnRenames(
 	}
 	return resolveRenames<AST.ColumnDef, CatalogTable['columns'][number]>({
 		kind: 'constraint', // unused for ColumnRenameOp; kind only flows into RenameOp not surfaced here
+		noun: 'column',
 		declared: declaredColumns,
 		actual: actualColumns,
 		getDeclaredName: d => d.name,

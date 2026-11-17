@@ -971,3 +971,45 @@ diff schema main;
 → []
 
 drop table t28;
+
+-- ===================================
+-- 29. Conflict: a rename's old name is also declared as a new object
+-- ===================================
+
+-- The declared `x` would name-match the existing `x` that `y` renames away. Refused regardless of
+-- declaration order (`x` is declared before `y` here); the supported path is two applies.
+create table t29 (id integer primary key, x integer);
+
+declare schema main {
+	table t29 {
+		id integer primary key,
+		x integer,
+		y integer with tags ("quereus.previous_name" = 'x')
+	}
+}
+
+-- run
+
+diff schema main;
+-- error: Rename conflict for column 'y'
+
+create table a29 (id integer primary key);
+
+declare schema main {
+	table b29 {
+		id integer primary key
+	} with tags ("quereus.previous_name" = 'a29')
+
+	table a29 {
+		id integer primary key,
+		extra integer null
+	}
+}
+
+-- run
+
+diff schema main;
+-- error: Rename conflict for table 'b29'
+
+drop table a29;
+drop table t29;
