@@ -177,22 +177,25 @@ describe('scalar fusion', () => {
 		});
 
 		it('a function argument counts toward MAX_FUSION_DEPTH', () => {
-			// `lower(?)` wrapped in n operators: the argument sits one frame below the
-			// call, so the same cap that bounds an operator chain bounds this one.
-			const atCap = 'select lower(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH - 1) + ' as v';
+			// `abs(?)` wrapped in n operators: the argument sits one frame below the
+			// call, so the same cap that bounds an operator chain bounds this one. (`abs`,
+			// not a string builtin: a declared text argument gets a planner-inserted cast,
+			// which would add a frame between the call and `?`.)
+			const atCap = 'select abs(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH - 1) + ' as v';
 			expect(fuseFrom(atCap, PlanNodeType.BinaryOp), 'at the cap').to.be.a('function');
-			const pastCap = 'select lower(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH + 1) + ' as v';
+			const pastCap = 'select abs(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH + 1) + ' as v';
 			expect(fuseFrom(pastCap, PlanNodeType.BinaryOp), 'past the cap').to.equal(undefined);
 		});
 
 		it('nested function calls fuse, and nest against the same depth cap', () => {
-			// `lower(lower(…(?)))` — the only shape where every frame in the chain is a
+			// `abs(abs(…(?)))` — the only shape where every frame in the chain is a
 			// call. n nestings put the parameter at depth n, so the cap bites at n > MAX.
-			const nest = (n: number) => 'select ' + 'lower('.repeat(n) + '?' + ')'.repeat(n) + ' as v';
+			// (`abs` declares no text argument, so no planner cast joins the chain.)
+			const nest = (n: number) => 'select ' + 'abs('.repeat(n) + '?' + ')'.repeat(n) + ' as v';
 
 			const shallow = fuseFrom(nest(3), PlanNodeType.ScalarFunctionCall);
 			expect(shallow).to.be.a('function');
-			expect(shallow!(makeRctx(db, { 1: 'MiXeD' }))).to.equal('mixed');
+			expect(shallow!(makeRctx(db, { 1: -5 }))).to.equal(5);
 
 			expect(fuseFrom(nest(MAX_FUSION_DEPTH), PlanNodeType.ScalarFunctionCall), 'at the cap')
 				.to.be.a('function');

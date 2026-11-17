@@ -343,9 +343,10 @@ import type { Database, SqlValue } from '@quereus/quereus';
 
 const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
 
+// `textArgs: [0]` below makes the planner hand this a string or NULL.
 function reverse(text: SqlValue): SqlValue {
-  if (text === null || text === undefined) return null;
-  return String(text).split('').reverse().join('');
+  if (text === null) return null;
+  return Array.from(text as string).reverse().join('');
 }
 
 export default function register(db: Database, config: Record<string, SqlValue> = {}) {
@@ -353,7 +354,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
     functions: [
       {
         schema: createScalarFunction(
-          { name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
+          { name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN, textArgs: [0] },
           reverse
         )
       }
@@ -361,6 +362,8 @@ export default function register(db: Database, config: Record<string, SqlValue> 
   };
 }
 ```
+
+**Text arguments.** A function that reads an argument as text should list its position in `textArgs` (`'all'` for a variadic function) instead of converting the value itself. The planner wraps each such argument whose type is not TEXT in `cast(<arg> as text)`, so the implementation receives a string or `NULL`, the value is spelled exactly as `cast(x as text)` spells it everywhere else ([types.md § Value to text](./types.md#value-to-text)), and `inferReturnType` sees the argument as TEXT. JavaScript's `String(x)` is not that conversion: it turns a BLOB into its comma-joined byte numbers and a JSON object into `[object Object]`. The field lives on the schema, so a hand-built schema passed to `Database.registerFunction` declares it the same way.
 
 #### Asynchronous scalar functions
 

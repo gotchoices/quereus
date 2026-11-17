@@ -208,6 +208,13 @@ interface BaseFunctionSchema {
 	 *  A function that also declares {@link BaseFunctionSchema.returnsArg} skips the
 	 *  plan-time rewrite and coerces at emit time instead. */
 	readonly comparesArgs?: 'all' | readonly number[];
+	/** Argument positions this function reads as text. The planner wraps each such
+	 *  argument whose static type is not physically TEXT in `cast(<arg> as text)`
+	 *  (`planner/building/coercion.ts` `coerceTextArgs`), so `f(x)` = `f(cast(x as text))`
+	 *  holds by construction and the implementation never stringifies a value itself.
+	 *  `'all'` for a variadic function. Positions past the call's argument count are
+	 *  ignored. Scalar functions only. */
+	readonly textArgs?: 'all' | readonly number[];
 	/**
 	 * When `true`, this function returns one of its arguments verbatim, so its
 	 * {@link BaseFunctionSchema.comparesArgs} group must NOT be rewritten with

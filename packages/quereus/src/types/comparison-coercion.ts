@@ -27,7 +27,8 @@ import { ANY_TYPE, INTEGER_TYPE, NULL_TYPE, NUMERIC_TYPE } from './builtin-types
  * ({@link import('../schema/function.js').BaseFunctionSchema.comparesArgs}) names,
  * clamped to the call's actual arity. Index 0 of the result is the group's probe.
  * Shared by the plan-time rewrite and the emit-time group builder so they cannot
- * disagree about which positions form the group.
+ * disagree about which positions form the group. A `textArgs` declaration has the
+ * same shape and resolves through here too.
  */
 export function comparisonGroupIndices(
 	comparesArgs: 'all' | readonly number[],

@@ -25,13 +25,12 @@ function decodeUtf8(bytes: Uint8Array): string {
 /**
  * THE SQL value-to-text conversion. Every site that has to render a value as text —
  * CAST/parse to TEXT, `||`, LIKE operand coercion (the `LIKE` operator in
- * `runtime/emit/binary.ts` and the `like`/`glob` functions in
- * `func/builtins/string.ts`), `group_concat`, TEXT affinity — calls this and nothing
+ * `runtime/emit/binary.ts`), `group_concat`, `string_concat`, `split_string`, the
+ * scalar string builtins' text arguments, TEXT affinity — calls this and nothing
  * else, so a value has exactly one text spelling no matter which construct produced it.
- *
- * The remaining string builtins (`substr`, `trim`, `replace`, `instr`, and the ones
- * that return NULL for a non-text argument) are the known exception, tracked as
- * `debt-string-builtins-coerce-three-different-ways`.
+ * The scalar string builtins (`func/builtins/string.ts`) reach it through their
+ * `textArgs` declaration: the planner wraps each such argument in `cast(<arg> as text)`
+ * (`planner/building/coercion.ts` `coerceTextArgs`).
  *
  * | source            | text              | notes                                                        |
  * |-------------------|-------------------|--------------------------------------------------------------|

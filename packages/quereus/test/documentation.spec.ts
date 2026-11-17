@@ -177,16 +177,17 @@ describe('Documentation Validation', () => {
 		});
 
 		it('should run the scalar function example', async () => {
+			// `textArgs: [0]` below makes the planner hand this a string or NULL.
 			function reverse(text: SqlValue): SqlValue {
-				if (text === null || text === undefined) return null;
-				return String(text).split('').reverse().join('');
+				if (text === null) return null;
+				return Array.from(text as string).reverse().join('');
 			}
 
 			await registerPlugin(db, (): PluginRegistrations => ({
 				functions: [
 					{
 						schema: createScalarFunction(
-							{ name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
+							{ name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN, textArgs: [0] },
 							reverse
 						)
 					}

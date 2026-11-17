@@ -6,7 +6,7 @@ import { StatusCode } from '../../common/types.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_TYPE, TEXT_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
-import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN, convertsToNumber, isNumberValued, isTextOrBlobValued, isTextValued, nullPropagatingReturn } from './return-types.js';
+import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN, convertsToNumber, isNumberValued, isTextOrBlobValued, nullPropagatingReturn } from './return-types.js';
 
 const log = createLogger('func:builtins:scalar');
 const warnLog = log.extend('warn');
@@ -32,7 +32,7 @@ export const lengthFunc = createScalarFunction(
 const substrImpl = (str: SqlValue, start: SqlValue, len?: SqlValue): SqlValue => {
 	if (str === null || start === null) return null;
 
-	const s = String(str); // Coerce main arg to string
+	const s = valueToText(str);
 	let y = Number(start);
 	let z = len === undefined ? undefined : Number(len);
 
@@ -68,8 +68,9 @@ const substrImpl = (str: SqlValue, start: SqlValue, len?: SqlValue): SqlValue =>
 	return cps.slice(begin, end).join('');
 };
 
-// The string is stringified, never refused; a missing start is NaN, so a one-argument call
-// is always NULL. Over-claims a NULL length, which `Number(null)` reads as 0 (empty result).
+// The planner converts the string argument to text, so it is never refused; a missing start
+// is NaN, so a one-argument call is always NULL. Over-claims a NULL length, which
+// `Number(null)` reads as 0 (empty result).
 const substrReturnType = nullPropagatingReturn({
 	logicalType: TEXT_TYPE,
 	accepts: [undefined, convertsToNumber, convertsToNumber],
@@ -77,12 +78,12 @@ const substrReturnType = nullPropagatingReturn({
 });
 
 export const substrFunc = createScalarFunction(
-	{ name: 'substr', numArgs: -1, deterministic: true, inferReturnType: substrReturnType },
+	{ name: 'substr', numArgs: -1, deterministic: true, textArgs: [0], inferReturnType: substrReturnType },
 	substrImpl
 );
 
 export const substringFunc = createScalarFunction(
-	{ name: 'substring', numArgs: -1, deterministic: true, inferReturnType: substrReturnType },
+	{ name: 'substring', numArgs: -1, deterministic: true, textArgs: [0], inferReturnType: substrReturnType },
 	substrImpl
 );
 
@@ -91,7 +92,7 @@ export const substringFunc = createScalarFunction(
 // one `emitLikeOp` uses — `like('ab', x'6162')` and `x'6162' like 'ab'` are two
 // spellings of one operation and must not answer differently.
 export const likeFunc = createScalarFunction(
-	{ name: 'like', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
+	{ name: 'like', numArgs: 2, deterministic: true, textArgs: [0, 1], returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
 		return simpleLike(valueToText(pattern), valueToText(text));
@@ -99,18 +100,15 @@ export const likeFunc = createScalarFunction(
 );
 
 export const globFunc = createScalarFunction(
-	{ name: 'glob', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
+	{ name: 'glob', numArgs: 2, deterministic: true, textArgs: [0, 1], returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
 		return simpleGlob(valueToText(pattern), valueToText(text));
 	}
 );
 
-/** For a TEXT function that stringifies its arguments with `String()`, so refuses none. */
-const stringifyingTextReturn = nullPropagatingReturn({ logicalType: TEXT_TYPE });
-
-/** For a TEXT function whose implementation requires every argument to be a JS string. */
-const textOnlyReturn = nullPropagatingReturn({ logicalType: TEXT_TYPE, accepts: [isTextValued] });
+/** For a TEXT function whose arguments are all `textArgs`: the planner converts each to text, so it refuses none. */
+const textArgsReturn = nullPropagatingReturn({ logicalType: TEXT_TYPE });
 
 const trimPatterns = {
 	both: (escaped: string) => `^[${escaped}]+|[${escaped}]+$`,
@@ -140,12 +138,12 @@ const trimWithChars = (str: string, chars: string, side: TrimSide): string => {
 
 // Over-claims a NULL trim set, which falls back to trimming whitespace.
 const createTrimFunc = (name: string, side: TrimSide) => createScalarFunction(
-	{ name, numArgs: -1, deterministic: true, inferReturnType: stringifyingTextReturn },
+	{ name, numArgs: -1, deterministic: true, textArgs: [0, 1], inferReturnType: textArgsReturn },
 	(strVal: SqlValue, charsVal?: SqlValue): SqlValue => {
 		if (strVal === null) return null;
-		const str = String(strVal);
+		const str = valueToText(strVal);
 		if (charsVal === undefined || charsVal === null) return trimDefaults[side](str);
-		return trimWithChars(str, String(charsVal), side);
+		return trimWithChars(str, valueToText(charsVal), side);
 	}
 );
 
@@ -160,13 +158,13 @@ export const rtrimFunc = createTrimFunc('rtrim', 'right');
 
 // --- replace(X, Y, Z) ---
 export const replaceFunc = createScalarFunction(
-	{ name: 'replace', numArgs: 3, deterministic: true, inferReturnType: stringifyingTextReturn },
+	{ name: 'replace', numArgs: 3, deterministic: true, textArgs: [0, 1, 2], inferReturnType: textArgsReturn },
 	(strVal: SqlValue, patternVal: SqlValue, replacementVal: SqlValue): SqlValue => {
 		if (strVal === null || patternVal === null || replacementVal === null) return null;
 
-		const str = String(strVal);
-		const pattern = String(patternVal);
-		const replacement = String(replacementVal);
+		const str = valueToText(strVal);
+		const pattern = valueToText(patternVal);
+		const replacement = valueToText(replacementVal);
 
 		if (pattern === '') return str;
 		return str.split(pattern).join(replacement);
@@ -179,13 +177,14 @@ export const instrFunc = createScalarFunction(
 		name: 'instr',
 		numArgs: 2,
 		deterministic: true,
+		textArgs: [0, 1],
 		inferReturnType: nullPropagatingReturn({ logicalType: INTEGER_TYPE })
 	},
 	(strVal: SqlValue, subVal: SqlValue): SqlValue => {
 		if (strVal === null || subVal === null) return null;
 
-		const str = String(strVal);
-		const sub = String(subVal);
+		const str = valueToText(strVal);
+		const sub = valueToText(subVal);
 
 		if (sub.length === 0) return 0;
 		if (str.length === 0) return 0;
@@ -197,10 +196,10 @@ export const instrFunc = createScalarFunction(
 
 // String reverse function
 export const reverseFunc = createScalarFunction(
-	{ name: 'reverse', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
+	{ name: 'reverse', numArgs: 1, deterministic: true, textArgs: [0], inferReturnType: textArgsReturn },
 	(str: SqlValue): SqlValue => {
-		if (typeof str !== 'string') return null;
-		return Array.from(str).reverse().join('');
+		if (str === null) return null;
+		return Array.from(valueToText(str)).reverse().join('');
 	}
 );
 
@@ -218,15 +217,17 @@ const createPadFunc = (name: string, side: 'left' | 'right') => createScalarFunc
 		name,
 		numArgs: 3,
 		deterministic: true,
+		textArgs: [0, 2],
 		inferReturnType: nullPropagatingReturn({
 			logicalType: TEXT_TYPE,
-			accepts: [isTextValued, isNumberValued, isTextValued],
+			accepts: [undefined, isNumberValued],
 		}),
 	},
-	(str: SqlValue, len: SqlValue, pad: SqlValue): SqlValue => {
-		if (typeof str !== 'string' || typeof pad !== 'string') return null;
+	(strVal: SqlValue, len: SqlValue, padVal: SqlValue): SqlValue => {
+		if (strVal === null || padVal === null) return null;
 		if (typeof len !== 'number' && typeof len !== 'bigint') return null;
-		const padding = buildPadding(str, Number(len), pad);
+		const str = valueToText(strVal);
+		const padding = buildPadding(str, Number(len), valueToText(padVal));
 		return side === 'left' ? padding + str : str + padding;
 	}
 );
@@ -237,25 +238,27 @@ export const lpadFunc = createPadFunc('lpad', 'left');
 // --- rpad(X, N, PAD) ---
 export const rpadFunc = createPadFunc('rpad', 'right');
 
-// Split a string into rows (table-valued function)
+// Split a string into rows (table-valued function). The `textArgs` seam is scalar-only, so
+// both arguments go through the one value-to-text rule here; NULL in either yields no rows.
 export const splitStringFunc = createTableValuedFunction(
 	{ name: 'split_string', numArgs: 2, deterministic: true },
 	async function* (str: SqlValue, delimiter: SqlValue): AsyncIterable<Row> {
-		if (typeof str !== 'string' || typeof delimiter !== 'string') return;
+		if (str === null || delimiter === null) return;
 
-		const parts = str.split(delimiter);
+		const parts = valueToText(str).split(valueToText(delimiter));
 		for (let i = 0; i < parts.length; i++) {
 			yield [parts[i], i]; // value, index
 		}
 	}
 );
 
-// String concatenation aggregate (like GROUP_CONCAT but simpler)
+// String concatenation aggregate (like GROUP_CONCAT but simpler). Skips NULLs and renders
+// every other value through the one value-to-text rule, as group_concat does.
 export const stringConcatFunc = createAggregateFunction(
 	{ name: 'string_concat', numArgs: 1, initialValue: [], returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
 	(acc: string[], value: SqlValue) => {
-		if (typeof value === 'string') {
-			acc.push(value);
+		if (value !== null) {
+			acc.push(valueToText(value));
 		}
 		return acc;
 	},
@@ -264,17 +267,17 @@ export const stringConcatFunc = createAggregateFunction(
 
 // --- lower(X) ---
 export const lowerFunc = createScalarFunction(
-	{ name: 'lower', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
+	{ name: 'lower', numArgs: 1, deterministic: true, textArgs: [0], inferReturnType: textArgsReturn },
 	(arg: SqlValue): SqlValue => {
-		return typeof arg === 'string' ? arg.toLowerCase() : null;
+		return arg === null ? null : valueToText(arg).toLowerCase();
 	}
 );
 
 // --- upper(X) ---
 export const upperFunc = createScalarFunction(
-	{ name: 'upper', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
+	{ name: 'upper', numArgs: 1, deterministic: true, textArgs: [0], inferReturnType: textArgsReturn },
 	(arg: SqlValue): SqlValue => {
-		return typeof arg === 'string' ? arg.toUpperCase() : null;
+		return arg === null ? null : valueToText(arg).toUpperCase();
 	}
 );
 

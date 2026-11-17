@@ -258,6 +258,14 @@ describe('Announced result-column types match produced values', () => {
 		});
 	});
 
+	describe('announced nullability of a string builtin over a non-text argument', () => {
+		// The planner casts a declared text argument BEFORE inferring the return type, so
+		// inference sees a non-null TEXT argument rather than one it would refuse.
+		it('announces non-null for upper() over a non-null integer column', async () => {
+			expect(await announcedNullable('select upper(id) as v from t')).to.equal(false);
+		});
+	});
+
 	describe('announced nullability of a scalar subquery (NULL when it finds no row)', () => {
 		it('announces non-null only when the subquery always yields a row', async () => {
 			// An ungrouped aggregate yields exactly one row, even over an empty input.

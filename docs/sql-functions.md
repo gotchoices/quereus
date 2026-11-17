@@ -31,6 +31,8 @@ Scalar functions operate on single values and return a single value per row.
 - `hex(X)`: Returns the uppercase hex spelling of X's bytes, no separator. A non-blob X converts to bytes first, the same path `cast(X as blob)` takes
 - `unhex(X)`: Returns the BLOB parsed from hex string X, or `NULL` if X is not text, or is text that is not a whole number of hex digit pairs
 
+A non-text argument where these functions expect a string is read as `cast(X as text)`: `upper(x'6162')` is `'AB'`. `length`, `hex` and `unhex` are the exceptions (see [functions.md § String Functions](functions.md#string-functions)).
+
 **Examples:**
 ```sql
 -- String manipulation

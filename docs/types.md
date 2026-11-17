@@ -918,15 +918,19 @@ There is exactly ONE conversion from a value to text — `valueToText`
 (`util/value-text.ts`). Every construct that has to render a value as text calls
 it and nothing else: `TEXT_TYPE.parse` (and so `cast(x as text)`, `text(x)`, and
 any write into a TEXT column), `castFallback`'s TEXT and BLOB arms, `||`, LIKE's
-operand coercion (both the `LIKE` operator and the `like`/`glob` functions),
-`group_concat`, and TEXT affinity. A value therefore has one text spelling no
-matter which construct produced it.
+operand coercion (the `LIKE` operator), `group_concat`, `string_concat`,
+`split_string`, every string builtin's text arguments (`lower`, `upper`, `substr`,
+`trim`, `replace`, `instr`, `reverse`, `lpad`, `rpad`, `like`, `glob`), and TEXT
+affinity. A value therefore has one text spelling no matter which construct
+produced it.
 
-The one exception is the rest of the string builtin family — `substr`, `trim`,
-`replace`, `instr`, `lower`, `upper`, `reverse`, `lpad`, `rpad` — which still coerce
-a non-text argument their own way (some with JavaScript stringification, some by
-returning NULL). See [functions.md § String functions](functions.md#string-functions);
-tracked as `debt-string-builtins-coerce-three-different-ways`.
+The scalar string builtins reach it through a declaration rather than by converting
+for themselves: a function lists the argument positions it reads as text in its
+schema's `textArgs`, and the planner wraps each such argument whose static type is
+not physically TEXT in `cast(<arg> as text)` before inferring the call's return type
+(`planner/building/coercion.ts` `coerceTextArgs`). So `f(x)` is `f(cast(x as text))`
+by construction, and EXPLAIN shows the inserted cast. `length`, `hex` and `unhex`
+deliberately declare none — see [functions.md § String Functions](functions.md#string-functions).
 
 | source | text | notes |
 |---|---|---|

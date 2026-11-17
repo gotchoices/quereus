@@ -7,7 +7,7 @@ import * as AST from "../../parser/ast.js";
 import { ScalarPlanNode } from "../nodes/plan-node.js";
 import { isAggregateFunctionSchema, isScalarFunctionSchema, type ArgTypeValidator } from '../../schema/function.js';
 import { buildExpression } from "./expression.js";
-import { coerceComparisonGroup } from "./coercion.js";
+import { coerceComparisonGroup, coerceTextArgs } from "./coercion.js";
 import { ScalarFunctionCallNode, inferScalarCallType } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
@@ -146,6 +146,10 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 		// also lets inferReturnType see the arguments the user actually wrote.
 		if (isScalarFunctionSchema(functionSchema) && functionSchema.comparesArgs && !functionSchema.returnsArg) {
 			coerceComparisonGroup(ctx.scope, functionSchema.comparesArgs, args);
+		}
+		// Same ordering constraint: a text argument's cast makes inference see TEXT.
+		if (isScalarFunctionSchema(functionSchema) && functionSchema.textArgs) {
+			coerceTextArgs(ctx.scope, functionSchema.textArgs, args);
 		}
 
 		let inferredType: ScalarType | undefined;

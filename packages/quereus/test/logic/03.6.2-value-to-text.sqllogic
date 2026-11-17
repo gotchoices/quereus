@@ -179,6 +179,38 @@ insert into vt_n values (1, 'a'), (2, null), (3, 'b');
 select group_concat(v) as r from vt_n;
 → [{"r":"a,b"}]
 
+-- === The string builtins use the same rule ===
+-- Each one reads a non-text argument as cast(x as text). substr used JS
+-- stringification ('97,98' for this blob); upper/lower/reverse/lpad returned NULL.
+-- Per-position agreement over every declared text argument is generated from the
+-- registry in test/string-text-args.spec.ts; these rows pin the user-visible results.
+
+select substr(x'6162', 1, 1) as r;
+→ [{"r":"a"}]
+
+select upper(x'6162') as r;
+→ [{"r":"AB"}]
+
+select lower(true) as r;
+→ [{"r":"true"}]
+
+select reverse(12) as r;
+→ [{"r":"21"}]
+
+select lpad(5, 3, 0) as r;
+→ [{"r":"005"}]
+
+select replace(json('{"a":1}'), 'a', 'b') as r;
+→ [{"r":"{\"b\":1}"}]
+
+-- split_string (table-valued) and string_concat (aggregate) convert the same way.
+-- split_string declares no column names, so read the segments through `*`.
+select * from split_string(x'612c62', ',');
+→ [{"col_0":"a","col_1":0},{"col_0":"b","col_1":1}]
+
+select string_concat(b) = group_concat(b) as r from vt_b;
+→ [{"r":true}]
+
 -- === The write path stores the conversion, not just the display ===
 
 -- Inserting a blob into a TEXT column now STORES the UTF-8 decode (was the hex

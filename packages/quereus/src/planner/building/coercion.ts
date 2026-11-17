@@ -3,6 +3,8 @@ import type { Scope } from '../scopes/scope.js';
 import { CastNode } from '../nodes/scalar.js';
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
 import { comparisonGroupCoercions, comparisonGroupIndices, crossTypeCoercion } from '../../types/comparison-coercion.js';
+import { PhysicalType } from '../../types/logical-type.js';
+import { TEXT_TYPE } from '../../types/builtin-types.js';
 
 /**
  * Plan-build cross-type coercion for comparison sites. Every construct that
@@ -17,6 +19,9 @@ import { comparisonGroupCoercions, comparisonGroupIndices, crossTypeCoercion } f
  * `types/comparison-coercion.ts`, shared with the emit-time consumer
  * (`runtime/emit/operand-comparator.ts` `makeComparisonGroup`) that serves the
  * builtins which return one of their arguments and so cannot be rewritten here.
+ *
+ * It also owns the one non-comparison argument rewrite, {@link coerceTextArgs}, which
+ * converts a function's declared text arguments with a user-equivalent cast.
  */
 
 /**
@@ -91,11 +96,38 @@ export function coerceComparisonGroup(
 	valueIdx.forEach((argIdx, j) => { args[argIdx] = values[j]; });
 }
 
-/** Create a synthetic CastNode wrapping `operand` with the given target type name. */
+/**
+ * Convert each argument a scalar function declares as text
+ * ({@link import('../../schema/function.js').BaseFunctionSchema.textArgs}) whose static
+ * type is not physically TEXT, by wrapping it in `cast(<arg> as text)` — so
+ * `upper(x'6162')` runs as `upper(cast(x'6162' as text))` and every string builtin
+ * shares the one value-to-text rule (`util/value-text.ts`). Mutates `args` in place.
+ *
+ * The cast is NOT synthetic: it is the user-visible conversion `cast(x as text)`
+ * (`lenientCast`), not a comparison operand (`comparandConverter`), and analyses must
+ * not look through it to the operand's own type.
+ */
+export function coerceTextArgs(
+	scope: Scope,
+	textArgs: 'all' | readonly number[],
+	args: ScalarPlanNode[],
+): void {
+	for (const i of comparisonGroupIndices(textArgs, args.length)) {
+		if (args[i].getType().logicalType.physicalType !== PhysicalType.TEXT) {
+			args[i] = wrapInCast(scope, args[i], TEXT_TYPE.name, false);
+		}
+	}
+}
+
+/**
+ * Create a planner-minted CastNode wrapping `operand` with the given target type name.
+ * `synthetic` (default) marks a comparison-operand coercion — see {@link CastNode.synthetic}.
+ */
 export function wrapInCast(
 	scope: Scope,
 	operand: ScalarPlanNode,
 	targetType: string,
+	synthetic = true,
 ): CastNode {
 	// Synthesise an AST.CastExpr. `targetType` is the only field CastNode itself
 	// reads, but `formatExpression` renders a node from its AST rather than from
@@ -107,5 +139,5 @@ export function wrapInCast(
 		expr: operand.expression,
 		targetType,
 	};
-	return new CastNode(scope, syntheticExpr, operand, true);
+	return new CastNode(scope, syntheticExpr, operand, synthetic);
 }

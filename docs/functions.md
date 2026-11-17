@@ -107,8 +107,8 @@ to `1`, but `0` is never a result). Storage class survives too:
 
 | Function | Args | Returns | Description |
 |---|---|---|---|
-| `lower(X)` | 1 | TEXT | Lowercase. `NULL` if not a string |
-| `upper(X)` | 1 | TEXT | Uppercase. `NULL` if not a string |
+| `lower(X)` | 1 | TEXT | Lowercase |
+| `upper(X)` | 1 | TEXT | Uppercase |
 | `length(X)` | 1 | INTEGER | Character count (TEXT) or byte count (BLOB) |
 | `substr(X, Y, Z?)` | 2-3 | TEXT | Substring starting at position Y (1-based), Z chars long |
 | `substring(X, Y, Z?)` | 2-3 | TEXT | Alias for `substr` |
@@ -116,25 +116,16 @@ to `1`, but `0` is never a result). Storage class survives too:
 | `ltrim(X, Y?)` | 1-2 | TEXT | Remove leading chars |
 | `rtrim(X, Y?)` | 1-2 | TEXT | Remove trailing chars |
 | `replace(X, Y, Z)` | 3 | TEXT | Replace all occurrences of Y in X with Z. Case-sensitive |
-| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` |
+| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL`. Over two blobs this is a character position in their decoded text, not SQLite's byte position |
 | `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
-| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL`. A non-text operand is rendered through the one value-to-text conversion first (see [types.md § Value to text](types.md#value-to-text)) |
-| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL`. Operands render the same way `like` renders them |
+| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
+| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
 | `hex(X)` | 1 | TEXT | Uppercase hex spelling of X's bytes, no separator. A non-blob argument converts to bytes first, the same path `cast(X as blob)` takes |
 | `unhex(X)` | 1 | BLOB | Parses a hex string into bytes. `NULL` (not an error) if X is not a whole number of hex digit pairs |
 
-`hex`/`unhex` are on the one *blob* conversion (`hex` converts a non-blob argument through
-the same path `cast(X as blob)` takes; see [types.md § Binary types](types.md#binary-types)), so they are
-not part of the divergence below.
-
-The rest of the table above is **not** yet on the one value-to-text conversion. Given a
-non-text argument, `substr`/`substring`, `trim`/`ltrim`/`rtrim`, `replace` and `instr`
-still use JavaScript's own stringification (a BLOB becomes its comma-joined byte numbers,
-`97,98`), while `lower`, `upper`, `reverse`, `lpad` and `rpad` return `NULL` instead. Pass
-`text(X)` explicitly if the argument may not be text. Tracked as
-`debt-string-builtins-coerce-three-different-ways`.
+Every string argument of these functions reads a non-text value through the one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)), so `f(x)` is `f(cast(x as text))`: `upper(x'6162')` is `'AB'`, `lpad(5, 3, 0)` is `'005'`. A number argument (`substr`'s start and length, the pad length) is not converted. The exceptions are deliberate: `length` reports bytes for a BLOB and characters for TEXT, which converting would erase; `hex`/`unhex` are on the one *blob* conversion (`hex` converts a non-blob argument through the same path `cast(X as blob)` takes; see [types.md § Binary types](types.md#binary-types)), and `unhex` returns `NULL` for a non-text argument.
 
 ```sql
 select lower('Quereus');             -- 'quereus'
@@ -152,7 +143,7 @@ select unhex('cafe');               -- x'cafe'
 
 ### String Table-Valued Function
 
-**`split_string(str, delimiter)`** -- Splits a string into rows.
+**`split_string(str, delimiter)`** -- Splits a string into rows. A non-text argument converts the way `cast(x as text)` does; no rows if either argument is `NULL`.
 
 | Column | Type | Description |
 |---|---|---|
@@ -166,7 +157,7 @@ select value from split_string('a,b,c', ',');
 
 ### String Aggregate
 
-**`string_concat(X)`** -- Concatenates all non-NULL string values with commas.
+**`string_concat(X)`** -- Concatenates all non-NULL values with commas, each rendered as text the way `group_concat` renders it.
 
 ```sql
 select string_concat(name) from users;

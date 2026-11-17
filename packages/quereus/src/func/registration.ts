@@ -65,6 +65,10 @@ interface ScalarFuncOptions {
 	 *  coerces at emit time instead of being rewritten with plan-time casts. See
 	 *  {@link import('../schema/function.js').BaseFunctionSchema.returnsArg}. */
 	returnsArg?: boolean;
+	/** Argument positions this function reads as text (`'all'` for a variadic function);
+	 *  the planner converts each one with `cast(<arg> as text)`. See
+	 *  {@link import('../schema/function.js').BaseFunctionSchema.textArgs}. */
+	textArgs?: 'all' | readonly number[];
 }
 
 /**
@@ -398,6 +402,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		hidden: options.hidden,
 		comparesArgs: options.comparesArgs,
 		returnsArg: options.returnsArg,
+		textArgs: options.textArgs,
 	});
 }
 

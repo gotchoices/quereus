@@ -524,13 +524,13 @@ select lower('hello') as r;
 select upper('HELLO') as r;
 → [{"r":"HELLO"}]
 
--- Kill: lower on non-string returns null (not coerced)
+-- Kill: lower on a non-text argument reads it as cast(x as text), not NULL
 select lower(v_int) as r from mk where id = 4;
-→ [{"r":null}]
+→ [{"r":"42"}]
 
--- Kill: upper on non-string returns null
+-- Kill: upper on a non-text argument reads it as cast(x as text), not NULL
 select upper(v_int) as r from mk where id = 4;
-→ [{"r":null}]
+→ [{"r":"42"}]
 
 -- ============================================================
 -- string.ts: reverse
