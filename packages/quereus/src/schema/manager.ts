@@ -15,7 +15,7 @@ import { requireRegisteredTypeName } from '../types/registry.js';
 import { buildColumnIndexMap, columnDefToSchema, columnTypeSubject, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
-import type { ResolveColumnInSource } from './rename-rewriter.js';
+import type { ResolveColumnInSource } from './rename/shared.js';
 import { collectGeneratedColumnRefs } from './generated-column-refs.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
@@ -259,8 +259,9 @@ const unconsultedColumnResolver: ResolveColumnInSource = () => false;
  * mutation-context variables, and the sources a FROM inside the DEFAULT selects from —
  * never the row through its own table name. So `<table>.<column>` (with or without the
  * schema), a qualifier nothing binds (`zz.x`, `old.x`), and `context.<name>` of an
- * undeclared variable would fail every insert that uses the default. The classifier is the generated-column one, which tracks the FROM
- * frames of subqueries, so a correlated `t.b` inside one is caught as well; a reference
+ * undeclared variable would fail every insert that uses the default. The classifier is
+ * the generated-column one, which tracks the FROM frames of subqueries, so a correlated
+ * `t.b` inside one is caught as well; a reference
  * it cannot decide (an opaque source intervenes) is left for INSERT to judge.
  *
  * Unqualified names are the caller's concern: a bare name may be a context variable.

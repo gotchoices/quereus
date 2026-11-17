@@ -146,7 +146,12 @@ determinism checks).
   exception — it explicitly reads a sibling value the INSERT supplies, so it
   passes the pre-walk and its build/determinism check is deferred to INSERT
   time (no row scope at CREATE TABLE), alongside the deferrals for
-  mutation-context identifiers and self-referencing subqueries.
+  mutation-context identifiers and self-referencing subqueries. A second,
+  scope-aware pre-walk (the generated-column reference classifier) rejects,
+  at any subquery depth and with or without a mutation context, a qualified
+  reference to the row through its own table name (`t.b`, `main.t.b`) and a
+  qualifier nothing binds (`zz.x`, `old.x`, `context.<name>` of an undeclared
+  variable) — neither can resolve at INSERT time.
 - DEFAULT expressions are then built and rejected if their physical
   `deterministic` property is false (e.g. `random()`).
 - CHECK constraints are walked at DDL time: any function call is rejected
@@ -165,7 +170,8 @@ determinism checks).
 
 `ALTER TABLE … ALTER COLUMN … SET DEFAULT` routes the new default through the
 **same** validator (`SchemaManager.validateAlterColumnDefault`): bind
-parameters / bare columns / non-determinism are rejected at `ALTER` time, and a
+parameters / bare columns / own-table and unbound qualified references /
+non-determinism are rejected at `ALTER` time, and a
 `new.<column>` default is accepted with the build/determinism check deferred to
 INSERT time. `ALTER TABLE ADD COLUMN` routes its default through the same shared
 validator (`SchemaManager.validateAddColumnDefault`, at plan-build time), so a
