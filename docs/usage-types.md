@@ -265,6 +265,10 @@ console.log(typeof small.value); // "number"
 const large = await db.prepare("select 9007199254740992 as value").get();
 console.log(typeof large.value); // "bigint"
 
+// Integer + - * stays exact past the safe range: the result widens to bigint
+const product = await db.prepare("select 9007199254740991 * 3 as value").get();
+console.log(product.value); // 27021597764222973n
+
 // You can pass bigint as parameters
 await db.exec("insert into counters (id, count) values (?, ?)",
   [1, 9007199254740992n]);
