@@ -65,9 +65,12 @@ import type { RuntimeContext } from '../types.js';
  * (`SchemaManager.createTable` / `createIndex` / `dropIndex` / `dropTable` / `createBackingTable`),
  * and the only post-emit work any DDL emitter still does — `dropMaintainedTable`'s
  * `materialized_view_removed` notify — cannot throw, because `SchemaChangeNotifier.notifyChange`
- * swallows listener errors. If a DDL emitter ever gains work that runs AFTER a catalog change
- * landed and can throw, this scope would un-announce a change the catalog kept; that arm needs
- * the carve-out treatment (its own inner scope, or no scope), not a wider one.
+ * swallows listener errors. Its one throwing step, the pre-dispatch check that an announced
+ * table is the registered one (docs/schema.md § Event Types), skips removal events and throws
+ * only INTERNAL — a bug in the announcing code, not a listener failure. If a DDL emitter ever
+ * gains work that runs AFTER a catalog change landed and can throw, this scope would
+ * un-announce a change the catalog kept; that arm needs the carve-out treatment (its own inner
+ * scope, or no scope), not a wider one.
  *
  * The one nesting today is `apply schema`: its own mark encloses the scope of every generated
  * sub-statement (forward steps and undo statements alike). A restored apply's outer discard

@@ -1373,8 +1373,7 @@ export async function attachMaintainedDerivation(
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
 				moduleMutated = true;
 			}
-			live = graftReshapedRecord(current, maintained);
-			schema.addTable(live);
+			live = schema.addTable(graftReshapedRecord(current, maintained));
 		}
 
 		// Materialize the durable backing store the reconcile will write into,
@@ -1450,8 +1449,7 @@ export async function attachMaintainedDerivation(
 			await db._commitConnectionEarly(conn, () => { reconcileCommitted = true; });
 			for (const op of reshapePlan.postReconcileOps) {
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
-				live = graftReshapedRecord(current, maintained);
-				schema.addTable(live);
+				live = schema.addTable(graftReshapedRecord(current, maintained));
 			}
 		}
 
@@ -2749,8 +2747,7 @@ async function reshapeBackingInPlace(
 	mv.derivation.coarsenedKey = shape.coarsenedKey;
 	mv.derivation.ordering = shape.ordering;
 	adoptShapeSources(mv.derivation, shape);
-	let live: MaintainedTableSchema = graftReshapedRecord(current, mv);
-	schema.addTable(live);
+	let live = schema.addTable(graftReshapedRecord(current, mv));
 
 	// Data reconcile: re-run the body and swap contents (the identity-preserving
 	// data-only path — same host, same incarnation). The column preview lets that
@@ -2785,8 +2782,7 @@ async function reshapeBackingInPlace(
 	// previewed and keeps validating right here — see previewReshapedColumns.
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
-		live = graftReshapedRecord(current, mv);
-		schema.addTable(live);
+		live = schema.addTable(graftReshapedRecord(current, mv));
 	}
 
 	// One engine-level event for the whole reshape: invalidate cached plans scanning
@@ -3361,8 +3357,7 @@ async function renameShiftedBackingColumns(
 		// The module's alterTable returns a fresh TableSchema that does NOT carry
 		// the derivation or the catalog-only tags — re-graft both so the registered
 		// record stays maintained and keeps its tags.
-		const renamed: TableSchema = graftReshapedRecord(current, mv);
-		schema.addTable(renamed);
+		const renamed = schema.addTable(graftReshapedRecord(current, mv));
 		db.schemaManager.getChangeNotifier().notifyChange({
 			type: 'table_modified',
 			schemaName: mv.schemaName,

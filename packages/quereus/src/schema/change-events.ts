@@ -3,6 +3,8 @@ import type { FunctionSchema } from './function.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import type { ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
+import { QuereusError } from '../common/errors.js';
+import { StatusCode } from '../common/types.js';
 
 const log = createLogger('schema:change-events');
 
@@ -165,11 +167,68 @@ export type SchemaChangeEvent =
  */
 export type SchemaChangeListener = (event: SchemaChangeEvent) => void;
 
+/** Looks up the catalog's current table entry; `undefined` when none is registered. */
+export type RegisteredTableLookup = (schemaName: string, tableName: string) => TableSchema | undefined;
+
+/**
+ * The table definition an event claims the catalog now holds, or `undefined` for an
+ * event that makes no such claim. Removal events are excluded on purpose: their payload
+ * is leaving the catalog, and a detach re-registers the table without its derivation,
+ * so the departing object is legitimately not the registered one.
+ */
+function announcedRegisteredTable(event: SchemaChangeEvent): TableSchema | undefined {
+	switch (event.type) {
+		case 'table_added':
+		case 'table_modified':
+		case 'materialized_view_added':
+		case 'materialized_view_modified':
+			return event.newObject;
+		case 'materialized_view_refreshed':
+			return event.object;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Every announced table definition must be the very object the catalog holds under
+ * that name (docs/schema.md § Event Types, "Registered-object contract"). Listeners
+ * cache the payload — the store module keeps it as its working copy and builds later
+ * ALTER results from it — so announcing anything else (typically the pre-
+ * `Schema.addTable` object, when registration corrected it) puts the uncorrected
+ * definition back into the catalog on the next ALTER.
+ *
+ * Reference equality, not a structural compare: it is the exact property listeners
+ * rely on, and needs no deep compare of ASTs and maps.
+ *
+ * @throws QuereusError (`INTERNAL`) when no table is registered under the event's name,
+ *   or a different object is — either is a bug in the announcing path
+ */
+export function assertAnnouncedTableIsRegistered(event: SchemaChangeEvent, lookup: RegisteredTableLookup): void {
+	const announced = announcedRegisteredTable(event);
+	if (!announced) return;
+	const registered = lookup(event.schemaName, event.objectName);
+	if (registered === announced) return;
+	const problem = registered
+		? 'a different object is registered under that name; announce the value Schema.addTable returned'
+		: 'no table is registered under that name';
+	throw new QuereusError(
+		`Schema change '${event.type}' for '${event.schemaName}.${event.objectName}' announces a table definition the catalog does not hold: ${problem}`,
+		StatusCode.INTERNAL,
+	);
+}
+
 /**
  * Manages schema change listeners and notifications.
  */
 export class SchemaChangeNotifier {
 	private listeners = new Set<SchemaChangeListener>();
+
+	/**
+	 * @param verify Run on every event before any listener sees it, outside the
+	 *   per-listener error trap, so a violation throws to the announcing code.
+	 */
+	constructor(private readonly verify?: (event: SchemaChangeEvent) => void) {}
 
 	/**
 	 * Adds a schema change listener.
@@ -192,9 +251,13 @@ export class SchemaChangeNotifier {
 	}
 
 	/**
-	 * Notifies all listeners of a schema change event.
+	 * Notifies all listeners of a schema change event. Listener errors are logged and
+	 * swallowed; only the constructor's `verify` hook can throw.
 	 */
 	notifyChange(event: SchemaChangeEvent): void {
+		// NOTE: checked once before dispatch; if a listener ever re-registers the announced
+		// table, later listeners receive a superseded object.
+		this.verify?.(event);
 		log('Notifying %d listeners of schema change: %s %s',
 			this.listeners.size, event.type, event.objectName);
 

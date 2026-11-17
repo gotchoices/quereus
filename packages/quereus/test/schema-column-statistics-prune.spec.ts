@@ -20,6 +20,8 @@ import { Database } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
 import { pruneStaleColumnStatistics, type TableSchema } from '../src/schema/table.js';
 import type { ColumnStatistics, TableStatistics } from '../src/planner/stats/catalog-stats.js';
+import { QuereusError } from '../src/common/errors.js';
+import { StatusCode } from '../src/common/types.js';
 
 function colStats(distinctCount: number): ColumnStatistics {
 	return { distinctCount, nullCount: 0, minValue: 0, maxValue: distinctCount - 1 };
@@ -119,6 +121,22 @@ describe('column statistics never outlive their columns', () => {
 			schema.addTable(withStats(mixed, { mixed: colStats(7), gone: colStats(3) }));
 
 			assert.deepEqual([...schema.getTable('m')!.statistics!.columnStats.keys()], ['mixed']);
+		});
+	});
+
+	describe('announcing a table definition', () => {
+		// The notifier's pre-dispatch check is what keeps a caller from announcing the
+		// object it handed to `addTable` instead of the one `addTable` registered; this
+		// proves it is wired into every database's notifier.
+		it('rejects an announcement whose payload is not the registered object', () => {
+			const announce = () => db.schemaManager.getChangeNotifier().notifyChange({
+				type: 'table_modified',
+				schemaName: 'main',
+				objectName: 't',
+				oldObject: base,
+				newObject: { ...base },
+			});
+			assert.throws(announce, (e: unknown) => e instanceof QuereusError && e.code === StatusCode.INTERNAL);
 		});
 	});
 

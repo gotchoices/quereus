@@ -115,14 +115,14 @@ async function runAddCheckEngineSide(
 		checkConstraints: Object.freeze(updatedConstraints),
 	};
 
-	schema.addTable(updatedTableSchema);
+	const registeredSchema = schema.addTable(updatedTableSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema
+		newObject: registeredSchema
 	});
 
 	// A module with no `alterTable` hook is exactly the backend this fallback exists for, so

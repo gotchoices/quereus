@@ -300,7 +300,7 @@ async function runRenameTable(
 
 	// Remove old, add new in the catalog
 	schema.removeTable(oldName);
-	schema.addTable(renamedTableSchema);
+	const registeredRenamed = schema.addTable(renamedTableSchema);
 
 	// Snapshot which MVs are stale BEFORE this statement's first schema-change
 	// notify: the MV propagation below restores staleness set by this very
@@ -314,7 +314,7 @@ async function runRenameTable(
 		schemaName: tableSchema.schemaName,
 		objectName: newName,
 		oldObject: tableSchema,
-		newObject: renamedTableSchema,
+		newObject: registeredRenamed,
 	});
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
@@ -327,9 +327,20 @@ async function runRenameTable(
 	// re-key: the row-time plan is keyed by `schema.name`, so release the old key
 	// and re-register under the new one, then move the persisted MV catalog entry
 	// (`materialized_view_removed` old name → `materialized_view_added` new name).
-	if (isMaintainedTable(renamedTableSchema)) {
+	if (isMaintainedTable(registeredRenamed)) {
+		// `propagateTableRename` walks the just-renamed table too and re-registers it when
+		// a self-referencing FK / CHECK or the MV body pass rewrites it, so the object
+		// registered above may already be superseded — register and announce what the
+		// catalog holds now.
+		const current = schema.getTable(newName);
+		if (!isMaintainedTable(current)) {
+			throw new QuereusError(
+				`Renamed materialized view '${tableSchema.schemaName}.${newName}' lost its registration during rename propagation`,
+				StatusCode.INTERNAL,
+			);
+		}
 		rctx.db.unregisterMaterializedView(tableSchema.schemaName, oldName);
-		rctx.db.registerMaterializedView(renamedTableSchema);
+		rctx.db.registerMaterializedView(current);
 		const notifier = rctx.db.schemaManager.getChangeNotifier();
 		notifier.notifyChange({
 			type: 'materialized_view_removed',
@@ -341,7 +352,7 @@ async function runRenameTable(
 			type: 'materialized_view_added',
 			schemaName: tableSchema.schemaName,
 			objectName: newName,
-			newObject: renamedTableSchema,
+			newObject: current,
 		});
 	}
 
@@ -1035,14 +1046,14 @@ async function runAddColumn(
 	}
 
 	// Every constraint validated and installed — publish the module's final schema.
-	schema.addTable(finalTableSchema);
+	const registeredSchema = schema.addTable(finalTableSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: finalTableSchema,
+		newObject: registeredSchema,
 	});
 
 	// ONE event for the whole statement, even when the column declared inline constraints.
@@ -2602,13 +2613,13 @@ function propagateTableRenameInSchema(
 		// DEFAULT / index-predicate ASTs) still name the old one and need rewriting.
 		const updated = rewriteTableForTableRename(table, targetFor);
 		if (updated !== table) {
-			schema.addTable(updated);
+			const registered = schema.addTable(updated);
 			notifier.notifyChange({
 				type: 'table_modified',
 				schemaName: schema.name,
-				objectName: updated.name,
+				objectName: registered.name,
 				oldObject: table,
-				newObject: updated,
+				newObject: registered,
 			});
 		}
 	}
@@ -2761,13 +2772,13 @@ function propagateColumnRenameInSchema(
 	for (const table of Array.from(schema.getAllTables())) {
 		const updated = rewriteTableForColumnRename(table, tableName, oldCol, newCol, resolvers, targetKey, resolveColumnInSource);
 		if (updated !== table) {
-			schema.addTable(updated);
+			const registered = schema.addTable(updated);
 			notifier.notifyChange({
 				type: 'table_modified',
 				schemaName: schema.name,
-				objectName: updated.name,
+				objectName: registered.name,
 				oldObject: table,
-				newObject: updated,
+				newObject: registered,
 			});
 		}
 	}

@@ -352,7 +352,7 @@ export function disambiguateAutoConstraintName(base: string, taken: Set<string>)
  * @param table The table schema about to be registered
  * @returns `table`, or a copy whose `statistics.columnStats` names only live columns
  */
-export function pruneStaleColumnStatistics(table: TableSchema): TableSchema {
+export function pruneStaleColumnStatistics<T extends TableSchema>(table: T): T {
 	const stats = table.statistics;
 	if (!stats || stats.columnStats.size === 0) return table;
 

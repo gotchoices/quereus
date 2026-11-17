@@ -483,7 +483,9 @@ The `SchemaChangeEvent` discriminated union includes:
 
 All events carry `schemaName` and `objectName` fields. **Naming contract:** events fire the *stored* names of the swapped object — `schemaName` is the canonical (lowercase) schema name (canonicalized on tables/views/MVs at create/import time via `SchemaManager.canonicalSchemaName`), and `objectName` is the object's stored display casing, never the raw spelling from the triggering statement. Prepared statements rely on this: `Statement.compile()` invalidates its cached plan by comparing recorded dependencies (which carry stored names) against event names **exactly**, so a raw-cased name on either side would silently miss invalidation. The same stored-name guarantee holds for the **module-facing calls** the SchemaManager makes (`create`, `connect`, `createIndex`, `dropIndex`, `destroy`, `alterTable`, `renameTable`, …) — see [module authoring § Identifier casing in module-facing calls](module-authoring.md#identifier-casing-in-module-facing-calls).
 
-Listener errors are caught and logged — a failing listener does not disrupt other listeners or the originating operation.
+**Registered-object contract:** an event that claims the catalog holds a table definition — `table_added`, `table_modified`, `materialized_view_added`, `materialized_view_modified`, `materialized_view_refreshed` — carries the very object the catalog holds under that name: the value `Schema.addTable` *returned*, which can differ from what it was handed (it prunes stale column statistics). Listeners cache the payload, so announcing anything else puts an uncorrected definition back into circulation. `notifyChange` checks this before any listener runs and throws an `INTERNAL` error on a mismatch (`assertAnnouncedTableIsRegistered` in `schema/change-events.ts`).
+
+Listener errors are caught and logged — a failing listener does not disrupt other listeners or the originating operation. Only the registered-object check above can throw out of `notifyChange`.
 
 ### Database-Level Events
 

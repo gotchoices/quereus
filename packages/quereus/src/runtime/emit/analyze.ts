@@ -139,7 +139,7 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 						log('Collected statistics for %s: %d rows', tableSchema.name, stats.rowCount);
 						// Create a new schema with statistics (honor immutability of frozen schemas)
 						const updatedTableSchema: TableSchema = { ...tableSchema, statistics: stats };
-						schema.addTable(updatedTableSchema);
+						const registeredSchema = schema.addTable(updatedTableSchema);
 						// NOTE: the named form resolves its target through resolveTableSchema at
 						// build time, so ANALYZE records a 'table' dependency on itself and this
 						// notifyChange nulls the statement's own cached plan/scheduler mid-run
@@ -152,7 +152,7 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 							schemaName: tableSchema.schemaName,
 							objectName: tableSchema.name,
 							oldObject: tableSchema,
-							newObject: updatedTableSchema,
+							newObject: registeredSchema,
 						});
 						await saveStatisticsIfSupported(vtab, tableSchema, stats);
 						report.push([tableSchema.name, stats.rowCount]);

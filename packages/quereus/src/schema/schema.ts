@@ -59,7 +59,12 @@ export class Schema {
 	 * RETURN value on**, or it propagates the very schema the catalog just corrected. That
 	 * is not hypothetical: DROP COLUMN notifying with its own copy is how a dropped
 	 * column's measurements reached the store's cached schema and were rebuilt into the
-	 * next ADD COLUMN's result.
+	 * next ADD COLUMN's result. The schema change notifier enforces this for every
+	 * table-carrying announcement (see `assertAnnouncedTableIsRegistered`).
+	 *
+	 * Generic so a maintained-table caller keeps its narrower type on the return: the
+	 * only correction is a spread that replaces `statistics`, so every other field
+	 * (including `derivation`) survives.
 	 *
 	 * @param table The table schema object
 	 * @returns The schema actually registered — `table` itself unless it needed correcting
@@ -67,7 +72,7 @@ export class Schema {
 	 *   primary-key member's definition collation disagrees with its column's, or if
 	 *   `generatedColumnTopoOrder` does not cover exactly the table's generated columns
 	 */
-	addTable(table: TableSchema): TableSchema {
+	addTable<T extends TableSchema>(table: T): T {
 		// Ensure no view conflict (maintained tables — materialized views — live
 		// in this same map, so table-name uniqueness covers them too).
 		if (this.views.has(table.name.toLowerCase())) {

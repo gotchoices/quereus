@@ -29,7 +29,7 @@ import { Parser } from '../parser/parser.js';
 import { traverseAst } from '../parser/visitor.js';
 import { findUnbuildableCall, isQueryBoundary, resolveCallSchema } from './declaration-calls.js';
 import { FunctionFlags } from '../common/constants.js';
-import { SchemaChangeNotifier } from './change-events.js';
+import { assertAnnouncedTableIsRegistered, SchemaChangeNotifier } from './change-events.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { buildExpression } from '../planner/building/expression.js';
 import type { PlanningContext } from '../planner/planning-context.js';
@@ -309,7 +309,10 @@ export class SchemaManager {
 	private defaultVTabModuleName: string = 'memory';
 	private defaultVTabModuleArgs: Record<string, SqlValue> = {};
 	private db: Database;
-	private changeNotifier = new SchemaChangeNotifier();
+	/** Rejects a table-carrying announcement whose payload is not the registered table. */
+	private changeNotifier = new SchemaChangeNotifier(
+		event => assertAnnouncedTableIsRegistered(event, (schemaName, tableName) => this.getSchema(schemaName)?.getTable(tableName)),
+	);
 	/**
 	 * Re-entrancy guard: when truthy, optimizer-side assertion hoisting is
 	 * suppressed. Set by `AssertionEvaluator` while compiling an assertion's
@@ -905,9 +908,7 @@ export class SchemaManager {
 		if (!table) {
 			throw new QuereusError(`Cannot attach derivation: table '${schemaName}.${tableName}' not found`, StatusCode.INTERNAL);
 		}
-		const maintained: MaintainedTableSchema = { ...table, derivation };
-		schema.addTable(maintained);
-		return maintained;
+		return schema.addTable<MaintainedTableSchema>({ ...table, derivation });
 	}
 
 	/**
@@ -1010,17 +1011,17 @@ export class SchemaManager {
 	 */
 	private commitTagUpdate(targetSchemaName: string, oldSchema: TableSchema, newSchema: TableSchema): void {
 		const schema = this.getSchemaOrFail(targetSchemaName);
-		schema.addTable(newSchema);
+		const registered = schema.addTable(newSchema);
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
 			// Stored names of the swapped object, not the raw ALTER args — see
 			// canonicalSchemaName for the emitter/stored-name invariant. A raw
 			// `targetSchemaName` here (e.g. `alter index MAIN.idx set tags`) would
 			// miss the table dep's stored `'main'`.
-			schemaName: newSchema.schemaName,
-			objectName: newSchema.name,
+			schemaName: registered.schemaName,
+			objectName: registered.name,
 			oldObject: oldSchema,
-			newObject: newSchema,
+			newObject: registered,
 		});
 	}
 
@@ -1368,15 +1369,15 @@ export class SchemaManager {
 		const updated: MaintainedTableSchema = { ...table, tags: compute(table.tags) };
 		// See updateViewTags: tags ride the persisted DDL, so veto before the swap.
 		assertCatalogObjectPersistable(this.db, 'materializedView', updated);
-		schema.addTable(updated);
+		const registered = schema.addTable(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',
 			// Stored names of the swapped object, not the raw ALTER args — see
 			// canonicalSchemaName for the emitter/stored-name invariant.
 			schemaName: schema.name,
-			objectName: updated.name,
+			objectName: registered.name,
 			oldObject: table,
-			newObject: updated,
+			newObject: registered,
 		});
 	}
 
@@ -2733,7 +2734,7 @@ export class SchemaManager {
 
 		const updatedTableSchema = appendIndexToTableSchema(tableSchema, indexSchema);
 		const schema = this.getSchemaOrFail(targetSchemaName);
-		schema.addTable(updatedTableSchema);
+		const registeredSchema = schema.addTable(updatedTableSchema);
 
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
@@ -2741,10 +2742,10 @@ export class SchemaManager {
 			// canonicalSchemaName for the emitter/stored-name invariant. A raw
 			// `create index … on T` (stored `t`) or an unqualified CREATE INDEX against
 			// a `MAIN.`-created table would otherwise miss the cached plan's table dep.
-			schemaName: updatedTableSchema.schemaName,
-			objectName: updatedTableSchema.name,
+			schemaName: registeredSchema.schemaName,
+			objectName: registeredSchema.name,
 			oldObject: tableSchema,
-			newObject: updatedTableSchema
+			newObject: registeredSchema
 		});
 
 		this.emitAutoSchemaEventIfNeeded(tableSchema.vtabModuleName, {
@@ -2961,7 +2962,7 @@ export class SchemaManager {
 				? Object.freeze(updatedUniqueConstraints)
 				: undefined,
 		};
-		schema.addTable(updatedTableSchema);
+		const registeredSchema = schema.addTable(updatedTableSchema);
 
 		this.changeNotifier.notifyChange({
 			type: 'table_modified',
@@ -2970,7 +2971,7 @@ export class SchemaManager {
 			schemaName: ownerTable.schemaName,
 			objectName: ownerTable.name,
 			oldObject: ownerTable,
-			newObject: updatedTableSchema
+			newObject: registeredSchema
 		});
 
 		this.emitAutoSchemaEventIfNeeded(ownerTable.vtabModuleName, {
@@ -3203,16 +3204,16 @@ export class SchemaManager {
 			validateForeignKeyCollations(this.db, completeTableSchema, fk);
 		}
 
-		schema.addTable(completeTableSchema);
+		const registeredSchema = schema.addTable(completeTableSchema);
 		log(`Successfully created table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
 
 		this.changeNotifier.notifyChange({
 			type: 'table_added',
 			// Stored names of the registered table — see canonicalSchemaName for the
 			// emitter/stored-name invariant.
-			schemaName: completeTableSchema.schemaName,
-			objectName: completeTableSchema.name,
-			newObject: completeTableSchema
+			schemaName: registeredSchema.schemaName,
+			objectName: registeredSchema.name,
+			newObject: registeredSchema
 		});
 
 		this.emitAutoSchemaEventIfNeeded(moduleName, {
@@ -3222,7 +3223,7 @@ export class SchemaManager {
 			objectName: completeTableSchema.name,
 		});
 
-		return completeTableSchema;
+		return registeredSchema;
 	}
 
 	/**
@@ -3275,14 +3276,14 @@ export class SchemaManager {
 			tableInstance, tableName, targetSchemaName, moduleName, tableSchema.vtabArgs ?? {}, moduleInfo
 		);
 
-		schema.addTable(completeTableSchema);
+		const registeredSchema = schema.addTable(completeTableSchema);
 		log(`Successfully created backing table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
 
 		this.changeNotifier.notifyChange({
 			type: 'table_added',
 			schemaName: targetSchemaName,
 			objectName: tableName,
-			newObject: completeTableSchema
+			newObject: registeredSchema
 		});
 
 		this.emitAutoSchemaEventIfNeeded(moduleName, {
@@ -3292,7 +3293,7 @@ export class SchemaManager {
 			objectName: tableName,
 		});
 
-		return completeTableSchema;
+		return registeredSchema;
 	}
 
 	/**
