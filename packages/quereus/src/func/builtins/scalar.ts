@@ -38,8 +38,9 @@ function findCommonType(types: ReadonlyArray<DeepReadonly<LogicalType>>): DeepRe
 /**
  * abs, floor, ceil and one-argument round keep their argument's type and are NULL
  * only for a NULL argument or one `Number()` cannot convert. Each answers a `bigint`
- * without converting it, so an integer past the double range cannot become Infinity
- * (which they would turn into NULL).
+ * without converting it, so an out-of-safe-range integer keeps its low digits. A REAL
+ * value can be ±Infinity (`1e999` is a REAL literal, and storable in a `real not null`
+ * column), so each passes ±Infinity through rather than nulling it.
  */
 const numericPreservingReturn = nullPropagatingReturn({
 	logicalType: argTypes => argTypes[0],
@@ -60,20 +61,23 @@ export const absFunc = createScalarFunction(
 		if (arg === null) return null;
 		if (typeof arg === 'bigint') return arg < 0n ? -arg : arg;
 		const num = Number(arg);
-		if (!Number.isFinite(num)) return null;
+		if (isNaN(num)) return null;
 		return Math.abs(num);
 	}
 );
 
 // --- round(X, Y?) ---
 
-/** `x` rounded to `places` decimal places, or null when that is not a finite double. */
+/**
+ * `x` (not NaN) rounded to `places` decimal places; ±Infinity is returned unchanged. Null
+ * only when rounding a finite `x` carries it past the double range.
+ */
 function roundToPlaces(x: number, places: number): number | null {
 	const factor = Math.pow(10, places);
 	const scaled = x * factor;
-	// Overflow (or `factor` itself Infinity): x has no digit at the 10^-places position
-	// a double can hold, so it is already rounded there.
-	if (!Number.isFinite(scaled)) return Number.isFinite(x) ? x : null;
+	// Overflow (or `factor` itself Infinity): finite x has no digit at the 10^-places
+	// position a double can hold, so it is already rounded there; ±Infinity stays itself.
+	if (!Number.isFinite(scaled)) return x;
 	// 10^places underflowed to 0: every finite x rounds to 0 at that magnitude.
 	if (factor === 0) return 0;
 	const rounded = Math.round(scaled) / factor;
@@ -380,7 +384,7 @@ export const floorFunc = createScalarFunction(
 		if (arg === null) return null;
 		if (typeof arg === 'bigint') return arg;
 		const num = Number(arg);
-		if (!Number.isFinite(num)) return null;
+		if (isNaN(num)) return null;
 		return Math.floor(num);
 	}
 );
@@ -391,7 +395,7 @@ const ceil = (arg: SqlValue): SqlValue => {
 	if (arg === null) return null;
 	if (typeof arg === 'bigint') return arg;
 	const num = Number(arg);
-	if (!Number.isFinite(num)) return null;
+	if (isNaN(num)) return null;
 	return Math.ceil(num);
 };
 

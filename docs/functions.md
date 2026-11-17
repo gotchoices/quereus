@@ -44,7 +44,7 @@ select json('{"x":1}');      -- {"x":1}  (native object)
 |---|---|---|---|
 | `abs(X)` | 1 | numeric | Absolute value. Preserves input type (INTEGER/REAL/BIGINT) |
 | `round(X)` | 1 | numeric | Round to nearest integer |
-| `round(X, Y)` | 2 | numeric | Round X to Y decimal places |
+| `round(X, Y)` | 2 | numeric | Round X to Y decimal places (Y may be negative). `NULL` if rounding carries X past the REAL range (`round(1.7e308, -308)`) |
 | `sqrt(X)` | 1 | REAL | Square root. `NULL` if negative |
 | `pow(X, Y)` | 2 | REAL | X raised to power Y |
 | `power(X, Y)` | 2 | REAL | Alias for `pow` |

@@ -23,8 +23,8 @@ Scalar functions operate on single values and return a single value per row.
 - `rtrim(X[, Y])`: Removes trailing characters Y from X
 - `replace(X, Y, Z)`: Replaces all occurrences of Y in X with Z
 - `instr(X, Y)`: Returns the 1-based position of the first occurrence of Y in X
-- `lpad(X, Y[, Z])`: Left-pads string X to length Y with string Z (default space)
-- `rpad(X, Y[, Z])`: Right-pads string X to length Y with string Z (default space)
+- `lpad(X, Y, Z)`: Left-pads string X to length Y with string Z
+- `rpad(X, Y, Z)`: Right-pads string X to length Y with string Z
 - `reverse(X)`: Returns string X with characters in reverse order
 - `like(pattern, X)`: Returns BOOLEAN — `true` if X matches `pattern`, `false` otherwise, `NULL` if either argument is `NULL`
 - `glob(pattern, X)`: Returns BOOLEAN — `true` if X matches glob `pattern`, `false` otherwise, `NULL` if either argument is `NULL`

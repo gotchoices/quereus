@@ -258,6 +258,21 @@ describe('Announced result-column types match produced values', () => {
 		});
 	});
 
+	describe('numeric builtins over a stored ±Infinity', () => {
+		// A REAL value can be ±Infinity (`1e999` is a REAL literal), so a function that
+		// preserves its argument's type must pass it through, not null it under a
+		// non-null announcement.
+		it('announce non-null and yield a value', async () => {
+			await db.exec('create table inf (id integer primary key, x real not null)');
+			await db.exec('insert into inf values (1, 1e999), (2, -1e999)');
+			for (const fn of ['abs(x)', 'floor(x)', 'ceil(x)', 'round(x)']) {
+				const sql = `select ${fn} as v from inf`;
+				expect(await announcedNullable(sql), sql).to.equal(false);
+				for await (const row of db.eval(sql)) expect(row.v, sql).to.not.equal(null);
+			}
+		});
+	});
+
 	// Generated from the registry so a builtin added later is covered without editing
 	// this test. Covers the NULL-argument half of "announced non-null ⇒ never NULL"; a
 	// non-null argument the implementation refuses is left to the statement-egress check.
