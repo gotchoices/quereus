@@ -2570,7 +2570,8 @@ export class SchemaManager {
 	/**
 	 * Rejects a CHECK / GENERATED body containing a call the write-time build is
 	 * certain to refuse ({@link findUnbuildableCall}: an unknown function or wrong
-	 * argument count, an unknown window function, an aggregate outside any subquery),
+	 * argument count, an unknown window function, an aggregate outside any subquery,
+	 * an unknown table-valued function in a subquery's FROM),
 	 * so the table is refused where it is written rather than on every later write.
 	 * A resolution check like the bind-parameter pre-walk, not a determinism check,
 	 * so `nondeterministic_schema` does not lift it.
@@ -2613,7 +2614,7 @@ export class SchemaManager {
 				if (offendingExpr) return false;
 				if (node.type !== 'function') return;
 				const fnNode = node as AST.FunctionExpr;
-				const funcSchema = resolveCallSchema(findFunction, fnNode);
+				const funcSchema = resolveCallSchema(findFunction, fnNode.name, fnNode.args.length);
 				if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
 					offendingExpr = fnNode;
 					return false;

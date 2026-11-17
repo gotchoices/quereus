@@ -205,3 +205,20 @@ create table t_unknown_nondet (id integer primary key, a integer check (nosuchfn
 -- error: Function not found: nosuchfn/1
 
 pragma nondeterministic_schema = false;
+
+create table t_unknown_tvf (id integer primary key, a integer, check (exists (select 1 from nosuchtvf(a))));
+-- error: Function not found: nosuchtvf/1
+
+-- The walk resolves calls only, never table references: a subquery naming a table created
+-- later, a window function and an aggregate inside a subquery all still declare and write.
+create table t_fwd_check (
+    id integer primary key,
+    a integer,
+    check (a in (select v from t_fwd_later)),
+    check ((select count(*) from (select row_number() over (order by v) as rn from t_fwd_later) w) >= 1)
+);
+create table t_fwd_later (v integer primary key);
+insert into t_fwd_later values (1);
+insert into t_fwd_check values (1, 1);
+select a from t_fwd_check;
+→ [{"a":1}]

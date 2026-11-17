@@ -1,6 +1,6 @@
 import type * as AST from '../parser/ast.js';
 import { traverseAst } from '../parser/visitor.js';
-import { isAggregateFunctionSchema, type FunctionSchema } from './function.js';
+import { isAggregateFunctionSchema, isTableValuedFunctionSchema, type FunctionSchema } from './function.js';
 import { resolveWindowFunction } from './window-function.js';
 
 /** The registry lookup the gates resolve against — `SchemaManager.findFunction`. */
@@ -8,7 +8,7 @@ export type FindFunction = (name: string, nArg: number) => FunctionSchema | unde
 
 /** A call in a declaration body that the write-time build is certain to refuse. */
 export interface UnbuildableCall {
-	node: AST.FunctionExpr;
+	node: AST.FunctionExpr | AST.FunctionSource;
 	/** Worded as the builder words the same refusal, so both surfaces read alike. */
 	reason: string;
 }
@@ -28,8 +28,8 @@ export function isQueryBoundary(node: AST.AstNode): boolean {
  * then a variadic (`-1`) registration. Mirrors `resolveFunctionSchema` in
  * `planner/building/schema-resolution.ts`, which the write-time build uses.
  */
-export function resolveCallSchema(findFunction: FindFunction, call: AST.FunctionExpr): FunctionSchema | undefined {
-	return findFunction(call.name, call.args.length) ?? findFunction(call.name, -1);
+export function resolveCallSchema(findFunction: FindFunction, name: string, argCount: number): FunctionSchema | undefined {
+	return findFunction(name, argCount) ?? findFunction(name, -1);
 }
 
 /**
@@ -40,7 +40,9 @@ export function resolveCallSchema(findFunction: FindFunction, call: AST.Function
  * - a window call naming no registered window function (window calls resolve
  *   against their own registry, so their inner call is not looked up as a plain one);
  * - an aggregate call outside every subquery — the body is evaluated per row, so
- *   the build refuses it there, while `(select count(*) from …)` is legitimate.
+ *   the build refuses it there, while `(select count(*) from …)` is legitimate;
+ * - a subquery's `from f(…)` naming no registered table-valued function
+ *   (`buildTableFunctionCall` resolves it the same way and refuses a scalar one).
  *
  * Purely a resolution check — it walks the AST because the body's own column
  * references have no scope yet, and it never inspects table references, so a
@@ -63,6 +65,9 @@ export function findUnbuildableCall(expr: AST.AstNode, findFunction: FindFunctio
 			} else if (node.type === 'function' && !windowCalls.has(node as AST.FunctionExpr)) {
 				found = checkPlainCall(node as AST.FunctionExpr, findFunction, subqueryDepth === 0);
 				if (found) return false;
+			} else if (node.type === 'functionSource') {
+				found = checkTableFunctionSource(node as AST.FunctionSource, findFunction);
+				if (found) return false;
 			}
 			if (isQueryBoundary(node)) subqueryDepth += 1;
 		},
@@ -74,12 +79,25 @@ export function findUnbuildableCall(expr: AST.AstNode, findFunction: FindFunctio
 }
 
 function checkPlainCall(call: AST.FunctionExpr, findFunction: FindFunction, atRowLevel: boolean): UnbuildableCall | undefined {
-	const schema = resolveCallSchema(findFunction, call);
+	const schema = resolveCallSchema(findFunction, call.name, call.args.length);
 	if (!schema) {
 		return { node: call, reason: `Function not found: ${call.name}/${call.args.length}` };
 	}
 	if (atRowLevel && isAggregateFunctionSchema(schema)) {
 		return { node: call, reason: `Aggregate function ${call.name} not allowed in this context` };
+	}
+	return undefined;
+}
+
+function checkTableFunctionSource(source: AST.FunctionSource, findFunction: FindFunction): UnbuildableCall | undefined {
+	const name = source.name.name;
+	const argCount = source.args.length;
+	const schema = resolveCallSchema(findFunction, name, argCount);
+	if (!schema) {
+		return { node: source, reason: `Function not found: ${name}/${argCount}` };
+	}
+	if (!isTableValuedFunctionSchema(schema)) {
+		return { node: source, reason: `Function ${name}/${argCount} is not a table-valued function` };
 	}
 	return undefined;
 }

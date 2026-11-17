@@ -158,7 +158,8 @@ determinism checks).
 - CHECK constraints are walked at DDL time. Every function call must
   resolve in the registry the way the write-time build resolves it (by name
   and argument count, falling back to a variadic registration; a window call
-  against the window-function registry), and an aggregate call is rejected
+  against the window-function registry; a subquery's `from f(…)` to a
+  table-valued function), and an aggregate call is rejected
   outside a subquery, since the body is evaluated per row — these hold in
   both `nondeterministic_schema` modes, so `check (nosuchfn(a) > 0)` or
   `check (abs(a, a) > 0)` is refused at CREATE TABLE instead of failing
