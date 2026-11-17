@@ -954,9 +954,7 @@ dispatches on the runtime value and cannot see the declared type. And because
 the UTF-8 decode; that is a stored value, not just a display, and it is lossy for
 non-UTF-8 bytes.
 
-Number spelling stays JavaScript's: `cast(1.0 as text)` is `1` where SQLite gives
-`1.0`, and non-finite values give `Infinity`/`NaN` where SQLite gives `Inf`. That is
-a separate divergence, tracked on its own.
+Number spelling stays JavaScript's, by decision: `cast(1.0 as text)` is `1` where SQLite gives `1.0`, and non-finite values give `Infinity`/`NaN` where SQLite gives `Inf`. A REAL `1.0` and an INTEGER `1` are the same runtime value (rules R1/R2), and the conversion dispatches on the value alone, so it cannot produce `1.0` without making two equal values render differently depending on plan-time type inference. `Infinity` is kept over `Inf` because it round-trips: `REAL_TYPE.parse` reads `'Infinity'` back as Infinity, while `cast('Inf' as real)` is `0`. Revisit if REAL and INTEGER ever get distinct runtime forms.
 
 Behaviour is pinned in `test/logic/03.6.2-value-to-text.sqllogic` (SQL-visible) and
 `test/util/value-text.spec.ts` (per-type table).

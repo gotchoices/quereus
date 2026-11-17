@@ -28,7 +28,7 @@ describe('valueToText', () => {
 		expect(valueToText(123)).to.equal('123');
 		expect(valueToText(3.14)).to.equal('3.14');
 		expect(valueToText(-2.5)).to.equal('-2.5');
-		// Deliberate SQLite divergence, tracked separately: SQLite gives '1.0' / 'Inf'.
+		// Accepted SQLite divergence (see the NOTE in value-text.ts): SQLite gives '1.0' / 'Inf'.
 		expect(valueToText(1.0)).to.equal('1');
 		expect(valueToText(Infinity)).to.equal('Infinity');
 		expect(valueToText(NaN)).to.equal('NaN');

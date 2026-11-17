@@ -54,10 +54,11 @@ function decodeUtf8(bytes: Uint8Array): string {
  * consequence is real: `JSON_TYPE.compare` is a structural deep-compare, so two
  * documents differing only in key order are *equal* yet render *different* text.
  *
- * **Number spelling stays `String(v)`**, so `cast(1.0 as text)` is `1` where SQLite
- * gives `1.0`, and non-finite values give `Infinity`/`NaN` where SQLite gives `Inf`.
- * That divergence is tracked separately (`bug-real-to-text-formatting-differs-from-sqlite`)
- * and is not this function's to fix.
+ * **Number spelling stays `String(v)`, deliberately**, so `cast(1.0 as text)` is `1`
+ * where SQLite gives `1.0`, and non-finite values give `Infinity`/`NaN` where SQLite
+ * gives `Inf`. REAL `1.0` and INTEGER `1` are one runtime value, and this conversion
+ * sees only the value, not the declared type, so it cannot tell them apart.
+ * `Infinity` is kept because it round-trips through `REAL_TYPE.parse`; `Inf` does not.
  *
  * **Total.** This never throws for a value that satisfies `SqlValue`. That is
  * load-bearing: `castCanYieldNull` (`types/cast-semantics.ts`) declares TEXT and BLOB
@@ -72,6 +73,7 @@ export function valueToText(value: SqlValue): string | null {
 	if (value === null) return null;
 	switch (typeof value) {
 		case 'string': return value;
+		// NOTE: accepted tradeoff — JS spelling, not SQLite's ('1' for 1.0, 'Infinity' not 'Inf'); REAL 1.0 and INTEGER 1 are one runtime value and 'Infinity' round-trips through REAL parse; revisit if REAL/INTEGER ever get distinct runtime forms.
 		case 'number': return String(value);
 		case 'bigint': return value.toString();
 		case 'boolean': return value ? 'true' : 'false';
