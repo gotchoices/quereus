@@ -36,15 +36,15 @@ export function emitRemoteQuery(plan: RemoteQueryNode, _ctx: EmissionContext): I
 		);
 		await assertCatalogMatchesModule(rctx.db, vtabModule, tableSchema.schemaName, tableSchema.name, table);
 
-		if (!table.executePlan) {
-			throw new QuereusError(
-				`Virtual table module for '${tableSchema.name}' does not implement executePlan() ` +
-				`despite indicating support via supports() method.`,
-				StatusCode.INTERNAL
-			);
-		}
-
 		try {
+			// Inside the try so the connected instance is still disconnected.
+			if (!table.executePlan) {
+				throw new QuereusError(
+					`Virtual table module for '${tableSchema.name}' does not implement executePlan() ` +
+					`despite indicating support via supports() method.`,
+					StatusCode.INTERNAL
+				);
+			}
 			for await (const row of table.executePlan(rctx.db, plan.source, plan.moduleCtx)) {
 				yield row;
 			}

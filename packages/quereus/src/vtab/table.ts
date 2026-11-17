@@ -93,6 +93,11 @@ export abstract class VirtualTable {
 	/** The schema (database) this table lives in, e.g. `main`. */
 	public readonly schemaName: string;
 	public errorMessage?: string;
+	/**
+	 * The layout this instance stores rows in. Optional, but when set the engine compares it with
+	 * the connecting `Database`'s catalog at every connect (runtime/stale-catalog-guard.ts), so it
+	 * must track the module's current column names, order and primary key.
+	 */
 	public tableSchema?: TableSchema;
 
 	/**

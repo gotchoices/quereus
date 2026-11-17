@@ -12,6 +12,8 @@ VirtualTableModule.alterTable(db, schemaName, tableName, change): Promise<TableS
 
 passing a `SchemaChangeInfo` discriminated union as `change` and registering the returned `TableSchema` in the catalog. This is a **module-level** hook; the engine never dispatches an `ALTER TABLE` statement through the optional per-table `VirtualTable.alterSchema` method. That method survives for *in-process wrappers* that own a table instance directly — the isolation layer forwards a change to a connection's overlay table through it. Such a caller may pass `alterSchema(change, /* validateOnly */ true)`, which must run every pre-mutation validation the change would run, throw exactly what the real application would throw, and **mutate nothing**; a module that cannot validate without mutating must throw `UNSUPPORTED` rather than silently apply. The statement dispatch lives in `runtime/emit/alter-table.ts`: each `run*` helper resolves the change and, if `module.alterTable` is absent, throws a sited `QuereusError(StatusCode.UNSUPPORTED)`. `ALTER TABLE ... RENAME TO` is schema-only and routes through the separate `renameTable` hook instead.
 
+If your table instances report `VirtualTable.tableSchema`, an instance connected after `alterTable` returns must agree with the returned `TableSchema` on column count, column names in order, generated-ness and the primary key. The engine compares the two at every connect to detect a catalog left stale by another `Database` sharing your module, and fails a mismatch with `SCHEMA` (see [schema.md § Catalogs are per connection](schema.md#catalogs-are-per-connection)).
+
 The current arms of the union (`vtab/module.ts`):
 
 ```typescript
