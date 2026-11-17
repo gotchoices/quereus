@@ -232,21 +232,23 @@ apply schema main to version '1.0.0' options (
 
 **Safety:**
 - Seed data application is destructive (clears table before inserting).
-- `allow_destructive` is **enforced for one case today**: a backing-module change on a maintained table (`materialized view … using <module>` or `create table … maintained as … using <module>`). Such a move physically relocates the table to a different store with no in-place primitive, so it is realized as a `DROP TABLE` + `create materialized view … using <newmodule>` that **mints a new incarnation** (changing row identity for a replicated/synced table). `apply schema` aborts — before any DDL runs — unless re-run with `options (allow_destructive = true)`:
+- `allow_destructive` is **enforced for one case today**: moving an existing table to another module (see "What a declaration pins" below for when a declaration names a module). There is no in-place primitive for that, so it is realized as a `DROP TABLE` + a recreate in the declared module (`create table … using <module>`, or `create materialized view … using <module>` for the sugar form). A **plain table loses its rows**. A **maintained table** (`materialized view …` / `table … maintained as`) is re-materialized from its body, which **mints a new incarnation** (changing row identity for a replicated/synced table). `apply schema` aborts — before any DDL runs — unless re-run with `options (allow_destructive = true)`:
 
   ```sql
-  -- Re-declared with a moved backing module; refused without the ack:
+  -- Re-declared with a different module; refused without the ack:
   apply schema main;
-  -- Error: backing-module change on maintained table(s) 'mv' is destructive
-  --        (drop + recreate, new incarnation). Re-run with options
-  --        (allow_destructive = true) to migrate the backing.
+  -- Error: apply schema 'main': moving a table to another module is destructive:
+  --        table(s) 't' (memory → mem2) would be dropped and recreated empty — their
+  --        rows are lost; maintained table(s) 'mv' (memory → mem2) would be dropped and
+  --        re-materialized as a new incarnation. Re-run with options
+  --        (allow_destructive = true) to migrate.
 
-  -- Acknowledged — drops + recreates, re-materializing the body into the new module:
+  -- Acknowledged — drops + recreates in the declared module:
   apply schema main options (allow_destructive = true);
   ```
 
-  `diff schema` surfaces the `DROP TABLE` / `create materialized view` DDL unconditionally (it is a read-only preview, never gated). Other drops are **not yet** gated — a general `allow_destructive` gate over all destructive schema changes remains future work.
-- A plain (non-maintained) table's module is read only when the table is created. The differ does not compare it, so re-declaring an existing table with a different `using` gives an empty diff and the table stays on its original module.
+  The table's declared indexes are recreated after the drop. A move whose `DROP TABLE` the foreign-key check would refuse — another table still has rows referencing the moved one — is refused up front as well, naming the referencing table. `diff schema` surfaces the `DROP TABLE` / recreate DDL unconditionally (it is a read-only preview, never gated). Other drops are **not yet** gated — a general `allow_destructive` gate over all destructive schema changes remains future work.
+- **What a declaration pins.** The module a declared table is compared against is its own `using <module> [(args)]`; else, for the table form (plain or `table … maintained as`), the schema's `using (default_vtab_module = …, default_vtab_args = …)`; else, for `materialized view …`, `memory` (its create path ignores both defaults). A table-form item with no `using` anywhere pins **nothing** and stays on whatever module it is on. The session `default_vtab_module` is deliberately not consulted: it is not stored with the database, so comparing against it would flag every table of a database reopened under a different default, and an exported declaration (which omits `using` when it matches the session default) would stop being portable. Names compare case-insensitively with `mem` ⇒ `memory`; args compare by value with sorted keys, absent ⇒ none. A table↔maintained transition (attach / detach) is never treated as a move, so a declaration that both attaches (or detaches) and changes the module converges in two applies.
 - Rename hints prevent accidental drops during renames — see "Rename detection" below.
 
 **Rename detection (`rename_policy`):**

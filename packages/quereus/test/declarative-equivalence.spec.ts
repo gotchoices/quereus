@@ -1574,7 +1574,7 @@ describe('declarative-equivalence: materialized views', () => {
 
 	it('a backing-module change on a maintained table schedules a destructive drop+recreate', async function () {
 		// A maintained table is a TABLE now, but the catalog DOES carry its normalized
-		// backing module (CatalogTable.maintained.backingModuleName/Args). A both-
+		// backing module (CatalogTable.module). A both-
 		// maintained name-match whose declared module moves is an incarnation-minting
 		// relocation with no in-place primitive, so the differ schedules a destructive
 		// drop+recreate (gated at apply on allow_destructive) — NOT a body re-attach.
@@ -1599,8 +1599,8 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — the recreate subsumes it').to.be.undefined;
 			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
 			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
-			expect(diff.maintainedModuleMigrations, 'one module migration recorded').to.deep.equal([
-				{ name: 'mv', fromModule: 'memory', toModule: 'mem2' },
+			expect(diff.moduleMigrations, 'one module migration recorded').to.deep.equal([
+				{ name: 'mv', fromModule: 'memory', toModule: 'mem2', maintained: true },
 			]);
 		} finally {
 			await db.close();
@@ -1658,8 +1658,8 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — recreate subsumes it').to.be.undefined;
 			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
 			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
-			expect(diff.maintainedModuleMigrations, 'one args-only module migration recorded').to.deep.equal([
-				{ name: 'mv', fromModule: `mem2(k="a")`, toModule: `mem2(k="b")` },
+			expect(diff.moduleMigrations, 'one args-only module migration recorded').to.deep.equal([
+				{ name: 'mv', fromModule: `mem2(k="a")`, toModule: `mem2(k="b")`, maintained: true },
 			]);
 		} finally {
 			await db.close();
@@ -1696,7 +1696,7 @@ describe('declarative-equivalence: materialized views', () => {
 			// No partial migration: the live backing is still the memory default.
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv');
 			expect(live?.maintained, 'mv is still maintained').to.not.be.undefined;
-			expect(live!.maintained!.backingModuleName, 'still on the memory default backing').to.be.undefined;
+			expect(live!.module?.name, 'still on the memory default backing').to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -1735,7 +1735,7 @@ describe('declarative-equivalence: materialized views', () => {
 
 			// Live backing is now mem2.
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv');
-			expect(live!.maintained!.backingModuleName, 'mv now backed by mem2').to.equal('mem2');
+			expect(live!.module?.name, 'mv now backed by mem2').to.equal('mem2');
 
 			// Rows re-materialized from current sources.
 			const rows: Array<Record<string, unknown>> = [];
@@ -1747,7 +1747,7 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff2.maintainedModuleMigrations, 'no second migration').to.deep.equal([]);
+			expect(diff2.moduleMigrations, 'no second migration').to.deep.equal([]);
 			expect(diff2.tablesToDrop, 'no second drop').to.deep.equal([]);
 			expect(diff2.tablesToCreate, 'no second create').to.deep.equal([]);
 		} finally {
@@ -1838,8 +1838,8 @@ describe('declarative-equivalence: materialized views', () => {
 				diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv2\b/i.test(s) && /mem2/i.test(s)),
 				'mv2 recreated using mem2',
 			).to.be.true;
-			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
-				{ name: 'mv2', fromModule: 'memory', toModule: 'mem2' },
+			expect(diff.moduleMigrations, 'one module migration recorded under the new name').to.deep.equal([
+				{ name: 'mv2', fromModule: 'memory', toModule: 'mem2', maintained: true },
 			]);
 
 			// End-to-end: the destructive apply renames-then-recreates-in-place, the rows
@@ -1847,7 +1847,7 @@ describe('declarative-equivalence: materialized views', () => {
 			await db.exec('apply schema main options (allow_destructive = true)');
 
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv2');
-			expect(live!.maintained!.backingModuleName, 'mv2 now backed by mem2').to.equal('mem2');
+			expect(live!.module?.name, 'mv2 now backed by mem2').to.equal('mem2');
 
 			const mvRows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mv2 order by id')) mvRows.push(r);
@@ -1882,7 +1882,7 @@ describe('declarative-equivalence: materialized views', () => {
 			);
 			// The recreate (new module + new body) subsumes the body re-attach: exactly
 			// one migration, the drop+recreate, and NO `set maintained as` alter for mv.
-			expect(diff.maintainedModuleMigrations.length, 'one migration only').to.equal(1);
+			expect(diff.moduleMigrations.length, 'one migration only').to.equal(1);
 			expect(diff.tablesToDrop, 'mv dropped once').to.deep.equal(['mv']);
 			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'recreate carries new module').to.be.true;
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no separate re-attach alter for mv').to.be.undefined;
@@ -1916,8 +1916,8 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.maintainedModuleMigrations, 'one migration recorded for the declared-shape table').to.deep.equal([
-				{ name: 'mvt', fromModule: 'memory', toModule: 'mem2' },
+			expect(diff.moduleMigrations, 'one migration recorded for the declared-shape table').to.deep.equal([
+				{ name: 'mvt', fromModule: 'memory', toModule: 'mem2', maintained: true },
 			]);
 			expect(diff.tablesToDrop, 'mvt dropped for the recreate').to.deep.equal(['mvt']);
 			// Recreate renders the declared-shape `create table … maintained as` form
@@ -1929,7 +1929,7 @@ describe('declarative-equivalence: materialized views', () => {
 			// End-to-end gate-on apply migrates and re-materializes the rows.
 			await db.exec('apply schema main options (allow_destructive = true)');
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mvt');
-			expect(live!.maintained!.backingModuleName, 'mvt now backed by mem2').to.equal('mem2');
+			expect(live!.module?.name, 'mvt now backed by mem2').to.equal('mem2');
 			const rows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mvt order by id')) rows.push(r);
 			expect(rows, 'rows re-derived into the new backing').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
@@ -1971,13 +1971,13 @@ describe('declarative-equivalence: materialized views', () => {
 				diff.tablesToCreate.map(c => c.sql).some(s => /create\s+table\s+(?:"mvt2"|mvt2)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
 				'recreate is a create-table-maintained-as carrying mem2 under the new name',
 			).to.be.true;
-			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
-				{ name: 'mvt2', fromModule: 'memory', toModule: 'mem2' },
+			expect(diff.moduleMigrations, 'one module migration recorded under the new name').to.deep.equal([
+				{ name: 'mvt2', fromModule: 'memory', toModule: 'mem2', maintained: true },
 			]);
 
 			await db.exec('apply schema main options (allow_destructive = true)');
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mvt2');
-			expect(live!.maintained!.backingModuleName, 'mvt2 now backed by mem2').to.equal('mem2');
+			expect(live!.module?.name, 'mvt2 now backed by mem2').to.equal('mem2');
 			const rows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mvt2 order by id')) rows.push(r);
 			expect(rows, 'rows re-derived into the new backing under the new name').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
@@ -2011,11 +2011,90 @@ describe('declarative-equivalence: materialized views', () => {
 			await db.exec('apply schema main options (allow_destructive = true)');
 
 			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv2');
-			expect(live!.maintained!.backingModuleName, 'mv2 now backed by mem2').to.equal('mem2');
+			expect(live!.module?.name, 'mv2 now backed by mem2').to.equal('mem2');
 
 			const depRows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mvdep order by id')) depRows.push(r);
 			expect(depRows, 'dependent MV retargeted to mv2 and still correct').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a module change on a PLAIN table is an ack-gated drop+recreate that loses its rows', async function () {
+		// Regression: a plain table's module was never compared, so a changed `using`
+		// (or schema default) diffed empty and the table silently stayed put.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		const diffOf = () => computeSchemaDiff(db.declaredSchemaManager.getDeclaredSchema('main')!, collectSchemaCatalog(db, 'main'));
+		const moduleOfT = () => collectSchemaCatalog(db, 'main').tables.find(t => t.name === 't')!.module?.name;
+		const applyError = async (sql: string): Promise<Error | undefined> => {
+			try {
+				await db.exec(sql);
+			} catch (e) {
+				return e as Error;
+			}
+			return undefined;
+		};
+		try {
+			await db.exec('declare schema main { table t (id integer primary key) using memory }');
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1)');
+
+			await db.exec('declare schema main { table t (id integer primary key) using mem2 }');
+			const diff = diffOf();
+			expect(diff.moduleMigrations).to.deep.equal([{ name: 't', fromModule: 'memory', toModule: 'mem2', maintained: false }]);
+			expect(diff.tablesToDrop).to.deep.equal(['t']);
+			expect(diff.tablesToCreate.map(c => c.sql)).to.deep.equal(['create table t (id integer primary key) using mem2']);
+
+			const refused = await applyError('apply schema main');
+			expect(refused?.message).to.match(/allow_destructive/).and.to.match(/'t'/).and.to.match(/rows are lost/);
+			expect(moduleOfT(), 'refused apply leaves t on memory').to.be.undefined;
+			expect(await db.get('select count(*) as n from t')).to.deep.equal({ n: 1 });
+
+			await db.exec('apply schema main options (allow_destructive = true)');
+			expect(moduleOfT()).to.equal('mem2');
+			expect(await db.get('select count(*) as n from t'), 'rows are lost').to.deep.equal({ n: 0 });
+			const rediff = diffOf();
+			expect([rediff.moduleMigrations, rediff.tablesToDrop, rediff.tablesToCreate]).to.deep.equal([[], [], []]);
+
+			await db.exec(`declare schema main { table t (id integer primary key) using mem2 (k = 'a') }`);
+			expect(diffOf().moduleMigrations, 'an args-only change is a move too').to.deep.equal([
+				{ name: 't', fromModule: 'mem2', toModule: 'mem2(k="a")', maintained: false },
+			]);
+
+			// The schema default pins a table declared without `using`. The second apply
+			// records the applied-state snapshot, so the third is refused only if editing
+			// the default alone gets past the unchanged-catalog fast path.
+			await db.exec(`declare schema main using (default_vtab_module = 'mem2') { table t (id integer primary key) }`);
+			await db.exec('apply schema main');
+			await db.exec('apply schema main');
+			await db.exec(`declare schema main using (default_vtab_module = 'memory') { table t (id integer primary key) }`);
+			expect((await applyError('apply schema main'))?.message).to.match(/'t' \(mem2 → memory\)/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('tables declared without `using` are unpinned, so a session default module does not read as a move', async function () {
+		// Regression: a `table … maintained as` with no `using` was compared as if it
+		// pinned memory, so under a non-memory session default every re-apply reported a
+		// move. The MV sugar does pin memory, and lands there regardless of the default.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		db.setOption('default_vtab_module', 'mem2');
+		try {
+			await db.exec(`declare schema main {
+				table t (id integer primary key)
+				table m (id integer primary key) maintained as select id from t
+				materialized view mv as select id from t
+			}`);
+			await db.exec('apply schema main');
+			const modules = Object.fromEntries(collectSchemaCatalog(db, 'main').tables.map(t => [t.name, t.module?.name]));
+			expect(modules).to.deep.equal({ t: 'mem2', m: 'mem2', mv: undefined });
+
+			const diff = computeSchemaDiff(db.declaredSchemaManager.getDeclaredSchema('main')!, collectSchemaCatalog(db, 'main'));
+			expect([diff.moduleMigrations, diff.tablesToDrop, diff.tablesToCreate, diff.tablesToAlter]).to.deep.equal([[], [], [], []]);
 		} finally {
 			await db.close();
 		}

@@ -89,7 +89,7 @@ async function expectRoundTrip(ddl: string[], declaredBody: string): Promise<voi
 
 function makeEmptySchemaDiff(): SchemaDiff {
 	return {
-		tablesToCreate: [], tablesToDrop: [], tablesToAlter: [], maintainedModuleMigrations: [],
+		tablesToCreate: [], tablesToDrop: [], tablesToAlter: [], moduleMigrations: [],
 		viewsToCreate: [], viewsToDrop: [], indexesToCreate: [], indexesToDrop: [],
 		assertionsToCreate: [], assertionsToDrop: [], viewTagsChanges: [], indexTagsChanges: [],
 		renames: [], lensToAttach: [], lensToDetach: [], releasedDrops: [],
@@ -696,7 +696,7 @@ function broadDiff(): SchemaDiff {
 			tableTagsChange: {},
 			maintainedTags: true,
 		}],
-		maintainedModuleMigrations: [],
+		moduleMigrations: [],
 		viewsToCreate: [migrationCreate('create view fresh_v as select id from fresh')],
 		viewsToDrop: ['gone_v'],
 		indexesToCreate: [migrationCreate('create index idx_fresh on fresh (name)')],

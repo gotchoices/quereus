@@ -1553,7 +1553,29 @@ export class SchemaManager {
 	 * No-op when foreign_keys is off.
 	 */
 	private async assertNoReferencingChildrenForDrop(parentSchemaName: string, parentTableName: string): Promise<void> {
-		if (!this.db.options.getBooleanOption('foreign_keys')) return;
+		const childTable = await this.findChildBlockingDrop(parentSchemaName, parentTableName);
+		if (childTable) {
+			throw new QuereusError(
+				`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	}
+
+	/**
+	 * The first other table holding a row whose foreign key references the given
+	 * table — what makes `DROP TABLE` of it fail — or `undefined`. Always
+	 * `undefined` when the drop would not check (foreign_keys off, or one of the
+	 * suppressed scopes below). `skipChild` leaves out children the caller drops
+	 * first. Exposed so `apply schema` can refuse a migration up front rather than
+	 * at the failing `DROP TABLE`.
+	 */
+	async findChildBlockingDrop(
+		parentSchemaName: string,
+		parentTableName: string,
+		skipChild?: (childTable: TableSchema) => boolean,
+	): Promise<TableSchema | undefined> {
+		if (!this.db.options.getBooleanOption('foreign_keys')) return undefined;
 		// Suppressed scope (see Database._setFkRestrictSuppressed). Its one drop-issuing
 		// caller is the ALTER PRIMARY KEY shadow rebuild, which drops a table whose rows are
 		// moments from being renamed back over it under the same name — re-checking
@@ -1562,10 +1584,10 @@ export class SchemaManager {
 		// `dropTable`), so this arm is inert for it today; were that to change, its
 		// trust-the-origin posture — the origin enforced the drop at its own commit — is the
 		// same reason it skips the row-level RESTRICT pre-checks.
-		if (this.db._isFkRestrictSuppressed()) return;
+		if (this.db._isFkRestrictSuppressed()) return undefined;
 		// A failed apply's unwind (see Database._setSchemaUnwinding) drops a table this apply
 		// created. Rows pointing at it were left dangling before the apply and go back to that.
-		if (this.db._isSchemaUnwinding()) return;
+		if (this.db._isSchemaUnwinding()) return undefined;
 
 		const parentSchemaLower = parentSchemaName.toLowerCase();
 		const parentTableLower = parentTableName.toLowerCase();
@@ -1577,6 +1599,7 @@ export class SchemaManager {
 			// Skip the table being dropped itself — self-FK rows are going away with it.
 			if (childTable.schemaName.toLowerCase() === parentSchemaLower &&
 				childTable.name.toLowerCase() === parentTableLower) continue;
+			if (skipChild?.(childTable)) continue;
 
 			// MATCH SIMPLE: row is referencing iff every FK column is non-NULL.
 			const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
@@ -1588,13 +1611,9 @@ export class SchemaManager {
 
 			// Cached internal statement (compiled once per shape) rather than a fresh
 			// per-drop prepare/finalize — see InternalStatementCache.
-			if (await this.db._internalStatementCache.probe(sql)) {
-				throw new QuereusError(
-					`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
-					StatusCode.CONSTRAINT,
-				);
-			}
+			if (await this.db._internalStatementCache.probe(sql)) return childTable;
 		}
+		return undefined;
 	}
 
 	/**

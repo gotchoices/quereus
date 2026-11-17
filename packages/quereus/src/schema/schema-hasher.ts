@@ -52,8 +52,8 @@ function stripTagsFromDeclaredSchema(schema: AST.DeclareSchemaStmt): AST.Declare
 }
 
 /**
- * Canonical text of a declared schema — the `isLogical` kind prefix plus the
- * generated DDL, joined by newlines.
+ * Canonical text of a declared schema — the `isLogical` kind prefix, the schema's
+ * module defaults, and the generated DDL, joined by newlines.
  *
  * **Tags-inclusive, deliberately.** This is the reconciliation rendering: the
  * schema differ DOES diff tags and emits `ALTER … SET TAGS` steps for them, so
@@ -67,7 +67,18 @@ export function renderDeclaredSchemaCanonical(declaredSchema: AST.DeclareSchemaS
 	// logical declarations (their tables / columns / constraints, emitted by
 	// generateDeclaredDDL) are covered.
 	const kindPrefix = declaredSchema.isLogical ? 'logical\n' : '';
-	return kindPrefix + generateDeclaredDDL(declaredSchema).join('\n');
+	return kindPrefix + moduleDefaultsLine(declaredSchema) + generateDeclaredDDL(declaredSchema).join('\n');
+}
+
+/**
+ * The schema's `using (default_vtab_module …, default_vtab_args …)`, which decides
+ * the module of every table declared without its own `using` — so editing it alone
+ * moves tables and must change the rendering. Empty when the schema has none.
+ */
+function moduleDefaultsLine(declaredSchema: AST.DeclareSchemaStmt): string {
+	const { defaultVtabModule, defaultVtabArgs } = declaredSchema.using ?? {};
+	if (defaultVtabModule === undefined && defaultVtabArgs === undefined) return '';
+	return `using ${JSON.stringify({ module: defaultVtabModule ?? null, args: defaultVtabArgs ?? null })}\n`;
 }
 
 /**

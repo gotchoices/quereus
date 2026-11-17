@@ -106,7 +106,7 @@ function sortedRenderings<T>(items: readonly T[], render: (item: T) => string): 
 
 function renderTable(t: CatalogTable): string {
 	// `contextVariables` omitted: the table's `ddl` already renders the `with context` clause.
-	const { name, ddl, columns, primaryKey, referencedTables, contextVariables: _contextVariables, tags, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
+	const { name, ddl, columns, primaryKey, referencedTables, contextVariables: _contextVariables, tags, module, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
 	assertEveryFieldConsidered(rest);
 	return [
 		`table ${name}`,
@@ -114,6 +114,9 @@ function renderTable(t: CatalogTable): string {
 		// nothing extra (it is already computed by `collectSchemaCatalog`) and removes
 		// any need to argue about what `generateTableDDL` does or does not render.
 		`\tddl ${ddl}`,
+		// Rendered on its own: the collected `ddl` elides a `using` clause that matches
+		// the session default, so a table moved by direct DDL could leave it unchanged.
+		`\tmodule ${module?.name ?? '-'} args ${renderTags(module?.args)}`,
 		// Column ORDER is behavioural — never sorted.
 		...columns.map(c => `\t${renderColumn(c)}`),
 		`\tpk ${primaryKey.map(pk => `${pk.columnName} ${pk.desc ? 'desc' : 'asc'}`).join(', ')}`,
@@ -171,9 +174,9 @@ function renderMaintained(m: NonNullable<CatalogTable['maintained']>): string {
 	// matches, so the AST-tolerant path is unreachable and the hash fully
 	// determines the outcome.
 	// `columns` omitted: it is folded into `bodyHash` (see `CatalogTable.maintained`).
-	const { bodyHash, backingModuleName, backingModuleArgs, select: _select, columns: _columns, ...rest } = m;
+	const { bodyHash, select: _select, columns: _columns, ...rest } = m;
 	assertEveryFieldConsidered(rest);
-	return `body ${bodyHash} module ${backingModuleName ?? '-'} args ${renderTags(backingModuleArgs)}`;
+	return `body ${bodyHash}`;
 }
 
 function renderView(v: CatalogView): string {

@@ -479,7 +479,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			await db.exec('apply schema main options (allow_destructive = true)');
 
 			expect(await planOf(db)).to.deep.equal([]);
-			expect(collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'm')!.maintained!.backingModuleName).to.equal('mem2');
+			expect(collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'm')!.module?.name).to.equal('mem2');
 			expect((await rejection(db.exec('insert into P values (2, 11)'))).message).to.match(/CHECK constraint failed/);
 		});
 

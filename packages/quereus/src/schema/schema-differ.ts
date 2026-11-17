@@ -108,17 +108,18 @@ export interface SchemaDiff {
 	tablesToDrop: string[];
 	tablesToAlter: TableAlterDiff[];
 	/**
-	 * Maintained tables whose declared backing module drifted from the live backing
-	 * — a destructive, incarnation-minting migration realized as drop+recreate (the
-	 * DROP rides {@link tablesToDrop} under the actual name; the recreate, which
-	 * re-materializes the body into the new module, rides {@link tablesToCreate}).
-	 * Recorded separately for the apply-time `allow_destructive` gate and for
-	 * diagnostics: `diff schema` surfaces the DDL unconditionally (read-only
-	 * preview), while `apply schema` refuses unless acknowledged. Distinct from a
-	 * non-destructive body re-attach (`set maintained as`), which preserves the
-	 * incarnation. See `docs/materialized-views.md` § Declarative-schema integration.
+	 * Tables whose declared module differs from the module they live in (see
+	 * {@link declaredTableModule}) — a destructive migration realized as
+	 * drop+recreate, there being no in-place move primitive. The DROP rides
+	 * {@link tablesToDrop}; the recreate rides {@link tablesToCreate}. A plain
+	 * table's rows are lost; a maintained table (`maintained: true`) is
+	 * re-materialized from its body as a new incarnation. Recorded separately for
+	 * the apply-time `allow_destructive` gate and for diagnostics: `diff schema`
+	 * surfaces the DDL unconditionally (read-only preview), while `apply schema`
+	 * refuses unless acknowledged. `fromModule` / `toModule` are normalized labels
+	 * (`name` or `name(args)`). See `docs/sql-ddl.md` § Semantics and Features, "What a declaration pins".
 	 */
-	maintainedModuleMigrations: Array<{ name: string; fromModule: string; toModule: string }>;
+	moduleMigrations: Array<{ name: string; fromModule: string; toModule: string; maintained: boolean }>;
 	viewsToCreate: MigrationCreate[];
 	viewsToDrop: string[];
 	indexesToCreate: MigrationCreate[];
@@ -305,19 +306,6 @@ export interface TableAlterDiff {
 	 * the table is plain and the ordinary ALTER TABLE path applies (flag absent).
 	 */
 	maintainedTags?: boolean;
-	/**
-	 * Set when a name-matched maintained table's declared backing module drifted
-	 * from the live backing (BOTH sides maintained). A backing-module move
-	 * physically relocates the table to a different store and mints a new
-	 * incarnation — there is no in-place move primitive — so it must take a
-	 * destructive drop+recreate, NOT any of the alter ops above. This flag signals
-	 * {@link computeSchemaDiff} to route the table to drop+recreate (and record a
-	 * {@link SchemaDiff.maintainedModuleMigrations} entry) instead of pushing this
-	 * alter diff; the recreate subsumes any concurrent body / tag / shape op also
-	 * present on this diff. `fromModule` / `toModule` are the normalized backing
-	 * labels (`name` or `name(args)`) for the diagnostic.
-	 */
-	maintainedModuleMigration?: { fromModule: string; toModule: string };
 }
 
 /** Kind label as it appears in the duplicate-declaration diagnostic. */
@@ -461,7 +449,7 @@ export function computeSchemaDiff(
 		tablesToCreate: [],
 		tablesToDrop: [],
 		tablesToAlter: [],
-		maintainedModuleMigrations: [],
+		moduleMigrations: [],
 		viewsToCreate: [],
 		viewsToDrop: [],
 		indexesToCreate: [],
@@ -673,17 +661,22 @@ export function computeSchemaDiff(
 	// The same pass records which declared columns each table already has
 	// (`existingColumnsByTable`), so an added column's inline foreign key naming only
 	// those can merely prefer to follow its parent (see `recordCrossTableReads`). A
-	// table the plan drops and recreates has none.
+	// table the plan drops and recreates — one moving to another module
+	// (`moduleMoves`) — has none.
 	const columnRenamesByTable = new Map<string, ColumnRenameOp[]>();
 	const existingColumnsByTable = new Map<string, ReadonlySet<string>>();
+	const moduleMoves = new Map<string, ModuleMove>();
 	for (const [name, declaredTable] of declaredTables) {
 		const matchedActual = tableRenames.pairs.get(name);
 		if (!matchedActual) continue;
+		const declaredModule = declaredTableModule(declaredTable.tableStmt, declaredMaterializedViews.has(name), targetSchemaName, defaultVtabModule, defaultVtabArgs);
+		const move = tableModuleMove(declaredModule, declaredTable.tableStmt.maintained !== undefined, matchedActual);
+		if (move) moduleMoves.set(name, move);
 		const { renames, pairs } = resolveColumnRenames(declaredTable, matchedActual, policy);
 		if (renames.length > 0) {
 			columnRenamesByTable.set(name, renames.map(r => ({ oldName: r.oldName, newName: r.newName })));
 		}
-		if (pairs.size > 0 && !movesBackingModule(declaredTable, matchedActual)) existingColumnsByTable.set(name, new Set(pairs.keys()));
+		if (pairs.size > 0 && !move) existingColumnsByTable.set(name, new Set(pairs.keys()));
 	}
 
 	// Declared-side column-existence resolver for the scope-aware seeded column
@@ -720,14 +713,14 @@ export function computeSchemaDiff(
 		freshTableCreate(name, tableStmt, declaredMaterializedViews, declaredViewBodies, targetSchemaName, defaultVtabModule, defaultVtabArgs);
 
 	// Tables: creates / alters. `dropSet` accumulates the destructive
-	// backing-module moves here (the live incarnation must be dropped) AND the
+	// module moves here (the live table must be dropped) AND the
 	// orphan drops below — both flow through `orderDropsByFKDependency` together.
-	// `maintainedModuleRecreates` counts those module-move drop+create pairs so the
+	// `moduleRecreates` counts those module-move drop+create pairs so the
 	// require-hint guard can exclude them (a deliberate recreate of a matched
 	// object, not an ambiguous unhinted rename — mirroring viewRecreates /
 	// indexRecreates).
 	const dropSet = new Set<string>();
-	let maintainedModuleRecreates = 0;
+	let moduleRecreates = 0;
 	// Declared (lowercased) names of the tables a module move recreates: their
 	// indexes go with the `DROP TABLE`, so the index loop recreates every matched one.
 	const tablesRecreatedByModuleMove = new Set<string>();
@@ -735,26 +728,21 @@ export function computeSchemaDiff(
 		const tableStmt = declaredTable.tableStmt;
 		const matchedActual = tableRenames.pairs.get(name);
 		if (matchedActual) {
-			// Either a rename match or a name-based match — compute alter diff against the matched actual.
-			// Thread the table renames (all `kind: 'table'` from this resolver), the
-			// schema name, and the cross-table column-rename map so the constraint body
-			// comparison can reconcile a renamed local column / FK-parent-table /
-			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
-			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, existingColumnsByTable, resolveDeclaredColumn, defaultCollation);
-			if (alterDiff.maintainedModuleMigration) {
-				// Destructive backing-module move: drop the live incarnation (via the
-				// shared drop ordering) and recreate into the newly declared module
-				// (re-materializing the body). The recreate subsumes any concurrent body /
-				// tag / shape op, so the alter diff is SUPPRESSED — no `tablesToAlter`
-				// entry for this table. Gated at apply (allow_destructive); surfaced
+			const move = moduleMoves.get(name);
+			if (move) {
+				// Destructive module move: drop the live table (via the shared drop
+				// ordering) and recreate it in the declared module (a maintained body
+				// re-materializes; a plain table's rows are lost). The recreate subsumes
+				// any concurrent column / constraint / body / tag op, so no alter diff is
+				// computed for this table. Gated at apply (allow_destructive); surfaced
 				// unconditionally by `diff schema`.
 				//
-				// Rename-coincident case: when the same apply BOTH renames this
-				// maintained table (hinted match, `matchedActual.name !== name`) AND moves
-				// its backing module, the table RENAME op is preserved in `diff.renames`
-				// (dependents over the old name retarget via the ALTER … RENAME primitive —
-				// see reconciledDeclaredViewDefinition). At apply that rename runs FIRST,
-				// moving the live incarnation to the NEW declared name, so the drop must
+				// Rename-coincident case: when the same apply BOTH renames this table
+				// (hinted match, `matchedActual.name !== name`) AND moves its module, the
+				// table RENAME op is preserved in `diff.renames` (dependents over the old
+				// name retarget via the ALTER … RENAME primitive — see
+				// reconciledDeclaredViewDefinition). At apply that rename runs FIRST,
+				// moving the live table to the NEW declared name, so the drop must
 				// target the NEW name `name` — dropping the old `matchedActual.name` would
 				// no-op (it was just renamed away) and the recreate, which renders under
 				// `name`, would then collide ("already exists"). For a plain name match the
@@ -763,14 +751,16 @@ export function computeSchemaDiff(
 				dropSet.add(dropName);
 				tablesRecreatedByModuleMove.add(name);
 				diff.tablesToCreate.push(freshCreate(name, tableStmt));
-				diff.maintainedModuleMigrations.push({
-					name: tableStmt.table.name,
-					fromModule: alterDiff.maintainedModuleMigration.fromModule,
-					toModule: alterDiff.maintainedModuleMigration.toModule,
-				});
-				maintainedModuleRecreates++;
+				diff.moduleMigrations.push({ name: tableStmt.table.name, ...move, maintained: tableStmt.maintained !== undefined });
+				moduleRecreates++;
 				continue;
 			}
+			// Either a rename match or a name-based match — compute alter diff against the matched actual.
+			// Thread the table renames (all `kind: 'table'` from this resolver), the
+			// schema name, and the cross-table column-rename map so the constraint body
+			// comparison can reconcile a renamed local column / FK-parent-table /
+			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
+			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, existingColumnsByTable, resolveDeclaredColumn, defaultCollation);
 			// If this was a rename, set the alter target to the new name (post-rename)
 			if (matchedActual.name.toLowerCase() !== name) {
 				alterDiff.tableName = tableStmt.table.name;
@@ -870,10 +860,10 @@ export function computeSchemaDiff(
 	// table category above, so the unified table loop recognizes a body change as a
 	// re-attach (`set maintained as`), a table↔maintained transition as an
 	// attach/detach, and an undeclared live maintained table as a `drop table` —
-	// see `computeTableAlterDiff` / `applyMaintainedTransition`. A backing-module
-	// change on a both-maintained name-match IS detected (see `backingModuleDrifted`)
-	// and routed to a destructive drop+recreate in the table loop above —
-	// incarnation-minting, so gated at apply on `allow_destructive`.)
+	// see `computeTableAlterDiff` / `applyMaintainedTransition`. A module change on
+	// a same-kind name-match IS detected (see `tableModuleMove`) and routed to a
+	// destructive drop+recreate in the table loop above — gated at apply on
+	// `allow_destructive`.)
 
 	// Indexes: creates / drops / body-change recreates / hinted-rename recreates /
 	// in-place tag changes.
@@ -924,7 +914,7 @@ export function computeSchemaDiff(
 		const declaredTableForIndex = declaredTables.get(declaredTableKey);
 		const indexColRenames = columnRenamesByTable.get(declaredTableKey) ?? [];
 		const declaredBody = declaredIndexCanonicalBody(declaredIndex.indexStmt, declaredTableForIndex, indexColRenames, tableRenames.renames, targetSchemaName, defaultCollation);
-		// A backing-module move drops the index's table and recreates it, so an
+		// A module move drops the index's table and recreates it, so an
 		// unchanged index needs the same drop+recreate a body change gets — the
 		// `DROP INDEX IF EXISTS` is then a no-op behind the `DROP TABLE`.
 		if (declaredBody !== matchedActual.definition || tablesRecreatedByModuleMove.has(declaredTableKey)) {
@@ -958,11 +948,11 @@ export function computeSchemaDiff(
 	// both a create and a drop, which would falsely trip the unhinted-rename guard
 	// — so exclude those from the view/index counts (the constraint path does the
 	// same with its pure counts): both are deliberate drop+create pairs of a
-	// matched object, not an ambiguous unhinted rename. A backing-module move is the
+	// matched object, not an ambiguous unhinted rename. A module move is the
 	// table-side analogue (matched-object recreate, not a rename), so subtract
-	// `maintainedModuleRecreates` from both table counts.
+	// `moduleRecreates` from both table counts.
 	if (policy === 'require-hint') {
-		enforceRequireHint('table', diff.tablesToCreate.length - maintainedModuleRecreates, diff.tablesToDrop.length - maintainedModuleRecreates);
+		enforceRequireHint('table', diff.tablesToCreate.length - moduleRecreates, diff.tablesToDrop.length - moduleRecreates);
 		enforceRequireHint('view', diff.viewsToCreate.length - viewRecreates, diff.viewsToDrop.length - viewRecreates);
 		enforceRequireHint('index', diff.indexesToCreate.length - indexRecreates, diff.indexesToDrop.length - indexRecreates);
 	}
@@ -993,7 +983,7 @@ export function computeSchemaDiff(
 	// An unchanged assertion naming an object this same migration DROPS must still
 	// be dropped and recreated around it — otherwise the DROP is refused by the
 	// runtime guard (`assertNoAssertionDependsOn`) and the migration dies. The live
-	// cases are a redefined view and a maintained table whose backing module changed:
+	// cases are a redefined view and a table whose module changed:
 	// each emits a drop plus a recreate under the same name, so the assertion's target
 	// comes back and the recreate (emitted last) succeeds. When the object is
 	// genuinely gone, the recreate fails loudly with the build-time error above
@@ -1246,8 +1236,8 @@ function enforceRequireHint(kind: string, creates: number, drops: number): void 
 
 /**
  * Builds the fresh-create step for a declared table — shared by the create branch
- * and the destructive backing-module move's recreate, so both re-materialize a
- * maintained body into the declared module through one renderer. A maintained
+ * and the destructive module move's recreate, so both land the table in the
+ * declared module through one renderer. A maintained
  * table declared via the `materialized view` sugar renders that sugar (its
  * column-less normalized table form has no parseable `create table` DDL); a
  * declared-shape maintained table and a plain table render the `create table …`
@@ -2164,8 +2154,6 @@ interface UnnamedConstraintDiffContext {
 	addedColumns: readonly string[];
 	/** Lowercased names of the columns this diff drops. */
 	droppedColumns: ReadonlySet<string>;
-	/** Throw on an unmatched actual constraint no statement can drop; false when the alter diff will be discarded. */
-	refuseUndroppable: boolean;
 }
 
 /**
@@ -2212,7 +2200,7 @@ function diffUnnamedConstraints(
 		if (a.name !== undefined) drops.push(a.name);
 		else if (!prunedByColumnDrop(a, ctx.droppedColumns)) undroppable.push(a);
 	}
-	if (undroppable.length > 0 && ctx.refuseUndroppable) {
+	if (undroppable.length > 0) {
 		throw new QuereusError(
 			`Cannot drop unnamed constraint ${undroppable.map(a => `'${a.definition}'`).join(', ')} from table '${ctx.schemaName}.${actualTable.name}': `
 				+ `it is no longer declared, but it was created without a name, so no statement can drop it. `
@@ -2377,20 +2365,6 @@ function computeTableAlterDiff(
 	const declaredMaintained = declaredTable.tableStmt.maintained;
 	const liveMaintained = actualTable.maintained;
 
-	// Backing-module drift on a both-maintained name-match → a destructive,
-	// incarnation-minting move (drop+recreate). Detected here, where both module
-	// sides are in scope (declared on the table stmt; live on the maintained
-	// descriptor); `computeSchemaDiff` routes it to drop+recreate instead of
-	// pushing this alter. Compare ONLY when BOTH sides are maintained — a
-	// table↔maintained transition is an attach/detach (handled by
-	// applyMaintainedTransition), never a module move — and use the SAME
-	// normalization the live catalog already applied (absent/`mem` ⇒ `memory`;
-	// args stable-sorted, absent ⇒ ''), so the two spellings of the memory default
-	// never drift. The module is deliberately separate from `bodyHash`, so the body
-	// re-attach path stays untouched.
-	const moduleMigration = backingModuleDrifted(declaredMaintained, liveMaintained, declaredTable.tableStmt.moduleName, declaredTable.tableStmt.moduleArgs);
-	if (moduleMigration) diff.maintainedModuleMigration = moduleMigration;
-
 	// MV-sugar / implicit maintained form: the body owns the shape, so the differ
 	// stays PLAN-FREE — it never derives or compares this table's columns /
 	// constraints / PK. A genuine shape mismatch surfaces at apply's attach shape
@@ -2552,8 +2526,6 @@ function computeTableAlterDiff(
 		namedDrops: constraintsToDrop,
 		addedColumns: addedColumnDefs.map(c => c.name),
 		droppedColumns: new Set(diff.columnsToDrop.map(c => c.toLowerCase())),
-		// A backing-module move recreates the table, so its alter diff is discarded.
-		refuseUndroppable: !diff.maintainedModuleMigration,
 	});
 	constraintsToDrop.push(...unnamed.drops);
 	constraintsToAdd.push(...unnamed.adds);
@@ -2896,12 +2868,6 @@ function recordForeignKeyParent(
 	(namesOnlyExisting ? into.preferred : into.required).add(parent);
 }
 
-/** Whether the plan drops `actual` and recreates it in the backing module `declaredTable` names. */
-function movesBackingModule(declaredTable: AST.DeclaredTable, actual: CatalogTable): boolean {
-	const stmt = declaredTable.tableStmt;
-	return backingModuleDrifted(stmt.maintained, actual.maintained, stmt.moduleName, stmt.moduleArgs) !== undefined;
-}
-
 /**
  * Adds the tables and views in `schemaName` that a written-row expression names, given the
  * mutation-context variables in scope there: a `context.<name>` reading one names no table.
@@ -2944,37 +2910,66 @@ function markMaintainedTagRoute(diff: TableAlterDiff, liveMaintained: CatalogTab
 }
 
 /**
- * Detects a backing-module move on a name-matched maintained table: the declared
- * `using <module>(args)` clause normalizes to a different backing than the live
- * one. Returns `{ fromModule, toModule }` (normalized labels) on drift, else
- * `undefined`. Fires ONLY when BOTH sides are maintained — a table↔maintained
- * transition is an attach/detach, not a module move. The name half uses
- * {@link normalizeBackingModuleName} (absent/`mem` ⇒ `memory`, lowercased) and
- * the args half {@link canonicalBackingModuleArgs} (stable sorted-key render,
- * absent ⇒ ''), so the two spellings of the memory default (`using memory()` /
- * `using mem()` / omitted) never register as drift.
+ * A table's module as the differ compares it: the name through
+ * {@link normalizeBackingModuleName} (lowercased, `mem` ⇒ `memory`) and the args
+ * through {@link canonicalBackingModuleArgs} (sorted keys, absent or empty ⇒ ''),
+ * so the spellings of one module (`using memory()` / `using mem` / `using MEMORY`)
+ * never register as a move.
  */
-function backingModuleDrifted(
-	declaredMaintained: AST.MaintainedClause | undefined,
-	liveMaintained: CatalogTable['maintained'],
-	declaredModuleName: string | undefined,
-	declaredModuleArgs: Readonly<Record<string, SqlValue>> | undefined,
-): { fromModule: string; toModule: string } | undefined {
-	if (!declaredMaintained || !liveMaintained) return undefined;
-	const declName = normalizeBackingModuleName(declaredModuleName);
-	const liveName = normalizeBackingModuleName(liveMaintained.backingModuleName);
-	const declArgs = canonicalBackingModuleArgs(declaredModuleArgs);
-	const liveArgs = canonicalBackingModuleArgs(liveMaintained.backingModuleArgs);
-	if (declName === liveName && declArgs === liveArgs) return undefined;
-	return {
-		fromModule: backingModuleLabel(liveName, liveArgs),
-		toModule: backingModuleLabel(declName, declArgs),
-	};
+interface ModuleIdentity {
+	name: string;
+	args: string;
 }
 
-/** Renders a normalized backing-module identity as `name` or `name(args)` for diagnostics. */
-function backingModuleLabel(name: string, canonicalArgs: string): string {
-	return canonicalArgs ? `${name}(${canonicalArgs})` : name;
+/** A detected module move, as normalized labels (`name` or `name(args)`) for the diagnostic. */
+interface ModuleMove {
+	fromModule: string;
+	toModule: string;
+}
+
+/**
+ * The module a declared table item pins, or `undefined` when it pins none. The
+ * table form (plain, or `table … maintained as`) takes the item's own `using`,
+ * else the schema's `using (default_vtab_module …)` — exactly what
+ * {@link applyTableDefaults} hands its create. With neither it is unpinned: the
+ * session `default_vtab_module` that would place a fresh create is deliberately
+ * not consulted, because it is not stored with the database, and comparing
+ * against it would flag every table of a database reopened under a different
+ * default. The `materialized view` sugar takes its own `using`, else `memory`:
+ * its create path ignores both defaults.
+ */
+function declaredTableModule(
+	tableStmt: AST.CreateTableStmt,
+	isMaterializedViewSugar: boolean,
+	targetSchemaName: string,
+	defaultVtabModule: string | undefined,
+	defaultVtabArgs: string | undefined,
+): ModuleIdentity | undefined {
+	const effective = isMaterializedViewSugar ? tableStmt : applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
+	if (!effective.moduleName && !isMaterializedViewSugar) return undefined;
+	return { name: normalizeBackingModuleName(effective.moduleName), args: canonicalBackingModuleArgs(effective.moduleArgs) };
+}
+
+/**
+ * The module move a name-matched table needs, or `undefined`: the declaration
+ * pins a module other than the one the table lives in. Compared only when both
+ * sides are the same kind (plain / plain or maintained / maintained) — a
+ * table↔maintained transition is an attach / detach, never a move.
+ *
+ * NOTE: a declaration that both attaches (or detaches) and changes the module
+ * therefore converges in two applies: the first attaches / detaches in place, the
+ * second sees a same-kind pair and moves it. If that shows up in practice, compare
+ * across kinds and route the pair to a recreate in the declared kind.
+ */
+function tableModuleMove(declaredModule: ModuleIdentity | undefined, declaredMaintained: boolean, actual: CatalogTable): ModuleMove | undefined {
+	if (!declaredModule || declaredMaintained !== (actual.maintained !== undefined)) return undefined;
+	const live: ModuleIdentity = { name: normalizeBackingModuleName(actual.module?.name), args: canonicalBackingModuleArgs(actual.module?.args) };
+	if (live.name === declaredModule.name && live.args === declaredModule.args) return undefined;
+	return { fromModule: moduleLabel(live), toModule: moduleLabel(declaredModule) };
+}
+
+function moduleLabel(module: ModuleIdentity): string {
+	return module.args ? `${module.name}(${module.args})` : module.name;
 }
 
 /**
@@ -2994,10 +2989,9 @@ function backingModuleLabel(name: string, canonicalArgs: string): string {
  *
  * A pure in-diff source rename is inverse-applied before the hash compare so a
  * rename never churns a spurious re-attach (mirrors the view/MV body reconcile).
- * A backing-module change is deliberately NOT compared here — it is a destructive
- * incarnation-minting move (drop+recreate), detected separately by
- * {@link backingModuleDrifted} in `computeTableAlterDiff` and routed by
- * `computeSchemaDiff`, never folded into this non-destructive body transition.
+ * A module change is deliberately NOT compared here — it is a destructive
+ * incarnation-minting move (drop+recreate), detected by {@link tableModuleMove}
+ * in `computeSchemaDiff`, which then never computes this table's alter diff.
  */
 function applyMaintainedTransition(
 	diff: TableAlterDiff,
@@ -3660,7 +3654,7 @@ function createdObjectTarget(ast: AST.Statement): AST.IdentifierExpr | undefined
 
 /**
  * The `objectRefKey`s of the tables and views this diff drops and creates again under the same
- * name: a redefined view, or a maintained table moving to another backing module. A view hinted to
+ * name: a redefined view, or a table moving to another module. A view hinted to
  * a new name is a different name on each side, so it is not one, and neither is a view replaced by
  * a table, which the two buckets keep apart.
  */

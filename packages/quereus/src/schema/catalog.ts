@@ -59,6 +59,17 @@ export interface CatalogTable {
 	contextVariables?: ReadonlyArray<string>;
 	tags?: Readonly<Record<string, SqlValue>>;
 	/**
+	 * The module the table lives in, normalized by `normalizeBackingModule`: lowercased,
+	 * `mem` ⇒ `memory`, empty args dropped. Absent ⇒ `memory` with no args. Plain and
+	 * maintained tables alike; the differ compares it against the module a declaration
+	 * pins (`docs/sql-ddl.md` § Semantics and Features, "What a declaration pins").
+	 */
+	module?: {
+		name: string;
+		/** Recorded only when non-empty. */
+		args?: Readonly<Record<string, SqlValue>>;
+	};
+	/**
 	 * Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags and a
 	 * canonical body fragment. Constraints without a user-supplied name are excluded
 	 * (they are in {@link CatalogTable.unnamedConstraints}).
@@ -113,10 +124,6 @@ export interface CatalogTable {
 	 */
 	maintained?: {
 		bodyHash: string;
-		/** Normalized backing-host module when non-default (absent ⇒ memory). */
-		backingModuleName?: string;
-		/** Backing-module args; recorded only when non-empty. */
-		backingModuleArgs?: Readonly<Record<string, SqlValue>>;
 		/**
 		 * The live derivation body AST, for the differ's rename-artifact-tolerant
 		 * hash re-compare (see `CatalogView.select`). Read-only to consumers.
@@ -362,6 +369,7 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 	}
 
 	const { namedConstraints, unnamedConstraints } = catalogConstraints(tableSchema);
+	const backing = normalizeBackingModule(tableSchema.vtabModuleName, tableSchema.vtabArgs);
 
 	return {
 		name: tableSchema.name,
@@ -373,6 +381,9 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 			? { contextVariables: tableSchema.mutationContext.map(contextVar => contextVar.name.toLowerCase()) }
 			: {}),
 		tags: tableSchema.tags,
+		...(backing.storedModuleName !== undefined
+			? { module: { name: backing.storedModuleName, ...(backing.storedModuleArgs ? { args: backing.storedModuleArgs } : {}) } }
+			: {}),
 		namedConstraints,
 		unnamedConstraints,
 		...(maintainedTable ? { maintained: maintainedDescriptor(maintainedTable) } : {}),
@@ -411,17 +422,14 @@ function catalogConstraints(tableSchema: TableSchema): Pick<CatalogTable, 'named
 
 /**
  * The derivation dimension surfaced on a maintained table's catalog entry — the
- * canonical body hash plus the normalized backing module (compared separately
- * from the hash, the module is deliberately not folded into the hash formula).
- * The differ uses this to recognize a body change (re-attach) vs an unchanged
- * maintained table (no-op), and table↔maintained transitions (attach / detach).
+ * canonical body hash (the backing module is on `CatalogTable.module`, deliberately
+ * not folded into the hash formula). The differ uses this to recognize a body
+ * change (re-attach) vs an unchanged maintained table (no-op), and
+ * table↔maintained transitions (attach / detach).
  */
 function maintainedDescriptor(table: MaintainedTableSchema): NonNullable<CatalogTable['maintained']> {
-	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
 	return {
 		bodyHash: table.derivation.bodyHash,
-		backingModuleName: backing.storedModuleName,
-		backingModuleArgs: backing.storedModuleArgs,
 		select: table.derivation.selectAst,
 		columns: table.derivation.columns,
 	};

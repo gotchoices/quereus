@@ -120,7 +120,7 @@ function makeEmptySchemaDiff(): SchemaDiff {
 		tablesToCreate: [],
 		tablesToDrop: [],
 		tablesToAlter: [],
-		maintainedModuleMigrations: [],
+		moduleMigrations: [],
 		viewsToCreate: [],
 		viewsToDrop: [],
 		indexesToCreate: [],

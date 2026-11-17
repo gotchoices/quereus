@@ -351,7 +351,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// so skip it. `computeSchemaDiff` reads nothing but its four arguments; the
 		// remaining one, `renamePolicy`, is inert when there are no differences (no
 		// name-change pairs for a policy to police), and `allow_destructive` only
-		// gates a non-empty `diff.maintainedModuleMigrations`. So the skip is
+		// gates a non-empty `diff.moduleMigrations`. So the skip is
 		// behaviour-preserving. See docs/schema-declarative.md § Applied-state snapshot.
 		const catalogRendering = renderCatalogForComparison(actualCatalog);
 		const declaredRendering = rctx.db.declaredSchemaManager.getDeclaredRendering(schemaName);
@@ -375,21 +375,17 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
 			const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', defaultCollation);
 
-			// Acknowledgement gate: a backing-module change on a maintained table is a
-			// destructive incarnation-minting move (drop + recreate — fires
-			// materialized_view_removed then _added, so row identity changes for a
-			// replicated/synced table). Refuse to execute it unless the user opted in via
+			// Acknowledgement gate: a module change is a destructive drop + recreate. A
+			// plain table loses its rows; a maintained table re-materializes as a new
+			// incarnation (materialized_view_removed then _added, so row identity changes
+			// for a replicated/synced table). Refuse unless the user opted in via
 			// `options (allow_destructive = true)`. The whole apply aborts here, BEFORE any
 			// DDL runs, so no partial migration occurs. (`diff schema` does NOT gate — it
 			// is a read-only preview and surfaces the DROP/recreate DDL unconditionally.)
-			if (diff.maintainedModuleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
-				const names = diff.maintainedModuleMigrations.map(m => `'${m.name}'`).join(', ');
-				throw new QuereusError(
-					`apply schema '${schemaName}': backing-module change on maintained table(s) ${names} is destructive ` +
-					`(drop + recreate, new incarnation). Re-run with options (allow_destructive = true) to migrate the backing.`,
-					StatusCode.ERROR,
-				);
+			if (diff.moduleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
+				throw new QuereusError(moduleMigrationRefusal(schemaName, diff.moduleMigrations), StatusCode.ERROR);
 			}
+			await refuseModuleMoveLeavingDanglingRows(rctx.db, schemaName, diff);
 
 			// Build the migration plan. Same ordering (and same DDL text) `diff schema`
 			// previews; the create steps additionally carry the statement they were
@@ -581,6 +577,46 @@ function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: n
 		if (typeof module.endSchemaBatch === 'function') return false;
 	}
 	return true;
+}
+
+/** The `allow_destructive` refusal for module moves, naming what each kind of table loses. */
+function moduleMigrationRefusal(schemaName: string, migrations: SchemaDiff['moduleMigrations']): string {
+	const describe = (maintained: boolean): string | undefined => {
+		const names = migrations.filter(m => m.maintained === maintained).map(m => `'${m.name}' (${m.fromModule} → ${m.toModule})`);
+		if (names.length === 0) return undefined;
+		return maintained
+			? `maintained table(s) ${names.join(', ')} would be dropped and re-materialized as a new incarnation`
+			: `table(s) ${names.join(', ')} would be dropped and recreated empty — their rows are lost`;
+	};
+	const parts = [describe(false), describe(true)].filter((p): p is string => p !== undefined);
+	return `apply schema '${schemaName}': moving a table to another module is destructive: ${parts.join('; ')}. `
+		+ `Re-run with options (allow_destructive = true) to migrate.`;
+}
+
+/**
+ * Refuses, before any step runs, a module move whose `DROP TABLE` the foreign-key check would
+ * refuse because another table's rows reference the moved table. Without this the apply fails at
+ * that step, after earlier steps ran. A child the same plan drops is dropped first (see
+ * `orderDropsByFKDependency`), so it does not count.
+ *
+ * `move.name` is the declared name; under a hinted rename the table is still under its old one here.
+ */
+async function refuseModuleMoveLeavingDanglingRows(db: Database, schemaName: string, diff: SchemaDiff): Promise<void> {
+	if (diff.moduleMigrations.length === 0) return;
+	const ownSchema = schemaName.toLowerCase();
+	const dropped = new Set(diff.tablesToDrop.map(name => name.toLowerCase()));
+	const droppedFirst = (child: TableSchema): boolean => child.schemaName.toLowerCase() === ownSchema && dropped.has(child.name.toLowerCase());
+	for (const move of diff.moduleMigrations) {
+		const rename = diff.renames.find(r => r.kind === 'table' && r.newName.toLowerCase() === move.name.toLowerCase());
+		const child = await db.schemaManager.findChildBlockingDrop(schemaName, rename?.oldName ?? move.name, droppedFirst);
+		if (!child) continue;
+		throw new QuereusError(
+			`apply schema '${schemaName}': cannot move table '${move.name}' to module ${move.toModule}: `
+				+ `table '${child.name}' has rows referencing it, so the DROP TABLE that moves it would fail. `
+				+ `Delete or re-point those rows first.`,
+			StatusCode.CONSTRAINT,
+		);
+	}
 }
 
 /**
