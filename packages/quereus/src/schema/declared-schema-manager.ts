@@ -31,8 +31,8 @@ export interface LensSnapshotPair {
  * text. Storing them (rather than hashing) is what makes the comparison exact.
  * If a host ever declares many large schemas and this shows up in a heap profile,
  * the trade to revisit is hashing the catalog rendering instead — FNV-1a over
- * 119 KB measured 1.46 ms, three times the string compare it would replace, plus
- * a small collision risk.
+ * 119 KB measured 1.46 ms, against the ~0.017 ms string compare it would replace
+ * at that size (about twice the whole 0.77 ms render), plus a small collision risk.
  */
 export interface AppliedSchemaSnapshot {
 	/** `renderDeclaredSchemaCanonical` of the declaration that was applied. */
