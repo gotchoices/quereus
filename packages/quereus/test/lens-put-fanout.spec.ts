@@ -1569,7 +1569,7 @@ describe('lens decomposition put: INSERT fan-out (edge cases)', () => {
 			db.registerModule('mmod', mod);
 			await db.exec('create table M_core (id integer primary key) using mmod');
 			await db.exec('create table M_eav (eid integer, attr text, val integer, primary key (eid, attr)) using mmod');
-			await db.exec('declare logical schema x { table M { id integer primary key, City integer } }');
+			await db.exec('declare logical schema x { table M { id integer primary key, City integer null } }');
 			await db.exec('apply schema x');
 
 			await db.exec('insert into x.M (id, City) values (1, 555)');

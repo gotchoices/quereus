@@ -515,7 +515,7 @@ select o.n, (select id from (select id from lim_big b where b.id in (select bid 
 
 -- A LIMIT that writes must stay off the node: a second evaluation would write twice.
 create table lim_log (n integer primary key);
-select id from lim_big b where b.id in (select bid from lim_keys) order by b.v limit (insert into lim_log values (1) returning n);
+select id from lim_big b where b.id in (select bid from lim_keys) order by b.v limit coalesce((insert into lim_log values (1) returning n), 0);
 → [{"id":1999}]
 select count(*) as c from lim_log;
 → [{"c":1}]

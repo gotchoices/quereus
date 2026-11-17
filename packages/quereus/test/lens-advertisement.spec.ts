@@ -606,7 +606,7 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 			// entity 2 has a nick triple but no city triple.
 			await db.exec("insert into Prof_eav values (1, 'nick', 'Ada'), (1, 'city', 'London'), (2, 'nick', 'Bob')");
 
-			await db.exec('declare logical schema x { table Profile { id integer primary key, nick text, city text } }');
+			await db.exec('declare logical schema x { table Profile { id integer primary key, nick text null, city text null } }');
 			await db.exec('apply schema x');
 
 			const slot = db.schemaManager.getSchema('x')!.getLensSlot('Profile')!;

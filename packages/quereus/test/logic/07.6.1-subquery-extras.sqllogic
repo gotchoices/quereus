@@ -23,12 +23,17 @@ select id, val from sqx_outer order by id;
 create table sqx_limits (lim integer primary key, off integer);
 insert into sqx_limits values (2, 0), (3, 1);
 
--- LIMIT from scalar subquery
+-- A scalar subquery that may find no row is NULL then, so it is rejected as a LIMIT
+-- even over a NOT NULL column; coalesce supplies the no-row value
 select id from sqx_outer order by id limit (select lim from sqx_limits where lim = 2);
+-- error: LIMIT expression may be NULL
+
+-- LIMIT from scalar subquery
+select id from sqx_outer order by id limit coalesce((select lim from sqx_limits where lim = 2), 0);
 → [{"id":1},{"id":2}]
 
 -- LIMIT and OFFSET both from scalar subqueries
-select id from sqx_outer order by id limit (select lim from sqx_limits where lim = 3) offset (select off from sqx_limits where lim = 3);
+select id from sqx_outer order by id limit coalesce((select lim from sqx_limits where lim = 3), 0) offset coalesce((select off from sqx_limits where lim = 3), 0);
 → [{"id":2},{"id":3}]
 
 drop table sqx_limits;

@@ -258,6 +258,17 @@ describe('Announced result-column types match produced values', () => {
 		});
 	});
 
+	describe('announced nullability of a scalar subquery (NULL when it finds no row)', () => {
+		it('announces non-null only when the subquery always yields a row', async () => {
+			// An ungrouped aggregate yields exactly one row, even over an empty input.
+			expect(await announcedNullable('select (select count(*) from t) as v')).to.equal(false);
+			// A grouped aggregate yields no row over an empty input.
+			expect(await announcedNullable('select (select count(*) from t group by i) as v')).to.equal(true);
+			// `id` is NOT NULL, but the filter may leave no row.
+			expect(await announcedNullable('select (select id from t where i = 1) as v')).to.equal(true);
+		});
+	});
+
 	describe('numeric builtins over a stored ±Infinity', () => {
 		// A REAL value can be ±Infinity (`1e999` is a REAL literal), so a function that
 		// preserves its argument's type must pass it through, not null it under a

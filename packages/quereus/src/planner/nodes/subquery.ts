@@ -10,6 +10,7 @@ import { BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { StatusCode } from "../../common/types.js";
 import { Cached } from "../../util/cached.js";
 import { collationConflictError, resolveInCollationForNode } from "../analysis/comparison-collation.js";
+import { alwaysYieldsARow } from "../analysis/always-yields-row.js";
 
 export class ScalarSubqueryNode extends PlanNode implements ScalarPlanNode {
 	override readonly nodeType = PlanNodeType.ScalarSubquery;
@@ -23,11 +24,12 @@ export class ScalarSubqueryNode extends PlanNode implements ScalarPlanNode {
 	}
 
 	getType(): ScalarType {
-		// Scalar subqueries produce a single value, type depends on the subquery's first column
+		// The value is the first column of the subquery's row, or NULL when it finds none.
 		const subqueryType = this.subquery.getType();
 		if (subqueryType.typeClass === 'relation' && subqueryType.columns.length > 0) {
-			const firstColumn = subqueryType.columns[0];
-			return firstColumn.type;
+			const columnType = subqueryType.columns[0].type;
+			if (columnType.nullable || alwaysYieldsARow(this.subquery)) return columnType;
+			return { ...columnType, nullable: true };
 		}
 		// Fallback to nullable BLOB if we can't determine type
 		return {
