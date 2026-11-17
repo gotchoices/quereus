@@ -1,6 +1,6 @@
 {
 	"name": "@quereus/bundle",
-	"version": "5.5.0",
+	"version": "5.6.0",
 	"type": "module",
 	"description": "Save and load a Quereus database's schema and data as a single bundle.yaml file",
 	"keywords": [
