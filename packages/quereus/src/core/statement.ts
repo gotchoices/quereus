@@ -13,7 +13,7 @@ import { WorkCounterCollector, computePlanShape, type PlanShape, type WorkCounte
 import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { REPR_STRICT } from '../runtime/strict-flags.js';
-import { assertRowConforms } from '../runtime/strict-representation.js';
+import { assertAnnouncedNonNull, assertRowConforms } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -652,20 +652,30 @@ export class Statement {
 		// R1 + R2, against each result column's announced type (a `ScalarType` inference,
 		// reachable via `getColumnDefs()`). An announced ANY imposes no R2 constraint.
 		//
-		// The announced NULLABILITY flag is a separate axis this seam does not check:
-		// R2 admits null in every position. A measurement run asserting "announced
-		// non-nullable ⇒ no null cell" found ~28 violations across several classes
-		// (builtins whose `inferReturnType` claims non-nullable while nulling on a null
-		// argument, outer-join columns not widened, empty scalar subqueries) — see
-		// `backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
-		const reprColumns = REPR_STRICT ? this.columnDefCache.value : undefined;
-		const reprNames = reprColumns?.map(col => col.name);
-		const reprTypes = reprColumns?.map(col => col.type.logicalType);
+		// Plus the announced NULLABILITY flag, which R2 does not cover (it admits null in
+		// every position): a column announced non-nullable must yield no null cell. The
+		// lens prover and other consumers trust that flag, so a NOT NULL table column
+		// holding null, a builtin/UDF declared not-null returning null, or an inference
+		// that misses a null-producing path all fail here.
+		const repr = REPR_STRICT ? this.egressReprCheck() : undefined;
 		for await (const row of source) {
 			if (signal) throwIfAborted(signal);
-			if (reprTypes) assertRowConforms(row, reprTypes, 'the statement result row', reprNames);
+			repr?.(row);
 			yield row;
 		}
+	}
+
+	/** The strict-mode row check for `_iterateWithSignal`, built once per execution. */
+	private egressReprCheck(): (row: Row) => void {
+		const columns = this.columnDefCache.value;
+		const names = columns.map(col => col.name);
+		const types = columns.map(col => col.type.logicalType);
+		const nonNullIndices = columns.flatMap((col, i) => col.type.nullable === false ? [i] : []);
+		const where = 'the statement result row';
+		return row => {
+			assertRowConforms(row, types, where, names);
+			assertAnnouncedNonNull(row, nonNullIndices, types, where, names);
+		};
 	}
 
 	/** @internal Low-level row iteration without overrides. */

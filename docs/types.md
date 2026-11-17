@@ -215,7 +215,7 @@ Five seams, each chosen so a violation is reported at the layer that CAUSED it:
 | table-valued function output (`runtime/emit/table-valued-function.ts`) | each row a table-valued function yields, after row-width normalization | its declared column types — R1 + R2; a function declaring no columns gets R1 only |
 | DML write (`runtime/emit/dml-executor.ts`) | the row about to reach `vtab.update`, after the pipeline's coercion pass | the declared column types — R1 + R2 |
 | UDF return (`runtime/emit/scalar-function.ts`) | a scalar function's returned value | its schema's declared return type — R1 + R2 |
-| statement row egress (`core/statement.ts`) | each row yielded to the caller | each result column's announced type — R1 + R2; an announced `ANY` gets R1 only |
+| statement row egress (`core/statement.ts`) | each row yielded to the caller | each result column's announced type — R1 + R2, and no NULL in a column announced NOT NULL; an announced `ANY` gets R1 only |
 
 The egress seam is the backstop for an *expression* producing a non-canonical value (an
 arithmetic path that forgot to narrow), which none of the other four sees. A result
@@ -228,9 +228,17 @@ untyped parameters) names a type whose value space the column's values inhabit, 
 concrete type announces **ANY**, which is an honest "no representation constraint —
 convert before trusting", never a guess.
 
-The seam asserts that announcement. The announced `nullable` flag is a further axis R2
-does not cover (null is admissible in every position) — its violations are tracked as
-`backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
+The seam asserts that announcement, including its `nullable` flag — an axis R2 alone does
+not cover, since R2 admits null in every position. A result column announced NOT NULL that
+yields a NULL cell fails, because the planner and the lens prover rely on that flag (a
+`not null` lens column over a computed expression deploys only if the expression is
+announced non-null). For a module or UDF author this means: a virtual table whose declared
+NOT NULL column returns NULL from `query()`, or a function declared with a non-nullable
+return type (the `*_RETURN_NOT_NULL` constants in `func/builtins/return-types.ts`, or a
+`returnType` / `inferReturnType` with `nullable: false`) that returns NULL, fails strict-mode
+tests the moment such a value reaches a result row. Declare the column or return type
+nullable instead. The check reads the same per-statement column definitions as R1/R2, so it
+always compares against the plan that produced the rows.
 
 **No capability flag, and why.** A `representationFidelity` declaration on
 `VirtualTableModule` (alongside `scanSnapshotIsolation`) was considered and rejected:

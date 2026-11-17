@@ -32,8 +32,10 @@ import { valueToText } from '../util/value-text.js';
  *   inhabits that type's JS value space (INTEGER → safe-integer `number` or `bigint`,
  *   TEXT → `string`, BLOB → `Uint8Array`, …). Implies R1.
  *
- * `null` is always admissible: nullability is `not null` constraint enforcement's
- * job and lives elsewhere.
+ * `null` is always admissible under R1/R2: nullability is `not null` constraint
+ * enforcement's job and lives elsewhere. The one nullability check here is separate,
+ * {@link assertAnnouncedNonNull}, used only at statement egress: a result column the
+ * planner announced NOT NULL must never yield a null cell.
  *
  * R2's predicate itself lives one layer down, in `types/representation.ts`
  * ({@link conformsToType}), because the DML write path needs the same answer: its
@@ -174,5 +176,31 @@ export function assertRowConforms(
 		} else {
 			assertConformsToType(row[i], type, at);
 		}
+	}
+}
+
+/**
+ * Announced nullability: no cell at an index in `nonNullIndices` — the columns whose
+ * announced type is NOT NULL — may be null. Takes the precomputed indices so the
+ * per-row cost is a loop over those columns only. `types`, `where` and `columnNames`
+ * as for {@link assertRowConforms}.
+ */
+export function assertAnnouncedNonNull(
+	row: Row,
+	nonNullIndices: readonly number[],
+	types: readonly DeclaredType[],
+	where: string,
+	columnNames?: readonly (string | undefined)[],
+): void {
+	for (const i of nonNullIndices) {
+		if (row[i] !== null) continue;
+		const name = columnNames?.[i];
+		const at = name ? `${where} column ${i} (${name})` : `${where} column ${i}`;
+		throw new RepresentationError(
+			`repr-strict: null at ${at}, whose announced type is ${types[i].name} NOT NULL. Either the ` +
+			`value is wrong or the announcement is: a NOT NULL table column must not hold null, a ` +
+			`function declared not-null must not return it, and a computed column must be inferred ` +
+			`nullable when it can produce null. See docs/types.md § Enforcement: QUEREUS_REPR_STRICT.`,
+		);
 	}
 }

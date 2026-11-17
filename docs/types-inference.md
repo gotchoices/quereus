@@ -224,9 +224,10 @@ non-finite result (`1/0`, `%` by zero, REAL overflow to `Infinity`) and `runTemp
 nulls a value its declared kind cannot parse. The one exception is `+ - *` over two
 `INTEGER`-class operands (above) — the only shape with no non-finite path — where the operands' own nullability
 stands. That exception is load-bearing: the lens prover uses expression nullability to
-prove a computed `v + 1` column NOT NULL. The announced `nullable` flag is *not* yet
-consistent engine-wide; the remaining classes are tracked in
-`backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
+prove a computed `v + 1` column NOT NULL. Under `QUEREUS_REPR_STRICT` the statement egress
+seam asserts that every result column announced non-null yields no NULL (see
+[types.md § Enforcement](types.md#enforcement-quereus_repr_strict)), so an inference that
+misses a null-producing path fails the strict test run.
 
 ## Unary operator result types
 
