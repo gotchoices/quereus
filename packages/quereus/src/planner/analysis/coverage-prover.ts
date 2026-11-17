@@ -125,7 +125,11 @@
  * reference in expression context before the prover runs (see
  * `AliasedScope.resolveSymbol` / `resolveColumn`), so a real materialized view can
  * never carry such a term — the guard is reachable only by feeding `proveCoverage`
- * a hand-built `selectAst` (which is what the dedicated unit test does). The two
+ * a hand-built `selectAst` (which is what the dedicated unit test does). The planner
+ * also rejects a FROM clause exposing one name twice (`t left join s2.t` — see
+ * `assertDistinctExposedNames` in `building/select.ts`), so the colliding body itself
+ * no longer plans; the unit test plans an aliased twin for the root and keeps the
+ * colliding body only in the stub `selectAst`. The two
  * SQL-reachable orderings (`order by uc` bare, `order by t.uc` 2-part) both
  * resolve to base `T`'s column, a genuine cover, and are unchanged.
  *

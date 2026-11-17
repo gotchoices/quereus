@@ -798,6 +798,7 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 		}
 	}
 	const rightNode = buildFrom(joinClause.right, rightContext, cteNodes);
+	assertDistinctExposedNames(joinClause);
 
 	// Create a combined scope for join expressions
 	const leftScope = parentContext.outputScopes.get(leftNode);
@@ -868,6 +869,49 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 	parentContext.outputScopes.set(joinNode, columnScope);
 
 	return joinNode;
+}
+
+/** A FROM source together with the name it exposes for qualified references (`t.x`, `t.*`). */
+interface ExposedSource {
+	name: string;
+	source: AST.FromClause;
+}
+
+/**
+ * The names a FROM source exposes, as written: a table or function source's alias, else
+ * its own (unqualified) name; a subquery's alias — the parser generates a unique one when
+ * none is written, so an unaliased subquery never collides; a join's names from both sides.
+ */
+function exposedSources(source: AST.FromClause): ExposedSource[] {
+	switch (source.type) {
+		case 'table': return [{ name: source.alias ?? source.table.name, source }];
+		case 'functionSource': return [{ name: source.alias ?? source.name.name, source }];
+		case 'subquerySource': return [{ name: source.alias, source }];
+		case 'join': return [...exposedSources(source.left), ...exposedSources(source.right)];
+	}
+}
+
+/**
+ * Reject a join whose two sides expose the same name. Standard SQL requires the exposed
+ * names within one FROM clause to be distinct; allowing a repeat leaves `t.x` (first
+ * same-named source that has `x`), `t.*` (every same-named source) and the column-rename
+ * walk (first source) each answering "which source is `t`?" differently. Each join node
+ * compares its full left and right leaf sets, so every repeat is caught exactly once.
+ *
+ * NOTE: names compare schema-blind, so `main.t join s2.t` is rejected too — nothing can tell
+ * the two apart, since three-part column references (`s2.t.x`) are rejected at bind time
+ * (see AliasedScope.resolveSymbol). If those are ever supported, compare `(schema, name)`
+ * for unaliased table sources, as PostgreSQL does.
+ */
+function assertDistinctExposedNames(joinClause: AST.JoinClause): void {
+	const leftNames = new Set(exposedSources(joinClause.left).map(s => s.name.toLowerCase()));
+	for (const { name, source } of exposedSources(joinClause.right)) {
+		if (leftNames.has(name.toLowerCase())) {
+			throw new QuereusError(
+				`table name "${name}" specified more than once in FROM clause; give one of them an alias to tell them apart`,
+				StatusCode.ERROR, undefined, source.loc?.start.line, source.loc?.start.column);
+		}
+	}
 }
 
 /**

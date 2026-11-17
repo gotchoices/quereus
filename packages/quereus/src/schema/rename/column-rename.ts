@@ -663,23 +663,13 @@ function buildScopeFrame(from: AST.FromClause[] | undefined, state: ColumnRewrit
 /**
  * Bind a FROM source's one qualifier in `frame`, FIRST-write-wins.
  *
- * The order only matters when two sources in one FROM claim the same qualifier
- * (`from t join u as t`), which is legal here — the planner accepts it and
- * resolves a qualified ref to the FIRST such source in FROM order (`select t.k
- * from t join u as t` reads `t`; `from u as t join t` reads `u`; a BARE `k` is
- * rejected as ambiguous either way). Measured against the engine, not assumed.
- * Skipping the overwrite is what keeps {@link resolveQualifierBinding} agreeing
- * with that, now that one map holds aliases and bare names together — a
- * two-map lookup used to answer alias-first, which matched the planner only
- * when the aliased source came first.
- *
- * First-wins matches how the planner resolves a qualified COLUMN, but the planner
- * expands a qualified STAR by name-matching every source, so `select t.* from u as
- * t join t` yields both sources' columns while this walk sees only `u` — the
- * engine disagreeing with itself about a duplicated qualifier, tracked by
- * `bug-duplicate-from-qualifier-resolves-inconsistently`. Making this walk match
- * the star would just pick the other side of the disagreement; the ticket's fix is
- * to reject the duplicate at build time, after which the question stops existing.
+ * The order would only matter if two sources in one FROM claimed the same
+ * qualifier (`from t join u as t`), and the planner rejects that (see
+ * `assertDistinctExposedNames` in `planner/building/select.ts`), so a body this
+ * walk visits binds each qualifier at most once per frame. A stored body that
+ * repeats a qualifier predates that check and fails to plan whatever this walk
+ * does to it, so skipping the overwrite is a harmless guard, not a semantics.
+ * One map holds aliases and bare names together.
  */
 function bindQualifier(frame: ScopeFrame, qualifierLower: string, key: string): void {
 	if (!frame.qualifiers.has(qualifierLower)) frame.qualifiers.set(qualifierLower, key);
@@ -872,11 +862,9 @@ function frameBindsTarget(frame: ScopeFrame, targetKey: string): boolean {
  * rather than falling through to the caller's seedless fallback, which would
  * hit a real table that happens to be named `s`.
  *
- * A qualifier claimed TWICE inside one FROM (`from t join u as t`) is legal and
- * resolves to the FIRST such source; {@link bindQualifier} is what makes that
- * true here, and it is a small IMPROVEMENT on the two-map lookup this replaced
- * (which answered alias-first, and so read `from t join u as t` as `u` where
- * the planner reads it as `t`).
+ * A qualifier binds at most one source per frame: the planner rejects one FROM
+ * exposing a name twice (`from t join u as t`), so the first-wins guard in
+ * {@link bindQualifier} never has to choose.
  */
 function resolveQualifierBinding(
 	state: ColumnRewriteState,

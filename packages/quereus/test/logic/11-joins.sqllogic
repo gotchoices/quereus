@@ -84,3 +84,29 @@ SELECT order_id, total FROM je_order_view ORDER BY order_id;
 DROP VIEW je_order_view;
 DROP TABLE je_orders;
 DROP TABLE je_customers;
+
+-- ===================================================================
+-- Exposed source names must be distinct within one FROM clause.
+-- A repeat left `t.x`, `t.*` and the column-rename walk each picking a
+-- different source for `t`; the planner now rejects it, as standard SQL does.
+-- ===================================================================
+
+create table dn_t (id integer primary key, x integer);
+create table dn_u (id integer primary key, y integer);
+insert into dn_t values (1, 5);
+insert into dn_u values (2, 7);
+
+-- an alias repeating another source's name
+select dn_t.* from dn_t join dn_u as dn_t on 1=1;
+-- error: specified more than once in FROM clause
+
+-- an unaliased self-join
+select * from dn_t join dn_t on 1=1;
+-- error: specified more than once in FROM clause
+
+-- distinct names stay legal, including a correlated subquery reusing an outer name
+select dn_t.x, t2.id from dn_t join dn_t as t2 on 1=1 where exists (select 1 from dn_t join dn_u on 1=1 where dn_t.id = t2.id);
+→ [{"x":5,"id":1}]
+
+drop table dn_u;
+drop table dn_t;

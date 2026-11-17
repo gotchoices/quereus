@@ -808,13 +808,17 @@ describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
  * mis-map onto base `T`'s same-named column (which would be a false Covers). See
  * the coverage-prover module doc § cross-schema.
  *
- * This path is unreachable from SQL: the binder rejects every 3-part
- * `schema.table.column` reference in expression context before a plan (let alone
- * an MV) exists, so the 3-part ORDER BY term is **hand-built** and the prover is
- * exercised at its boundary only (`proveCoverage` reads `mv.derivation.selectAst`
- * directly, without re-binding). The two SQL-reachable orderings — bare `uc` and 2-part
- * `t.uc` (the `schema: undefined` case) — both correctly resolve to base `T`'s
- * column, so they are the regression floor.
+ * This path is doubly unreachable from SQL: the binder rejects every 3-part
+ * `schema.table.column` reference in expression context, and the planner rejects a
+ * FROM clause that exposes the name `t` twice (`t left join s2.t`), both before a plan
+ * (let alone an MV) exists. So the duplicate-named body is only ever **parsed** into
+ * the stub `selectAst` — with a hand-built 3-part ORDER BY term — and the plan root
+ * comes from its plannable twin with the lookup aliased; the prover is exercised at
+ * its boundary only (`proveCoverage` reads `mv.derivation.selectAst` directly,
+ * without re-binding, and the join shape from the root). It defends the day 3-part
+ * column references and a schema-aware duplicate-name check arrive together. The two
+ * SQL-reachable orderings — bare `uc` and 2-part `t.uc` (the `schema: undefined`
+ * case) — both correctly resolve to base `T`'s column, so they are the regression floor.
  *
  * Fixture: base `main.t (id pk, uc not null, lkref not null, unique(uc))`
  * left-joined to lookup `s2.t (pkid pk, uc not null)`. Both tables are named `t`
@@ -824,7 +828,10 @@ describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
  * ORDER BY is a base-`T` `uc` ordering.
  */
 describe('coverage prover — cross-schema qualifier resolution (defense-in-depth)', () => {
+	/** The stub's body: lookup unaliased, so both sources expose `t`. Parsed only — it no longer plans. */
 	const BODY = 'select t.uc, t.id from t left join s2.t on lkref = pkid order by uc';
+	/** BODY with the lookup aliased: the same plan (`t.uc` binds base `t` in both), and it plans. */
+	const PLANNABLE_BODY = 'select t.uc, t.id from t left join s2.t as l on lkref = pkid order by uc';
 
 	async function freshCrossSchema(): Promise<Database> {
 		const db = await freshDb([
@@ -838,8 +845,8 @@ describe('coverage prover — cross-schema qualifier resolution (defense-in-dept
 	/**
 	 * Proves `BODY` against base `main.t`'s `unique(uc)` with a single hand-built
 	 * ORDER BY term `{ type: 'column', name: 'uc', table: 't', schema }` — the
-	 * 3-part form SQL cannot produce. `root` comes from the real (plannable) body;
-	 * only the stub `selectAst`'s ORDER BY is replaced with the schema-qualified term.
+	 * 3-part form SQL cannot produce. `root` comes from `PLANNABLE_BODY`; the stub
+	 * `selectAst` is `BODY` with its ORDER BY replaced by the schema-qualified term.
 	 */
 	function proveWithOrderSchema(db: Database, schema: string | undefined): CoverageResult {
 		const selectAst = parseSelect(BODY) as AST.SelectStmt;
@@ -848,7 +855,7 @@ describe('coverage prover — cross-schema qualifier resolution (defense-in-dept
 		const mvStub = { name: 'ix', schemaName: 'main', derivation: { selectAst } } as unknown as MaintainedTableSchema;
 		const table = db.schemaManager.getTable('main', 't')!;
 		const uc = table.uniqueConstraints![0];
-		return proveCoverage(bodyRoot(db, BODY), mvStub, uc, table);
+		return proveCoverage(bodyRoot(db, PLANNABLE_BODY), mvStub, uc, table);
 	}
 
 	it('lookup-schema-qualified (s2.t.uc) does NOT cover — ordering-mismatch (the fix)', async () => {

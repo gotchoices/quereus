@@ -467,6 +467,9 @@ table_reference:
 | table_reference join_type join table_reference [join_specification]
 ```
 
+**Source names:**
+Each source exposes a name for qualified references (`t.x`, `t.*`): its alias, else its table or function name (without the schema). These names must be distinct within one FROM clause — `from t join t`, `from t join u as t` and `from main.t join s2.t` are errors (`table name "t" specified more than once in FROM clause`), so a self-join needs an alias on at least one side. A subquery without an alias gets a generated one and never collides. A subquery in the WHERE or select list has its own FROM clause and may reuse an outer name, shadowing it.
+
 **Mutating Statements:**
 Quereus supports **relational orthogonality** - any statement that results in a relation can be used anywhere that expects a relation value. This includes:
 - `(INSERT ... RETURNING ...) AS alias`

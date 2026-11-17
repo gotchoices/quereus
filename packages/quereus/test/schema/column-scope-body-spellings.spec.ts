@@ -175,24 +175,6 @@ describe('column verbs: body spellings that reach one table\'s column', () => {
 			});
 		}
 
-		// A qualifier claimed by two sources in one FROM is legal, and the planner
-		// resolves it to the FIRST of them. The walk must agree, or it rewrites
-		// the wrong table's column.
-		it('a duplicated qualifier follows the planner — first source in FROM order', async () => {
-			await db.exec('create table u (id integer primary key, x integer)');
-			await db.exec('insert into u values (1, 9)');
-			await db.exec('create view first_t as select t.x as r from t join u as t on t.id = t.id');
-			await db.exec('create view first_u as select t.x as r from u as t join t on t.id = t.id');
-			expect(await db.get('select r from first_t')).to.deep.equal({ r: 5 });
-			expect(await db.get('select r from first_u')).to.deep.equal({ r: 9 });
-
-			await db.exec('alter table t rename column x to z');
-			// `first_t`'s `t.x` names the renamed table and must have followed it;
-			// `first_u`'s names `u` and must not have moved. Both must still plan.
-			expect(await db.get('select r from first_t')).to.deep.equal({ r: 5 });
-			expect(await db.get('select r from first_u')).to.deep.equal({ r: 9 });
-		});
-
 		it('a reader of the republished name follows the rename too', async () => {
 			await db.exec('create view v as select * from t a');
 			await db.exec('create view w as select x from v');
