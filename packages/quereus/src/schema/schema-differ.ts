@@ -98,7 +98,23 @@ export interface MigrationStep {
 	 * executor's diagnostic.
 	 */
 	readonly irreversible?: string;
+	/**
+	 * Set together with `irreversible` by exactly the three steps that discard stored
+	 * data — a `DROP TABLE` of a table that exists, a `DROP COLUMN`, and an
+	 * `ALTER COLUMN … SET DATA TYPE` — and never by an `irreversible` that only reports a
+	 * catalog entry lacking what its restore needs. Present only when the plan was built
+	 * with the pre-apply catalog. The apply-time `allow_destructive` gate reads it.
+	 */
+	readonly destroys?: DestroyedData;
 }
+
+/**
+ * What a migration step destroys: the stored data no statement can put back. Names
+ * are spelled as the step spells them — after the plan's renames, as declared.
+ */
+export type DestroyedData =
+	| { readonly kind: 'table'; readonly table: string }
+	| { readonly kind: 'column' | 'retype'; readonly table: string; readonly column: string };
 
 /**
  * Represents the difference between a declared schema and actual database state
@@ -3978,7 +3994,7 @@ function pushTagChanges(alter: TableAlterDiff, sink: AlterStepSink): void {
 }
 
 /** The reversal half of a {@link MigrationStep}: the statements that undo it, or why none can. */
-type StepUndo = { readonly undo: readonly string[] } | { readonly irreversible: string };
+type StepUndo = { readonly undo: readonly string[] } | { readonly irreversible: string; readonly destroys?: DestroyedData };
 
 /** A step that changed nothing, so nothing has to be put back. */
 const NOTHING_TO_UNDO: StepUndo = { undo: [] };
@@ -4095,19 +4111,29 @@ class UndoRenderer {
 		return { undo: [`${verb} IF EXISTS ${this.schemaPrefix}${quoteIdentifier(name)}`] };
 	}
 
-	droppedTable(actualName: string): StepUndo {
-		if (!this.tables.has(actualName.toLowerCase())) return NOTHING_TO_UNDO;
-		return { irreversible: `dropping table "${actualName}" also discards its rows, and no statement can bring them back` };
+	/** Looked up through the renames in force (Rule 1): a module move that also renames the table drops it under its new name. */
+	droppedTable(table: string): StepUndo {
+		if (!this.tableNow(table)) return NOTHING_TO_UNDO;
+		return {
+			irreversible: `dropping table "${table}" also discards its rows, and no statement can bring them back`,
+			destroys: { kind: 'table', table },
+		};
 	}
 
 	droppedColumn(table: string, column: string): StepUndo {
 		if (!this.columnNow(table, column)) return NOTHING_TO_UNDO;
-		return { irreversible: `dropping column "${column}" from table "${table}" discards the values stored in it, and no statement can bring them back` };
+		return {
+			irreversible: `dropping column "${column}" from table "${table}" discards the values stored in it, and no statement can bring them back`,
+			destroys: { kind: 'column', table, column },
+		};
 	}
 
 	retypedColumn(table: string, column: string): StepUndo {
 		if (!this.columnNow(table, column)) return NOTHING_TO_UNDO;
-		return { irreversible: `changing the type of column "${column}" in table "${table}" converts the values stored in it, and a conversion can lose information that no statement can bring back` };
+		return {
+			irreversible: `changing the type of column "${column}" in table "${table}" converts the values stored in it, and a conversion can lose information that no statement can bring back`,
+			destroys: { kind: 'retype', table, column },
+		};
 	}
 
 	recreateAssertion(name: string): StepUndo {

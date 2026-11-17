@@ -139,7 +139,7 @@ describe('assertion body validation: declarative routes that used to brick write
 			expect(diff.assertionsToCreate.length, 'and recreated from the declaration').to.equal(1);
 
 			await expectThrows(
-				() => db.exec('apply schema main'),
+				() => db.exec('apply schema main options (allow_destructive = true)'),
 				`Cannot create assertion 'a_t': Table 't' not found`);
 
 			// The apply stopped at the recreate rather than leaving an unresolvable

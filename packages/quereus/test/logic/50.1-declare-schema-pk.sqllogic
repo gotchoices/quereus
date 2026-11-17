@@ -64,7 +64,7 @@ diff schema main;
 → [{"ddl": "ALTER TABLE t_pk_drop ALTER PRIMARY KEY (new_id)"}, {"ddl": "ALTER TABLE t_pk_drop DROP COLUMN old_id"}]
 
 -- Apply should succeed (rekey happens before drop)
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 

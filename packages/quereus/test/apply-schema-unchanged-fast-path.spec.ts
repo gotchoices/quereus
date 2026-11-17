@@ -319,7 +319,7 @@ describe('APPLY SCHEMA unchanged fast path', () => {
 			it(`${what} → full reconcile restores the declared shape`, async () => {
 				db = await settledDb();
 				await db.exec(sql);
-				await db.exec('apply schema main');
+				await db.exec('apply schema main options (allow_destructive = true)');
 				check(db);
 			});
 		}

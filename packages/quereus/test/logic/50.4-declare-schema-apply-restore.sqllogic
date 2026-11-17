@@ -492,7 +492,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -520,7 +520,7 @@ declare schema main {
 diff schema main;
 → [{"ddl": "ALTER TABLE u DROP COLUMN z"}, {"ddl": "ALTER TABLE t DROP COLUMN d"}]
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -1036,7 +1036,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: cannot drop table 'main.a_t': assertion 'a_ck' reaches it through view 'a_v3'
 
 select n from a_t;
@@ -1167,7 +1167,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 select count(*) as n from schema() where name = 'd_t';
 → [{"n": 0}]
@@ -1232,7 +1232,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
 
 -- The table and the view both go while the CHECK stays. Nothing reads d_t2 after the plan, but
@@ -1244,7 +1244,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
 
 -- The CHECK moves to a view in another schema, whose body the differ cannot follow back to d_t2.
@@ -1257,7 +1257,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: cannot drop table 'main.d_t2': CHECK constraint 'd_pc' on table 'd_p' reaches it through view 'd_v9'
 
 select n from d_t2;

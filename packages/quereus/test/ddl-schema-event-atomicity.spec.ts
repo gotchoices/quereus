@@ -357,7 +357,7 @@ for (const backend of BACKENDS) {
 			// poisoned), then the create, then the failing ALTER.
 			await db.exec('begin');
 			await db.exec("insert into t values (2, 'b')");
-			await assert.rejects(() => db.exec('apply schema main'), /partially migrated and could not be restored/);
+			await assert.rejects(() => db.exec('apply schema main options (allow_destructive = true)'), /partially migrated and could not be restored/);
 			await db.exec('commit');
 
 			// The drop and the create really happened and cannot be taken back, so they stay

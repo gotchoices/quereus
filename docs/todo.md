@@ -189,7 +189,7 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
 
 **Planned:**
 - [x] Rename detection with `old name` hints and stable `id` matching (tables, columns, named constraints; views/indexes drop+recreate when hinted — see `docs/sql.md` §"Rename detection")
-- [ ] Destructive change gating with `allow_destructive` option
+- [x] Destructive change gating with `allow_destructive` option (dropped tables and columns, retyped columns, module moves — see `docs/sql-ddl.md` § Safety)
 - [ ] Import support: `import schema <alias> from '<url>' cache '<key>' version '<semver>'`
 - [ ] Local cache registry for offline imports
 - [ ] Idempotent seeds with PK/UNIQUE upsert logic
@@ -204,7 +204,7 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
 
 - **DDL remains primary**: Declarative schema is optional and generates canonical DDL
 - **Module-agnostic**: Works with any VTab module, uses standard catalog introspection
-- **Safe by default**: Non-destructive operations only (drops require future `allow_destructive` flag)
+- **Safe by default**: a plan that destroys stored data (drops a table or column, retypes a column, moves a table to another module) runs only with `options (allow_destructive = true)`
 - **Order-independent**: Forward references allowed within declaration blocks
 - **Deterministic**: Schema hash computed from canonical DDL representation
 - **Contextual keywords**: `schema`, `version`, `seed` are contextual to avoid breaking `schema()` function or column names

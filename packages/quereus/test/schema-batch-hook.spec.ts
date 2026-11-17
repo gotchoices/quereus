@@ -289,9 +289,9 @@ describe('APPLY SCHEMA batch hooks', () => {
 			return renderCatalogForRestoreCheck(collectSchemaCatalog(db, 'main'));
 		}
 
-		async function refusedApply(): Promise<Error> {
+		async function refusedApply(apply = 'apply schema main'): Promise<Error> {
 			try {
-				await db.exec('apply schema main');
+				await db.exec(apply);
 			} catch (e) {
 				return e as Error;
 			}
@@ -356,7 +356,7 @@ describe('APPLY SCHEMA batch hooks', () => {
 			const unsubscribe = db.onSchemaChange(e => events.push(e));
 
 			await db.exec('begin');
-			const err = await refusedApply();
+			const err = await refusedApply('apply schema main options (allow_destructive = true)');
 			await db.exec('commit');
 			unsubscribe();
 

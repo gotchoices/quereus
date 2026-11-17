@@ -1166,6 +1166,12 @@ drop table cn_ab;
 -- own check. Runs last, against an otherwise-empty main schema, so the
 -- declaration below is the whole of main and the diff generates no drops.
 
+drop table reuse_pt;
+drop table iul_m;
+drop table iul_n;
+drop table iul_o;
+drop table iul_p;
+
 create table as_t (id integer primary key, a text, b text);
 create index as_foo on as_t (b);
 insert into as_t values (1, 'x', 'p'), (2, 'y', 'q');

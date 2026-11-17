@@ -39,7 +39,7 @@ describe('apply schema: table alters run in stages across tables', () => {
 
 	async function applies(declaration: string): Promise<void> {
 		await db.exec(declaration);
-		await db.exec('apply schema main');
+		await db.exec('apply schema main options (allow_destructive = true)');
 		expect(await rows(db, 'diff schema main')).to.deep.equal([]);
 	}
 

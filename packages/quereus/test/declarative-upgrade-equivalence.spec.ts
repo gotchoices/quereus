@@ -135,7 +135,7 @@ const cases: UpgradeCase[] = [
 
 async function declareAndApply(db: Database, body: string): Promise<void> {
 	await db.exec(`declare schema main { ${body} }`);
-	await db.exec('apply schema main');
+	await db.exec('apply schema main options (allow_destructive = true)');
 }
 
 async function diffRows(db: Database): Promise<unknown[]> {
@@ -211,7 +211,7 @@ describe('Declarative fresh-vs-upgrade constraint equivalence', () => {
 			try {
 				await freshDb.exec(`declare schema main { ${c.v1} }`);
 				if (c.freshRemovable) {
-					await freshDb.exec('apply schema main');
+					await freshDb.exec('apply schema main options (allow_destructive = true)');
 					expect(await diffRows(freshDb)).to.deep.equal([]);
 				} else {
 					let message = '';

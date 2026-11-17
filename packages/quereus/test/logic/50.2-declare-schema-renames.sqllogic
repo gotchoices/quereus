@@ -214,7 +214,7 @@ declare schema main {
 -- run
 
 -- Under deny, the hint is ignored. Drop + create wipes data.
-apply schema main options (rename_policy = 'deny');
+apply schema main options (allow_destructive = true, rename_policy = 'deny');
 
 -- run
 

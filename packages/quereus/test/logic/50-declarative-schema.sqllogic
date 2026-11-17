@@ -129,7 +129,7 @@ diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS comments"}, {"ddl": "DROP TABLE IF EXISTS posts"}]
 
 -- Step 16: Apply to drop extra tables
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -175,7 +175,7 @@ declare schema main {
 -- run
 
 -- Step 19: Apply complete replacement (drops users, creates categories/products)
-apply schema main with seed;
+apply schema main with seed options (allow_destructive = true);
 
 -- run
 
@@ -201,7 +201,7 @@ declare schema main {
 
 -- run
 
-apply schema main with seed;
+apply schema main with seed options (allow_destructive = true);
 
 -- run
 
@@ -231,7 +231,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -330,7 +330,7 @@ diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS test_trailing"}, {"ddl": "create table users (id INTEGER primary key, name TEXT not null, email TEXT, active INTEGER default 1)"}, {"ddl": "create table posts (id INTEGER primary key, user_id INTEGER not null, title TEXT not null, content TEXT, constraint fk_user foreign key (user_id) references users(id))"}, {"ddl": "create view active_users as select id, name, email from users where active = 1"}, {"ddl": "create view user_posts as select u.name as author, p.title, p.content from users as u inner join posts as p on u.id = p.user_id where u.active = 1"}]
 
 -- Step 28: Apply schema with views
-apply schema main with seed;
+apply schema main with seed options (allow_destructive = true);
 
 -- run
 
@@ -360,7 +360,7 @@ diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS posts"}, {"ddl": "DROP VIEW IF EXISTS active_users"}, {"ddl": "DROP VIEW IF EXISTS user_posts"}, {"ddl": "create view user_summary (user_id, full_name, contact) as select id, name, email from users where active = 1"}]
 
 -- Step 32: Apply view changes
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -435,7 +435,7 @@ diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS users"}, {"ddl": "create table products_with_indexes (id INTEGER primary key, name TEXT not null, category TEXT, price REAL)"}]
 
 -- Step 40: Apply schema
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -648,7 +648,7 @@ diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS products_with_indexes"}, {"ddl": "create table assert_accounts (id INTEGER primary key, balance INTEGER not null)"}, {"ddl": "create assertion positive_balance check (not exists (select 1 from assert_accounts where balance < 0))"}]
 
 -- Step 56: Apply creates the table and assertion
-apply schema main with seed;
+apply schema main with seed options (allow_destructive = true);
 
 -- run
 
@@ -725,7 +725,7 @@ declare schema main {
 diff schema main;
 → [{"ddl": "DROP TABLE IF EXISTS assert_accounts"}, {"ddl": "create table assert_items (id INTEGER primary key, qty INTEGER not null, price INTEGER not null)"}, {"ddl": "create assertion qty_positive check (not exists (select 1 from assert_items where qty < 0))"}, {"ddl": "create assertion price_positive check (not exists (select 1 from assert_items where price < 0))"}]
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -1044,7 +1044,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -1726,7 +1726,7 @@ declare schema decl_collate_retype using (default_vtab_module = 'memory') {
 diff schema decl_collate_retype;
 → [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE BINARY"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE DATE"}]
 
-apply schema decl_collate_retype;
+apply schema decl_collate_retype options (allow_destructive = true);
 
 -- run
 
@@ -1750,7 +1750,7 @@ declare schema decl_collate_retype using (default_vtab_module = 'memory') {
 diff schema decl_collate_retype;
 → [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE TEXT"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE NOCASE"}]
 
-apply schema decl_collate_retype;
+apply schema decl_collate_retype options (allow_destructive = true);
 
 -- run
 
@@ -2042,6 +2042,60 @@ apply schema main options (allow_destructive = true, rename_policy = 'deny');
 
 drop table opt_probe;
 
+-- ===================================
+-- A plan that destroys stored data — a dropped table, a dropped column, a
+-- changed column type — is refused before anything runs, unless acknowledged
+-- with allow_destructive.
+-- ===================================
+
+declare schema destr_gate {
+	table keep {
+		id integer primary key,
+		a text null,
+		b text null
+	}
+	table gone {
+		id integer primary key
+	}
+}
+
+-- run
+
+apply schema destr_gate;
+
+-- run
+
+insert into destr_gate.keep values (1, 'x', '7');
+insert into destr_gate.gone values (1);
+
+declare schema destr_gate {
+	table keep {
+		id integer primary key,
+		b integer null
+	}
+}
+
+-- run
+
+apply schema destr_gate;
+-- error: this migration destroys stored data: table(s) 'gone' would be dropped with their rows; column(s) 'keep.a' would be dropped with their values; column(s) 'keep.b' would change type
+
+select id from destr_gate.gone;
+→ [{"id": 1}]
+
+select id, a, b from destr_gate.keep;
+→ [{"id": 1, "a": "x", "b": "7"}]
+
+apply schema destr_gate options (allow_destructive = true);
+
+-- run
+
+select id from destr_gate.gone;
+-- error: not found
+
+select id, b from destr_gate.keep;
+→ [{"id": 1, "b": 7}]
+
 -- ===================================================================
 -- Unnamed CHECK / UNIQUE / FOREIGN KEY constraints are diffed by body
 -- (ticket declarative-differ-ignores-unnamed-constraint-additions). The
@@ -2313,7 +2367,7 @@ declare schema main {
 diff schema main;
 → [{"ddl": "ALTER TABLE uc_g DROP COLUMN a"}]
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 
@@ -2500,7 +2554,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: still has rows referencing it
 
 select id from fkr_t;
@@ -2515,7 +2569,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- error: still has rows referencing it
 
 select id from fkr_t;
@@ -2530,7 +2584,7 @@ declare schema main {
 diff schema main;
 → [{"ddl": "ALTER TABLE fkr_p DROP CONSTRAINT pf"}, {"ddl": "DROP TABLE IF EXISTS fkr_t"}]
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 
 -- run
 

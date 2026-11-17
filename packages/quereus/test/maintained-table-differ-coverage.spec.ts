@@ -88,7 +88,7 @@ describe('Maintained-table differ — review coverage', () => {
 		// table no longer drops EARLY (it is a table now), so this verifies dropping
 		// the source out from under it in the same migration is tolerated.
 		await db.exec(`declare schema main {}`);
-		await db.exec('apply schema main');
+		await db.exec('apply schema main options (allow_destructive = true)');
 		expect(db.schemaManager.getTable('main', 'm'), 'orphan maintained dropped').to.be.undefined;
 		expect(db.schemaManager.getTable('main', 's'), 'source dropped').to.be.undefined;
 	});
@@ -107,7 +107,7 @@ describe('Maintained-table differ — review coverage', () => {
 		await db.exec(`declare schema main {
 			table m { id integer primary key, v integer }
 		}`);
-		await db.exec('apply schema main');
+		await db.exec('apply schema main options (allow_destructive = true)');
 		expect(db.schemaManager.getTable('main', 's'), 'source dropped').to.be.undefined;
 		const m = db.schemaManager.getTable('main', 'm');
 		expect(m, 'm survives as plain table').to.not.be.undefined;

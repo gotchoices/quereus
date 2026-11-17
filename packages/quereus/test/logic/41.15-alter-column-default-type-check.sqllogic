@@ -143,7 +143,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- run
 
 insert into t_mig (id) values (2);
@@ -167,7 +167,7 @@ declare schema main {
 
 -- run
 
-apply schema main;
+apply schema main options (allow_destructive = true);
 -- run
 
 insert into t_mig_drop (id) values (2);

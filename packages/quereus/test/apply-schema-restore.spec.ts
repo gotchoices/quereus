@@ -457,7 +457,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			await db.exec('insert into P values (1, 5)');
 			await db.exec(`declare schema main { ${NEW_T} view V1 as select sum(N) - 9 as S from T ${P_READING_V1} }`);
 
-			const err = await rejection(db.exec('apply schema main')) as QuereusError;
+			const err = await rejection(db.exec('apply schema main options (allow_destructive = true)')) as QuereusError;
 
 			expect(err.message).to.match(/reads recreated 'main\.v1' and fails/);
 			expect(err.message).to.match(/partially migrated and could not be restored: the earlier step `DROP TABLE IF EXISTS old` cannot be undone/);
@@ -524,7 +524,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			// Drops run before alters: DROP TABLE old lands, then the ADD COLUMN fails.
 			await db.exec(`declare schema main { ${FAILING_T} }`);
 
-			const err = await rejection(db.exec('apply schema main'));
+			const err = await rejection(db.exec('apply schema main options (allow_destructive = true)'));
 			expect(err.message).to.match(/^Failed to execute DDL: ALTER TABLE t ADD COLUMN/);
 			expect(err.message).to.match(/The schema is partially migrated and could not be restored/);
 			expect(err.message).to.match(/the earlier step `DROP TABLE IF EXISTS old` cannot be undone/);
@@ -549,7 +549,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 				}
 			`);
 
-			const err = await rejection(db.exec('apply schema main'));
+			const err = await rejection(db.exec('apply schema main options (allow_destructive = true)'));
 			expect(err.message).to.match(/^Failed to execute DDL: ALTER TABLE t ALTER COLUMN v SET DATA TYPE/);
 			expect(err.message).to.match(/The schema could not be restored: the failing step `ALTER TABLE t ALTER COLUMN v SET DATA TYPE INTEGER` cannot be undone/);
 		});
@@ -684,7 +684,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 					events.length = 0;
 
 					await db.exec('begin');
-					await rejection(db.exec('apply schema main'));
+					await rejection(db.exec('apply schema main options (allow_destructive = true)'));
 					await db.exec('commit');
 
 					// Drops, then creates, then the ALTER that failed and retracted its own.
@@ -801,7 +801,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			await db.exec(`declare schema main { ${rekeyedT()} }`);
 			expect(await planOf(db)).to.deep.equal(['DROP TABLE IF EXISTS old', 'ALTER TABLE t ALTER PRIMARY KEY (c)']);
 
-			await expectRefused();
+			await expectRefused('apply schema main options (allow_destructive = true)');
 			expect(await rows(db, 'select id from old')).to.deep.equal([{ id: 1 }]);
 		});
 
@@ -817,7 +817,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 				'ALTER TABLE renamed ALTER PRIMARY KEY (c)',
 			]);
 
-			await expectRefused();
+			await expectRefused('apply schema main options (allow_destructive = true)');
 			expect(await rows(db, 'select count(*) as n from old')).to.deep.equal([{ n: 0 }]);
 		});
 

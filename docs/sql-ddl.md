@@ -219,7 +219,7 @@ apply schema main to version '1.0.0' options (
 **Migration Application:**
 - `apply schema` executes the migration DDL automatically.
 - Migrations are applied in safe order: drops first, then creates, then alters.
-- Seed data application: `with seed` clears existing data and inserts declared seed rows.
+- Seed data application: `with seed` inserts each declared seed row as `INSERT … ON CONFLICT (<pk>) DO NOTHING`. It deletes nothing: a row already holding a seed row's primary key is left untouched (so user edits survive a re-seed), while a seed row that violates a CHECK, NOT NULL or foreign key still aborts the apply.
 
 **Versioning and Hashing:**
 - Schema declarations can include semantic versions.
@@ -231,23 +231,36 @@ apply schema main to version '1.0.0' options (
 `allow_destructive` (boolean literal `true` / `false`) and `rename_policy` (string) are the only keys accepted; both are described below. Anything else is a parse error — an unrecognized key, or a non-boolean value for `allow_destructive`. Silently dropping an option the engine will not honor would run the full migration anyway, which is precisely what the caller was trying to avoid. `dry_run` and `validate_only` were accepted-and-ignored by earlier builds and are now rejected by name: use `diff schema` for a read-only preview of the exact migration DDL. There is no engine-level dry-run or validate-only mode.
 
 **Safety:**
-- Seed data application is destructive (clears table before inserting).
-- `allow_destructive` is **enforced for one case today**: moving an existing table to another module (see "What a declaration pins" below for when a declaration names a module). There is no in-place primitive for that, so it is realized as a `DROP TABLE` + a recreate in the declared module (`create table … using <module>`, or `create materialized view … using <module>` for the sugar form). A **plain table loses its rows**. A **maintained table** (`materialized view …` / `table … maintained as`) is re-materialized from its body, which **mints a new incarnation** (changing row identity for a replicated/synced table). `apply schema` aborts — before any DDL runs — unless re-run with `options (allow_destructive = true)`:
+- Seeding deletes and overwrites nothing (see Migration Application above).
+- `allow_destructive` gates every step that destroys stored data. `apply schema` refuses, before any DDL runs, a plan that drops a table, drops a column, changes a column's type (a conversion can lose information) or moves a table to another module, unless re-run with `options (allow_destructive = true)`. The decision comes from the plan, never from row counts: dropping an empty table is refused too, so an apply that passes against an empty development database cannot start failing against a populated one. One error lists everything at risk:
+
+  ```sql
+  -- Re-declared without column t.note; refused without the ack:
+  apply schema main;
+  -- Error: apply schema 'main': this migration destroys stored data: column(s) 't.note'
+  --        would be dropped with their values. Re-run with options
+  --        (allow_destructive = true) to migrate. A renamed table or column keeps its
+  --        data only with a rename hint (the quereus.previous_name tag).
+
+  -- Acknowledged:
+  apply schema main options (allow_destructive = true);
+  ```
+
+  When the drop is really a rename, add a rename hint instead (see "Rename detection" below); under `rename_policy = 'deny'` even a hinted rename becomes a drop + create and needs the acknowledgement. A widening type change that loses nothing (say `integer` → `real`) needs it as well, because the plan does not tell lossless conversions from lossy ones. `diff schema` is never gated: it is a read-only preview and lists the same DDL unconditionally.
+
+  **Moving a table to another module** (see "What a declaration pins" below for when a declaration names a module) is one of the gated cases. There is no in-place primitive for it, so it is realized as a `DROP TABLE` + a recreate in the declared module (`create table … using <module>`, or `create materialized view … using <module>` for the sugar form). A **plain table loses its rows**. A **maintained table** (`materialized view …` / `table … maintained as`) is re-materialized from its body, which **mints a new incarnation** (changing row identity for a replicated/synced table). The refusal describes a move as a move:
 
   ```sql
   -- Re-declared with a different module; refused without the ack:
   apply schema main;
-  -- Error: apply schema 'main': moving a table to another module is destructive:
-  --        table(s) 't' (memory → mem2) would be dropped and recreated empty — their
-  --        rows are lost; maintained table(s) 'mv' (memory → mem2) would be dropped and
-  --        re-materialized as a new incarnation. Re-run with options
-  --        (allow_destructive = true) to migrate.
-
-  -- Acknowledged — drops + recreates in the declared module:
-  apply schema main options (allow_destructive = true);
+  -- Error: apply schema 'main': this migration destroys stored data: table(s) 't'
+  --        (memory → mem2) would be moved to another module by dropping and recreating
+  --        them empty — their rows are lost; maintained table(s) 'mv' (memory → mem2)
+  --        would be moved to another module by dropping and re-materializing them as a
+  --        new incarnation. Re-run with options (allow_destructive = true) to migrate.
   ```
 
-  The table's declared indexes are recreated after the drop. A move whose `DROP TABLE` the foreign-key check would refuse — another table still has rows referencing the moved one, through a foreign key the declaration keeps on a table it keeps — is refused up front as well, naming the referencing table. A referencing table the declaration drops is dropped first and does not block the move; neither does a foreign key it removes, except in the rare plan whose constraint drops must wait until after the table drops (see `SchemaDiff.removalsStillReferenced`). `diff schema` surfaces the `DROP TABLE` / recreate DDL unconditionally (it is a read-only preview, never gated). Other drops are **not yet** gated — a general `allow_destructive` gate over all destructive schema changes remains future work.
+  The table's declared indexes are recreated after the drop. A move whose `DROP TABLE` the foreign-key check would refuse — another table still has rows referencing the moved one, through a foreign key the declaration keeps on a table it keeps — is refused up front as well (once acknowledged), naming the referencing table. A referencing table the declaration drops is dropped first and does not block the move; neither does a foreign key it removes, except in the rare plan whose constraint drops must wait until after the table drops (see `SchemaDiff.removalsStillReferenced`).
 - **What a declaration pins.** The module a declared table is compared against is its own `using <module> [(args)]`; else, for the table form (plain or `table … maintained as`), the schema's `using (default_vtab_module = …, default_vtab_args = …)`; else, for `materialized view …`, `memory` (its create path ignores both defaults). A table-form item with no `using` anywhere pins **nothing** and stays on whatever module it is on. The session `default_vtab_module` is deliberately not consulted: it is not stored with the database, so comparing against it would flag every table of a database reopened under a different default, and an exported declaration (which omits `using` when it matches the session default) would stop being portable. Names compare case-insensitively with `mem` ⇒ `memory`; args compare by value with sorted keys, absent ⇒ none. A table↔maintained transition (attach / detach) is never treated as a move, so a declaration that both attaches (or detaches) and changes the module converges in two applies.
 - Rename hints prevent accidental drops during renames — see "Rename detection" below.
 

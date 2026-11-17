@@ -121,7 +121,7 @@ describe('Maintained-table migration capstone (expand → flip → contract)', (
 		await db.exec(`declare schema main {
 			table contact_v2 { id integer primary key, email text }
 		}`);
-		await db.exec('apply schema main');
+		await db.exec('apply schema main options (allow_destructive = true)');
 
 		expect(db.schemaManager.getTable('main', 'contact_v1'), 'v1 dropped on contract').to.be.undefined;
 		expect(isMaintained('contact_v2'), 'v2 stays plain after contract').to.be.false;

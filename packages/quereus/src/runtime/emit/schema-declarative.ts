@@ -6,7 +6,7 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
 import { renderCatalogForComparison, renderCatalogForRestoreCheck } from '../../schema/catalog-rendering.js';
-import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, objectsRecreatedByDiff, objectsReleasedByDiff, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, objectsRecreatedByDiff, objectsReleasedByDiff, type DestroyedData, type MigrationStep, type SchemaDiff } from '../../schema/schema-differ.js';
 import { describeDependentTable, findChecksReachingObjects, findTableExpressionDependent, type CheckReachingObjects } from '../../schema/expression-dependents.js';
 import { objectRefKey } from '../../schema/rename-rewriter.js';
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
@@ -351,8 +351,8 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// so skip it. `computeSchemaDiff` reads nothing but its four arguments; the
 		// remaining one, `renamePolicy`, is inert when there are no differences (no
 		// name-change pairs for a policy to police), and `allow_destructive` only
-		// gates a non-empty `diff.moduleMigrations`. So the skip is
-		// behaviour-preserving. See docs/schema-declarative.md § Applied-state snapshot.
+		// gates a plan that destroys data, and an unchanged schema's plan is empty. So
+		// the skip is behaviour-preserving. See docs/schema-declarative.md § Applied-state snapshot.
 		const catalogRendering = renderCatalogForComparison(actualCatalog);
 		const declaredRendering = rctx.db.declaredSchemaManager.getDeclaredRendering(schemaName);
 		const snapshot = rctx.db.declaredSchemaManager.getAppliedSnapshot(schemaName);
@@ -375,23 +375,16 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
 			const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', defaultCollation);
 
-			// Acknowledgement gate: a module change is a destructive drop + recreate. A
-			// plain table loses its rows; a maintained table re-materializes as a new
-			// incarnation (materialized_view_removed then _added, so row identity changes
-			// for a replicated/synced table). Refuse unless the user opted in via
-			// `options (allow_destructive = true)`. The whole apply aborts here, BEFORE any
-			// DDL runs, so no partial migration occurs. (`diff schema` does NOT gate — it
-			// is a read-only preview and surfaces the DROP/recreate DDL unconditionally.)
-			if (diff.moduleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
-				throw new QuereusError(moduleMigrationRefusal(schemaName, diff.moduleMigrations), StatusCode.ERROR);
-			}
-			await refuseModuleMoveLeavingDanglingRows(rctx.db, schemaName, diff);
-
 			// Build the migration plan. Same ordering (and same DDL text) `diff schema`
 			// previews; the create steps additionally carry the statement they were
 			// rendered from, so the loop below skips re-parsing them, and every step
 			// carries its undo (rendered from `actualCatalog`, the pre-apply state).
 			const migrationStatements = generateMigrationPlan(diff, schemaName, actualCatalog);
+
+			// Acknowledgement gate. Runs before any DDL, so a refusal leaves nothing to undo.
+			// (`diff schema` does NOT gate — it is a read-only preview.)
+			if (!applyStmt.options?.allowDestructive) refuseUnacknowledgedDataLoss(schemaName, migrationStatements, diff);
+			await refuseModuleMoveLeavingDanglingRows(rctx.db, schemaName, diff);
 
 			// Run the migration loop. When there are no statements we keep the
 			// idempotency fast-path: no module batch hooks fire. The restore fingerprint
@@ -579,18 +572,49 @@ function rebuildWouldBeOnlyEffect(db: Database, schemaName: string, stepCount: n
 	return true;
 }
 
-/** The `allow_destructive` refusal for module moves, naming what each kind of table loses. */
-function moduleMigrationRefusal(schemaName: string, migrations: SchemaDiff['moduleMigrations']): string {
-	const describe = (maintained: boolean): string | undefined => {
-		const names = migrations.filter(m => m.maintained === maintained).map(m => `'${m.name}' (${m.fromModule} → ${m.toModule})`);
-		if (names.length === 0) return undefined;
-		return maintained
-			? `maintained table(s) ${names.join(', ')} would be dropped and re-materialized as a new incarnation`
-			: `table(s) ${names.join(', ')} would be dropped and recreated empty — their rows are lost`;
-	};
-	const parts = [describe(false), describe(true)].filter((p): p is string => p !== undefined);
-	return `apply schema '${schemaName}': moving a table to another module is destructive: ${parts.join('; ')}. `
-		+ `Re-run with options (allow_destructive = true) to migrate.`;
+/**
+ * Refuses a plan that destroys stored data — a step carrying `MigrationStep.destroys`, or a
+ * module move (a drop + recreate; a maintained table re-materializes as a new incarnation, so
+ * row identity changes for a replicated table). Decided from the plan, never from row counts:
+ * an apply that passes against an empty database must not fail against a populated one.
+ */
+function refuseUnacknowledgedDataLoss(schemaName: string, plan: readonly MigrationStep[], diff: SchemaDiff): void {
+	const destroyed = plan.flatMap(step => step.destroys ? [step.destroys] : []);
+	if (destroyed.length === 0 && diff.moduleMigrations.length === 0) return;
+	throw new QuereusError(dataLossRefusal(schemaName, destroyed, diff), StatusCode.ERROR);
+}
+
+/**
+ * The `allow_destructive` refusal, naming everything at risk grouped by what it loses. A module
+ * move's own `DROP TABLE` is described once, as the move. That drop names the declared table
+ * even when the same apply renames it (the rename runs first), so the move's name matches it.
+ */
+function dataLossRefusal(schemaName: string, destroyed: readonly DestroyedData[], diff: SchemaDiff): string {
+	const moved = new Set(diff.moduleMigrations.map(m => m.name.toLowerCase()));
+	const names = (kind: DestroyedData['kind']): string[] => destroyed
+		.filter(d => d.kind === kind && !(kind === 'table' && moved.has(d.table.toLowerCase())))
+		.map(d => d.kind === 'table' ? `'${d.table}'` : `'${d.table}.${d.column}'`);
+	const moves = (maintained: boolean): string[] => diff.moduleMigrations
+		.filter(m => m.maintained === maintained)
+		.map(m => `'${m.name}' (${m.fromModule} → ${m.toModule})`);
+	const tables = names('table');
+	const columns = names('column');
+	const parts = [
+		refusalPart('table(s)', tables, 'would be dropped with their rows'),
+		refusalPart('column(s)', columns, 'would be dropped with their values'),
+		refusalPart('column(s)', names('retype'), 'would change type, which can lose values'),
+		refusalPart('table(s)', moves(false), 'would be moved to another module by dropping and recreating them empty — their rows are lost'),
+		refusalPart('maintained table(s)', moves(true), 'would be moved to another module by dropping and re-materializing them as a new incarnation'),
+	].filter((p): p is string => p !== undefined);
+	const renameHint = tables.length + columns.length > 0
+		? ' A renamed table or column keeps its data only with a rename hint (the quereus.previous_name tag).'
+		: '';
+	return `apply schema '${schemaName}': this migration destroys stored data: ${parts.join('; ')}. `
+		+ `Re-run with options (allow_destructive = true) to migrate.${renameHint}`;
+}
+
+function refusalPart(subject: string, names: readonly string[], predicate: string): string | undefined {
+	return names.length === 0 ? undefined : `${subject} ${names.join(', ')} ${predicate}`;
 }
 
 /**

@@ -855,7 +855,7 @@ describe('alter table replication', () => {
 						}
 					}
 				`);
-				await a.db.exec('apply schema main;');
+				await a.db.exec('apply schema main options (allow_destructive = true);');
 				await settle();
 
 				await relayAll(a, b);

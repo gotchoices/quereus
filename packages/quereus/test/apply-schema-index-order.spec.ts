@@ -142,7 +142,7 @@ describe('apply schema: index creates run after the table-alter block', () => {
 		await db.exec('apply schema main');
 
 		await db.exec('declare schema main { table t { id integer primary key } }');
-		await db.exec('apply schema main');
+		await db.exec('apply schema main options (allow_destructive = true)');
 
 		expect(indexNames(db, 't')).to.deep.equal([]);
 	});
