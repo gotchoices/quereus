@@ -1348,8 +1348,7 @@ export async function attachMaintainedDerivation(
 	// refresh reshapes it back). Coherent and re-runnable either way.
 	const restoreReshaped = (moduleSchema: TableSchema): void => {
 		if (priorMaintained) {
-			const restored = graftReshapedRecord(moduleSchema, priorMaintained);
-			schema.addTable(restored);
+			const restored = schema.addTable(graftReshapedRecord(moduleSchema, priorMaintained));
 			db.markMaterializedViewStale(restored);
 		} else {
 			const { derivation: _derivation, ...plain } = moduleSchema as Partial<MaintainedTableSchema> & TableSchema;
@@ -1560,7 +1559,7 @@ export function detachMaintainedDerivation(db: Database, mv: MaintainedTableSche
 	const live = schema.getTable(mv.name);
 	const source = live && isMaintainedTable(live) ? live : mv;
 	const { derivation: _derivation, ...plain } = source;
-	schema.addTable(plain);
+	const registered = schema.addTable(plain);
 
 	sm.getChangeNotifier().notifyChange({
 		type: 'materialized_view_removed',
@@ -1568,7 +1567,7 @@ export function detachMaintainedDerivation(db: Database, mv: MaintainedTableSche
 		objectName: mv.name,
 		oldObject: source,
 	});
-	return plain;
+	return registered;
 }
 
 /**

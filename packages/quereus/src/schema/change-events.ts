@@ -265,6 +265,10 @@ export class SchemaChangeNotifier {
 			try {
 				listener(event);
 			} catch (error) {
+				// NOTE: this trap also catches a `verify` failure raised by an announcement a
+				// listener makes (e.g. emitBackingInvalidation, which re-fetches the registered
+				// table and so cannot fail it); if a listener ever announces a table it built
+				// itself, rethrow INTERNAL here so the violation is not reduced to a debug log.
 				log('Error in schema change listener: %s', error);
 			}
 		}
