@@ -853,6 +853,52 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 		]);
 	});
 
+	it('a collision during the copy names the user table, not the hidden rebuild table', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (a integer primary key, b integer not null) using noalter`);
+		await db.exec(`insert into t values (1, 10), (2, 10)`);
+
+		const err = await attemptAlter(db, `alter table t alter primary key (b)`);
+		expect(err, 'the collision is reported').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+		expect(err!.message, 'no machine-generated name').to.not.match(/__rekey_/);
+		expect(err!.message, 'names the table').to.match(/t/);
+	});
+
+	// The rebuild's internal DROP is scaffolding: the table comes back under its own name with the
+	// same rows, so no rule that reads it is broken, and none may refuse the re-key.
+	for (const [label, setup, violation] of [
+		[
+			'an assertion over the table',
+			[`create table t (id integer primary key, code integer not null) using noalter`,
+				`create assertion a check (not exists (select 1 from t where code < 0))`],
+			`insert into t values (2, -1)`,
+		],
+		[
+			"another table's CHECK subquery naming the table",
+			[`create table t (id integer primary key, code integer not null) using noalter`,
+				`create table u (id integer primary key, x integer not null, constraint ck check (x <= (select max(code) from t))) using noalter`],
+			`insert into u values (1, 1000)`,
+		],
+		[
+			"the table's own CHECK subquery naming itself",
+			[`create table t (id integer primary key, code integer not null, constraint ck check (code >= 0 or not exists (select 1 from t where code >= 0))) using noalter`],
+			`insert into t values (2, -1)`,
+		],
+	] as const) {
+		it(`${label} does not refuse the re-key, and still holds afterwards`, async () => {
+			db = openRebuildDb();
+			for (const sql of setup) await db.exec(sql);
+			await db.exec(`insert into t values (1, 100)`);
+
+			await db.exec(`alter table t alter primary key (code)`);
+
+			expect(await pkColumns(db), 'PK re-keyed').to.deep.equal(['code']);
+			expect(await rows(db, `select id, code from t`), 'row kept').to.deep.equal([{ id: 1, code: 100 }]);
+			await expectConstraint(db, violation, `${label} after rebuild`);
+		});
+	}
+
 	// A re-key changes no row, so a violation already standing must not stop it. Each shape below
 	// reaches the copy through a different builder, and each must still bind the next write.
 	it('a subquery CHECK whose subject has moved does not stop the re-key, and still refuses a new violation', async () => {
