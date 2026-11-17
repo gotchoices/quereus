@@ -8,6 +8,8 @@ files:
 ----
 **Blocked — category (a): the specification contradicts itself.** It unblocks when a maintainer picks one of the options below (or edits the recommended text). Two written rules now collide: `docs/doc-conventions.md` says the invariant register is **one file** (`docs/invariants.md`), and the same document caps **every** doc at 12,000 words with no grace band. The register measures 11,850 words, so the documentation check (`yarn docs:check`) already prints a near-cap notice for it, and the next invariant of normal size (about 150 words with its metadata) turns the build red.
 
+**Update (2026-11-17, release prep):** it already went red. `create-table-names-every-unnamed-constraint` grew SCH-005 and took the register to 12,026 words. SCH-005 was tightened back under its 120-word entry limit, which leaves the register at 11,987 words, 13 under the cap. The next invariant added to any area fails `yarn check`.
+
 ## Background, for a reader with no context
 
 `docs/invariants.md` is the list of statements the code must always satisfy — "a logical removal never drops basis storage", "every registered optimizer rule declares its side-effect mode". Each entry is at most 120 words, names the code that upholds it and the test that guards it, and the checker verifies those pointers still exist. Topic docs link to entries by their heading anchor (126 such links across `docs/` and source today).
