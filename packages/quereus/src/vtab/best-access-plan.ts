@@ -8,6 +8,7 @@ import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import { validateIndexDescriptor, type IndexDescriptor } from './index-descriptor.js';
 import type { IndexColumnSchema, TableSchema } from '../schema/table.js';
+import { columnNeverNullOnRead } from './capabilities.js';
 import { collationRefines, normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -263,7 +264,7 @@ export function nullSafeOrderingPrefixLength(
 	for (let i = 0; i < orderPreservingPrefix; i++) {
 		const col = keyColumns[i];
 		if (!!col.desc === reverse) continue; // walked ascending: NULLs come out first
-		if (tableInfo.columns[col.index]?.notNull) continue;
+		if (columnNeverNullOnRead(tableInfo, col.index)) continue;
 		if (pinnedCols.has(col.index)) continue;
 		if (request.filters.some(f => f.columnIndex === col.index && NULL_EXCLUDING_OPS.has(f.op))) continue;
 		return i;

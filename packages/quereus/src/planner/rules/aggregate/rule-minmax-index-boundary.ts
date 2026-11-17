@@ -81,9 +81,11 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	const scope = node.scope;
 	// NOTE: two different sources of truth decide "can a NULL reach this column" — this
 	// line reads the column reference's own type, while `nullSafeOrderingPrefixLength`
-	// (vtab/best-access-plan.ts) reads `tableSchema.columns[i].notNull`. They agree today
-	// because a bare table column's `columnType` is built from that same schema column,
-	// and a walk that runs the column descending (a DESC column forwards, an ASC column
+	// (vtab/best-access-plan.ts) reads `columnNeverNullOnRead(tableSchema, i)`. They agree
+	// today because a bare table column's `columnType` is built through that same helper
+	// (`tableColumnReadType`; the scan passes its resolved module, the access plan the
+	// schema's `vtabModule` — the same instance for a registered table), and a walk that
+	// runs the column descending (a DESC column forwards, an ASC column
 	// backwards) fails safe either way (a missing filter makes the ordering claim be
 	// refused, so the rule declines). A walk that runs it ascending does NOT fail safe: that
 	// claim over a nullable column is granted unconditionally, so a type that under-reports

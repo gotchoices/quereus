@@ -19,7 +19,7 @@ import { ReturningNode, type ReturningProjection } from '../nodes/returning-node
 import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
-import { columnSchemaToScalarType } from '../type-utils.js';
+import { columnSchemaToScalarType, tableColumnReadType } from '../type-utils.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildGeneratedColumnExpr } from './generated-column-scope.js';
@@ -235,11 +235,13 @@ export function buildUpdateStmt(
     sourceNode = new FilterNode(updateCtx.scope, sourceNode, filterExpression);
   }
 
-  // Create OLD/NEW attributes for UPDATE (used for both RETURNING and non-RETURNING paths)
-  const oldAttributes = tableReference.tableSchema.columns.map((col) => ({
+  // Create OLD/NEW attributes for UPDATE (used for both RETURNING and non-RETURNING paths).
+  // OLD is a stored row, typed as a read; NEW passes the declared NOT NULL before it is
+  // written, so it keeps the declared type.
+  const oldAttributes = tableReference.tableSchema.columns.map((col, i) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: columnSchemaToScalarType(col),
+    type: tableColumnReadType(tableReference.tableSchema, i, tableReference.vtabModule),
     sourceRelation: `OLD.${tableReference.tableSchema.name}`
   }));
 

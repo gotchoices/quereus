@@ -64,6 +64,7 @@
 
 import type { FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { TableSchema } from '../../schema/table.js';
+import { columnNeverNullOnRead } from '../../vtab/capabilities.js';
 import type * as AST from '../../parser/ast.js';
 import { columnIndexFromExpr, flattenDisjunction, flipComparison, literalValue, type ColumnIndexResolver } from './predicate-shape.js';
 import { compareSqlValues } from '../../util/comparison.js';
@@ -91,7 +92,7 @@ export function extractPartialUniqueGuardedFds(
 	const colCount = tableSchema.columns.length;
 
 	const isColumnNotNullDeclared = (col: number): boolean =>
-		tableSchema.columns[col]?.notNull === true;
+		columnNeverNullOnRead(tableSchema, col);
 
 	const isColumnNumericDeclared = (col: number): boolean =>
 		tableSchema.columns[col]?.logicalType?.isNumeric === true;
@@ -116,7 +117,7 @@ export function extractPartialUniqueGuardedFds(
 			if (c.kind === 'is-null' && c.negated === true) nonNullByPredicate.add(c.column);
 		}
 		const allUcColumnsNonNullable = uc.columns.every(idx =>
-			tableSchema.columns[idx]?.notNull === true || nonNullByPredicate.has(idx),
+			columnNeverNullOnRead(tableSchema, idx) || nonNullByPredicate.has(idx),
 		);
 		if (!allUcColumnsNonNullable) continue;
 
@@ -198,7 +199,7 @@ export function recognizeConjunctiveClauses(
 	resolve?: ColumnIndexResolver,
 ): GuardClause[] | undefined {
 	const isColumnNotNullDeclared = (col: number): boolean =>
-		tableSchema.columns[col]?.notNull === true;
+		columnNeverNullOnRead(tableSchema, col);
 	const isColumnNumericDeclared = (col: number): boolean =>
 		tableSchema.columns[col]?.logicalType?.isNumeric === true;
 	const resolver: ColumnIndexResolver = resolve ?? ((e) => columnIndexFromExpr(e, tableSchema.columnIndexMap));

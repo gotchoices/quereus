@@ -5,13 +5,25 @@ import type { RelationType, ColumnDef, ScalarType, ColRef } from '../common/data
 import { StatusCode, type DeepReadonly } from '../common/types.js';
 import type { AstNode } from '../parser/ast.js';
 import { QuereusError } from '../common/errors.js';
+import { columnNeverNullOnRead, type CapabilityProvider } from '../vtab/capabilities.js';
 
 /**
  * Converts a TableSchema (from src/schema/table.ts) to a RelationType (from src/common/datatype.ts).
  * This is used by PlanNodes that source data directly from a base table.
+ *
+ * Column nullability and key promotion are read-side facts, so they go through
+ * `columnNeverNullOnRead`: `vtabModule` (default: the schema's own) may grandfather
+ * NULLs into declared NOT NULL columns.
  */
-export function relationTypeFromTableSchema(tableSchema: TableSchema): RelationType {
-  const columnDefs: ColumnDef[] = tableSchema.columns.map((col: ColumnSchema) => columnSchemaToDef(col.name, col));
+export function relationTypeFromTableSchema(
+  tableSchema: TableSchema,
+  vtabModule: CapabilityProvider | undefined = tableSchema.vtabModule,
+): RelationType {
+  const columnDefs: ColumnDef[] = tableSchema.columns.map((col: ColumnSchema, i) => ({
+    name: col.name,
+    type: tableColumnReadType(tableSchema, i, vtabModule),
+    generated: col.generated,
+  }));
 
   // Populate keys from primaryKeyDefinition and unique constraints
   const keys: ColRef[][] = [];
@@ -38,7 +50,7 @@ export function relationTypeFromTableSchema(tableSchema: TableSchema): RelationT
   if (tableSchema.uniqueConstraints) {
     for (const uc of tableSchema.uniqueConstraints) {
       if (uc.predicate !== undefined) continue;
-      const allNotNull = uc.columns.every(idx => tableSchema.columns[idx]?.notNull);
+      const allNotNull = uc.columns.every(idx => columnNeverNullOnRead(tableSchema, idx, vtabModule));
       if (allNotNull && enforcementCollationCoversDeclared(tableSchema, uc)) {
         keys.push(uc.columns.map(idx => ({ index: idx })));
       }
@@ -130,6 +142,22 @@ export function columnSchemaToScalarType(
 		nullable: overrides?.nullable ?? !col.notNull,
 		isReadOnly: overrides?.isReadOnly ?? false,
 	};
+}
+
+/**
+ * The scalar type a read of column `columnIndex` of `tableSchema` yields: the
+ * declared type, nullable unless {@link columnNeverNullOnRead} holds. Use this,
+ * not {@link columnSchemaToScalarType}, for a table scan's output — the latter
+ * also builds write-side row images, where the declared NOT NULL is enforced.
+ */
+export function tableColumnReadType(
+	tableSchema: TableSchema,
+	columnIndex: number,
+	vtabModule: CapabilityProvider | undefined = tableSchema.vtabModule,
+): ScalarType {
+	return columnSchemaToScalarType(tableSchema.columns[columnIndex], {
+		nullable: !columnNeverNullOnRead(tableSchema, columnIndex, vtabModule),
+	});
 }
 
 export function columnSchemaToDef(colName: string, colDef: ColumnSchema): ColumnDef {

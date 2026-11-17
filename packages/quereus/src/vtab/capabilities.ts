@@ -1,4 +1,5 @@
 import type { SqlValue, Row, CompareFn } from '../common/types.js';
+import type { TableSchema } from '../schema/table.js';
 
 /**
  * How a module's DDL (schema-change) statements behave with respect to the
@@ -74,6 +75,12 @@ export interface ModuleCapabilities {
 	 * rather than applied retroactively to pre-existing rows. Such a module must
 	 * still perform its own validation in `alterTable` if it wants any.
 	 *
+	 * A module whose `alterTable` leaves pre-existing rows NULL in the new NOT
+	 * NULL column must ALSO declare `permitsGrandfatheredNotNullViolators`: this
+	 * flag only hands the decision over (a delegating module may still reject the
+	 * add or backfill a value), so on its own it does not tell the planner that
+	 * reads may see NULL there.
+	 *
 	 * Native modules (memory, store) leave this off, so their behavior — and
 	 * Quereus's own conformance suite — is unchanged.
 	 */
@@ -145,13 +152,19 @@ export interface ModuleCapabilities {
 	 * replicated backend admitting a row from a peer whose older schema epoch
 	 * never had the column.
 	 *
-	 * Default/absent ⇒ the lens prover treats a `not null` logical column whose
-	 * basis-derived expression is nullable (and that has no total default) as the
-	 * deploy-blocking error `lens.nullability-mismatch` — sound for a declarant
-	 * that can actually promise totality.
+	 * Default/absent ⇒ the planner trusts a declared NOT NULL as a fact about
+	 * every stored row (non-nullable announced column types, NOT NULL UNIQUE
+	 * promoted to a key, …), and the lens prover treats a `not null` logical
+	 * column whose basis-derived expression is nullable (and that has no total
+	 * default) as the deploy-blocking error `lens.nullability-mismatch` — sound
+	 * for a declarant that can actually promise totality.
 	 *
-	 * When true (checked against every basis table the compiled body reads —
-	 * mixed-module bodies stay strict), that diagnostic is demoted to a
+	 * When true, the planner reads every column of this module's tables as
+	 * nullable (`columnNeverNullOnRead`, below): announced types say nullable, a
+	 * NOT NULL UNIQUE is no longer a key, and no NOT-NULL-derived optimizer fact
+	 * is drawn. In the lens prover (checked against every basis table the
+	 * compiled body reads — mixed-module bodies stay strict), the nullability
+	 * diagnostic is demoted to a
 	 * non-blocking warning-severity advisory: still emitted, surfaced in the
 	 * deploy report and `quereus_lens_advisories`, and ack-governable
 	 * (`quereus.lens.ack.nullability-mismatch`), but it no longer blocks the
@@ -196,6 +209,29 @@ export interface ModuleCapabilities {
  */
 export interface CapabilityProvider {
 	getCapabilities?(): ModuleCapabilities;
+}
+
+/**
+ * True iff a read of column `columnIndex` of `table` can never yield NULL: the
+ * column is declared NOT NULL **and** the owning module does not declare
+ * `permitsGrandfatheredNotNullViolators` (under which stored rows may hold NULL
+ * there). Every read-side consumer of a table column's NOT NULL — announced
+ * column types, UNIQUE→key promotion, FK child nullability, partial-UNIQUE and
+ * coverage reasoning, access-path shortcuts — goes through this; write-side
+ * enforcement reads `column.notNull` directly, since forward writes still enforce
+ * the declaration.
+ *
+ * `module` defaults to the schema's own `vtabModule`; pass it explicitly at sites
+ * that resolve the module independently of the schema (`TableReferenceNode`).
+ * Logical tables carry no module and fall back to the declaration.
+ */
+export function columnNeverNullOnRead(
+	table: Pick<TableSchema, 'columns' | 'vtabModule'>,
+	columnIndex: number,
+	module: CapabilityProvider | undefined = table.vtabModule,
+): boolean {
+	if (table.columns[columnIndex]?.notNull !== true) return false;
+	return module?.getCapabilities?.().permitsGrandfatheredNotNullViolators !== true;
 }
 
 /**

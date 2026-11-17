@@ -11,7 +11,7 @@ import { buildWithContext } from './select-context.js';
 import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
 import { buildExpression } from './expression.js';
-import { checkColumnsAssignable, columnSchemaToDef, columnSchemaToScalarType } from '../type-utils.js';
+import { checkColumnsAssignable, columnSchemaToDef, columnSchemaToScalarType, tableColumnReadType } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
@@ -470,10 +470,11 @@ function buildUpsertUpdateValidation(
 ): UpsertUpdateValidation {
 	const tableSchema = tableReference.tableSchema;
 
-	const oldAttributes = tableSchema.columns.map((col) => ({
+	// OLD is the stored conflict row, typed as a read.
+	const oldAttributes = tableSchema.columns.map((col, i) => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,
-		type: columnSchemaToScalarType(col),
+		type: tableColumnReadType(tableSchema, i, tableReference.vtabModule),
 		sourceRelation: `OLD.${tableSchema.name}`
 	}));
 
@@ -573,11 +574,11 @@ function buildUpsertClausePlans(
 		}
 
 		// Build UPDATE action
-		// Create attributes for the existing row (conflict row)
-		const existingAttributes = tableSchema.columns.map((col) => ({
+		// Create attributes for the existing row (conflict row) — a stored row, typed as a read
+		const existingAttributes = tableSchema.columns.map((col, i) => ({
 			id: PlanNode.nextAttrId(),
 			name: col.name,
-			type: columnSchemaToScalarType(col, { isReadOnly: true }),
+			type: { ...tableColumnReadType(tableSchema, i), isReadOnly: true },
 			sourceRelation: `existing.${tableSchema.name}`
 		}));
 

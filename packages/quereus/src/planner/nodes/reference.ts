@@ -10,7 +10,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
-import { columnSchemaToScalarType, relationTypeFromTableSchema } from '../type-utils.js';
+import { relationTypeFromTableSchema, tableColumnReadType } from '../type-utils.js';
 import { plannedRowCount } from '../stats/table-cardinality.js';
 import { Cached } from '../../util/cached.js';
 import type { FunctionSchema } from '../../schema/function.js';
@@ -19,18 +19,26 @@ import { formatScalarType } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
+import type { CapabilityProvider } from '../../vtab/capabilities.js';
 import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
 import { resolveModuleCostProfile } from '../../vtab/cost-profile.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import type { ColumnReferenceCapable } from '../framework/characteristics.js';
 
-/** Fresh attributes for a scan of `tableSchema`'s rows, one per column. */
-export function tableSchemaAttributes(tableSchema: TableSchema): Attribute[] {
-	return tableSchema.columns.map((column) => ({
+/**
+ * Fresh attributes for a scan of `tableSchema`'s rows, one per column. Typed as
+ * reads (`tableColumnReadType`), so `vtabModule` — default: the schema's own —
+ * decides whether a declared NOT NULL column may still read NULL.
+ */
+export function tableSchemaAttributes(
+	tableSchema: TableSchema,
+	vtabModule: CapabilityProvider | undefined = tableSchema.vtabModule,
+): Attribute[] {
+	return tableSchema.columns.map((column, i) => ({
 		id: PlanNode.nextAttrId(),
 		name: column.name,
-		type: columnSchemaToScalarType(column),
+		type: tableColumnReadType(tableSchema, i, vtabModule),
 		sourceRelation: `${tableSchema.schemaName}.${tableSchema.name}`,
 		relationName: tableSchema.name
 	}));
@@ -72,8 +80,8 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	) {
 		super(scope, estimatedCostOverride ?? 1);
 		this.plannedRows = plannedRowCount(tableSchema, schemaManager?.getRowCountSources());
-		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema));
-		this.attributesCache = new Cached(() => tableSchemaAttributes(this.tableSchema));
+		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema, vtabModule));
+		this.attributesCache = new Cached(() => tableSchemaAttributes(this.tableSchema, this.vtabModule));
 	}
 
 	getType(): RelationType {

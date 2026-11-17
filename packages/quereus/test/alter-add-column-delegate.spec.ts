@@ -41,7 +41,8 @@ function hasValueSource(columnDef: ColumnDef): boolean {
  * A structurally-total memory module. It advertises
  * `delegatesNotNullBackfill` and, for ADD COLUMN, carries pre-existing rows
  * forward (backfilling NULL) rather than rejecting a NOT NULL add on a
- * non-empty table. It relaxes the column to nullable when delegating to the
+ * non-empty table — so it also declares `permitsGrandfatheredNotNullViolators`,
+ * which tells the planner those NOT NULL columns may still read NULL. It relaxes the column to nullable when delegating to the
  * base manager (so the manager's own backfill doesn't reject), then presents
  * the declared NOT NULL shape in the returned schema — modelling a module
  * that enforces NOT NULL at write time going forward.
@@ -54,7 +55,7 @@ function hasValueSource(columnDef: ColumnDef): boolean {
  */
 class TotalMemoryModule extends MemoryTableModule {
 	override getCapabilities(): ModuleCapabilities {
-		return { ...super.getCapabilities(), delegatesNotNullBackfill: true };
+		return { ...super.getCapabilities(), delegatesNotNullBackfill: true, permitsGrandfatheredNotNullViolators: true };
 	}
 
 	override async alterTable(
@@ -149,6 +150,14 @@ describe('ALTER TABLE ADD COLUMN NOT NULL backfill delegation', () => {
 		const col = table!.columns.find(c => c.name === 'required');
 		expect(col, 'new column should be present').to.exist;
 		expect(col!.notNull, 'column carries declared NOT NULL shape').to.equal(true);
+
+		// The planner must not announce the grandfathered column as never-null.
+		const stmt = db.prepare(`select required from t`);
+		try {
+			expect(stmt.getColumnDefs()[0].type.nullable, 'announced nullable on read').to.equal(true);
+		} finally {
+			await stmt.finalize();
+		}
 
 		// Pre-existing rows are carried forward (backfilled NULL).
 		const rows = await collect(db, `select id, required from t order by id`);

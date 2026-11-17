@@ -19,7 +19,7 @@ import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
 import { buildConstraintChecks } from './constraint-builder.js';
-import { columnSchemaToScalarType } from '../type-utils.js';
+import { columnSchemaToScalarType, tableColumnReadType } from '../type-utils.js';
 import { buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
@@ -174,11 +174,13 @@ export function buildDeleteStmt(
     sourceNode = new FilterNode(deleteCtx.scope, sourceNode, filterExpression);
   }
 
-  // Create OLD/NEW attributes for DELETE (OLD = actual values being deleted, NEW = all NULL)
-  const oldAttributes = tableReference.tableSchema.columns.map((col) => ({
+  // Create OLD/NEW attributes for DELETE (OLD = actual values being deleted, NEW = all NULL).
+  // OLD is a stored row, so it is typed as a read (a grandfathering module may hold NULL
+  // in a declared NOT NULL column).
+  const oldAttributes = tableReference.tableSchema.columns.map((col, i) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: columnSchemaToScalarType(col),
+    type: tableColumnReadType(tableReference.tableSchema, i, tableReference.vtabModule),
     sourceRelation: `OLD.${tableReference.tableSchema.name}`
   }));
 

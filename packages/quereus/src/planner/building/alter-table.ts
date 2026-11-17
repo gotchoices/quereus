@@ -16,7 +16,7 @@ import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType, requireRegisteredTypeName } from '../../types/registry.js';
 import { buildCellCoercion } from '../../types/validation.js';
-import { columnSchemaToScalarType } from '../type-utils.js';
+import { tableColumnReadType } from '../type-utils.js';
 import { astToString, expressionToString, quoteIdentifier } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { columnTypeSubject, opsToMask, validateAddColumnGeneratedRefs, type TableSchema } from '../../schema/table.js';
@@ -332,10 +332,10 @@ function buildAddColumnBackfill(
   // column refs and resolved at runtime via the row slot the emitter installs over
   // each existing row. Minting fresh (rather than reusing the table reference's
   // attributes) keeps the node self-contained so the optimizer can't dangle it.
-  const rowAttrs: Attribute[] = tableSchema.columns.map(column => ({
+  const rowAttrs: Attribute[] = tableSchema.columns.map((column, i) => ({
     id: PlanNode.nextAttrId(),
     name: column.name,
-    type: columnSchemaToScalarType(column),
+    type: tableColumnReadType(tableSchema, i, tableReference.vtabModule),
     sourceRelation: 'add-column-backfill',
   }));
   let node: ScalarPlanNode;
@@ -409,10 +409,10 @@ function buildAddColumnChecks(
   // Fresh attributes for the existing columns followed by the new column. The new column's
   // logical type / nullability come from the column def (same inference the schema builder
   // uses); refs in the CHECK resolve through the row slot the emitter installs per row.
-  const existingAttrs: Attribute[] = tableSchema.columns.map(column => ({
+  const existingAttrs: Attribute[] = tableSchema.columns.map((column, i) => ({
     id: PlanNode.nextAttrId(),
     name: column.name,
-    type: columnSchemaToScalarType(column),
+    type: tableColumnReadType(tableSchema, i, tableReference.vtabModule),
     sourceRelation: 'add-column-check',
   }));
   const newColNotNull = (columnDef.constraints ?? []).some(c => c.type === 'notNull');

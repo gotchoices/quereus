@@ -64,6 +64,7 @@ import { JoinNode } from '../nodes/join-node.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema } from '../../schema/table.js';
+import { columnNeverNullOnRead } from '../../vtab/capabilities.js';
 import { getFunctionKey, type AggregateFunctionSchema } from '../../schema/function.js';
 import type { SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
@@ -1345,7 +1346,7 @@ function resolveMergeablePartial(
 	// count(same-arg) fallback: count(*) counts the same rows as count(x) only when x is
 	// NOT NULL (no NULLs to exclude). Retains the pre-retarget avg relaxation.
 	if (backingCol === undefined && p.func === 'count' && partialArgBaseCol !== undefined
-		&& baseTable.columns[partialArgBaseCol]?.notNull === true) {
+		&& columnNeverNullOnRead(baseTable, partialArgBaseCol)) {
 		backingCol = findStored(stored, 'count', undefined);
 		storedArgc = 0;
 	}

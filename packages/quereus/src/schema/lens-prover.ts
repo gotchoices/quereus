@@ -24,6 +24,7 @@ import { ConflictResolution, FunctionFlags } from '../common/constants.js';
 import { compareSqlValues } from '../util/comparison.js';
 import { catalogRowCount } from '../planner/stats/table-cardinality.js';
 import type { SqlValue } from '../common/types.js';
+import { columnNeverNullOnRead } from '../vtab/capabilities.js';
 
 const log = createLogger('schema:lens-prover');
 
@@ -1234,7 +1235,9 @@ function proveForwardInjective(
 	if (!basis || authored.puts.length !== 1) return false;
 	const put = authored.puts[0];
 	const bi = basis.columnIndexMap.get(put.baseColumn.toLowerCase());
-	if (bi === undefined || !basis.columns[bi]?.notNull) return false;
+	// A basis module grandfathering NULLs may store a NULL there — a value outside
+	// the enumeration — so the read-side answer gates, not the declaration.
+	if (bi === undefined || !columnNeverNullOnRead(basis, bi)) return false;
 	// Trusted accessor: when the basis module declares
 	// `permitsGrandfatheredCheckViolators`, stored basis rows may violate the
 	// declared CHECK, so its enum domain cannot witness the bijection — the

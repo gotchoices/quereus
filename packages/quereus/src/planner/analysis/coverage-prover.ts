@@ -195,6 +195,7 @@ import { BINARY_JOIN_TYPES, type EquiJoinPair } from '../nodes/join-utils.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
+import { columnNeverNullOnRead } from '../../vtab/capabilities.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
 import type { ColumnIndexResolver } from './predicate-shape.js';
@@ -563,7 +564,7 @@ function provePredicateAlignment(
 		if (ucClauses === undefined) return notCovers('predicate-entailment');
 		requiredClauses.push(...ucClauses);
 	}
-	const nullableUcCols = uc.columns.filter(c => baseTable.columns[c]?.notNull !== true);
+	const nullableUcCols = uc.columns.filter(c => !columnNeverNullOnRead(baseTable, c));
 	for (const c of nullableUcCols) {
 		requiredClauses.push({ kind: 'is-null', column: c, negated: true });
 	}

@@ -26,7 +26,7 @@
 
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
-import type { CapabilityProvider } from '../../vtab/capabilities.js';
+import { columnNeverNullOnRead, type CapabilityProvider } from '../../vtab/capabilities.js';
 import type { InclusionDependency, RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
@@ -155,7 +155,7 @@ export function lookupCoveringFK(
 		}
 		if (!aligned) continue;
 
-		return { fk, nullable: fkChildNullable(childSchema, fk) };
+		return { fk, nullable: fkChildNullable(childSchema, fk, childModule) };
 	}
 	return undefined;
 }
@@ -168,13 +168,16 @@ export function lookupCoveringFK(
  *
  * A nullable child column means the FK→parent inclusion only guarantees the
  * non-null FK rows have a parent (a NULL FK row is excluded — `nullRejecting`).
+ * "Nullable" is the read-side answer (`columnNeverNullOnRead`): a declared NOT
+ * NULL column still counts as nullable when `childModule` grandfathers NULLs.
  */
 export function fkChildNullable(
 	childSchema: TableSchema,
 	fk: ForeignKeyConstraintSchema,
+	childModule: CapabilityProvider | undefined = childSchema.vtabModule,
 ): boolean {
 	for (const colIdx of fk.columns) {
-		if (!childSchema.columns[colIdx]?.notNull) return true;
+		if (!columnNeverNullOnRead(childSchema, colIdx, childModule)) return true;
 	}
 	return false;
 }
@@ -247,7 +250,7 @@ export function seedTableForeignKeyInds(
 				table: parent.name,
 				targetCols: refCols.slice(),
 			},
-			nullRejecting: fkChildNullable(childSchema, fk),
+			nullRejecting: fkChildNullable(childSchema, fk, childModule),
 		});
 	}
 	return inds;

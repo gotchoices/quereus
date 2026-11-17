@@ -35,6 +35,7 @@ import { FilterNode } from '../../nodes/filter.js';
 import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
 import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
 import type { TableSchema } from '../../../schema/table.js';
+import { columnNeverNullOnRead } from '../../../vtab/capabilities.js';
 import type * as AST from '../../../parser/ast.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { isIndexStyleContext } from '../shared/index-style-context.js';
@@ -379,12 +380,13 @@ type ConsumedSet = Set<PlannerPredicateConstraint>;
 
 /**
  * True for a constraint no row can fail, so a `Filter` re-checking it could reject nothing:
- * `is not null` on a column declared `not null`. Sound under the isolation layer too, since
+ * `is not null` on a column that never reads NULL (declared `not null`, on a module that does
+ * not grandfather NULLs — `columnNeverNullOnRead`). Sound under the isolation layer too, since
  * `not null` is enforced when a row is staged, and tombstones (whose non-key columns are
  * null) never reach the emitted stream.
  */
 function holdsForEveryRow(tableSchema: TableSchema, constraint: PlannerPredicateConstraint): boolean {
-	return constraint.op === 'IS NOT NULL' && tableSchema.columns[constraint.columnIndex].notNull;
+	return constraint.op === 'IS NOT NULL' && columnNeverNullOnRead(tableSchema, constraint.columnIndex);
 }
 
 /**

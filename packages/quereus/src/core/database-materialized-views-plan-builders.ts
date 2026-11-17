@@ -40,6 +40,7 @@ import { tryResolveBackingHost } from '../runtime/emit/materialized-view-helpers
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema } from '../schema/table.js';
+import { columnNeverNullOnRead } from '../vtab/capabilities.js';
 import type { Database } from './database.js';
 import type * as AST from '../parser/ast.js';
 import {
@@ -858,7 +859,7 @@ export function buildDeltaAggregateDescriptor(
 				&& sourceSchema.columns[argSourceCol]?.logicalType.physicalType === PhysicalType.INTEGER;
 			if (!resultExact && !argExact) return undefined;
 			const retractionSafe = algebra.decodeExact === true
-				|| (argSourceCol !== undefined && sourceSchema.columns[argSourceCol]?.notNull === true);
+				|| (argSourceCol !== undefined && columnNeverNullOnRead(sourceSchema, argSourceCol));
 			aggColumns.push({
 				backingCol: outCol,
 				schema,
@@ -965,7 +966,7 @@ function resolveDecomposePartial(
 		aggColumns.findIndex(c => c.schema.name.toLowerCase() === name && c.argSourceCol === argCol);
 	let idx = find(funcName, targetArg);
 	if (idx < 0 && funcName === 'count' && targetArg !== undefined
-		&& sourceSchema.columns[targetArg]?.notNull === true) {
+		&& columnNeverNullOnRead(sourceSchema, targetArg)) {
 		idx = find('count', undefined); // count(*) qualifies as the count(x) divisor when x is NOT NULL
 	}
 	return idx < 0 ? undefined : idx;

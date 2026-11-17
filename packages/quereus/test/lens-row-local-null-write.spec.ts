@@ -665,21 +665,21 @@ describe('lens logical NOT NULL on a write — single-source over a grandfathere
 		}
 	});
 
-	it('a non-nullable derived column classifies `proved`: no advisory, and the BASIS rejects the NULL itself', async () => {
+	it('a basis column declared `not null` still reads nullable on the grandfathering module: advisory, and the NULL write still rejects', async () => {
 		const db = new Database();
 		try {
-			// Same capability module, but the basis column IS `not null` — the derived
-			// output is non-nullable, so the lens attaches nothing and the basis
-			// write's own NOT NULL does the rejecting (named after the basis table).
+			// Same capability module, basis column declared `not null`. The module may hold
+			// grandfathered NULLs there, so the derived output is nullable on read and the
+			// prover emits the demoted advisory; the write is rejected all the same.
 			db.registerModule('gfmem', new GrandfatheredMemoryModule());
 			await db.exec('create table P (id integer primary key, tag text) using gfmem');
 			await db.exec('declare logical schema x { table P { id integer primary key, tag text not null } }');
 			await db.exec('apply schema x');
 			const report = db.declaredSchemaManager.getDeployedLensReport('x');
 			expect(
-				report?.warnings.some(w => w.code === 'lens.nullability-mismatch'),
-				'no nullability advisory for a proved NOT NULL',
-			).to.equal(false);
+				report?.warnings.some(w => w.code === 'lens.nullability-mismatch' && w.site.column === 'tag'),
+				'a declared NOT NULL basis column is not trusted on a grandfathering module',
+			).to.equal(true);
 			await expectThrows(
 				() => db.exec("insert into x.P (id, tag) values (1, null)"),
 				/NOT NULL constraint failed: P\.tag/);
