@@ -351,8 +351,9 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// so skip it. `computeSchemaDiff` reads nothing but its four arguments; the
 		// remaining one, `renamePolicy`, is inert when there are no differences (no
 		// name-change pairs for a policy to police), and `allow_destructive` /
-		// `destructive_apply_policy` only gate a plan that destroys data, and an unchanged schema's plan is empty. So
-		// the skip is behaviour-preserving. See docs/schema-declarative.md § Applied-state snapshot.
+		// `destructive_apply_policy` only gate a plan that destroys data, and an
+		// unchanged schema's plan is empty. So the skip is behaviour-preserving.
+		// See docs/schema-declarative.md § Applied-state snapshot.
 		const catalogRendering = renderCatalogForComparison(actualCatalog);
 		const declaredRendering = rctx.db.declaredSchemaManager.getDeclaredRendering(schemaName);
 		const snapshot = rctx.db.declaredSchemaManager.getAppliedSnapshot(schemaName);
