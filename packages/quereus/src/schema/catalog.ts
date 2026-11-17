@@ -1,6 +1,6 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema, NamedConstraintClass, RowConstraintSchema, ForeignKeyConstraintSchema } from './table.js';
-import { forEachDeclaredConstraintName } from './table.js';
+import { forEachDeclaredConstraintName, isAutoConstraintName } from './table.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema } from './derivation.js';
@@ -222,21 +222,6 @@ export interface CatalogAssertion {
 	 * consumers.
 	 */
 	check?: AST.Expression;
-}
-
-/**
- * True when a constraint name is engine-synthesized rather than user-supplied.
- * The schema extractors auto-name unnamed column/table constraints with a
- * reserved `_`-leading prefix (`_check_<col>`, `_fk_<table>_<cols>`,
- * `_uc_<cols>`); such names are deterministic from structure but are NOT stable
- * identity a declarative schema can reference, so they are kept out of the
- * catalog's user-addressable `namedConstraints` (which drives differ
- * add/drop/rename lifecycle) and listed in `unnamedConstraints`, which the differ
- * matches by body. A user who explicitly names a constraint `_x` gets it treated
- * as unnamed — matched by body, not by the name — an acceptable corner.
- */
-function isAutoConstraintName(name: string): boolean {
-	return name.startsWith('_');
 }
 
 /**
@@ -691,10 +676,11 @@ function findUniqueConstraintSharingBackingName(
 
 /**
  * How a UNIQUE constraint is named back to the user in a collision message: by the
- * name they wrote when it has one, else by the columns they wrote.
+ * name they wrote when it has one, else (no name, or an engine `_uc_<cols>` mint) by
+ * the columns they wrote.
  */
 function describeUniqueConstraint(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
-	return constraintName !== undefined ? `'${constraintName}'` : `on (${columnNames.join(', ')})`;
+	return hasUserWrittenName(constraintName) ? `'${constraintName}'` : `on (${columnNames.join(', ')})`;
 }
 
 /**
@@ -747,87 +733,6 @@ export function assertUniqueConstraintIndexNameFree(
 	);
 }
 
-/**
- * A UNIQUE constraint as its declaration spells it — the name the user wrote (absent
- * when unnamed) and the names of the columns it covers. Enough to derive its backing
- * structure name and to describe it back in a message, and available before the
- * constraint (or, for `ADD COLUMN`, its column) exists on any schema.
- */
-export interface DeclaredUniqueConstraint {
-	readonly name?: string;
-	readonly columnNames: ReadonlyArray<string>;
-}
-
-/**
- * The pairwise form of {@link assertUniqueConstraintIndexNameFree}'s constraint arm:
- * refuses a set of UNIQUE constraints declared TOGETHER, none of them on a table yet,
- * in which two derive one backing structure name.
- *
- * Two callers hold a whole declaration at once and so have no table to compare
- * against: `CREATE TABLE` (its entire constraint list) and
- * `ALTER TABLE … ADD COLUMN` (the inline `unique` constraints on the new column).
- * Both run it AFTER the duplicate-constraint guards, so a genuine duplicate keeps
- * producing the constraint-worded duplicate message rather than a structure-name one,
- * and — for `CREATE TABLE` — before `module.create`, so a refusal leaves no storage
- * behind.
- *
- * Takes {@link DeclaredUniqueConstraint}s rather than built
- * {@link UniqueConstraintSchema}s so the ADD COLUMN caller, whose column does not exist
- * on any schema yet, can use it;
- * {@link assertNoDuplicateUniqueConstraintBackingNames} is the built-constraint wrapper.
- */
-export function assertUniqueConstraintBackingNamesDistinct(
-	declared: ReadonlyArray<DeclaredUniqueConstraint>,
-	operation: string,
-): void {
-	const seen = new Map<string, DeclaredUniqueConstraint>();
-	for (const uc of declared) {
-		const backingName = implicitIndexNameForColumns(uc.name, uc.columnNames);
-		const lower = backingName.toLowerCase();
-		const held = seen.get(lower);
-		if (held) {
-			throw new QuereusError(
-				`Cannot ${operation}: the UNIQUE constraint ${describeUniqueConstraint(held.name, held.columnNames)} and `
-					+ `the UNIQUE constraint ${describeUniqueConstraint(uc.name, uc.columnNames)} both derive backing `
-					+ `structure name '${backingName}'. Name or rename one of them — an unnamed one derives its `
-					+ `structure name from the columns it covers.`,
-				StatusCode.CONSTRAINT,
-			);
-		}
-		seen.set(lower, uc);
-	}
-}
-
-/**
- * The `CREATE TABLE` wrapper over {@link assertUniqueConstraintBackingNamesDistinct},
- * reading the BUILT constraints (column indices already resolved) so inline and
- * table-level spellings are compared in one place. A `CREATE TABLE` declares no
- * indexes, so this pairwise comparison is the whole of the check there.
- *
- * `derivedFromIndex` constraints are skipped for the same reason
- * {@link findUniqueConstraintSharingBackingName} skips them — unreachable from a
- * `CREATE TABLE` today (the statement carries no index declarations), kept so the two
- * arms answer alike if that ever changes.
- *
- * Called from `SchemaManager.createTable` only — never from the import / rehydrate
- * path, so a catalog written before this guard existed still opens (same placement
- * rationale as {@link assertNoDuplicateUniqueConstraints}; the memory backend's
- * `ensureUniqueConstraintIndexes` keeps its adoption behaviour as damage limitation
- * for exactly those catalogs).
- */
-export function assertNoDuplicateUniqueConstraintBackingNames(
-	constraints: ReadonlyArray<UniqueConstraintSchema>,
-	columns: ReadonlyArray<{ name: string }>,
-	operation: string,
-): void {
-	assertUniqueConstraintBackingNamesDistinct(
-		constraints
-			.filter(uc => uc.derivedFromIndex === undefined)
-			.map(uc => ({ name: uc.name, columnNames: uniqueConstraintColumnNames(columns, uc) })),
-		operation,
-	);
-}
-
 /* ─────────────── duplicate UNIQUE constraints ───────────────
  * An unnamed UNIQUE has no name to compare, so nothing but the derived structure
  * name ever noticed a repeat — and that name is only materialized by SOME backends,
@@ -855,11 +760,12 @@ export function uniqueConstraintColumnSetKey(columnNames: ReadonlyArray<string>)
 }
 
 /**
- * True when `uc` carries no identity of its own beyond the columns it covers:
- * unnamed, not synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex`), and
- * not partial (`predicate`). Two of these over one column set are wholly
- * indistinguishable — neither can be named in `DROP CONSTRAINT`, so neither can be
- * removed short of recreating the table, while every write pays the same check twice.
+ * True when `uc` carries no identity of its own beyond the columns it covers: no
+ * user-written name (none stored, or an engine `_uc_<cols>` auto-name — see
+ * `isAutoConstraintName`), not synthesized from a `CREATE UNIQUE INDEX`
+ * (`derivedFromIndex`), and not partial (`predicate`). Two of these over one column
+ * set are wholly indistinguishable — the same rule enforced twice, every write paying
+ * for both, under names the user never chose.
  *
  * The three exclusions each carve out a genuinely different constraint:
  * - `derivedFromIndex` — owned by its `CREATE UNIQUE INDEX`, addressable and
@@ -872,7 +778,17 @@ export function uniqueConstraintColumnSetKey(columnNames: ReadonlyArray<string>)
  * - a name — see the NOTE on {@link assertUniqueConstraintNotDuplicated}.
  */
 function isAnonymousUniqueConstraint(uc: UniqueConstraintSchema): boolean {
-	return uc.name === undefined && uc.derivedFromIndex === undefined && uc.predicate === undefined;
+	return !hasUserWrittenName(uc.name) && uc.derivedFromIndex === undefined && uc.predicate === undefined;
+}
+
+/**
+ * True when `name` is one a user wrote: present and not an engine auto-name. Every
+ * unnamed UNIQUE is stored as `_uc_<cols>`, so "absent" alone no longer means "the
+ * user wrote none" — testing only for absence would silently switch the duplicate
+ * guard off the moment the mint runs before it.
+ */
+function hasUserWrittenName(name: string | undefined): name is string {
+	return name !== undefined && !isAutoConstraintName(name);
 }
 
 function duplicateUniqueConstraintError(operation: string, columnNames: ReadonlyArray<string>): QuereusError {
@@ -895,14 +811,15 @@ function duplicateUniqueConstraintError(operation: string, columnNames: Readonly
  * earlier in the SAME statement, none of which is on `tableSchema` yet — one
  * `ADD COLUMN` can declare several inline `unique` constraints over its new column.
  *
- * NOTE: deliberately silent when the NEW constraint is named, and skips named
- * existing ones. A named UNIQUE beside an unnamed one over the same columns
+ * NOTE: deliberately silent when the NEW constraint is user-named, and skips
+ * user-named existing ones ("user-named" = a name without the reserved `_` prefix; an
+ * engine auto-name such as `_uc_c` counts as unnamed, so `constraintName` may be the
+ * already-minted name). A user-named UNIQUE beside an unnamed one over the same columns
  * (`create table t (…, unique (c))` then `alter table t add constraint u1 unique (c)`)
- * stays legal: both are addressable and droppable by name, so the state is merely
- * redundant rather than broken, and refusing it would change more surface than the
- * defect this guard exists for. Two DIFFERENTLY-named UNIQUEs over one column set are
- * legal for the same reason; two with the SAME name are refused by
- * `assertConstraintNameFree` on the ALTER paths and by
+ * stays legal: the state is merely redundant rather than broken, and refusing it would
+ * change more surface than the defect this guard exists for. Two DIFFERENTLY-named
+ * UNIQUEs over one column set are legal for the same reason; two with the SAME name are
+ * refused by `assertConstraintNameFree` on the ALTER paths and by
  * {@link assertNoDuplicateConstraintNames} at CREATE TABLE.
  */
 export function assertUniqueConstraintNotDuplicated(
@@ -912,7 +829,7 @@ export function assertUniqueConstraintNotDuplicated(
 	operation: string,
 	alsoDeclared?: ReadonlySet<string>,
 ): void {
-	if (constraintName !== undefined) return;
+	if (hasUserWrittenName(constraintName)) return;
 	const key = uniqueConstraintColumnSetKey(columnNames);
 	const duplicated = alsoDeclared?.has(key)
 		|| (tableSchema.uniqueConstraints ?? []).some(uc =>

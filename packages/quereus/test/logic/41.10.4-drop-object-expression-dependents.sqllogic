@@ -58,22 +58,19 @@ drop table DtRef;
 -- run
 
 -- ===================================================================
--- 2. An UNNAMED CHECK has no name to quote, so the message quotes its expression
+-- 2. An UNNAMED CHECK quotes its stored auto-name, which `DROP CONSTRAINT` reaches
 -- ===================================================================
---
--- Accepted cost, exactly as in §2 of 41.10.2: `DROP CONSTRAINT` resolves by name only, so
--- the referenced table can only be dropped by rebuilding the REFERENCING one. The quoted
--- expression is the only handle the user has on it.
 
 create table DtASrc (id integer primary key, v integer);
 create table DtARef (id integer primary key, n integer, check (n < (select max(v) from DtASrc)));
 -- run
 
 drop table DtASrc;
--- error: it is referenced by the CHECK constraint (n < (select max(v) from DtASrc))
+-- error: CHECK constraint '_check_0' on table 'DtARef'
 
-drop table DtARef;
+alter table DtARef drop constraint _check_0;
 drop table DtASrc;
+drop table DtARef;
 -- run
 
 -- ===================================================================

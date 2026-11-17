@@ -314,9 +314,10 @@ export class MemoryTableManager {
 			// `DROP INDEX` answers `no such index`, and a predicate over the covered column
 			// stops filtering. No write path can reach either producer of a held name any more
 			// — a duplicate unnamed UNIQUE (`assertNoDuplicateUniqueConstraints` /
-			// `assertUniqueConstraintNotDuplicated`) or two DIFFERENT UNIQUEs deriving one
-			// structure name (`assertNoDuplicateUniqueConstraintBackingNames` /
-			// `assertUniqueConstraintIndexNameFree`), refused at every declaration site — so
+			// `assertUniqueConstraintNotDuplicated`, refused at every declaration site) or two
+			// DIFFERENT UNIQUEs deriving one structure name (every unnamed one is stored under a
+			// disambiguated `_uc_<cols>` mint, and `assertUniqueConstraintIndexNameFree` refuses
+			// a name an index holds) — so
 			// this arm is defence in depth for a catalog written before those guards: it
 			// degrades to one shared structure rather than to a corrupt index list. For the
 			// duplicate that means double enforcement of the same rule; for the derived-name
@@ -3110,7 +3111,7 @@ export class MemoryTableManager {
 	 * `restoring` skips the validation and still builds the index: see `SchemaChangeInfo`.
 	 */
 	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: IssuerRowSources, restoring?: true): Promise<void> {
-		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
+		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap, collectTableConstraintNames(this.tableSchema));
 		const columns = this.tableSchema.columns;
 		const existingIndexes = this.tableSchema.indexes ?? [];
 

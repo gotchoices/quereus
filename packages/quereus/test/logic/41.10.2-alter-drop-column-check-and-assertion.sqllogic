@@ -70,30 +70,29 @@ drop table DcChk;
 -- run
 
 -- ===================================================================
--- 2. An UNNAMED table-level CHECK has no name to quote, so the message
---    quotes its expression instead — the only handle the user has on it.
+-- 2. An UNNAMED table-level CHECK is stored under the auto-name `_check_<position>`,
+--    so the refusal quotes that name and `DROP CONSTRAINT` can clear the way.
 -- ===================================================================
---
--- Accepted cost: `DROP CONSTRAINT` resolves by name only, so this column is undroppable
--- short of rebuilding the table. Same position SQLite takes.
 
 create table DcAnon (id integer primary key, a integer, b integer, check (b > a));
 -- run
 
 alter table DcAnon drop column a;
--- error: it is referenced by the CHECK constraint (b > a)
+-- error: CHECK constraint '_check_0'
+
+alter table DcAnon drop constraint _check_0;
+alter table DcAnon drop column a;
+select name from table_info('DcAnon') order by cid;
+→ [{"name":"id"},{"name":"b"}]
 
 drop table DcAnon;
 -- run
 
 -- ===================================================================
 -- 2b. A COLUMN-LEVEL unnamed CHECK is auto-named `_check_<column>` at
---     declaration time, so unlike §2 it DOES have a name to address.
+--     declaration time — and is refused like any other.
 -- ===================================================================
 --
--- The asymmetry with §2 is deliberate and worth pinning: `constraint-builder.ts` names a
--- column-level CHECK `_check_<column>` when it lifts it to the table's constraint list,
--- and that name is stored, so the refusal quotes it and `DROP CONSTRAINT` can resolve it.
 -- A column's OWN inline CHECK is refused like any other — the guard does not special-case
 -- "this CHECK only exists because of the column being dropped".
 
@@ -296,7 +295,7 @@ create table DcCase (id integer primary key, a integer, b integer, check (B > A)
 -- run
 
 alter table DcCase drop column a;
--- error: it is referenced by the CHECK constraint (B > A)
+-- error: it is referenced by CHECK constraint '_check_0'
 
 drop table DcCase;
 -- run
@@ -305,7 +304,7 @@ create table DcQual (id integer primary key, a integer, b integer, check (DcQual
 -- run
 
 alter table DcQual drop column a;
--- error: it is referenced by the CHECK constraint
+-- error: it is referenced by CHECK constraint '_check_0'
 
 drop table DcQual;
 -- run

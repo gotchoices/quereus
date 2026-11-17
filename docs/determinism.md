@@ -268,12 +268,12 @@ accepted afterwards. Consequences of routing through the module:
   before the module call, mirroring `runAddConstraintViaModule` — a pure schema check,
   so a rejected ALTER never reaches the module's persistence side effects.
 - An unnamed constraint is auto-named by the **same** convention the `CREATE TABLE`
-  spelling uses: `_check_<column>`, `_fk_<table>_<column>`. (The CHECK name is set by
-  the extractor, because the module's table-level `ADD CONSTRAINT` convention would
-  otherwise name it `check_<n>` — see below.) A name already taken — by another
-  auto-name in the same statement or by a constraint already on the table — gets a
-  deterministic collision-only `_<N>` suffix (`_check_b_2`), so the auto-name still
-  addresses exactly one constraint. Non-colliding names are unchanged.
+  spelling uses: `_check_<column>`, `_uc_<column>`, `_fk_<table>_<column>`. (The CHECK
+  and UNIQUE names are set by the extractors, because the table-level `ADD CONSTRAINT`
+  convention would otherwise name a CHECK `_check_<n>` — see below.) A name already
+  taken — by another auto-name in the same statement or by a constraint already on the
+  table — gets a deterministic collision-only `_<N>` suffix (`_check_b_2`), so the
+  auto-name still addresses exactly one constraint. Non-colliding names are unchanged.
 
 The table-level `ALTER TABLE … ADD CONSTRAINT` forms mint deterministically too, from
 the table's current constraint names — one case-folded namespace across CHECK / UNIQUE
@@ -282,15 +282,20 @@ the table's current constraint names — one case-folded namespace across CHECK 
 - An unnamed **FOREIGN KEY** takes the same `_fk_<table>_<cols>` mint and the same
   collision-only `_<N>` suffix as above, so `ALTER TABLE c ADD FOREIGN KEY (x) …` onto
   a column that already carries an unnamed key mints `_fk_c_x_2` rather than a second
-  `_fk_c_x`.
-- An unnamed **CHECK** is named `check_<n>`, where `n` starts at the number of CHECKs
-  already on the table and is bumped upward until the name is free. The index bumps
-  rather than taking a `_<N>` suffix (which on this base would read `check_1_2`), and
-  it is seeded from the count rather than scanned from zero so every non-colliding name
-  keeps its historical spelling — a table whose only CHECK is user-named still mints
-  `check_1`, not a now-free `check_0`. Bumping is what keeps a `DROP CONSTRAINT
-  check_0` (which shrinks the count) from making the next unnamed add re-mint the still
-  live `check_1`.
+  `_fk_c_x`. An unnamed **UNIQUE** takes `_uc_<cols>` the same way.
+- An unnamed **CHECK** is named `_check_<n>`, where `n` starts at the number of CHECKs
+  already on the table — the position it is appended at, so the name equals the
+  `_check_<index>` label its violation reports — and is bumped upward until the name is
+  free. The index bumps rather than taking a `_<N>` suffix (which on this base would
+  read `_check_1_2`), and it is seeded from the count rather than scanned from zero — a
+  table whose only CHECK is user-named mints `_check_1`, not a now-free `_check_0`.
+  Bumping is what keeps a `DROP CONSTRAINT _check_0` (which shrinks the count) from
+  making the next unnamed add re-mint the still live `_check_1`. `CREATE TABLE` names a
+  table-level CHECK by the same rule (`n` = its position after the column-level
+  CHECKs), and the shared mint is `mintTableCheckConstraintName` (`schema/table.ts`).
+- The `ADD CONSTRAINT` emitter names an unnamed constraint once, before dispatching to
+  the module (`nameAddedTableConstraint`), so the engine's pre-dispatch guards and
+  existing-row scan, the module, and any wrapping layer all see one name.
 - Any failure from the materialization onward goes through `revertAddColumn`: each
   CHECK / FK the module already accepted is handed back via `dropConstraint` (newest
   first), then the column is dropped, the batched events are un-remapped, and the

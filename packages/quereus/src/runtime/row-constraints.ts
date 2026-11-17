@@ -130,6 +130,11 @@ function pickAction(
 	return stmtOR ?? constraintDefault ?? ConflictResolution.ABORT;
 }
 
+/**
+ * Violation label for a CHECK stored with no name. Every engine path names an unnamed CHECK
+ * (`_check_<col>`, or `_check_<n>` from its list position — the same spelling this produces),
+ * so this is reached only for a `TableSchema` a module built by hand.
+ */
 function generateDefaultConstraintName(tableSchema: TableSchema, constraint: RowConstraintSchema): string {
 	// Find the index of this constraint in the original array to get the correct constraint number
 	const originalIndex = tableSchema.checkConstraints.findIndex((c: RowConstraintSchema) => c === constraint);

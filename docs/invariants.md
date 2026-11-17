@@ -1257,16 +1257,19 @@ for the separate `alterTags` hook: it applies the tag edit or throws, and never 
 
 ### SCH-005 — One table, one backing structure name
 
-- code: `packages/quereus/src/schema/catalog.ts` — `assertUniqueConstraintIndexNameFree`, `assertUniqueConstraintBackingNamesDistinct`
-- code: `packages/quereus/src/schema/manager.ts` — `createTable`
-- guard: `packages/quereus/test/index-ddl-roundtrip.spec.ts` — `CREATE TABLE refuses two UNIQUE constraints that derive one structure name`
+- code: `packages/quereus/src/schema/catalog.ts` — `assertUniqueConstraintIndexNameFree`
+- code: `packages/quereus/src/schema/constraint-builder.ts` — `mintUniqueConstraintName`
+- guard: `packages/quereus/test/index-ddl-roundtrip.spec.ts` — `CREATE TABLE gives two UNIQUEs whose \`_uc_\` spellings coincide distinct names, both enforced`
 - doc: [SQL Virtual Tables § 6.3 Indexes on Virtual Tables](sql-vtab.md#63-indexes-on-virtual-tables)
 
-A UNIQUE constraint's implicit backing structure is named after the constraint, or
-`_uc_<covered columns joined by _>` when unnamed. Within one table that name is held by at
-most one object: no write path may leave two UNIQUE constraints, or a UNIQUE constraint and
-an index, deriving it. Every declaring and renaming path refuses ahead of the module, so the
-answer is identical on every backend and a refusal persists nothing. The comparison reads
+A UNIQUE constraint's implicit backing structure is named after the constraint, and an
+unnamed one is stored under a `_uc_<covered columns joined by _>` mint that skips every
+constraint name already taken on the table or in the statement. Within one table that name is
+held by at most one object: no write path may leave two UNIQUE constraints, or a UNIQUE
+constraint and an index, deriving it. The mint keeps two constraints apart by construction; a
+user-written name that is taken, or a name an index holds, is refused ahead of the module on
+every declaring and renaming path, so the answer is identical on every backend and a refusal
+persists nothing. The comparison reads
 `uniqueConstraints` and `.indexes` — both backend-independent — never a materialized
 structure. Sharing a name makes one constraint enforce under a structure keyed on the other's
 columns, silently accepting duplicates. Import/rehydrate is unguarded so older catalogs open.

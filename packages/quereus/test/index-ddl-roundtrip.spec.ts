@@ -303,44 +303,24 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		}
 	});
 
-	it('CREATE TABLE refuses two UNIQUE constraints that derive one structure name', async () => {
-		// The sibling test above pins what two entries under one name cost. This pins the
-		// other producer of that shape and the guard that closes it: a UNIQUE whose backing
-		// structure name is the one another UNIQUE on the same table derives. Reachable two
-		// ways — the engine's reserved `_uc_` prefix written into a constraint name (here),
-		// and the `_`-joined auto-name colliding on ORDINARY column names (the sibling test
-		// below). Both are refused at CREATE TABLE, as they already were at every ALTER path.
+	it('CREATE TABLE gives two UNIQUEs whose `_uc_` spellings coincide distinct names, both enforced', async () => {
+		// The sibling test above pins what two entries under one name cost. This pins why a
+		// declaration can no longer produce that shape: `_uc_<cols>` joins the covered column
+		// names with `_`, so a single column `a_b` spells the name the pair `(a, b)` spells,
+		// and the second unnamed UNIQUE is minted under a disambiguated name instead of
+		// adopting the first's structure (which would enforce it on the wrong columns).
 		const dst = new Database();
 		try {
-			let err: Error | undefined;
-			try {
-				await dst.exec('create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b), unique (c))');
-			} catch (e) { err = e as Error; }
-			expect(err?.message, 'refused').to.match(/both derive backing structure name '_uc_c'/i);
+			await dst.exec('create table t (id integer primary key, a_b integer, a integer, b integer, unique (a_b), unique (a, b))');
+			expect(await rows(dst, "select name from unique_constraint_info('t') group by name order by name"))
+				.to.deep.equal([{ name: '_uc_a_b' }, { name: '_uc_a_b_2' }]);
 
-			// Refused before `module.create`, so nothing was registered.
-			expect(dst._findTable('t'), 'no table left behind').to.equal(undefined);
-			expect(await rows(dst, "select count(*) as c from schema() where type = 'table' and name = 't'"))
-				.to.deep.equal([{ c: 0 }]);
-		} finally {
-			await dst.close();
-		}
-	});
-
-	it('the same collision is reachable with ordinary column names, and is refused there too', async () => {
-		// `_uc_<cols>` joins the covered column names with `_`, so a single column named
-		// `a_b` derives the name the pair `(a, b)` derives. No reserved prefix, no unusual
-		// spelling — two plain UNIQUE declarations. The duplicate-constraint guard does not
-		// fire (different column SETS, genuinely different rules), so only the structure-name
-		// guard catches it.
-		const dst = new Database();
-		try {
-			let err: Error | undefined;
-			try {
-				await dst.exec('create table t (id integer primary key, a_b integer, a integer, b integer, unique (a_b), unique (a, b))');
-			} catch (e) { err = e as Error; }
-			expect(err?.message, 'refused').to.match(/both derive backing structure name '_uc_a_b'/i);
-			expect(dst._findTable('t'), 'no table left behind').to.equal(undefined);
+			await dst.exec('insert into t values (1, 1, 1, 1)');
+			for (const [sql, rule] of [['insert into t values (2, 1, 2, 2)', 'unique (a_b)'], ['insert into t values (3, 3, 1, 1)', 'unique (a, b)']]) {
+				let err: Error | undefined;
+				try { await dst.exec(sql); } catch (e) { err = e as Error; }
+				expect(err?.message, `${rule} still enforces`).to.match(/UNIQUE constraint failed/i);
+			}
 		} finally {
 			await dst.close();
 		}

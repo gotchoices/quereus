@@ -10,7 +10,7 @@ import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
 import type { AnyVirtualTableModule, TagChangeInfo, TagChangeTarget, TagEdit } from '../../vtab/module.js';
 import { tagChangeEventShape } from '../../vtab/alter-event-shape.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, columnSchemaToColumnDef, collectTableConstraintNames } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, columnSchemaToColumnDef, collectTableConstraintNames, isAutoConstraintName } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -20,7 +20,7 @@ import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from 
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
-import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey, isImplicitCoveringIndex, type DeclaredUniqueConstraint } from '../../schema/catalog.js';
+import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, uniqueConstraintColumnSetKey, isImplicitCoveringIndex } from '../../schema/catalog.js';
 import { generateTableDDL, generateIndexDDL } from '../../schema/ddl-generator.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
@@ -782,14 +782,17 @@ async function runAddColumn(
 	// declaring several kinds reports the cheapest-to-explain violation first; the
 	// literal-default CHECK scan runs ahead of the whole loop (see below).
 	//
-	// The CHECK mint disambiguates against the table's existing constraint names
-	// plus this column's user-written inline names, so two unnamed CHECKs on the
-	// new column (legal — see assertInlineConstraintNamesFree below) mint
-	// `_check_<col>` / `_check_<col>_2` exactly as the CREATE TABLE spelling does,
-	// and a re-added `_check_<col>` never collides with one already on the table.
-	const inlineChecks = extractColumnLevelCheckConstraints(columnDef, collectTableConstraintNames(tableSchema));
+	// The UNIQUE and CHECK mints share one taken set — the table's existing constraint
+	// names plus this column's user-written inline names, accumulating each mint — so an
+	// unnamed `unique` is stored as `_uc_<col>` and two unnamed CHECKs on the new column
+	// (legal — see assertInlineConstraintNamesFree below) as `_check_<col>` /
+	// `_check_<col>_2`, exactly as the CREATE TABLE spelling names them, and no re-added
+	// auto-name collides with one already on the table.
+	const takenConstraintNames = collectTableConstraintNames(tableSchema);
+	const inlineUniques = extractColumnLevelUniqueConstraints(columnDef, takenConstraintNames);
+	const inlineChecks = extractColumnLevelCheckConstraints(columnDef, takenConstraintNames);
 	const inlineConstraints: AST.TableConstraint[] = [
-		...extractColumnLevelUniqueConstraints(columnDef),
+		...inlineUniques,
 		...inlineChecks,
 		...extractColumnLevelForeignKeys(columnDef),
 	];
@@ -798,11 +801,11 @@ async function runAddColumn(
 	// completely untouched rather than relying on the revert path.
 	assertInlineConstraintNamesFree(tableSchema, columnDef);
 
-	// An inline `unique` builds an implicit backing structure named after the constraint
-	// — or `_uc_<column>` when unnamed — so reject before the column is materialized when
-	// that name is already an index on this table, or when the declaration merely repeats
-	// a UNIQUE the table already carries. The column does not exist yet, so both tests run
-	// off the column definition's own name (which is exactly what
+	// An inline `unique` builds an implicit backing structure named after the (possibly
+	// minted) constraint name, so reject before the column is materialized when that name
+	// is already an index on this table, or when the declaration merely repeats a UNIQUE
+	// the table already carries. The column does not exist yet, so both tests run off the
+	// column definition's own name (which is exactly what
 	// `extractColumnLevelUniqueConstraints` put in `columns`). Placed here, ahead of
 	// `module.alterTable`, so a refused statement leaves the table completely untouched
 	// rather than relying on the revert path.
@@ -810,27 +813,17 @@ async function runAddColumn(
 	// Duplicate-first, index-name-second — see the ordering rationale in
 	// `runAddConstraintViaModule`. `declaredColumnSets` carries the unnamed sets claimed by
 	// earlier inline constraints in THIS statement (`add column c … unique unique`); none
-	// of them is on `tableSchema` yet, so the guard cannot see them any other way.
-	const inlineUniques: DeclaredUniqueConstraint[] = inlineConstraints
-		.filter(c => c.type === 'unique')
-		.map(c => ({ name: c.name, columnNames: (c.columns ?? []).map(col => col.name) }));
+	// of them is on `tableSchema` yet, so the guard cannot see them any other way. A `_`
+	// name — the mint — counts as unnamed, as it does for the guard itself.
 	const declaredColumnSets = new Set<string>();
 	for (const uc of inlineUniques) {
-		const operation = `add ${uc.name ? `constraint '${uc.name}'` : 'UNIQUE'} column '${columnDef.name}' to table '${tableSchema.name}'`;
-		assertUniqueConstraintNotDuplicated(tableSchema, uc.name, uc.columnNames, operation, declaredColumnSets);
-		assertUniqueConstraintIndexNameFree(tableSchema, uc.name, uc.columnNames, operation);
-		if (uc.name === undefined) declaredColumnSets.add(uniqueConstraintColumnSetKey(uc.columnNames));
+		const columnNames = (uc.columns ?? []).map(col => col.name);
+		const unnamed = isAutoConstraintName(uc.name);
+		const operation = `add ${unnamed ? 'UNIQUE' : `constraint '${uc.name}'`} column '${columnDef.name}' to table '${tableSchema.name}'`;
+		assertUniqueConstraintNotDuplicated(tableSchema, uc.name, columnNames, operation, declaredColumnSets);
+		assertUniqueConstraintIndexNameFree(tableSchema, uc.name, columnNames, operation);
+		if (unnamed) declaredColumnSets.add(uniqueConstraintColumnSetKey(columnNames));
 	}
-
-	// Two inline `unique` constraints on the SAME new column can also derive one backing
-	// structure name without duplicating each other (`add column c text constraint _uc_c
-	// unique unique` — a name and an auto-name that coincide). Neither is on `tableSchema`
-	// yet, so the per-constraint guard above cannot see the pair; this compares them against
-	// each other. After the loop, so a plain duplicate still reports as a duplicate.
-	assertUniqueConstraintBackingNamesDistinct(
-		inlineUniques,
-		`add column '${columnDef.name}' to table '${tableSchema.name}'`,
-	);
 
 	// A per-row backfill derives each existing row's value from that row. Install a row slot
 	// over the backfill's row descriptor; the evaluator the module calls per existing row
@@ -998,8 +991,8 @@ async function runAddColumn(
 		for (const constraint of inlineConstraints) {
 			// A CHECK / FK is dropped by NAME on the revert path, so resolve the name the
 			// module will store BEFORE handing the constraint over. UNIQUE needs no entry:
-			// an unnamed one has no name to drop by, and the module's own DROP COLUMN
-			// prunes a UNIQUE over the dropped column (as it does an FK, but not a CHECK).
+			// the module's own DROP COLUMN prunes a UNIQUE over the dropped column (as it
+			// does an FK, but not a CHECK).
 			let installedName: string | undefined;
 			if (constraint.type === 'foreignKey') {
 				// Reject a same-rank child/parent collation conflict (which enforcement would

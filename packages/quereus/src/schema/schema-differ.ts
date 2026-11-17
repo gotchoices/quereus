@@ -15,8 +15,8 @@ import { Parser } from '../parser/parser.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
-import { resolveDefaultCollation, disambiguateAutoConstraintName } from './table.js';
-import { extractColumnLevelCheckConstraints } from './constraint-builder.js';
+import { resolveDefaultCollation, disambiguateAutoConstraintName, mintTableCheckConstraintName } from './table.js';
+import { extractColumnLevelCheckConstraints, mintForeignKeyConstraintName, mintUniqueConstraintName } from './constraint-builder.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -2212,16 +2212,17 @@ interface UnnamedConstraintDiffContext {
  *   - declared, unmatched → ADD under a minted reserved name (see
  *     {@link mintUnnamedConstraintName}), so the result is unnamed-class on the
  *     next diff and droppable by name;
- *   - actual, unmatched   → DROP by its stored auto-name. One stored with no name
- *     (a CREATE-time table-level CHECK, any UNIQUE added unnamed) has no statement
- *     that removes it: skipped when a dropped column takes it along (DROP COLUMN
- *     prunes a UNIQUE / FK over the column), otherwise refused here — the
- *     alternative is the silent no-op that leaves an upgraded database enforcing a
- *     rule a fresh one does not.
+ *   - actual, unmatched   → DROP by its stored auto-name. Every engine path stores
+ *     an unnamed constraint under one (CREATE TABLE, rehydrate and every ALTER
+ *     mint it), so a constraint stored with NO name only comes from a module that
+ *     builds its `TableSchema` by hand. No statement removes such a one: skipped
+ *     when a dropped column takes it along (DROP COLUMN prunes a UNIQUE / FK over
+ *     the column), otherwise refused here — the alternative is the silent no-op
+ *     that leaves an upgraded database enforcing a rule a fresh one does not.
  *
- * NOTE: tags on an unnamed constraint are not diffed — with no name there is
- * nothing for `ALTER CONSTRAINT … SET TAGS` to address. A tag-only edit to an
- * unnamed constraint is a no-op; name the constraint to manage its tags.
+ * NOTE: tags on an unnamed constraint are not diffed — the declaration carries no
+ * name to key a tag edit on. A tag-only edit to an unnamed constraint is a no-op;
+ * name the constraint to manage its tags.
  */
 function diffUnnamedConstraints(
 	declared: ReadonlyArray<DeclaredUnnamedConstraint>,
@@ -2246,6 +2247,8 @@ function diffUnnamedConstraints(
 		if (a.name !== undefined) drops.push(a.name);
 		else if (!prunedByColumnDrop(a, ctx.droppedColumns)) undroppable.push(a);
 	}
+	// Unreachable for an engine-built table (see above); kept while the schema types still
+	// permit a nameless constraint (backlog: debt-constraint-schema-name-required).
 	if (undroppable.length > 0) {
 		throw new QuereusError(
 			`Cannot drop unnamed constraint ${undroppable.map(a => `'${a.definition}'`).join(', ')} from table '${ctx.schemaName}.${actualTable.name}': `
@@ -2313,33 +2316,30 @@ function uniqueBackingName(columns: ReadonlyArray<{ name: string }>): string {
 /**
  * The reserved `_`-prefixed name an unnamed constraint is ADDed under — reserved so
  * the result stays in the unnamed class (body-matched, stable on re-diff), named so
- * it can be dropped and its ADD undone. Each spells what the engine itself names
- * the constraint where it names one:
- *   - the `_`-name the declaration wrote, if any;
- *   - column-level CHECK → `_check_<column>` (CREATE TABLE's mint);
+ * it can be dropped and its ADD undone. Each is the engine's own mint for the
+ * declaration's shape, so a fresh CREATE and an upgrade name it alike:
+ *   - the `_`-name the declaration wrote, if any (disambiguated `_<N>`);
+ *   - column-level CHECK → `_check_<column>` (disambiguated `_<N>`);
  *   - table-level CHECK  → `_check_<n>`, `n` from the table's CHECK count, bumped
- *     until free (the `_check_<index>` label an unnamed CHECK's violation reports;
- *     each mint registers in `taken`, so the next one bumps past it).
- *     NOT left unnamed: `ALTER … ADD` would mint a user-class `check_<n>`, which
- *     the next diff would drop and re-add forever;
- *   - FOREIGN KEY → `_fk_<table>_<cols>` (both engine paths' mint);
- *   - UNIQUE      → `_uc_<cols>` (the backing-structure name both paths use).
- * Then disambiguated (`_<N>` suffix) against — and registered into — `taken`.
+ *     until free (`mintTableCheckConstraintName`; each mint registers in `taken`,
+ *     so the next one bumps past it);
+ *   - FOREIGN KEY → `_fk_<table>_<cols>`, UNIQUE → `_uc_<cols>` (the shared mints).
+ * Every one is disambiguated against — and registered into — `taken`.
  */
 function mintUnnamedConstraintName(d: DeclaredUnnamedConstraint, tableName: string, checkOrdinal: number, taken: Set<string>): string {
 	const tc = d.bodyAst;
-	if (d.name === undefined && tc.type === 'check' && d.column === undefined) {
-		let n = checkOrdinal;
-		while (taken.has(`_check_${n}`)) n++;
-		taken.add(`_check_${n}`);
-		return `_check_${n}`;
+	if (d.name !== undefined) return disambiguateAutoConstraintName(d.name, taken);
+	const columnNames = (tc.columns ?? []).map(c => c.name);
+	switch (tc.type) {
+		case 'check':
+			return d.column === undefined
+				? mintTableCheckConstraintName(checkOrdinal, taken)
+				: disambiguateAutoConstraintName(`_check_${d.column}`, taken);
+		case 'foreignKey':
+			return mintForeignKeyConstraintName(tableName, columnNames, taken);
+		default:
+			return mintUniqueConstraintName(columnNames, taken);
 	}
-	const columns = tc.columns ?? [];
-	const base = d.name
-		?? (tc.type === 'check' ? `_check_${d.column}`
-			: tc.type === 'foreignKey' ? `_fk_${tableName}_${columns.map(c => c.name).join('_')}`
-			: uniqueBackingName(columns));
-	return disambiguateAutoConstraintName(base, taken);
 }
 
 /**

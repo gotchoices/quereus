@@ -825,7 +825,7 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 			const routed = collectLensSetLevelConstraints(slot(db, 'u'));
 			expect(routed.length, 'one routed set-level check').to.equal(1);
 			expect(routed[0].tags?.[LENS_BOUNDARY_ATTACHED_TAG], 'boundary marker present').to.equal(true);
-			expect(routed[0].name, 'anonymous unique ⇒ lens:unique').to.equal('lens:unique');
+			expect(routed[0].name, 'an unnamed unique routes under its stored auto-name').to.equal('lens:unique:_uc_email');
 			const exprSql = astToString(routed[0].expr);
 			expect(exprSql, 'a count(*) existence-count check').to.match(/count\(\*\)/i);
 			expect(exprSql, 'compared <= 1').to.match(/<=\s*1/);
@@ -1277,7 +1277,7 @@ describe('lens enforcement: conflict action on a transport-proved key', () => {
 			await db.exec('apply schema y');
 			await db.exec('declare logical schema x { table t (id integer primary key, a integer not null, b integer not null, unique (a, b) on conflict replace) }');
 			await db.exec(SUPERKEY_BARE_LENS);
-			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action[\s\S]*basis unique \(a\)/);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action[\s\S]*basis unique '_uc_a'/);
 		} finally {
 			await db.close();
 		}

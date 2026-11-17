@@ -9,7 +9,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type { Schema } from '../../schema/schema.js';
 import { assertConstraintNameFree, collectTableConstraintNames, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
-import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateRowInvariantChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, nameAddedTableConstraint, validateRowInvariantChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { describeAddCheck } from '../../vtab/rollback-states.js';
@@ -34,7 +34,7 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start).
 		await rctx.db._ensureTransaction();
 
-		const constraint = plan.constraint;
+		const declared = plan.constraint;
 		const schemaManager = rctx.db.schemaManager;
 		const schema = schemaManager.getSchemaOrFail(tableSchema.schemaName);
 
@@ -47,7 +47,14 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		// `CREATE UNIQUE INDEX` (`derivedFromIndex` set), this says a constraint with that
 		// name exists rather than naming the index. That is still true, and it is what the
 		// rename path already reports for the same shape.
-		if (constraint.name) assertConstraintNameFree(tableSchema, constraint.name);
+		if (declared.name) assertConstraintNameFree(tableSchema, declared.name);
+
+		// An unnamed constraint is stored under a reserved auto-name so DROP CONSTRAINT can
+		// reach it. Named HERE, once, after the user-name check above (which must see only
+		// the name the user typed) and before either arm, so every guard, scan and module
+		// below sees the one name the catalog will carry. User-facing statement text keeps
+		// the user-written name (`declared.name`).
+		const constraint = nameAddedTableConstraint(declared, tableSchema);
 
 		// A CHECK on a module without an `alterTable` hook stays engine-side (catalog
 		// only — DROP/RENAME CONSTRAINT are unsupported on such a module anyway, so
@@ -59,7 +66,7 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		// against the module's stale schema reported it missing (and a later module-routed
 		// ALTER returned a schema that silently dropped it from the catalog).
 		if (constraint.type === 'check' && !tableSchema.vtabModule?.alterTable) {
-			return runAddCheckEngineSide(rctx, tableSchema, schema, constraint, plan.sql);
+			return runAddCheckEngineSide(rctx, tableSchema, schema, constraint, declared.name, plan.sql);
 		}
 
 		// Same statement-scoped schema-event scope every `ALTER TABLE` arm runs in: the module
@@ -67,7 +74,7 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		// must retract the announcement. The engine-side branch above needs no scope — the
 		// backend it exists for ships no emitter, and its own emit is already at the tail.
 		return withStatementScopedSchemaEvents(rctx, () =>
-			runAddConstraintViaModule(rctx, tableSchema, schema, constraint, plan.sql));
+			runAddConstraintViaModule(rctx, tableSchema, schema, constraint, declared.name, plan.sql));
 	}
 
 	return {
@@ -83,18 +90,20 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
  * `checkConstraints`. Modules that DO support `alterTable` take the module-routed
  * path instead (see {@link runAddConstraintViaModule}), keeping the module-cached
  * schema and the catalog consistent.
+ *
+ * `constraint` arrives already named ({@link nameAddedTableConstraint});
+ * `declaredName` is the name the user wrote, if any, for statement text.
  */
 async function runAddCheckEngineSide(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: Schema,
 	constraint: AddConstraintNode['constraint'],
+	declaredName: string | undefined,
 	sql: string,
 ): Promise<SqlValue> {
-	// Through the shared builder (which raises the same expression-less error) so this
-	// arm inherits one auto-naming rule with the module-routed backends rather than
-	// carrying a second copy: the mint is disambiguated against the names already on
-	// the table, so a drop-then-re-add cannot re-mint a live `check_<n>`.
+	// Through the shared builder, which raises the same expression-less error the
+	// module-routed backends do.
 	//
 	// Note: We don't validate determinism here because constraints may reference NEW/OLD
 	// which require special scoping. Determinism is validated at INSERT/UPDATE plan time
@@ -107,7 +116,7 @@ async function runAddCheckEngineSide(
 
 	// Existing rows must already satisfy the CHECK — BEFORE `schema.addTable` below, for
 	// the reason spelled out on `rejectCheckViolatedByExistingRows`.
-	await rejectCheckViolatedByExistingRows(rctx.db, tableSchema, constraintSchema, describeAddCheck(constraint.name));
+	await rejectCheckViolatedByExistingRows(rctx.db, tableSchema, constraintSchema, describeAddCheck(declaredName));
 
 	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
 	const updatedTableSchema: TableSchema = {
@@ -145,12 +154,16 @@ async function runAddCheckEngineSide(
  * `alterTable`, so anything that throws after that call must retract the announcement. The
  * window is narrow today — the module call is this arm's last real work — but leaving one
  * ALTER statement path unscoped is how the ADD COLUMN leak comes back.
+ *
+ * `constraint` arrives already named ({@link nameAddedTableConstraint});
+ * `declaredName` is the name the user wrote, if any, for statement text.
  */
 async function runAddConstraintViaModule(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: Schema,
 	constraint: AddConstraintNode['constraint'],
+	declaredName: string | undefined,
 	sql: string,
 ): Promise<SqlValue> {
 	const module = requireVtabModule(tableSchema);
@@ -167,12 +180,10 @@ async function runAddConstraintViaModule(
 	// inside alterTable; a post-call throw would leave the conflicting FK on disk, only to
 	// rehydrate on the next reopen). The FK's child columns already exist on the prior
 	// `tableSchema`, so resolution against it is well-defined — and we build the FK via the
-	// same `buildForeignKeyConstraintSchema` + `columnIndexMap` + taken-set the module uses,
-	// so the pre-built FK's NAME and column indices are identical to the module-returned
-	// FK's. (The name matters beyond diagnostics on the ADD COLUMN path, which drops by it
-	// on revert — see `runAddColumn`; keeping the two builds in lock-step here keeps that
-	// one rule.) Only FK ADD CONSTRAINT has a collation pairing (UNIQUE has none), so gate
-	// on the type. The
+	// same `buildForeignKeyConstraintSchema` + `columnIndexMap` the module uses, over the
+	// already-named constraint, so the pre-built FK's name and column indices are identical
+	// to the module-returned FK's. Only FK ADD CONSTRAINT has a collation pairing (UNIQUE
+	// has none), so gate on the type. The
 	// module-side `validateAddedForeignKeyOverExistingRows` stays where it is — it needs a row
 	// scan, this is a pure schema check. (The `foreign_keys` pragma does NOT gate this:
 	// a conflicting-collation declaration is malformed regardless of enforcement.)
@@ -185,7 +196,6 @@ async function runAddConstraintViaModule(
 			tableSchema.columnIndexMap,
 			tableSchema.name,
 			tableSchema.schemaName,
-			collectTableConstraintNames(tableSchema),
 		);
 		validateForeignKeyCollations(rctx.db, tableSchema, fk);
 
@@ -233,9 +243,12 @@ async function runAddConstraintViaModule(
 	// index-name test compares a backing structure only the memory backend materializes —
 	// letting the latter rule first made the two backends disagree on a plain duplicate
 	// and reported it as a collision with an index the user never created.
+	//
+	// Both take the stored (possibly minted) name: the duplicate test reads a `_uc_` mint
+	// as unnamed, and the index-name test must judge the name the structure will take.
 	if (constraint.type === 'unique') {
 		const columnNames = (constraint.columns ?? []).map(c => c.name);
-		const operation = `add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE constraint'} to table '${tableSchema.name}'`;
+		const operation = `add ${declaredName ? `constraint '${declaredName}'` : 'UNIQUE constraint'} to table '${tableSchema.name}'`;
 		assertUniqueConstraintNotDuplicated(tableSchema, constraint.name, columnNames, operation);
 		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
 	}
@@ -252,7 +265,7 @@ async function runAddConstraintViaModule(
 			rctx.db,
 			tableSchema,
 			buildCheckConstraintSchema(constraint, tableSchema.checkConstraints.length, collectTableConstraintNames(tableSchema)),
-			describeAddCheck(constraint.name),
+			describeAddCheck(declaredName),
 		);
 	}
 

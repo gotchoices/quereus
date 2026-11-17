@@ -8,7 +8,16 @@ Part of the [Quereus SQL Reference](sql.md) — see [Topic documents](sql.md#top
 
 **Constraint names are unique within a table — one case-insensitive name space across CHECK, UNIQUE and FOREIGN KEY.** A `CREATE TABLE` declaring two constraints under one name is refused with `CONSTRAINT`; so is every `ALTER TABLE … ADD CONSTRAINT` / `ADD COLUMN … constraint <name> …` / `RENAME CONSTRAINT` onto a taken name ([§2.7](sql-alter.md)). The rule exists because `DROP` / `RENAME CONSTRAINT` resolves by name: two constraints of the same class under one name would both be removed by a single `DROP`, and two of different classes would be rejected as **ambiguous** forever. The import / rehydrate path is deliberately *not* guarded, so a database written before the rule still opens and surfaces the collision at its next `ALTER`.
 
-Constraints written **without** a name are auto-named — `_check_<column>`, `_fk_<table>_<columns>`, `_uc_<columns>` for a UNIQUE's covering structure — and those names are user-addressable (a CHECK violation and a `DROP COLUMN` refusal both quote them back at you). Declaring two constraints that mint the *same* auto-name is legal — two unnamed CHECKs on one column, or two foreign keys from one child column into different parents — so the mint disambiguates instead of refusing: the first keeps the base spelling, the Nth gets a `_<N>` suffix (`_fk_c_x`, then `_fk_c_x_2`). The suffix is collision-only and the taken set includes the names the user typed, so an auto-name never lands on a user's name and every non-colliding auto-name is spelled exactly as it always was.
+Every CHECK, UNIQUE and FOREIGN KEY written **without** a name is stored under a reserved, `_`-prefixed auto-name, at every site that creates one (`CREATE TABLE`, catalog rehydrate, `ALTER TABLE … ADD CONSTRAINT`, `ADD COLUMN`, `apply schema`):
+
+| declaration | stored name |
+|---|---|
+| column-level CHECK on `a` | `_check_a` |
+| table-level CHECK | `_check_<n>`, `n` its position in the table's CHECK list |
+| UNIQUE (column- or table-level) | `_uc_<columns>` — also its covering structure's name |
+| FOREIGN KEY on `b` of table `t` | `_fk_t_b` |
+
+Those names are user-addressable: a CHECK violation and a `DROP COLUMN` refusal both quote them back at you, introspection (`check_constraint_info` / `unique_constraint_info` / `foreign_key_info`) reports them, and `DROP CONSTRAINT <auto-name>` removes the constraint. Declaring two constraints that mint the *same* auto-name is legal — two unnamed CHECKs on one column, two foreign keys from one child column into different parents, or `unique (a_b)` beside `unique (a, b)` — so the mint disambiguates instead of refusing: the first keeps the base spelling, the Nth gets a `_<N>` suffix (`_fk_c_x`, then `_fk_c_x_2`; a table-level CHECK bumps its index instead, `_check_1` → `_check_2`). The taken set includes the names the user typed, so an auto-name never lands on a user's name. A name with the reserved `_` prefix is not identity a declaration can reference: `apply schema` matches such a constraint by its body, not its name ([schema-rename-detection.md § Unnamed constraint lifecycle](schema-rename-detection.md#unnamed-constraint-lifecycle-body-matched)).
 
 ### 7.1 Primary Key Constraint
 
@@ -105,15 +114,15 @@ create table bookings (
 );
 ```
 
-**A table may not carry the same plain UNIQUE twice.** Two *unnamed*, non-partial UNIQUE
-constraints over the same column set are refused with `CONSTRAINT` — neither has a name
-for `DROP CONSTRAINT` to address, so neither could be removed short of recreating the
-table, while every write pays the identical check twice. Column order is not identity
+**A table may not carry the same plain UNIQUE twice.** Two *unnamed* (no name, or a
+reserved `_`-prefixed one), non-partial UNIQUE constraints over the same column set are
+refused with `CONSTRAINT` — the same rule enforced twice under names the user never
+chose, every write paying the identical check twice. Column order is not identity
 (`unique (a, b)` and `unique (b, a)` are one rule) and column names fold case. The rule
 holds identically at `CREATE TABLE` (both the column-level and table-level spellings, and
 across the two), `ALTER TABLE … ADD CONSTRAINT`, and `ALTER TABLE … ADD COLUMN … unique`
-— see [ALTER § ADD CONSTRAINT](sql-alter.md) for the two carve-outs (a *named* UNIQUE
-beside an unnamed one stays legal, as do partial UNIQUEs with a `where` predicate).
+— see [ALTER § ADD CONSTRAINT](sql-alter.md) for the two carve-outs (a *user-named*
+UNIQUE beside an unnamed one stays legal, as do partial UNIQUEs with a `where` predicate).
 Reading the catalog of a database written before the rule is unaffected.
 
 ### 7.4 CHECK Constraint

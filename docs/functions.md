@@ -575,7 +575,7 @@ The implicit covering structure backing a plain `UNIQUE` constraint is not a use
 | Column | Type | Description |
 |---|---|---|
 | `id` | INTEGER | Constraint index (0-based) |
-| `name` | TEXT? | Constraint name (NULL for unnamed) |
+| `name` | TEXT? | Constraint name — an unnamed one reports its stored auto-name (`_check_<col>` / `_check_<n>`, `_uc_<cols>`); NULL only for a constraint a module stored with no name |
 | `expr` | TEXT | CHECK expression as SQL text |
 | `operations` | TEXT | Comma-joined subset of `insert,update,delete` |
 | `deferrable` | INTEGER | 0/1 |
@@ -589,7 +589,7 @@ One row per (UNIQUE constraint, column) pair. The primary key is excluded — qu
 | Column | Type | Description |
 |---|---|---|
 | `id` | INTEGER | Constraint index (0-based) |
-| `name` | TEXT? | Constraint name (NULL for unnamed) |
+| `name` | TEXT? | Constraint name — an unnamed one reports its stored auto-name (`_check_<col>` / `_check_<n>`, `_uc_<cols>`); NULL only for a constraint a module stored with no name |
 | `seq` | INTEGER | 0-based column position within the constraint |
 | `column_name` | TEXT | Column name |
 | `partial` | INTEGER | 1 if the backing index has a `WHERE` predicate |

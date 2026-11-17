@@ -14,10 +14,10 @@
 create table AddU (id integer primary key);
 alter table AddU add column u integer unique;
 
--- The constraint is materialized and surfaces in introspection (unnamed → name null,
--- one row per constrained column).
+-- The constraint is materialized and surfaces in introspection (unnamed → stored under
+-- the auto-name `_uc_<col>`, one row per constrained column).
 select name, column_name from unique_constraint_info('AddU');
-→ [{"name":null,"column_name":"u"}]
+→ [{"name":"_uc_u","column_name":"u"}]
 
 -- Forward enforcement: a duplicate value is rejected.
 insert into AddU values (1, 5);

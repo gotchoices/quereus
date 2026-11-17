@@ -493,12 +493,12 @@ select count(*) as c from schema() where type = 'index' and name = 'ui_a';
 insert into iul_ui values (2, 'k');
 -- error: unique
 
--- 9f. ALTER TABLE RENAME COLUMN — the `_uc_<cols>` name MOVES with the column
--- The auto-name is derived from the covered columns' CURRENT names and recorded
--- nowhere, so renaming a covered column renames the backing structure. Two halves:
--- the structure must follow (or it is orphaned under the old name — surfacing as a
--- user index, droppable, and no longer recognized as the constraint's), and the
--- statement must be refused when the post-rename name is already an index here.
+-- 9f. ALTER TABLE RENAME COLUMN — the stored `_uc_<cols>` name STAYS with the constraint
+-- An unnamed UNIQUE is stored under the auto-name `_uc_<cols>` its columns had when it
+-- was declared, and its structure takes that stored name like any named UNIQUE's — so a
+-- column rename moves neither. The structure must stay the constraint's (not surface as
+-- a user index under either name), keep enforcing over the renamed column, and leave an
+-- index holding the would-be re-derived name alone.
 -- Column names are file-unique so a `drop index` below cannot resolve to some other
 -- table's index of the same name (see section 6).
 create table iul_rk (id integer primary key, rka text, rkb text, unique (rka));
@@ -508,7 +508,7 @@ insert into iul_rk values (1, 'x', 'p'), (2, 'y', 'q');
 alter table iul_rk rename column rka to rkz;
 -- run
 
--- The structure followed the column: nothing surfaces under either name.
+-- The structure is still the constraint's: nothing surfaces under either name.
 select count(*) as c from schema() where type = 'index' and tbl_name = 'iul_rk';
 → [{"c":0}]
 
@@ -525,7 +525,7 @@ drop index _uc_rkz;
 insert into iul_rk values (3, 'x', 'r');
 -- error: unique
 
--- Multi-column: the auto-name joins the NEW column names.
+-- Multi-column: nothing is derived from the NEW column names either.
 create table iul_rm (id integer primary key, rma text, rmb text, unique (rma, rmb));
 insert into iul_rm values (1, 'x', 'p');
 -- run
@@ -542,30 +542,24 @@ drop index _uc_rmz_rmb;
 insert into iul_rm values (2, 'x', 'p');
 -- error: unique
 
--- Collision: the post-rename name is already an index on this table.
+-- No collision: an index already holding the name a re-derivation WOULD produce does
+-- not block the rename, because nothing is re-derived.
 create table iul_rx (id integer primary key, rxa text, rxb text, unique (rxa));
 create index _uc_rxz on iul_rx (rxb);
 insert into iul_rx values (1, 'x', 'p'), (2, 'y', 'q');
 -- run
 
 alter table iul_rx rename column rxa to rxz;
--- error: would collide with existing index '_uc_rxz'
+-- run
 
--- Nothing moved: the column keeps its old name...
-select count(*) as c from table_info('iul_rx') where name = 'rxa';
-→ [{"c":1}]
-
-select count(*) as c from table_info('iul_rx') where name = 'rxz';
-→ [{"c":0}]
-
--- ...the user's index is still listed and still resolves rows...
+-- The user's index is still listed and still resolves rows...
 select count(*) as c from schema() where type = 'index' and name = '_uc_rxz';
 → [{"c":1}]
 
 select id from iul_rx where rxb = 'q';
 → [{"id":2}]
 
--- ...the constraint still enforces over the old column name...
+-- ...the constraint still enforces over the renamed column...
 insert into iul_rx values (3, 'x', 'r');
 -- error: unique
 
@@ -573,8 +567,8 @@ insert into iul_rx values (3, 'x', 'r');
 drop index _uc_rxz;
 -- run
 
--- A case-only rename derives a case-equal name, which must not be read as a
--- collision with the constraint's OWN structure.
+-- A case-only rename must not be read as a collision with the constraint's OWN
+-- structure.
 create table iul_rf (id integer primary key, rfa text, unique (rfa));
 insert into iul_rf values (1, 'x');
 -- run
@@ -588,8 +582,8 @@ select count(*) as c from index_info('iul_rf');
 insert into iul_rf values (2, 'x');
 -- error: unique
 
--- An EXPOSED implicit structure follows the rename too — it stays visible, under the
--- NEW derived name (exposure changes visibility, not who owns the name).
+-- An EXPOSED implicit structure stays visible under its stored name across the rename
+-- (exposure changes visibility, not who owns the name).
 create table iul_rp (id integer primary key, rpa text,
     unique (rpa) with tags ("quereus.expose_implicit_index" = true));
 insert into iul_rp values (1, 'x');
@@ -599,36 +593,15 @@ alter table iul_rp rename column rpa to rpz;
 -- run
 
 select index_name from index_info('iul_rp');
-→ [{"index_name":"_uc_rpz"}]
+→ [{"index_name":"_uc_rpa"}]
 
 insert into iul_rp values (2, 'x');
 -- error: unique
 
--- A NAMED UNIQUE's structure takes the CONSTRAINT's name, which no column rename
--- moves — so neither arm applies to it.
-create table iul_rn (id integer primary key, rna text, rnb text, constraint rn_uq unique (rna));
-create index _uc_rnz on iul_rn (rnb);
-insert into iul_rn values (1, 'x', 'p');
--- run
-
-alter table iul_rn rename column rna to rnz;
--- run
-
--- The index the unnamed case would have collided with is untouched...
-select count(*) as c from schema() where type = 'index' and name = '_uc_rnz' and tbl_name = 'iul_rn';
-→ [{"c":1}]
-
--- ...and the constraint's own structure is still hidden and still enforcing.
-select count(*) as c from index_info('iul_rn') where index_name = 'rn_uq';
-→ [{"c":0}]
-
-insert into iul_rn values (2, 'x', 'q');
--- error: unique
-
--- The re-derived name is also the key DROP COLUMN tears the structure down by, so a
--- rename followed by dropping a covered column must leave no orphan behind. Multi-column
--- on purpose: a single-column structure collapses to zero key columns and is dropped by
--- the shift helper regardless, so only this shape proves the key was re-derived.
+-- The stored name is also the key DROP COLUMN tears the structure down by, so a rename
+-- followed by dropping a covered column must leave no orphan behind. Multi-column on
+-- purpose: a single-column structure collapses to zero key columns and is dropped by the
+-- shift helper regardless, so only this shape proves the key was found.
 create table iul_rd (id integer primary key, rda text, rdb text, unique (rda, rdb));
 insert into iul_rd values (1, 'x', 'p');
 -- run
@@ -652,9 +625,9 @@ insert into iul_rd values (2, 'p');
 select count(*) as c from iul_rd;
 → [{"c":2}]
 
--- Renaming INSIDE an open transaction that has already staged a row: the structure moves
--- to its new name under the transaction's own layer too, so the staged row stays visible
--- to it, enforcement never lapses, and the commit does not drop the staged write.
+-- Renaming INSIDE an open transaction that has already staged a row: the staged row stays
+-- visible to the structure, enforcement never lapses, and the commit does not drop the
+-- staged write.
 create table iul_rs (id integer primary key, rsa text, unique (rsa));
 insert into iul_rs values (1, 'x');
 -- run
@@ -683,7 +656,6 @@ insert into iul_rs values (4, 'x');
 
 drop table iul_rs;
 drop table iul_rd;
-drop table iul_rn;
 drop table iul_rp;
 drop table iul_rf;
 drop table iul_rx;
@@ -912,150 +884,121 @@ drop table dup_ac;
 -- run
 
 -- ============================================================
--- 11. Two UNIQUE constraints may not derive ONE backing structure name
+-- 11. Two UNIQUE constraints never share ONE backing structure name
 -- ============================================================
--- A UNIQUE's backing structure is named after the constraint, or `_uc_<cols>` when
--- unnamed. Nothing in that rule stops two constraints on one table deriving the SAME
--- name. Two spellings reach it: a constraint name written with the engine's reserved
--- `_uc_` prefix, and the `_`-joined auto-name colliding on ordinary column names
--- (`unique (a_b)` beside `unique (a, b)` — both derive `_uc_a_b`). Left unguarded the
--- second constraint shares the first's structure and is then enforced by one keyed on
--- the OTHER constraint's columns, so it silently stops rejecting duplicates.
+-- A UNIQUE's backing structure takes the constraint's stored name, and an unnamed
+-- UNIQUE is stored under the auto-name `_uc_<cols>`. Two spellings could make two
+-- constraints on one table want the SAME name: a constraint name written with the
+-- engine's reserved `_uc_` prefix, and the `_`-joined auto-name colliding on ordinary
+-- column names (`unique (a_b)` beside `unique (a, b)` — both spell `_uc_a_b`). Shared,
+-- the second constraint would be enforced by a structure keyed on the OTHER
+-- constraint's columns, so it would silently stop rejecting duplicates.
 --
--- Refused on every authoring path. The comparison reads `uniqueConstraints`, which
--- BOTH backends carry, rather than a materialized index (memory has one, store does
--- not) — so the message below is identical on both, which is the point of this section.
+-- Neither can happen: the mint skips every name already taken on the table or in the
+-- statement (`_uc_a_b`, then `_uc_a_b_2`), and a user-written name that is taken is
+-- refused by the constraint-name guard. Every case below therefore either creates two
+-- independently-enforcing constraints or is refused by name, identically on both
+-- backends (the names live in `uniqueConstraints`, which both carry).
 
 -- 11a. CREATE TABLE — a constraint name carrying the reserved `_uc_` prefix
 create table cn_ct (id integer primary key, cn_c integer, cn_b integer,
     constraint _uc_cn_c unique (cn_b), unique (cn_c));
--- error: both derive backing structure name '_uc_cn_c'
+insert into cn_ct values (1, 1, 1);
+-- run
 
--- Refused before any storage is created.
-select count(*) as c from schema() where type = 'table' and name = 'cn_ct';
-→ [{"c":0}]
+select name from unique_constraint_info('cn_ct') order by name;
+→ [{"name":"_uc_cn_c"},{"name":"_uc_cn_c_2"}]
 
--- Case folds, like every other index-name compare.
-create table cn_ct (id integer primary key, cn_c integer, cn_b integer,
-    constraint _UC_CN_C unique (cn_b), unique (cn_c));
--- error: both derive backing structure name
+insert into cn_ct values (2, 2, 1);
+-- error: unique
 
--- Two inline `unique` constraints on ONE column, the written name coinciding with the
--- auto-name the other derives. The CREATE TABLE twin of the ADD COLUMN case in 11d —
--- neither constraint can be seen on a table, so only comparing the declaration against
--- itself catches it.
-create table cn_ct (id integer primary key, cn_c integer constraint _uc_cn_c unique unique);
--- error: both derive backing structure name '_uc_cn_c'
+insert into cn_ct values (3, 1, 3);
+-- error: unique
 
-select count(*) as c from schema() where type = 'table' and name = 'cn_ct';
-→ [{"c":0}]
+-- Two inline `unique` constraints on ONE column, the written `_` name coinciding with
+-- the auto-name: a `_` name is not user identity, so the pair is one rule declared twice.
+create table cn_cx (id integer primary key, cn_c integer constraint _uc_cn_c unique unique);
+-- error: an equivalent UNIQUE constraint on (cn_c) already exists
 
 -- 11b. CREATE TABLE — ordinary column names, no reserved prefix anywhere
--- The auto-name joins the covered column names with `_`, so the single column `cnq_cnr`
--- derives exactly what the pair `(cnq, cnr)` derives.
-create table cn_ab (id integer primary key, cnq_cnr integer, cnq integer, cnr integer,
-    unique (cnq_cnr), unique (cnq, cnr));
--- error: both derive backing structure name '_uc_cnq_cnr'
-
-select count(*) as c from schema() where type = 'table' and name = 'cn_ab';
-→ [{"c":0}]
-
--- Column-level and table-level spellings meet in the same comparison.
+-- The single column `cnq_cnr` spells exactly what the pair `(cnq, cnr)` spells; the
+-- column-level one is minted first.
 create table cn_ab (id integer primary key, cnq_cnr integer unique, cnq integer, cnr integer,
     unique (cnq, cnr));
--- error: both derive backing structure name '_uc_cnq_cnr'
-
--- Neither declaration alone is a problem: free names still create and enforce.
-create table cn_ab (id integer primary key, cnq_cnr integer, cnq integer, cnr integer,
-    unique (cnq_cnr), unique (cnq));
 insert into cn_ab values (1, 1, 1, 1);
 -- run
+
+select name, column_name from unique_constraint_info('cn_ab') order by name, column_name;
+→ [{"name":"_uc_cnq_cnr","column_name":"cnq_cnr"},{"name":"_uc_cnq_cnr_2","column_name":"cnq"},{"name":"_uc_cnq_cnr_2","column_name":"cnr"}]
 
 insert into cn_ab values (2, 1, 2, 2);
 -- error: unique
 
-insert into cn_ab values (3, 3, 1, 3);
+insert into cn_ab values (3, 3, 1, 1);
 -- error: unique
 
--- 11c. ALTER TABLE ADD CONSTRAINT — colliding with another CONSTRAINT's structure
--- (not an index), so the refusal must come from the constraint comparison on BOTH
--- backends rather than from memory's materialized index entry.
+-- 11c. ALTER TABLE ADD CONSTRAINT — a written name the table already holds as an
+-- auto-name is refused by name; an unnamed add beside a written `_uc_` name is minted past it.
 create table cn_ac (id integer primary key, cn_c integer, cn_b integer, unique (cn_c));
 -- run
 
 alter table cn_ac add constraint _uc_cn_c unique (cn_b);
--- error: would collide with the backing structure of the UNIQUE constraint on (cn_c)
+-- error: a constraint with that name already exists
 
--- Nothing was installed by the refusal.
 select count(distinct id) as c from unique_constraint_info('cn_ac');
 → [{"c":1}]
 
--- The mirror spelling: the reserved-prefix NAME is on the table and the auto-name is
--- the one being declared. The message names the other constraint the way it was written.
 create table cn_am (id integer primary key, cn_m integer, cn_n integer,
     constraint _uc_cn_m unique (cn_n));
+alter table cn_am add unique (cn_m);
 -- run
 
-alter table cn_am add unique (cn_m);
--- error: would collide with the backing structure of the UNIQUE constraint '_uc_cn_m'
-
-select count(distinct id) as c from unique_constraint_info('cn_am');
-→ [{"c":1}]
+select name from unique_constraint_info('cn_am') order by name;
+→ [{"name":"_uc_cn_m"},{"name":"_uc_cn_m_2"}]
 
 -- 11d. ALTER TABLE ADD COLUMN … unique
 create table cn_cc (id integer primary key, cn_q integer, constraint _uc_c unique (cn_q));
+alter table cn_cc add column c text unique;
 -- run
 
-alter table cn_cc add column c text unique;
--- error: would collide with the backing structure of the UNIQUE constraint '_uc_c'
+select name from unique_constraint_info('cn_cc') order by name;
+→ [{"name":"_uc_c"},{"name":"_uc_c_2"}]
 
--- The refusal left the table exactly as it was — the column was never added.
-select count(*) as c from table_info('cn_cc') where name = 'c';
-→ [{"c":0}]
-
--- Two inline `unique` constraints on ONE new column can collide with EACH OTHER, and
--- neither is on the table yet — so only comparing them against one another catches it.
+-- Two inline `unique` constraints on ONE new column, one written with the `_uc_`
+-- auto-name: one rule declared twice, as in 11a.
 create table cn_ci (id integer primary key, cn_r integer);
 -- run
 
 alter table cn_ci add column c text constraint _uc_c unique unique;
--- error: both derive backing structure name '_uc_c'
+-- error: an equivalent UNIQUE constraint on (c) already exists
 
 select count(*) as c from table_info('cn_ci') where name = 'c';
 → [{"c":0}]
 
--- 11e. ALTER TABLE RENAME COLUMN — the rename is what makes the two names meet
--- `_uc_<cols>` is derived from the covered columns' CURRENT names, so renaming a
--- covered column moves the structure onto a name another constraint already derives.
+-- 11e. ALTER TABLE RENAME COLUMN — stored names do not move, so a rename cannot make
+-- two of them meet.
 create table cn_rk (id integer primary key, cnk_cnm integer, cnk integer, cnx integer,
     unique (cnk_cnm), unique (cnk, cnx));
 insert into cn_rk values (1, 1, 1, 1);
+alter table cn_rk rename column cnx to cnm;
 -- run
 
-alter table cn_rk rename column cnx to cnm;
--- error: would collide with the backing structure of the UNIQUE constraint on (cnk_cnm)
+select name from unique_constraint_info('cn_rk') group by name order by name;
+→ [{"name":"_uc_cnk_cnm"},{"name":"_uc_cnk_cnx"}]
 
--- Nothing moved: the column keeps its old name...
-select count(*) as c from table_info('cn_rk') where name = 'cnx';
-→ [{"c":1}]
-
-select count(*) as c from table_info('cn_rk') where name = 'cnm';
-→ [{"c":0}]
-
--- ...and both constraints still enforce, each under its own structure.
 insert into cn_rk values (2, 1, 2, 2);
 -- error: unique
 
 insert into cn_rk values (3, 3, 1, 1);
 -- error: unique
 
--- 11f. ALTER TABLE RENAME CONSTRAINT onto another constraint's derived name
+-- 11f. ALTER TABLE RENAME CONSTRAINT onto another constraint's auto-name
 create table cn_rn (id integer primary key, cn_m integer, cn_n integer,
     unique (cn_m), constraint cn_u unique (cn_n));
 -- run
 
 alter table cn_rn rename constraint cn_u to _uc_cn_m;
--- error: would collide with the backing structure of the UNIQUE constraint on (cn_m)
+-- error: a constraint with that name already exists
 
 -- Neither constraint moved.
 select count(*) as c from unique_constraint_info('cn_rn') where name = 'cn_u';
@@ -1109,30 +1052,28 @@ select count(*) as c from schema() where type = 'index' and name = 'cn_ok3_i';
 insert into cn_ok3 values (2, 5);
 -- error: unique
 
--- A constraint synthesized by `create unique index` is SKIPPED by the constraint
--- comparison: its backing structure IS that index, already compared by the index arm,
--- so matching it here would report one collision twice under two messages. The proof is
--- the message — a declaration onto that name is refused as an INDEX collision.
+-- A `create unique index` synthesizes a constraint under the index's own name, so the
+-- mint skips that name too: the unnamed add lands beside it, and both enforce.
 create table cn_ok4 (id integer primary key, cn_c4 integer, cn_d4 integer);
 create unique index _uc_cn_d4 on cn_ok4 (cn_c4);
 insert into cn_ok4 values (1, 5, 6);
+alter table cn_ok4 add unique (cn_d4);
 -- run
 
-alter table cn_ok4 add unique (cn_d4);
--- error: would collide with existing index '_uc_cn_d4'
+select count(*) as c from unique_constraint_info('cn_ok4') where name = '_uc_cn_d4_2';
+→ [{"c":1}]
 
 insert into cn_ok4 values (2, 5, 7);
 -- error: unique
 
--- Same for a PARTIAL one. Only `create unique index … where` produces a partial UNIQUE
--- constraint today, so a partial's structure is always its own index and the index arm
--- owns the refusal — but the name may still not be shared.
+insert into cn_ok4 values (3, 8, 6);
+-- error: unique
+
+-- Same for a PARTIAL one: its synthesized constraint carries the index name.
 create table cn_ok5 (id integer primary key, cn_c5 integer, cn_s5 text, cn_d5 integer);
 create unique index _uc_cn_d5 on cn_ok5 (cn_c5) where cn_s5 = 'pos';
--- run
-
 alter table cn_ok5 add unique (cn_d5);
--- error: would collide with existing index '_uc_cn_d5'
+-- run
 
 -- The partial index still enforces its own narrower rule.
 insert into cn_ok5 values (1, 5, 'pos', 1);
@@ -1156,6 +1097,7 @@ drop table cn_cc;
 drop table cn_am;
 drop table cn_ac;
 drop table cn_ab;
+drop table cn_ct;
 -- run
 
 -- ============================================================
@@ -1209,14 +1151,3 @@ apply schema main;
 select count(*) as c from schema() where type = 'table' and name = 'as_dup';
 → [{"c":0}]
 
--- ...and so does a declared table whose two UNIQUEs derive one backing structure name.
-declare schema main {
-	table as_bn (id integer primary key, as_c integer, as_b integer, constraint _uc_as_c unique (as_b), unique (as_c))
-}
--- run
-
-apply schema main;
--- error: both derive backing structure name '_uc_as_c'
-
-select count(*) as c from schema() where type = 'table' and name = 'as_bn';
-→ [{"c":0}]

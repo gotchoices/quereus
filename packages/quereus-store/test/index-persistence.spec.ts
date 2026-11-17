@@ -976,68 +976,27 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(err2!.message).to.match(/an equivalent UNIQUE constraint on \(c\) already exists/i);
 	});
 
-	// An UNNAMED UNIQUE's backing structure is named `_uc_<covered column names>`,
-	// derived from the columns' CURRENT names and recorded nowhere — so RENAME COLUMN
-	// moves that name. Renaming onto a name an index on the same table already holds is
-	// the same durable loss as the declaration case above, reached through a rename: the
-	// rewritten bundle drops the user's `CREATE INDEX` line and the constraint's entries
-	// are then built into that index's store (physical store name is a pure function of
-	// schema + table + index name), so after reopen the index is gone and the constraint
-	// checks uniqueness against entries keyed on the WRONG column. Refused up front now.
-	it('a column rename colliding with an index name is refused and the index survives reopen intact', async () => {
+	// An UNNAMED UNIQUE is stored under the auto-name `_uc_<covered column names>` it got
+	// at declaration, and its backing store is keyed by that stored name — so RENAME
+	// COLUMN moves neither. Were the name re-derived from the columns' CURRENT names, the
+	// rename below would move the structure onto `_uc_z`, which a user index already
+	// holds: the rewritten bundle would drop that index's `CREATE INDEX` line and the
+	// constraint's entries would land in the index's store (physical store name is a pure
+	// function of schema + table + index name).
+	it('a column rename keeps an unnamed UNIQUE backing store under its stored name, beside an index holding the re-derived name', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, a text, b text, unique (a)) using store`);
 		await db.exec(`create index _uc_z on t (b)`);
 		await db.exec(`insert into t values (1, 'x', 'p'), (2, 'y', 'q')`);
+		expect(indexStoreSize('t', '_uc_a'), 'backing store built under the stored name').to.equal(2);
 		expect(indexStoreSize('t', '_uc_z'), 'index backed by one entry per row').to.equal(2);
-
-		const writes = await traceCatalogWrites();
-
-		let err: Error | undefined;
-		try { await db.exec(`alter table t rename column a to z`); } catch (e) { err = e as Error; }
-		expect(err, 'expected rejection').to.not.be.undefined;
-		expect(err!.message).to.match(/would collide with existing index '_uc_z'/i);
-
-		// The refusal precedes module.alterTable, so no bundle was rewritten at all; any
-		// write that DID happen still carries the index DDL.
-		for (const w of writes) {
-			expect(w, 'no catalog write drops the CREATE INDEX line').to.match(/CREATE INDEX/i);
-		}
-		const entry = (await catalogEntry('t'))!;
-		expect(entry, 'bundle still declares the index').to.match(/CREATE INDEX "_uc_z"/i);
-		expect(entry, 'bundle still declares the un-renamed column').to.match(/"a"\s+TEXT/i);
-		expect(indexStoreSize('t', '_uc_z'), 'backing store untouched').to.equal(2);
-
-		await mod.closeAll();
-		const { db: db2 } = await reopen();
-
-		const info = await indexInfo(db2, 't');
-		expect(info.map(r => r.index_name), 'index survives reopen').to.include('_uc_z');
-		expect(indexStoreSize('t', '_uc_z'), 'backing entries survive reopen').to.equal(2);
-		expect(await rows(db2, `select id from t where b = 'q'`)).to.deep.equal([{ id: 2 }]);
-
-		// The constraint kept its old column and still rejects duplicates on it.
-		let rejected = false;
-		try { await db2.exec(`insert into t values (3, 'x', 'r')`); } catch { rejected = true; }
-		expect(rejected, 'UNIQUE still enforces over the un-renamed column after reopen').to.be.true;
-	});
-
-	it('a column rename relocates an unnamed UNIQUE backing store and keeps it hidden + enforcing across reopen', async () => {
-		const { db, mod } = open();
-		await db.exec(`create table t (id integer primary key, a text, b text, unique (a)) using store`);
-		await db.exec(`insert into t values (1, 'x', 'p'), (2, 'y', 'q')`);
-		expect(indexStoreSize('t', '_uc_a'), 'backing store built under the derived name').to.equal(2);
 
 		await db.exec(`alter table t rename column a to z`);
 
-		// The derived name moved with the column: the old physical store is torn down and
-		// the entries are rebuilt under the new one.
-		expect(indexStoreSize('t', '_uc_a'), 'old backing store torn down').to.equal(0);
-		expect(indexStoreSize('t', '_uc_z'), 'entries rebuilt under the new derived name').to.equal(2);
-
-		// Still a hidden backing structure, not a user index.
-		expect(await indexInfo(db, 't'), 'structure stays hidden after the rename').to.have.lengthOf(0);
-		expect((await catalogEntry('t'))!, 'no CREATE INDEX line for the structure').to.not.match(/CREATE INDEX/i);
+		expect(indexStoreSize('t', '_uc_a'), 'backing store stays under the stored name').to.equal(2);
+		expect(indexStoreSize('t', '_uc_z'), 'the user index store is untouched').to.equal(2);
+		expect((await indexInfo(db, 't')).map(r => r.index_name), 'only the user index is visible').to.deep.equal(['_uc_z']);
+		expect((await catalogEntry('t'))!, 'bundle still declares the index').to.match(/CREATE INDEX "_uc_z"/i);
 
 		let rejected = false;
 		try { await db.exec(`insert into t values (3, 'x', 'r')`); } catch { rejected = true; }
@@ -1046,48 +1005,11 @@ describe('StoreModule secondary-index persistence', () => {
 		await mod.closeAll();
 		const { db: db2 } = await reopen();
 
-		expect(await indexInfo(db2, 't'), 'structure still hidden after reopen').to.have.lengthOf(0);
-		expect(indexStoreSize('t', '_uc_z'), 'relocated entries survive reopen').to.equal(2);
+		expect((await indexInfo(db2, 't')).map(r => r.index_name), 'still only the user index after reopen').to.deep.equal(['_uc_z']);
+		expect(indexStoreSize('t', '_uc_a'), 'backing entries survive reopen').to.equal(2);
+		expect(await rows(db2, `select id from t where b = 'q'`)).to.deep.equal([{ id: 2 }]);
 		let rejectedAfterReopen = false;
 		try { await db2.exec(`insert into t values (4, 'x', 's')`); } catch { rejectedAfterReopen = true; }
 		expect(rejectedAfterReopen, 'UNIQUE still enforces after reopen').to.be.true;
-	});
-
-	it('a legacy catalog whose two UNIQUEs derive one backing structure name still reopens', async () => {
-		// Two UNIQUE constraints on one table may not derive the same backing structure
-		// name (`constraint _uc_c unique (b)` beside `unique (c)` — both derive `_uc_c`);
-		// every write path refuses the pair now. But the guard sits on `createTable` only,
-		// never on the import / rehydrate path, so a catalog written BEFORE it existed must
-		// still open and must still behave as it did. No write path can produce such a
-		// catalog any more, so the bundle is hand-edited into the shape an older version
-		// would have persisted.
-		const { db, mod } = open();
-		await db.exec(`create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b)) using store`);
-		await db.exec(`insert into t values (1, 5, 7)`);
-		await mod.closeAll();
-
-		const before = (await catalogEntry('t'))!;
-		const legacy = before.replace(/(constraint\s+"?_uc_c"?\s+unique\s*\(\s*"?b"?\s*\))/i, '$1, unique ("c")');
-		expect(legacy, 'bundle rewritten to carry the colliding second UNIQUE').to.not.equal(before);
-		const catalog = await provider.getCatalogStore();
-		await catalog.put(buildCatalogKey('main', 't'), new TextEncoder().encode(legacy));
-
-		// `reopen()` asserts the rehydrated bundle parses cleanly — the open is not refused.
-		const { db: db2 } = await reopen();
-
-		expect(await rows(db2, `select count(distinct id) as c from unique_constraint_info('t')`),
-			'both constraints registered').to.deep.equal([{ c: 2 }]);
-		expect(await rows(db2, `select id from t`), 'the row survives').to.deep.equal([{ id: 1 }]);
-
-		// Enforcement is unchanged from what this catalog always did: the store resolves a
-		// constraint's serving structure by COLUMNS rather than by name, so the second
-		// constraint falls back to a correct scan instead of adopting the first's structure.
-		let err: Error | undefined;
-		try { await db2.exec(`insert into t values (2, 6, 7)`); } catch (e) { err = e as Error; }
-		expect(err?.message, 'the named UNIQUE on (b) still enforces').to.match(/unique/i);
-
-		err = undefined;
-		try { await db2.exec(`insert into t values (3, 5, 8)`); } catch (e) { err = e as Error; }
-		expect(err?.message, 'the unnamed UNIQUE on (c) still enforces').to.match(/unique/i);
 	});
 });

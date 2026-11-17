@@ -2274,9 +2274,10 @@ diff schema main;
 drop table uc_t;
 drop table uc_p;
 
--- Created fresh: a column-level unnamed CHECK / FK is stored under its
--- auto-name and drops; a table-level CHECK and any UNIQUE are stored with
--- no name, so dropping one from the declaration is refused, not ignored.
+-- Created fresh: CREATE TABLE stores every unnamed constraint under a
+-- reserved auto-name (`_check_a`, `_fk_uc_f_b`, the table-level CHECK at
+-- position 1 as `_check_1`, the UNIQUE as `_uc_a`), so each one dropped from
+-- the declaration is dropped by that name.
 declare schema main {
 	table uc_p { id integer primary key }
 	table uc_f {
@@ -2310,42 +2311,30 @@ apply schema main;
 
 declare schema main {
 	table uc_p { id integer primary key }
-	table uc_f { id integer primary key, a integer null, b integer null, unique (a) }
+	table uc_f { id integer primary key, a integer null, b integer null }
 }
 
 -- run
 
 diff schema main;
--- error: Cannot drop unnamed constraint 'check (a > 0)' from table 'main.uc_f'
+→ [{"ddl": "ALTER TABLE uc_f DROP CONSTRAINT _check_1"}, {"ddl": "ALTER TABLE uc_f DROP CONSTRAINT _uc_a"}]
 
 apply schema main;
--- error: created without a name, so no statement can drop it
-
-declare schema main {
-	table uc_p { id integer primary key }
-	table uc_f { id integer primary key, a integer null, b integer null, check (a > 0) }
-}
 
 -- run
 
-diff schema main;
--- error: Cannot drop unnamed constraint 'unique (a)' from table 'main.uc_f'
-
--- Still declaring both: converged.
-declare schema main {
-	table uc_p { id integer primary key }
-	table uc_f { id integer primary key, a integer null, b integer null, check (a > 0), unique (a) }
-}
-
--- run
+-- Neither rule binds any more: a non-positive `a`, twice.
+insert into uc_f values (1, -1, null), (2, -1, null);
+select count(*) as c from uc_f where a = -1;
+→ [{"c": 2}]
 
 diff schema main;
 → []
 
 drop table uc_f;
 
--- A dropped column takes its unnamed UNIQUE with it (DROP COLUMN prunes a
--- UNIQUE over the column), so that removal is not refused.
+-- A dropped column's unnamed UNIQUE is dropped by its stored name ahead of the
+-- column, as a named one is.
 declare schema main {
 	table uc_p { id integer primary key }
 	table uc_g { id integer primary key, a integer null, b integer null, unique (a) }
@@ -2365,7 +2354,7 @@ declare schema main {
 -- run
 
 diff schema main;
-→ [{"ddl": "ALTER TABLE uc_g DROP COLUMN a"}]
+→ [{"ddl": "ALTER TABLE uc_g DROP CONSTRAINT _uc_a"}, {"ddl": "ALTER TABLE uc_g DROP COLUMN a"}]
 
 apply schema main options (allow_destructive = true);
 

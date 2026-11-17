@@ -1115,7 +1115,7 @@ describe('StoreTable UNIQUE constraints', () => {
 			await db.exec(`INSERT INTO d1 VALUES (1, 'a@x')`); // lazy DDL persist
 			const bundle = await readCatalogEntry('d1');
 			expect(bundle, 'no implicit index CREATE INDEX line').to.not.match(/create index/i);
-			expect(bundle, 'no `_uc_` name leaked into the bundle').to.not.match(/_uc_/i);
+			expect(bundle, 'the `_uc_` auto-name is persisted only as the constraint name').to.match(/constraint\s+"?_uc_email"?\s+unique/i);
 		});
 
 		it('keeps the implicit `_uc_*` out of the engine-registered schema', async () => {

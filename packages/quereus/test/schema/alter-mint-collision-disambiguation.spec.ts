@@ -15,8 +15,9 @@ import type * as AST from '../../src/parser/ast.js';
  *
  *  - a mint must never repeat a name the table already holds (else one
  *    `DROP CONSTRAINT` removes two constraints), and
- *  - a NON-colliding mint must stay byte-identical to the historical spelling
- *    (else every persisted name and corpus assertion churns).
+ *  - a NON-colliding mint must keep its base spelling — for a CHECK, the
+ *    `_check_<index>` label its violation reports (else every persisted name
+ *    and corpus assertion churns).
  */
 describe('ALTER-path constraint-name mints', () => {
 	const checkCon: AST.TableConstraint = {
@@ -27,38 +28,38 @@ describe('ALTER-path constraint-name mints', () => {
 	const mintCheck = (existingCount: number, taken: readonly string[]): string | undefined =>
 		buildCheckConstraintSchema(checkCon, existingCount, new Set(taken)).name;
 
-	describe('CHECK — `check_<n>`', () => {
-		it('keeps the historical count-seeded spelling when it is free', () => {
-			expect(mintCheck(0, [])).to.equal('check_0');
-			expect(mintCheck(2, ['check_0', 'check_1'])).to.equal('check_2');
+	describe('CHECK — `_check_<n>`', () => {
+		it('keeps the position-seeded spelling when it is free', () => {
+			expect(mintCheck(0, [])).to.equal('_check_0');
+			expect(mintCheck(2, ['_check_0', '_check_1'])).to.equal('_check_2');
 		});
 
-		it('seeds from the CHECK count, not from the lowest free index', () => {
-			// The table's one CHECK is user-named, so `check_0` is free — but the
-			// historical mint said `check_1` and a non-colliding name must not move.
-			expect(mintCheck(1, ['ck_user'])).to.equal('check_1');
+		it('seeds from the position it is appended at, not from the lowest free index', () => {
+			// The table's one CHECK is user-named, so `_check_0` is free — but the CHECK
+			// lands at index 1, and its violation label says `_check_1`.
+			expect(mintCheck(1, ['ck_user'])).to.equal('_check_1');
 		});
 
 		it('bumps the index past a live name a drop left behind', () => {
-			// `check_0` dropped, `check_1` still live: the count says 1, which is taken.
-			expect(mintCheck(1, ['check_1'])).to.equal('check_2');
+			// `_check_0` dropped, `_check_1` still live: the count says 1, which is taken.
+			expect(mintCheck(1, ['_check_1'])).to.equal('_check_2');
 		});
 
 		it('bumps past a whole run of taken indices', () => {
-			expect(mintCheck(1, ['check_1', 'check_2', 'check_3'])).to.equal('check_4');
+			expect(mintCheck(1, ['_check_1', '_check_2', '_check_3'])).to.equal('_check_4');
 		});
 
 		it('bumps past a taken name whatever constraint class holds it', () => {
 			// The set is built by `collectTableConstraintNames`, which spans CHECK /
-			// UNIQUE / FK — so `check_0` blocks the mint whether a CHECK, a UNIQUE or an
+			// UNIQUE / FK — so `_check_0` blocks the mint whether a CHECK, a UNIQUE or an
 			// FK answers to it. The builder sees only names, so one fixture covers all
 			// three; DROP CONSTRAINT resolving across classes is what makes that right.
-			expect(mintCheck(0, ['check_0'])).to.equal('check_1');
+			expect(mintCheck(0, ['_check_0'])).to.equal('_check_1');
 		});
 
 		it('never overrides a user-written name', () => {
-			const named: AST.TableConstraint = { ...checkCon, name: 'check_0' };
-			expect(buildCheckConstraintSchema(named, 0, new Set(['check_0'])).name).to.equal('check_0');
+			const named: AST.TableConstraint = { ...checkCon, name: '_check_0' };
+			expect(buildCheckConstraintSchema(named, 0, new Set(['_check_0'])).name).to.equal('_check_0');
 		});
 	});
 

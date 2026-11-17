@@ -17,7 +17,8 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, collectDeclaredConstraintNames, disambiguateAutoConstraintName, requireVtabModule } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, collectDeclaredConstraintNames, collectTableConstraintNames, disambiguateAutoConstraintName, mintTableCheckConstraintName, requireVtabModule } from './table.js';
+import { implicitIndexNameForColumns } from './catalog.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -35,11 +36,21 @@ const log = createLogger('schema:constraint-builder');
 /**
  * Builds a {@link UniqueConstraintSchema} from a table-level UNIQUE
  * `AST.TableConstraint`, resolving each declared column name to its index in the
- * child table. Mirrors `SchemaManager.extractUniqueConstraints` (table-level arm).
+ * child table. Shared by `SchemaManager.extractUniqueConstraints` (both arms) and the
+ * modules' `ADD CONSTRAINT`.
+ *
+ * An unnamed UNIQUE is stored as `_uc_<cols>` — the name of its covering structure,
+ * spelled from the column names as the declaration writes them — so it can be dropped
+ * by name. `takenNames` is the mint disambiguation set, with the same contract as
+ * {@link buildForeignKeyConstraintSchema}'s. Every engine path names the constraint
+ * before it gets here (CREATE TABLE through the extractor's statement-wide set, the
+ * ALTER paths before dispatch), so the mint is the fallback for a module calling this
+ * builder directly with an unnamed constraint.
  */
 export function buildUniqueConstraintSchema(
 	con: AST.TableConstraint,
 	columnIndexMap: ReadonlyMap<string, number>,
+	takenNames?: Set<string>,
 ): UniqueConstraintSchema {
 	if (con.type !== 'unique' || !con.columns || con.columns.length === 0) {
 		throw new QuereusError('UNIQUE constraint requires at least one column', StatusCode.ERROR);
@@ -52,11 +63,23 @@ export function buildUniqueConstraintSchema(
 		return idx;
 	});
 	return {
-		name: con.name,
+		name: con.name ?? mintUniqueConstraintName(con.columns.map(c => c.name), takenNames),
 		columns: Object.freeze(colIndices),
 		defaultConflict: con.onConflict,
 		tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 	};
+}
+
+/**
+ * The auto-name for an unnamed UNIQUE over `columnNames`: `_uc_<cols>`, the covering
+ * structure's name ({@link implicitIndexNameForColumns}), so a non-colliding
+ * constraint's structure keeps the name (and, store-backed, the store key) it has
+ * always had. Disambiguated against — and registered into — `takenNames` when given
+ * (see {@link disambiguateAutoConstraintName}).
+ */
+export function mintUniqueConstraintName(columnNames: ReadonlyArray<string>, takenNames?: Set<string>): string {
+	const base = implicitIndexNameForColumns(undefined, columnNames);
+	return takenNames !== undefined ? disambiguateAutoConstraintName(base, takenNames) : base;
 }
 
 /**
@@ -95,9 +118,7 @@ export function buildForeignKeyConstraintSchema(
 		return idx;
 	});
 
-	const mintedName = `_fk_${childTableName}_${con.columns.map(c => c.name).join('_')}`;
-	const fkName = con.name
-		?? (takenNames !== undefined ? disambiguateAutoConstraintName(mintedName, takenNames) : mintedName);
+	const fkName = con.name ?? mintForeignKeyConstraintName(childTableName, con.columns.map(c => c.name), takenNames);
 
 	if (fk.columns && fk.columns.length !== childColIndices.length) {
 		throw new QuereusError(
@@ -120,57 +141,70 @@ export function buildForeignKeyConstraintSchema(
 }
 
 /**
+ * The auto-name for an unnamed FOREIGN KEY: `_fk_<table>_<cols>`, disambiguated
+ * against — and registered into — `takenNames` when given.
+ */
+export function mintForeignKeyConstraintName(childTableName: string, columnNames: ReadonlyArray<string>, takenNames?: Set<string>): string {
+	const base = `_fk_${childTableName}_${columnNames.join('_')}`;
+	return takenNames !== undefined ? disambiguateAutoConstraintName(base, takenNames) : base;
+}
+
+/**
+ * `con` as it will be stored when ALTER TABLE adds it to `tableSchema`: unchanged when
+ * the user named it, otherwise a copy carrying the reserved auto-name an unnamed CHECK
+ * (`_check_<n>`, appended at the current CHECK count), UNIQUE (`_uc_<cols>`) or FOREIGN
+ * KEY (`_fk_<table>_<cols>`) is stored under, disambiguated against the names already
+ * on the table. The `ADD CONSTRAINT` emitter names the constraint once, before
+ * dispatch, so its own pre-dispatch guards and scans, the module, and any wrapping
+ * layer (the isolation overlay names its UNIQUE index from `constraint.name`) all see
+ * the one name instead of each re-deriving it.
+ */
+export function nameAddedTableConstraint(con: AST.TableConstraint, tableSchema: TableSchema): AST.TableConstraint {
+	if (con.name) return con;
+	const taken = collectTableConstraintNames(tableSchema);
+	const columnNames = (con.columns ?? []).map(c => c.name);
+	switch (con.type) {
+		case 'check':
+			return { ...con, name: mintTableCheckConstraintName(tableSchema.checkConstraints.length, taken) };
+		case 'unique':
+			return { ...con, name: mintUniqueConstraintName(columnNames, taken) };
+		case 'foreignKey':
+			return { ...con, name: mintForeignKeyConstraintName(tableSchema.name, columnNames, taken) };
+		default:
+			return con;
+	}
+}
+
+/**
  * Builds a {@link RowConstraintSchema} from a table-level CHECK
  * `AST.TableConstraint` (the `ALTER TABLE … ADD CONSTRAINT … CHECK` form). The
  * single source of truth for that mapping, called by the built-in modules
  * (memory + store) so a CHECK added via ALTER lands in the *module-cached*
  * schema, in lock-step with the catalog — the same place inline-CREATE CHECKs
  * live and where `DROP/RENAME CONSTRAINT` later resolve the constraint class. An
- * unnamed CHECK is auto-named `check_<n>` — see {@link mintCheckConstraintName}
- * for how `n` is chosen. Determinism is intentionally NOT validated here — a
+ * unnamed CHECK is auto-named `_check_<n>` with `n` seeded at `existingCount` (the
+ * position it is appended at) — see {@link mintTableCheckConstraintName}. The engine
+ * names the constraint before dispatch, so the mint here is the fallback for a module
+ * calling the builder directly. Determinism is intentionally NOT validated here — a
  * CHECK may reference `new.*`/`old.*`, which is checked at INSERT/UPDATE plan time.
+ *
+ * `takenNames` is the table's existing constraint names, case-folded
+ * (`collectTableConstraintNames`); a mint registers into it.
  */
 export function buildCheckConstraintSchema(
 	con: AST.TableConstraint,
 	existingCount: number,
-	takenNames: ReadonlySet<string>,
+	takenNames: Set<string>,
 ): RowConstraintSchema {
 	if (con.type !== 'check' || !con.expr) {
 		throw new QuereusError('CHECK constraint requires an expression', StatusCode.ERROR);
 	}
 	return {
-		name: con.name || mintCheckConstraintName(existingCount, takenNames),
+		name: con.name || mintTableCheckConstraintName(existingCount, takenNames),
 		expr: con.expr,
 		operations: opsToMask(con.operations),
 		tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 	};
-}
-
-/**
- * The auto-name for an unnamed table-level CHECK: `check_<n>`, where `n` starts at
- * `existingCount` (the number of CHECKs already on the table — the engine's
- * historical spelling) and is bumped upward until the name is free on that table.
- *
- * `takenNames` is the table's existing constraint names, case-folded, spanning
- * CHECK / UNIQUE / FOREIGN KEY as one namespace (`collectTableConstraintNames`) —
- * the same namespace `namedConstraintExists` and `disambiguateAutoConstraintName`
- * use. Without the probe, `DROP CONSTRAINT check_0` followed by another unnamed
- * add re-mints a LIVE name (the count shrank), leaving two constraints one name
- * addresses and one `DROP` removes both of.
- *
- * NOT `disambiguateAutoConstraintName`: that appends a `_<N>` collision suffix,
- * which on this base would read `check_1_2`. Bumping the index instead keeps the
- * documented `check_<n>` shape. Seeding at `existingCount` rather than scanning
- * from 0 is what keeps every non-colliding name byte-identical to the historical
- * mint — a table whose two CHECKs are USER-named has `existingCount` 2, so the
- * next unnamed add stays `check_2` instead of shifting to a now-free `check_0`.
- */
-function mintCheckConstraintName(existingCount: number, takenNames: ReadonlySet<string>): string {
-	// `check_<n>` is already lower-case, and `takenNames` is case-folded, so no
-	// further folding is needed on either side of the membership test.
-	let n = existingCount;
-	while (takenNames.has(`check_${n}`)) n++;
-	return `check_${n}`;
 }
 
 /* ──────────────── ALTER TABLE ADD COLUMN inline constraints ────────────────
@@ -193,7 +227,7 @@ function mintCheckConstraintName(existingCount: number, takenNames: ReadonlySet<
  * ADD COLUMN` ColumnDef into the equivalent table-level constraints.
  *
  * An unnamed CHECK is named `_check_<column>` HERE rather than left to
- * {@link buildCheckConstraintSchema} (which would auto-name it `check_<n>`,
+ * {@link buildCheckConstraintSchema} (which would auto-name it `_check_<n>`,
  * the table-level `ADD CONSTRAINT` convention): the inline-CREATE-TABLE spelling
  * of the same declaration is named `_check_<column>`, and the two paths must agree.
  *
@@ -207,7 +241,7 @@ function mintCheckConstraintName(existingCount: number, takenNames: ReadonlySet<
  * to name the stored CHECKs at plan time, before the forward step has run.
  */
 export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef, takenNames: Set<string>): Array<AST.TableConstraint & { name: string }> {
-	for (const declared of collectDeclaredConstraintNames([columnDef], undefined)) takenNames.add(declared);
+	claimDeclaredInlineNames(columnDef, takenNames);
 	const result: Array<AST.TableConstraint & { name: string }> = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'check' || !con.expr) continue;
@@ -268,20 +302,34 @@ export function extractColumnLevelForeignKeys(columnDef: AST.ColumnDef): AST.Tab
  * those fields plus `columns[].name`, so no `operations` / `direction` is emitted.
  * Each inline `unique` ColumnConstraint becomes its own single-column table
  * constraint over `columnDef.name` (multiple are rare but handled like CHECK / FK).
+ *
+ * An unnamed one is named `_uc_<column>` here — the inline-CREATE-TABLE spelling's
+ * name — against `takenNames` under the same contract as
+ * {@link extractColumnLevelCheckConstraints}, whose set it shares.
  */
-export function extractColumnLevelUniqueConstraints(columnDef: AST.ColumnDef): AST.TableConstraint[] {
-	const result: AST.TableConstraint[] = [];
+export function extractColumnLevelUniqueConstraints(columnDef: AST.ColumnDef, takenNames: Set<string>): Array<AST.TableConstraint & { name: string }> {
+	claimDeclaredInlineNames(columnDef, takenNames);
+	const result: Array<AST.TableConstraint & { name: string }> = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'unique') continue;
 		result.push({
 			type: 'unique',
-			name: con.name,
+			name: con.name ?? mintUniqueConstraintName([columnDef.name], takenNames),
 			columns: [{ name: columnDef.name }],
 			onConflict: con.onConflict,
 			tags: con.tags,
 		});
 	}
 	return result;
+}
+
+/**
+ * Adds the column's user-written inline constraint names to `takenNames`, so no mint
+ * for the column can take a name declared beside it. Idempotent, so each inline
+ * extractor claims them itself whatever order the caller runs them in.
+ */
+function claimDeclaredInlineNames(columnDef: AST.ColumnDef, takenNames: Set<string>): void {
+	for (const declared of collectDeclaredConstraintNames([columnDef], undefined)) takenNames.add(declared);
 }
 
 /** Qualify a relation reference, eliding the `main.` prefix (the default schema). */

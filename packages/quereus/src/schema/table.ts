@@ -327,6 +327,43 @@ export function disambiguateAutoConstraintName(base: string, taken: Set<string>)
 }
 
 /**
+ * The auto-name for an unnamed table-level CHECK: `_check_<n>`, where `n` starts at
+ * `position` — the index the CHECK takes in the table's `checkConstraints` list (after
+ * the column-level CHECKs at CREATE; the current CHECK count for an appending ALTER or
+ * declarative ADD) — and is bumped upward while `_check_<n>` is in `taken`. The chosen
+ * name is registered into `taken` before returning.
+ *
+ * Seeding at the position is what makes the stored name equal the `_check_<index>`
+ * label a nameless CHECK's violation has always reported (`runtime/row-constraints.ts`),
+ * so a violation message is unchanged in every non-colliding case. The index is bumped
+ * rather than given {@link disambiguateAutoConstraintName}'s `_<N>` suffix, which on this
+ * base would read `_check_1_2`.
+ *
+ * `taken` is the case-folded CHECK / UNIQUE / FOREIGN KEY name space; `_check_<n>` is
+ * already lower-case, so the membership test needs no folding.
+ */
+export function mintTableCheckConstraintName(position: number, taken: Set<string>): string {
+	let n = position;
+	while (taken.has(`_check_${n}`)) n++;
+	const name = `_check_${n}`;
+	taken.add(name);
+	return name;
+}
+
+/**
+ * True when a constraint name is engine-synthesized rather than user-supplied. Every
+ * CHECK / UNIQUE / FOREIGN KEY written without a name is stored under a reserved
+ * `_`-leading name (`_check_<col>`, `_check_<n>`, `_uc_<cols>`, `_fk_<table>_<cols>`);
+ * such a name is deterministic from structure but is NOT identity a declaration can
+ * reference, so the catalog lists the constraint as unnamed (matched by body) and the
+ * duplicate-UNIQUE guard treats it as anonymous. A user who explicitly names a
+ * constraint `_x` gets it treated as unnamed — an accepted corner.
+ */
+export function isAutoConstraintName(name: string): boolean {
+	return name.startsWith('_');
+}
+
+/**
  * Enforces the catalog invariant that a registered table schema's statistics only
  * ever describe columns that schema actually has.
  *

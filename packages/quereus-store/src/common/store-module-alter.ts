@@ -584,7 +584,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// the transaction survives a CONSTRAINT rejection. Every state a rollback
 			// could restore is judged next (BUSY): a committed duplicate the
 			// transaction deleted would come back under the constraint on rollback.
-			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
+			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap, collectTableConstraintNames(oldSchema));
 			if (!change.restoring) {
 				const keyNormalizers = db.getKeyNormalizerResolver();
 				await validateUniqueOverExistingRows(effectiveDdlRows(table, rows), oldSchema, uc, keyNormalizers);

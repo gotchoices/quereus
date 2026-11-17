@@ -368,26 +368,25 @@ describe('StoreModule catalog-only tag persistence', () => {
 		expect(t.uniqueConstraints!.find(c => c.name === 'uq_vin')!.exposedIndexTags).to.deep.equal({ purpose: 'lookup' });
 	});
 
-	it('tags on an unnamed UC follow the implicit name across a column rename', async () => {
+	it('tags on an unnamed UC stay on its stored name across a column rename', async () => {
 		const { db, mod } = open();
-		// Unnamed table-level UNIQUE: implicit index name derives from the column (_uc_vin).
+		// Unnamed table-level UNIQUE: stored under the auto-name `_uc_vin`, which names its structure.
 		await db.exec(`create table t (id integer primary key, vin text, unique (vin) with tags ("quereus.expose_implicit_index" = true)) using store`);
 		await db.exec(`insert into t values (1, 'v1')`);
 		await db.exec(`alter index _uc_vin set tags (purpose = 'lookup')`);
 		await db.exec(`alter table t rename column vin to chassis`);
 		await mod.whenCatalogPersisted();
 
-		// Emitted name and reopen-time resolution both derive from the post-rename
-		// schema, so the bundle targets _uc_chassis.
-		expect(await readCatalogEntry('t')).to.match(/alter index main\._uc_chassis set tags \(/);
+		// The stored name does not follow the column, so the bundle still targets _uc_vin.
+		expect(await readCatalogEntry('t')).to.match(/alter index main\._uc_vin set tags \(/);
 
 		await mod.closeAll();
 		const db2 = await reopen();
 		const uc = db2.schemaManager.findTable('t')!.uniqueConstraints![0];
 		expect(uc.exposedIndexTags).to.deep.equal({ purpose: 'lookup' });
 
-		// Addressable under the renamed implicit name.
-		await db2.exec(`alter index _uc_chassis add tags (extra = true)`);
+		// Addressable under the stored name.
+		await db2.exec(`alter index _uc_vin add tags (extra = true)`);
 		const uc2 = db2.schemaManager.findTable('t')!.uniqueConstraints![0];
 		expect(uc2.exposedIndexTags).to.deep.equal({ purpose: 'lookup', extra: true });
 	});

@@ -119,7 +119,7 @@ describe('Statement.getWriteScope', () => {
 			expect(clauses[0].columns[0].provenance).to.deep.equal({ kind: 'self', columns: ['hits'] });
 			expect(write.selfIndependent).to.equal(false);
 			expect(constraintsOf(write, 'unique')).to.deep.equal([
-				{ kind: 'unique', columns: ['email'], locality: 'cross-row', timing: 'immediate', partial: false },
+				{ name: '_uc_email', kind: 'unique', columns: ['email'], locality: 'cross-row', timing: 'immediate', partial: false },
 			]);
 		});
 

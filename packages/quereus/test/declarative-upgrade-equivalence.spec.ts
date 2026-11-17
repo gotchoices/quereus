@@ -13,8 +13,10 @@
  *      AND ∀ probe: run(probe, fresh) ≡ run(probe, upgraded)
  *
  * and the reverse: dropping a constraint from the declaration converges an
- * upgraded database to the one a fresh create at the old version produces — or,
- * for a constraint stored with no name, is refused rather than silently ignored.
+ * upgraded database — and a database created fresh at the new version — to the
+ * one a fresh create at the old version produces. The fresh-v2 downgrade relies
+ * on CREATE TABLE storing every unnamed constraint under a reserved auto-name, so
+ * DROP CONSTRAINT can reach it.
  *
  * The motivating defect: the differ diffed constraints only by name, so an
  * unnamed CHECK / UNIQUE / FOREIGN KEY added to (or removed from) a declaration
@@ -37,12 +39,6 @@ interface UpgradeCase {
 	seed?: string[];
 	/** Run against both databases after reaching v2. */
 	probes: Probe[];
-	/**
-	 * Whether a database created FRESH at v2 can be taken back to v1. False when v2
-	 * adds a constraint CREATE TABLE stores without a name (a table-level CHECK, any
-	 * UNIQUE) — no statement can drop it, so the differ refuses.
-	 */
-	freshRemovable: boolean;
 }
 
 const parent = `table p { id integer primary key }`;
@@ -63,19 +59,18 @@ const fkProbes: Probe[] = [
 ];
 
 const cases: UpgradeCase[] = [
-	{ name: 'table-level unnamed CHECK', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('check (a > 0)')}`, probes: checkProbes, freshRemovable: false },
-	{ name: 'column-level unnamed CHECK', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', 'a integer null check (a > 0)')}`, probes: checkProbes, freshRemovable: true },
-	{ name: 'table-level unnamed UNIQUE', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('unique (a)')}`, probes: uniqueProbes, freshRemovable: false },
-	{ name: 'column-level unnamed UNIQUE', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', 'a integer null unique')}`, probes: uniqueProbes, freshRemovable: false },
-	{ name: 'table-level unnamed FOREIGN KEY', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('foreign key (b) references p(id)')}`, probes: fkProbes, freshRemovable: true },
-	{ name: 'column-level unnamed FOREIGN KEY', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', undefined, 'b integer null references p(id)')}`, probes: fkProbes, freshRemovable: true },
-	{ name: 'named CHECK (control)', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('constraint pos check (a > 0)')}`, probes: checkProbes, freshRemovable: true },
+	{ name: 'table-level unnamed CHECK', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('check (a > 0)')}`, probes: checkProbes },
+	{ name: 'column-level unnamed CHECK', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', 'a integer null check (a > 0)')}`, probes: checkProbes },
+	{ name: 'table-level unnamed UNIQUE', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('unique (a)')}`, probes: uniqueProbes },
+	{ name: 'column-level unnamed UNIQUE', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', 'a integer null unique')}`, probes: uniqueProbes },
+	{ name: 'table-level unnamed FOREIGN KEY', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('foreign key (b) references p(id)')}`, probes: fkProbes },
+	{ name: 'column-level unnamed FOREIGN KEY', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('', undefined, 'b integer null references p(id)')}`, probes: fkProbes },
+	{ name: 'named CHECK (control)', v1: `${parent} ${baseT()}`, v2: `${parent} ${baseT('constraint pos check (a > 0)')}`, probes: checkProbes },
 	{
 		name: 'a second identical unnamed CHECK is its own multiset entry',
 		v1: `${parent} ${baseT('check (a > 0)')}`,
 		v2: `${parent} ${baseT('check (a > 0), check (a > 0)')}`,
 		probes: checkProbes,
-		freshRemovable: false,
 	},
 	{
 		name: 'unnamed CHECK carrying an operation list',
@@ -85,7 +80,6 @@ const cases: UpgradeCase[] = [
 			{ sql: 'insert into t values (10, -1, null)', expect: { error: { messageIncludes: 'CHECK constraint failed' } } },
 			{ sql: 'update t set a = -5 where id = 1', expect: { rows: [] } },
 		],
-		freshRemovable: false,
 	},
 	{
 		name: 'table-level unnamed CHECK over a column the upgrade adds',
@@ -95,7 +89,6 @@ const cases: UpgradeCase[] = [
 			{ sql: 'insert into t values (10, null, null, -1)', expect: { error: { messageIncludes: 'CHECK constraint failed' } } },
 			{ sql: 'insert into t values (11, null, null, 1)', expect: { rows: [] } },
 		],
-		freshRemovable: false,
 	},
 	{
 		name: 'column-level unnamed CHECK on a column the upgrade adds',
@@ -105,7 +98,6 @@ const cases: UpgradeCase[] = [
 			{ sql: 'insert into t values (10, null, null, -1)', expect: { error: { messageIncludes: 'CHECK constraint failed' } } },
 			{ sql: 'insert into t values (11, null, null, 1)', expect: { rows: [] } },
 		],
-		freshRemovable: true,
 	},
 	{
 		name: 'named column-level CHECK on a column the upgrade adds',
@@ -115,7 +107,6 @@ const cases: UpgradeCase[] = [
 			{ sql: 'insert into t values (10, null, null, -1)', expect: { error: { messageIncludes: 'CHECK constraint failed: cpos' } } },
 			{ sql: 'insert into t values (11, null, null, 1)', expect: { rows: [] } },
 		],
-		freshRemovable: true,
 	},
 	{
 		name: 'every unnamed kind at once',
@@ -129,7 +120,6 @@ const cases: UpgradeCase[] = [
 			{ sql: 'insert into t values (13, 7, null)', expect: { error: { messageIncludes: 'UNIQUE constraint failed' } } },
 			{ sql: 'insert into t values (14, 8, 99)', expect: { error: { messageIncludes: '_fk_t_b' } } },
 		],
-		freshRemovable: false,
 	},
 ];
 
@@ -206,24 +196,16 @@ describe('Declarative fresh-vs-upgrade constraint equivalence', () => {
 			}
 		});
 
-		it(`${c.name}: a downgrade of a fresh v2 database ${c.freshRemovable ? 'converges' : 'is refused, not ignored'}`, async () => {
-			const freshDb = await fresh(c.v2);
+		it(`${c.name}: a downgrade of a fresh v2 database matches a fresh create at v1`, async () => {
+			const freshV1 = await fresh(c.v1);
+			const freshV2 = await fresh(c.v2);
 			try {
-				await freshDb.exec(`declare schema main { ${c.v1} }`);
-				if (c.freshRemovable) {
-					await freshDb.exec('apply schema main options (allow_destructive = true)');
-					expect(await diffRows(freshDb)).to.deep.equal([]);
-				} else {
-					let message = '';
-					try {
-						await diffRows(freshDb);
-					} catch (e) {
-						message = (e as Error).message;
-					}
-					expect(message).to.include('created without a name, so no statement can drop it');
-				}
+				await declareAndApply(freshV2, c.v1);
+				expect(await diffRows(freshV2), 'downgraded re-diff').to.deep.equal([]);
+				expect(constraintSet(freshV2)).to.deep.equal(constraintSet(freshV1));
 			} finally {
-				await freshDb.close();
+				await freshV1.close();
+				await freshV2.close();
 			}
 		});
 	}

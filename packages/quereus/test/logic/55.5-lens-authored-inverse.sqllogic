@@ -1061,7 +1061,7 @@ apply schema buct_x;
 -- Realizable, not proved: exactly one active no-backing-index advisory, sited at the
 -- unique constraint (the put target is not a basis key).
 select code, "constraint", status from quereus_lens_advisories('buct_x') where code = 'lens.no-backing-index';
-→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+→ [{"code": "lens.no-backing-index", "constraint": "unique '_uc_grp'", "status": "active"}]
 
 -- run
 
@@ -1235,7 +1235,7 @@ apply schema bumix_x;
 
 -- Commit-time (mixed bare + authored key): one no-backing-index, no unrealizable.
 select code, "constraint", status from quereus_lens_advisories('bumix_x') where code = 'lens.no-backing-index';
-→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+→ [{"code": "lens.no-backing-index", "constraint": "unique '_uc_tag_grp'", "status": "active"}]
 
 -- run
 

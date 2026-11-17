@@ -8,12 +8,12 @@
 --
 --   * `ADD FOREIGN KEY (...)`      → `_fk_<table>_<cols>`, `_<N>` suffix on collision
 --   * `ADD COLUMN … references …`  → same mint, same suffix
---   * `ADD CHECK (...)`            → `check_<n>`, n bumped upward until free
+--   * `ADD CHECK (...)`            → `_check_<n>`, n bumped upward until free
 --
--- `check_<n>` bumps its INDEX rather than taking a `_<N>` suffix (which would read
--- `check_1_2`); n starts at the number of CHECKs already on the table, which is
--- the historical spelling, so every non-colliding name is byte-identical to what
--- the engine minted before (§5 pins that).
+-- `_check_<n>` bumps its INDEX rather than taking a `_<N>` suffix (which would read
+-- `_check_1_2`); n starts at the number of CHECKs already on the table — the
+-- position the CHECK is appended at, which is the `_check_<index>` label its
+-- violation reports — so every non-colliding name keeps that spelling (§5 pins it).
 --
 -- A constraint the USER names and that collides keeps being refused (§6) — that is
 -- identity, not a mint.
@@ -146,9 +146,9 @@ select count(*) as c from foreign_key_info('RvC');
 
 -- ===================================================================
 -- 4. `ALTER TABLE … ADD CHECK (...)`: a drop shrinks the CHECK count, so the
---    next unnamed add would re-mint a LIVE `check_<n>`. The index is bumped
---    past it instead. (Before the fix the third add below re-minted `check_1`,
---    and `alter table Ckm drop constraint check_1` then switched off BOTH the
+--    next unnamed add would re-mint a LIVE `_check_<n>`. The index is bumped
+--    past it instead. (Before the fix the third add below re-minted the second
+--    add's name, and dropping that name then switched off BOTH the
 --    `a < 100` rule and the `a <> 7` rule.)
 -- ===================================================================
 
@@ -157,47 +157,47 @@ create table Ckm (id integer primary key, a integer null);
 alter table Ckm add check (a > 0);
 alter table Ckm add check (a < 100);
 select name from check_constraint_info('Ckm') order by name;
-→ [{"name":"check_0"},{"name":"check_1"}]
+→ [{"name":"_check_0"},{"name":"_check_1"}]
 
-alter table Ckm drop constraint check_0;
+alter table Ckm drop constraint _check_0;
 alter table Ckm add check (a <> 7);
 select name from check_constraint_info('Ckm') order by name;
-→ [{"name":"check_1"},{"name":"check_2"}]
+→ [{"name":"_check_1"},{"name":"_check_2"}]
 
 -- Both survivors enforce, each under its own name.
 insert into Ckm values (1, 200);
--- error: check_1
+-- error: _check_1
 
 insert into Ckm values (2, 7);
--- error: check_2
+-- error: _check_2
 
 -- The dropped lower bound no longer binds.
 insert into Ckm values (3, -1);
 select count(*) as c from Ckm;
 → [{"c":1}]
 
--- Dropping `check_1` releases ONLY the upper bound; `check_2` still rejects 7.
-alter table Ckm drop constraint check_1;
+-- Dropping `_check_1` releases ONLY the upper bound; `_check_2` still rejects 7.
+alter table Ckm drop constraint _check_1;
 insert into Ckm values (4, 200);
 select count(*) as c from Ckm;
 → [{"c":2}]
 
 insert into Ckm values (5, 7);
--- error: check_2
+-- error: _check_2
 
 -- ===================================================================
 -- 5. Non-colliding mints are unchanged (pins the compatibility property).
 --
 --    The index is seeded from the CHECK COUNT, not from the lowest free index,
---    so a table whose existing CHECK is user-named still mints `check_1` for the
---    first unnamed add — byte-identical to the historical spelling, even though
---    `check_0` happens to be free.
+--    so a table whose existing CHECK is user-named still mints `_check_1` for the
+--    first unnamed add — the position it lands at — even though `_check_0`
+--    happens to be free.
 -- ===================================================================
 
 create table CkU (id integer primary key, a integer null, constraint ck_user check (a > -100));
 alter table CkU add check (a > 0);
 select name from check_constraint_info('CkU') order by name;
-→ [{"name":"check_1"},{"name":"ck_user"}]
+→ [{"name":"_check_1"},{"name":"ck_user"}]
 
 -- A lone ALTER-added FK onto a table with no constraint of that name keeps the
 -- bare mint.

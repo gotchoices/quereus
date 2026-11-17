@@ -12,15 +12,15 @@ import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { foldDefaultToType } from '../types/validation.js';
 import { requireRegisteredTypeName } from '../types/registry.js';
-import { buildColumnIndexMap, columnDefToSchema, columnTypeSubject, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
+import { buildColumnIndexMap, columnDefToSchema, columnTypeSubject, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName, mintTableCheckConstraintName } from './table.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, mintForeignKeyConstraintName, validateForeignKeyCollations } from './constraint-builder.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
 import type { ResolveColumnInSource } from './rename/shared.js';
 import { collectGeneratedColumnRefs } from './generated-column-refs.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
-import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex, assertNoDuplicateUniqueConstraints, assertNoDuplicateUniqueConstraintBackingNames, assertNoDuplicateConstraintNames } from './catalog.js';
+import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex, assertNoDuplicateUniqueConstraints, assertNoDuplicateConstraintNames } from './catalog.js';
 import { assertCatalogObjectPersistable } from './catalog-persistability.js';
 import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
@@ -1934,8 +1934,9 @@ export class SchemaManager {
 	 * An unnamed column-level CHECK is minted `_check_<col>`; two on one column are
 	 * legal, so the mint disambiguates through the statement-wide `takenNames` set
 	 * (`_check_b`, then `_check_b_2`) — see `disambiguateAutoConstraintName`. An
-	 * unnamed table-level CHECK keeps no name at all (unchanged), so it cannot
-	 * collide.
+	 * unnamed table-level CHECK is minted `_check_<n>`, `n` its position in the
+	 * result (column-level CHECKs come first, so they are minted — and registered —
+	 * before any positional name is chosen) — see `mintTableCheckConstraintName`.
 	 */
 	private extractCheckConstraints(
 		astColumns: readonly AST.ColumnDef[],
@@ -1961,7 +1962,7 @@ export class SchemaManager {
 		for (const con of astConstraints ?? []) {
 			if (con.type === 'check' && con.expr) {
 				result.push({
-					name: con.name,
+					name: con.name ?? mintTableCheckConstraintName(result.length, takenNames),
 					expr: con.expr,
 					operations: opsToMask(con.operations),
 					defaultConflict: con.onConflict,
@@ -2010,7 +2011,7 @@ export class SchemaManager {
 						// Two FKs on one child column (different parents) are legal SQL,
 						// so a colliding mint disambiguates (`_fk_C_x`, then `_fk_C_x_2`)
 						// rather than rejecting — see `disambiguateAutoConstraintName`.
-						name: con.name ?? disambiguateAutoConstraintName(`_fk_${tableName}_${colDef.name}`, takenNames),
+						name: con.name ?? mintForeignKeyConstraintName(tableName, [colDef.name], takenNames),
 						columns: Object.freeze([childColIndex]),
 						referencedTable: fk.table,
 						referencedSchema: fk.schema ?? schemaName,
@@ -2037,28 +2038,30 @@ export class SchemaManager {
 
 	/**
 	 * Extracts UNIQUE constraints from AST column and table constraint definitions.
-	 * Resolves column names to indices.
+	 * Resolves column names to indices. An unnamed one is minted `_uc_<cols>` from the
+	 * column names as the declaration writes them, disambiguated through the
+	 * statement-wide `takenNames` set — see `buildUniqueConstraintSchema`.
 	 */
 	private extractUniqueConstraints(
 		astColumns: readonly AST.ColumnDef[],
 		astConstraints: readonly AST.TableConstraint[] | undefined,
 		columnIndexMap: ReadonlyMap<string, number>,
+		takenNames: Set<string>,
 	): UniqueConstraintSchema[] {
 		const result: UniqueConstraintSchema[] = [];
 
-		// Column-level unique constraints
+		// Column-level unique constraints — lifted to the table-level form over their one
+		// column so both spellings go through the shared builder.
 		for (const colDef of astColumns) {
 			for (const con of colDef.constraints ?? []) {
 				if (con.type === 'unique') {
-					const colIndex = columnIndexMap.get(colDef.name.toLowerCase());
-					if (colIndex !== undefined) {
-						result.push({
-							name: con.name,
-							columns: Object.freeze([colIndex]),
-							defaultConflict: con.onConflict,
-							tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
-						});
-					}
+					result.push(buildUniqueConstraintSchema({
+						type: 'unique',
+						name: con.name,
+						columns: [{ name: colDef.name }],
+						onConflict: con.onConflict,
+						tags: con.tags,
+					}, columnIndexMap, takenNames));
 				}
 			}
 		}
@@ -2067,7 +2070,7 @@ export class SchemaManager {
 		// the module `ADD CONSTRAINT` path).
 		for (const con of astConstraints ?? []) {
 			if (con.type === 'unique' && con.columns && con.columns.length > 0) {
-				result.push(buildUniqueConstraintSchema(con, columnIndexMap));
+				result.push(buildUniqueConstraintSchema(con, columnIndexMap, takenNames));
 			}
 		}
 
@@ -2103,16 +2106,19 @@ export class SchemaManager {
 
 		const astColumns = stmt.columns || [];
 		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation, targetSchemaName, tableName);
-		// Statement-wide taken-set the CHECK / FK mint sites disambiguate against:
-		// seeded with every user-written constraint name up front, then accumulating
-		// each mint, so a colliding auto-name gets a `_<N>` suffix instead of
-		// producing two constraints one name addresses. Shared across the extractors
-		// — one name space, not three.
+		// Statement-wide taken-set the CHECK / FK / UNIQUE mint sites disambiguate
+		// against: seeded with every user-written constraint name up front, then
+		// accumulating each mint, so a colliding auto-name gets a free spelling instead
+		// of producing two constraints one name addresses. Shared across the extractors
+		// — one name space, not three. Every constraint the declaration leaves unnamed
+		// comes out named, so each is droppable by name (docs/schema-rename-detection.md
+		// § Unnamed constraint lifecycle). The same rule runs on rehydrate, so a catalog
+		// persisted with a nameless constraint is named on load.
 		const takenConstraintNames = collectDeclaredConstraintNames(astColumns, stmt.constraints);
 		const checkConstraints = this.extractCheckConstraints(astColumns, stmt.constraints, takenConstraintNames);
 		const columnIndexMap = buildColumnIndexMap(columns);
 		const foreignKeys = this.extractForeignKeys(astColumns, stmt.constraints, columnIndexMap, tableName, targetSchemaName, takenConstraintNames);
-		const uniqueConstraints = this.extractUniqueConstraints(astColumns, stmt.constraints, columnIndexMap);
+		const uniqueConstraints = this.extractUniqueConstraints(astColumns, stmt.constraints, columnIndexMap, takenConstraintNames);
 
 		const mutationContextSchemas: MutationContextDefinition[] | undefined = stmt.contextDefinitions
 			? stmt.contextDefinitions.map(varDef => {
@@ -2196,7 +2202,7 @@ export class SchemaManager {
 		const checkConstraints = this.extractCheckConstraints(astColumns, stmt.constraints, takenConstraintNames);
 		const columnIndexMap = buildColumnIndexMap(columns);
 		const foreignKeys = this.extractForeignKeys(astColumns, stmt.constraints, columnIndexMap, tableName, schemaName, takenConstraintNames);
-		const uniqueConstraints = this.extractUniqueConstraints(astColumns, stmt.constraints, columnIndexMap);
+		const uniqueConstraints = this.extractUniqueConstraints(astColumns, stmt.constraints, columnIndexMap, takenConstraintNames);
 
 		return {
 			name: tableName,
@@ -3131,21 +3137,6 @@ export class SchemaManager {
 		// still open a catalog written before this guard existed (same placement rationale
 		// as the FK-collation check below).
 		assertNoDuplicateUniqueConstraints(
-			baseTableSchema.uniqueConstraints ?? [],
-			baseTableSchema.columns,
-			`create table '${tableName}'`,
-		);
-
-		// Two DIFFERENT UNIQUE constraints (different column sets, so the duplicate guard
-		// above passes) may still derive ONE backing structure name — via a constraint name
-		// written with the engine's reserved `_uc_` prefix, or via the `_`-joined auto-name
-		// colliding on ordinary column names (`unique (a_b)` beside `unique (a, b)`). The
-		// second constraint then adopts the first's structure and is enforced by one keyed on
-		// the OTHER constraint's columns, so it silently stops rejecting duplicates. Every
-		// ALTER path refuses this; refused here too, so one declaration gets one answer
-		// wherever it is written. After the duplicate guard (a genuine duplicate must keep its
-		// constraint-worded message) and before `module.create` (a refusal leaves no storage).
-		assertNoDuplicateUniqueConstraintBackingNames(
 			baseTableSchema.uniqueConstraints ?? [],
 			baseTableSchema.columns,
 			`create table '${tableName}'`,

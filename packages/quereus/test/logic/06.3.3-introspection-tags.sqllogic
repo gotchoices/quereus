@@ -117,7 +117,8 @@ SELECT count(*) AS cnt FROM index_info('PlainTable') WHERE index_name LIKE 'idx_
 → [{"cnt":0}]
 
 -- ===================================================================
--- check_constraint_info() — named CHECK with tags, unnamed without
+-- check_constraint_info() — named CHECK with tags, unnamed without (an unnamed
+-- table-level CHECK reports its stored auto-name, `_check_<position>`)
 -- ===================================================================
 
 CREATE TABLE ChkTable (
@@ -130,7 +131,7 @@ CREATE TABLE ChkTable (
 SELECT name, "deferrable", initially_deferred,
        json_extract(tags, '$.error_message') AS msg
     FROM check_constraint_info('ChkTable') ORDER BY id;
-→ [{"name":"chk_qty_positive","deferrable":0,"initially_deferred":0,"msg":"must be positive"},{"name":null,"deferrable":0,"initially_deferred":0,"msg":null}]
+→ [{"name":"chk_qty_positive","deferrable":0,"initially_deferred":0,"msg":"must be positive"},{"name":"_check_1","deferrable":0,"initially_deferred":0,"msg":null}]
 
 -- expr text round-trips through the AST stringifier
 SELECT expr FROM check_constraint_info('ChkTable') WHERE name = 'chk_qty_positive';
@@ -152,7 +153,7 @@ CREATE TABLE UqTable (
 SELECT id, name, seq, column_name, partial,
        json_extract(tags, '$.error_message') AS msg
     FROM unique_constraint_info('UqTable') ORDER BY id, seq;
-→ [{"id":0,"name":"uq_email","seq":0,"column_name":"email","partial":0,"msg":"email must be unique"},{"id":1,"name":null,"seq":0,"column_name":"region","partial":0,"msg":null},{"id":1,"name":null,"seq":1,"column_name":"code","partial":0,"msg":null}]
+→ [{"id":0,"name":"uq_email","seq":0,"column_name":"email","partial":0,"msg":"email must be unique"},{"id":1,"name":"_uc_region_code","seq":0,"column_name":"region","partial":0,"msg":null},{"id":1,"name":"_uc_region_code","seq":1,"column_name":"code","partial":0,"msg":null}]
 
 -- A partial unique INDEX synthesizing a partial unique constraint lives in
 -- 06.3.3.1-introspection-tags-index (it needs standalone CREATE UNIQUE INDEX).

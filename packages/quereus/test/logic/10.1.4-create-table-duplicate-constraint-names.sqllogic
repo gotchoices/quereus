@@ -10,10 +10,12 @@
 --      CONSTRAINT remove both, and a cross-class collision is permanently
 --      un-droppable (resolveNamedConstraintClass reports it ambiguous forever).
 --
---   2. ENGINE-MINTED names (`_check_<col>`, `_fk_<table>_<cols>`): the colliding
---      declaration is LEGAL (two unnamed CHECKs on one column; two FKs on one
---      child column into different parents), so the mint disambiguates instead of
---      rejecting: the first occurrence keeps the base name, the Nth gets `_<N>`
+--   2. ENGINE-MINTED names (`_check_<col>`, `_check_<n>`, `_uc_<cols>`,
+--      `_fk_<table>_<cols>`): every constraint left unnamed is stored under one,
+--      so DROP CONSTRAINT can reach it (§6). The colliding declaration is LEGAL
+--      (two unnamed CHECKs on one column; two FKs on one child column into
+--      different parents), so the mint disambiguates instead of rejecting: the
+--      first occurrence keeps the base name, the Nth gets `_<N>`
 --      (disambiguateAutoConstraintName, schema/table.ts). Every non-colliding
 --      mint stays byte-identical to before — 41.10.3 and 03.4 pin that.
 --
@@ -147,3 +149,25 @@ insert into MintU values (1, -1);
 create table Solo (id integer primary key, b integer null check (b > 0));
 insert into Solo values (1, -1);
 -- error: _check_b (b > 0)
+
+-- ===================================================================
+-- 6. A table-level CHECK and a UNIQUE left unnamed are stored under
+--    `_check_<position>` / `_uc_<cols>`, so each can be dropped by name, and
+--    ALTER continues the CHECK numbering from the table's CHECK count.
+-- ===================================================================
+
+create table Anon (a integer primary key, b integer, check (b > 0), unique (b));
+select name from check_constraint_info('Anon');
+→ [{"name":"_check_0"}]
+select name from unique_constraint_info('Anon');
+→ [{"name":"_uc_b"}]
+
+alter table Anon add check (b < 100);
+select name from check_constraint_info('Anon') order by name;
+→ [{"name":"_check_0"},{"name":"_check_1"}]
+
+alter table Anon drop constraint _check_0;
+alter table Anon drop constraint _uc_b;
+insert into Anon values (1, -1), (2, -1);
+select count(*) as c from Anon where b = -1;
+→ [{"c":2}]

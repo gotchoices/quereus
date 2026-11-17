@@ -433,7 +433,7 @@ describe('ALTER TABLE ADD CONSTRAINT … CHECK validates existing rows', () => {
 	it('an unnamed CHECK reports its minted name', async () => {
 		await db.exec('create table t (id integer primary key, n integer null)');
 		await db.exec('insert into t values (1, -5)');
-		await expectRejected('alter table t add check (n > 0)', /check_0/);
+		await expectRejected('alter table t add check (n > 0)', /_check_0/);
 		await expectNoCheckInstalled('insert into t values (2, -1)');
 	});
 
