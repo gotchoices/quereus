@@ -522,7 +522,7 @@ scalarReturn(TEXT_TYPE)         // { typeClass: 'scalar', logicalType: TEXT_TYPE
 scalarReturn(TEXT_TYPE, false)  // ...the same, declared NOT NULL
 ```
 
-Ready-made constants cover the common cases: `TEXT_RETURN`, `INTEGER_RETURN`, `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus `*_RETURN_NOT_NULL` variants for the ones that can never return NULL. A **relation** return type (table-valued functions) gives each column a `name` and a scalar type object as its `type` — again, not a type-name string. The shapes themselves are exported as types (`ScalarType`, `RelationType`, `ColumnDef`, `ColRef`) for plugins that build them outside a `create*` call.
+Ready-made constants cover the common cases: `TEXT_RETURN`, `INTEGER_RETURN`, `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus `*_RETURN_NOT_NULL` variants for the ones that can never return NULL. A function that maps a NULL argument to NULL is not one of those: declare it through `inferReturnType`, which receives each argument's nullability (`argNullable`) alongside its type, and derive the answer — `nullPropagatingReturn({ logicalType: TEXT_TYPE, accepts: [isTextValued] })` announces non-null only when every argument is non-null and of a type the function answers. A **relation** return type (table-valued functions) gives each column a `name` and a scalar type object as its `type` — again, not a type-name string. The shapes themselves are exported as types (`ScalarType`, `RelationType`, `ColumnDef`, `ColRef`) for plugins that build them outside a `create*` call.
 
 Rules:
 

@@ -67,8 +67,10 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 				break;
 			}
 			case '~':
-				// Bitwise NOT - results in integer
+				// Bitwise NOT - results in integer. A non-numeric operand is converted per
+				// row (`runtime/emit/unary.ts`) and is NULL when that gives NaN (`~'abc'`).
 				logicalType = INTEGER_TYPE;
+				if (!operandType.logicalType.isNumeric) nullable = true;
 				break;
 		}
 

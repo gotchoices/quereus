@@ -1,13 +1,12 @@
 import { createAggregateFunction, createScalarFunction, createTableValuedFunction } from '../registration.js';
-import type { Row, SqlValue, DeepReadonly } from '../../common/types.js';
+import type { Row, SqlValue } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_TYPE, TEXT_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
-import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN } from './return-types.js';
-import type { LogicalType } from '../../types/logical-type.js';
+import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN, convertsToNumber, isNumberValued, isTextOrBlobValued, isTextValued, nullPropagatingReturn } from './return-types.js';
 
 const log = createLogger('func:builtins:scalar');
 const warnLog = log.extend('warn');
@@ -18,13 +17,7 @@ export const lengthFunc = createScalarFunction(
 		name: 'length',
 		numArgs: 1,
 		deterministic: true,
-		// Type inference: length always returns INTEGER
-		inferReturnType: () => ({
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		})
+		inferReturnType: nullPropagatingReturn({ logicalType: INTEGER_TYPE, accepts: [isTextOrBlobValued] })
 	},
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
@@ -75,23 +68,21 @@ const substrImpl = (str: SqlValue, start: SqlValue, len?: SqlValue): SqlValue =>
 	return cps.slice(begin, end).join('');
 };
 
-const substrTypeInference = {
-	// Type inference: substr always returns TEXT
-	inferReturnType: (_argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
-		typeClass: 'scalar' as const,
-		logicalType: TEXT_TYPE,
-		nullable: false,
-		isReadOnly: true
-	})
-};
+// The string is stringified, never refused; a missing start is NaN, so a one-argument call
+// is always NULL. Over-claims a NULL length, which `Number(null)` reads as 0 (empty result).
+const substrReturnType = nullPropagatingReturn({
+	logicalType: TEXT_TYPE,
+	accepts: [undefined, convertsToNumber, convertsToNumber],
+	minArgs: 2,
+});
 
 export const substrFunc = createScalarFunction(
-	{ name: 'substr', numArgs: -1, deterministic: true, ...substrTypeInference },
+	{ name: 'substr', numArgs: -1, deterministic: true, inferReturnType: substrReturnType },
 	substrImpl
 );
 
 export const substringFunc = createScalarFunction(
-	{ name: 'substring', numArgs: -1, deterministic: true, ...substrTypeInference },
+	{ name: 'substring', numArgs: -1, deterministic: true, inferReturnType: substrReturnType },
 	substrImpl
 );
 
@@ -115,15 +106,11 @@ export const globFunc = createScalarFunction(
 	}
 );
 
-// Common type inference for string functions that return TEXT
-const textReturnTypeInference = {
-	inferReturnType: (_argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
-		typeClass: 'scalar' as const,
-		logicalType: TEXT_TYPE,
-		nullable: false,
-		isReadOnly: true
-	})
-};
+/** For a TEXT function that stringifies its arguments with `String()`, so refuses none. */
+const stringifyingTextReturn = nullPropagatingReturn({ logicalType: TEXT_TYPE });
+
+/** For a TEXT function whose implementation requires every argument to be a JS string. */
+const textOnlyReturn = nullPropagatingReturn({ logicalType: TEXT_TYPE, accepts: [isTextValued] });
 
 const trimPatterns = {
 	both: (escaped: string) => `^[${escaped}]+|[${escaped}]+$`,
@@ -151,8 +138,9 @@ const trimWithChars = (str: string, chars: string, side: TrimSide): string => {
 	}
 };
 
+// Over-claims a NULL trim set, which falls back to trimming whitespace.
 const createTrimFunc = (name: string, side: TrimSide) => createScalarFunction(
-	{ name, numArgs: -1, deterministic: true, ...textReturnTypeInference },
+	{ name, numArgs: -1, deterministic: true, inferReturnType: stringifyingTextReturn },
 	(strVal: SqlValue, charsVal?: SqlValue): SqlValue => {
 		if (strVal === null) return null;
 		const str = String(strVal);
@@ -172,7 +160,7 @@ export const rtrimFunc = createTrimFunc('rtrim', 'right');
 
 // --- replace(X, Y, Z) ---
 export const replaceFunc = createScalarFunction(
-	{ name: 'replace', numArgs: 3, deterministic: true, ...textReturnTypeInference },
+	{ name: 'replace', numArgs: 3, deterministic: true, inferReturnType: stringifyingTextReturn },
 	(strVal: SqlValue, patternVal: SqlValue, replacementVal: SqlValue): SqlValue => {
 		if (strVal === null || patternVal === null || replacementVal === null) return null;
 
@@ -191,13 +179,7 @@ export const instrFunc = createScalarFunction(
 		name: 'instr',
 		numArgs: 2,
 		deterministic: true,
-		// Type inference: instr returns INTEGER
-		inferReturnType: () => ({
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		})
+		inferReturnType: nullPropagatingReturn({ logicalType: INTEGER_TYPE })
 	},
 	(strVal: SqlValue, subVal: SqlValue): SqlValue => {
 		if (strVal === null || subVal === null) return null;
@@ -215,39 +197,45 @@ export const instrFunc = createScalarFunction(
 
 // String reverse function
 export const reverseFunc = createScalarFunction(
-	{ name: 'reverse', numArgs: 1, deterministic: true, ...textReturnTypeInference },
+	{ name: 'reverse', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
 	(str: SqlValue): SqlValue => {
 		if (typeof str !== 'string') return null;
 		return Array.from(str).reverse().join('');
 	}
 );
 
-const buildPadding = (str: SqlValue, len: SqlValue, pad: SqlValue): string | null => {
-	if (typeof str !== 'string' || typeof len !== 'number' || typeof pad !== 'string') return null;
-	if (pad.length === 0 || len <= str.length) return str;
-	const needed = len - str.length;
+/** The padding that brings `str` to `target` characters ('' when it is already that long). */
+const buildPadding = (str: string, target: number, pad: string): string => {
+	if (pad.length === 0 || target <= str.length) return '';
+	const needed = target - str.length;
 	return pad.repeat(Math.ceil(needed / pad.length)).substring(0, needed);
 };
 
-// --- lpad(X, N, PAD) ---
-export const lpadFunc = createScalarFunction(
-	{ name: 'lpad', numArgs: 3, deterministic: true, ...textReturnTypeInference },
+// A `bigint` length is outside the safe range: a negative one pads nothing, and a positive
+// one reaches `repeat()`'s range error exactly as an equally large `number` length does.
+const createPadFunc = (name: string, side: 'left' | 'right') => createScalarFunction(
+	{
+		name,
+		numArgs: 3,
+		deterministic: true,
+		inferReturnType: nullPropagatingReturn({
+			logicalType: TEXT_TYPE,
+			accepts: [isTextValued, isNumberValued, isTextValued],
+		}),
+	},
 	(str: SqlValue, len: SqlValue, pad: SqlValue): SqlValue => {
-		const padding = buildPadding(str, len, pad);
-		if (padding === str || padding === null) return padding;
-		return padding + str;
+		if (typeof str !== 'string' || typeof pad !== 'string') return null;
+		if (typeof len !== 'number' && typeof len !== 'bigint') return null;
+		const padding = buildPadding(str, Number(len), pad);
+		return side === 'left' ? padding + str : str + padding;
 	}
 );
 
-// Right padding function
-export const rpadFunc = createScalarFunction(
-	{ name: 'rpad', numArgs: 3, deterministic: true, ...textReturnTypeInference },
-	(str: SqlValue, len: SqlValue, pad: SqlValue): SqlValue => {
-		const padding = buildPadding(str, len, pad);
-		if (padding === str || padding === null) return padding;
-		return str + padding;
-	}
-);
+// --- lpad(X, N, PAD) ---
+export const lpadFunc = createPadFunc('lpad', 'left');
+
+// --- rpad(X, N, PAD) ---
+export const rpadFunc = createPadFunc('rpad', 'right');
 
 // Split a string into rows (table-valued function)
 export const splitStringFunc = createTableValuedFunction(
@@ -276,7 +264,7 @@ export const stringConcatFunc = createAggregateFunction(
 
 // --- lower(X) ---
 export const lowerFunc = createScalarFunction(
-	{ name: 'lower', numArgs: 1, deterministic: true, ...textReturnTypeInference },
+	{ name: 'lower', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
 	(arg: SqlValue): SqlValue => {
 		return typeof arg === 'string' ? arg.toLowerCase() : null;
 	}
@@ -284,7 +272,7 @@ export const lowerFunc = createScalarFunction(
 
 // --- upper(X) ---
 export const upperFunc = createScalarFunction(
-	{ name: 'upper', numArgs: 1, deterministic: true, ...textReturnTypeInference },
+	{ name: 'upper', numArgs: 1, deterministic: true, inferReturnType: textOnlyReturn },
 	(arg: SqlValue): SqlValue => {
 		return typeof arg === 'string' ? arg.toUpperCase() : null;
 	}
@@ -295,10 +283,6 @@ export const upperFunc = createScalarFunction(
 // via BLOB_TYPE.parse — so a JSON object/array argument throws rather than
 // returning NULL, matching blob()'s behavior instead of adding a second,
 // divergent conversion table here.
-// `TEXT_RETURN`, not the family's `textReturnTypeInference`: that helper declares
-// `nullable: false`, which is a lie for any function that maps NULL to NULL, and
-// the lens prover reads the flag to decide whether a NOT NULL logical column over
-// the expression is sound (`schema/lens-prover.ts` checkTypeAndNullability).
 // NOTE: @quereus/quereus cannot import `bytesToHex` from @quereus/quereus-store
 // (the dependency runs the other way), so this is a second byte→hex encoder in
 // the monorepo. They are not interchangeable: the store's must stay LOWERCASE —

@@ -10,7 +10,7 @@ import type { EmissionContext } from '../../runtime/emission-context.js';
 import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
-import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN, TEXT_RETURN_NOT_NULL } from './return-types.js';
+import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN, TEXT_RETURN_NOT_NULL, convertsToNumber, nullPropagatingReturn, scalarReturn } from './return-types.js';
 import { effectiveCollationOfTypes, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
 import type { ComparisonGroup } from '../../runtime/emit/operand-comparator.js';
 import { makeComparisonGroup, makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
@@ -35,19 +35,24 @@ function findCommonType(types: ReadonlyArray<DeepReadonly<LogicalType>>): DeepRe
 	return types.reduce((merged, t) => mergeSetOpAdvertisedType(merged as LogicalType, t as LogicalType));
 }
 
+/**
+ * abs, floor, ceil and one-argument round keep their argument's type and are NULL
+ * only for a NULL argument or one `Number()` cannot convert. Each answers a `bigint`
+ * without converting it, so an integer past the double range cannot become Infinity
+ * (which they would turn into NULL).
+ */
+const numericPreservingReturn = nullPropagatingReturn({
+	logicalType: argTypes => argTypes[0],
+	accepts: [convertsToNumber],
+});
+
 // --- abs(X) ---
 export const absFunc = createScalarFunction(
 	{
 		name: 'abs',
 		numArgs: 1,
 		deterministic: true,
-		// Type inference: return the same type as the input for numeric types
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: false,
-			isReadOnly: true
-		}),
+		inferReturnType: numericPreservingReturn,
 		// Validate that the argument is numeric (or unclassifiable — see the helper)
 		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
@@ -55,52 +60,60 @@ export const absFunc = createScalarFunction(
 		if (arg === null) return null;
 		if (typeof arg === 'bigint') return arg < 0n ? -arg : arg;
 		const num = Number(arg);
-		if (isNaN(num)) return null;
+		if (!Number.isFinite(num)) return null;
 		return Math.abs(num);
 	}
 );
 
 // --- round(X, Y?) ---
+
+/** `x` rounded to `places` decimal places, or null when that is not a finite double. */
+function roundToPlaces(x: number, places: number): number | null {
+	const factor = Math.pow(10, places);
+	const scaled = x * factor;
+	// Overflow (or `factor` itself Infinity): x has no digit at the 10^-places position
+	// a double can hold, so it is already rounded there.
+	if (!Number.isFinite(scaled)) return Number.isFinite(x) ? x : null;
+	// 10^places underflowed to 0: every finite x rounds to 0 at that magnitude.
+	if (factor === 0) return 0;
+	const rounded = Math.round(scaled) / factor;
+	// Rounding up near the top of the double range overflows: `round(1.7e308, -308)`.
+	return Number.isFinite(rounded) ? rounded : null;
+}
+
 const roundImpl = (numVal: SqlValue, placesVal?: SqlValue): SqlValue => {
 	if (numVal === null) return null;
+
+	let places = 0;
+	if (placesVal !== undefined && placesVal !== null) {
+		const numPlaces = Number(placesVal);
+		if (isNaN(numPlaces)) return null;
+		places = Math.trunc(numPlaces);
+	}
+
+	// An integer is already rounded at every non-negative place count; a Number() round
+	// trip would lose an out-of-safe-range one's low digits, or overflow it to Infinity.
+	if (typeof numVal === 'bigint' && places >= 0) return numVal;
 	const x = Number(numVal);
 	if (isNaN(x)) return null;
-
-	let y = 0;
-	if (placesVal !== undefined && placesVal !== null) {
-		const numY = Number(placesVal);
-		if (isNaN(numY)) return null;
-		y = Math.trunc(numY);
-	}
-
-	try {
-		const factor = Math.pow(10, y);
-		return Math.round(x * factor) / factor;
-	} catch {
-		return null;
-	}
+	return roundToPlaces(x, places);
 };
 
 const roundSchemaBase = {
 	name: 'round',
 	deterministic: true,
-	// Type inference: return the same type as the input for numeric types
-	inferReturnType: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
-		typeClass: 'scalar' as const,
-		logicalType: argTypes[0],
-		nullable: false,
-		isReadOnly: true
-	}),
 	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => isNumericOrUnknownType(argTypes[0])
 };
 
 export const roundFunc1 = createScalarFunction(
-	{ ...roundSchemaBase, numArgs: 1 },
+	{ ...roundSchemaBase, numArgs: 1, inferReturnType: numericPreservingReturn },
 	roundImpl
 );
 
+// Nullable whatever the arguments: a negative place count can round a finite value past
+// the double range (`round(1.7e308, -308)` is NULL), and the planner cannot see the sign.
 export const roundFunc2 = createScalarFunction(
-	{ ...roundSchemaBase, numArgs: 2 },
+	{ ...roundSchemaBase, numArgs: 2, inferReturnType: (argTypes) => scalarReturn(argTypes[0] as LogicalType) },
 	roundImpl
 );
 
@@ -360,19 +373,14 @@ export const floorFunc = createScalarFunction(
 		name: 'floor',
 		numArgs: 1,
 		deterministic: true,
-		// Type inference: preserve input type
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: false,
-			isReadOnly: true
-		}),
+		inferReturnType: numericPreservingReturn,
 		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
+		if (typeof arg === 'bigint') return arg;
 		const num = Number(arg);
-		if (isNaN(num)) return null;
+		if (!Number.isFinite(num)) return null;
 		return Math.floor(num);
 	}
 );
@@ -381,18 +389,14 @@ export const floorFunc = createScalarFunction(
 
 const ceil = (arg: SqlValue): SqlValue => {
 	if (arg === null) return null;
+	if (typeof arg === 'bigint') return arg;
 	const num = Number(arg);
-	if (isNaN(num)) return null;
+	if (!Number.isFinite(num)) return null;
 	return Math.ceil(num);
 };
 
 const ceilTypeInference = {
-	inferReturnType: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ({
-		typeClass: 'scalar' as const,
-		logicalType: argTypes[0],
-		nullable: false,
-		isReadOnly: true
-	}),
+	inferReturnType: numericPreservingReturn,
 	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => isNumericOrUnknownType(argTypes[0])
 };
 

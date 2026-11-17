@@ -37,12 +37,12 @@ export interface ScalarFunctionSchema {
 
 ### Examples
 
-**Simple case: Fixed types**
+**Simple case: Fixed types** (nullable: `sqrt(-1)` and `sqrt(null)` are NULL)
 ```typescript
 export const sqrtFunc = createScalarFunction({
   name: 'sqrt',
   numArgs: 1,
-  returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false }
+  returnType: REAL_RETURN
 }, sqrtImpl);
 ```
 
@@ -51,14 +51,15 @@ export const sqrtFunc = createScalarFunction({
 export const absFunc = createScalarFunction({
   name: 'abs',
   numArgs: 1,
-  inferReturnType: (argTypes) => ({
-    typeClass: 'scalar',
-    logicalType: argTypes[0], // Return same type as input
-    nullable: false
+  inferReturnType: nullPropagatingReturn({
+    logicalType: argTypes => argTypes[0], // Return same type as input
+    accepts: [convertsToNumber],          // Number(x) is NaN — so NULL — for anything else
   }),
   validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 }, absImpl);
 ```
+
+`nullPropagatingReturn` (`func/builtins/return-types.ts`) is for a function that is NULL exactly when an argument is NULL or is a value it cannot use: it announces non-null only when `argNullable` is known, every argument is non-null, the call supplies `minArgs` arguments, and every argument's type passes its `accepts` predicate. `abs`, `floor`, `ceil`, one-argument `round`, `length`, `substr`, `instr`, `replace`, the `trim` family, `lower`, `upper`, `reverse`, `lpad` and `rpad` all derive their nullability this way; a hard-coded `nullable: false` on such a function lets a `not null` lens column over `lower(nullable_col)` deploy and then read NULL. A test in `test/announced-result-types.spec.ts` calls every registered scalar builtin with NULL arguments and fails if one announced non-null yields NULL.
 
 **Nullability from the arguments**: `coalesce` announces non-null when any argument is non-null, which is what lets `coalesce((select max(n) from cfg), 10)` stand as a `limit` ([sql-select.md §3.6](sql-select.md#36-limit-and-offset-clauses)):
 ```typescript

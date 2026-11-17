@@ -12,6 +12,8 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { INTEGER_TYPE, REAL_TYPE } from '../src/types/builtin-types.js';
+import { BUILTIN_FUNCTIONS } from '../src/func/builtins/index.js';
+import { isScalarFunctionSchema } from '../src/schema/function.js';
 
 describe('Announced result-column types match produced values', () => {
 	let db: Database;
@@ -253,6 +255,55 @@ describe('Announced result-column types match produced values', () => {
 
 		it('keeps INTEGER + INTEGER non-nullable over non-null operands (no non-finite path)', async () => {
 			expect(await announcedNullable('select 1 + 2 as v')).to.equal(false);
+		});
+	});
+
+	// Generated from the registry so a builtin added later is covered without editing
+	// this test. Covers the NULL-argument half of "announced non-null ⇒ never NULL"; a
+	// non-null argument the implementation refuses is left to the statement-egress check.
+	describe('scalar builtins over NULL arguments', () => {
+		async function yieldsNull(sql: string): Promise<boolean> {
+			try {
+				for await (const row of db.eval(sql)) {
+					if (row.v === null) return true;
+				}
+			} catch {
+				// An error is not a NULL result (mutation_ordinal() outside a mutation).
+				return false;
+			}
+			return false;
+		}
+
+		/** Whether `sql` prepares, and if so whether it announces its column nullable. */
+		function prepareNullable(sql: string): boolean | 'rejected' {
+			let stmt;
+			try {
+				stmt = db.prepare(sql);
+				return stmt.getColumnDefs()[0].type.nullable;
+			} catch {
+				return 'rejected';
+			} finally {
+				void stmt?.finalize();
+			}
+		}
+
+		it('never yield NULL where they announce non-null', async () => {
+			const violations: string[] = [];
+			for (const schema of BUILTIN_FUNCTIONS.filter(isScalarFunctionSchema)) {
+				// Variadic: try a few arities, skipping those the function rejects at prepare.
+				const variadic = schema.numArgs < 0;
+				const arities = variadic ? [1, 2, 3] : [schema.numArgs];
+				for (const arity of arities) {
+					const sql = `select ${schema.name}(${Array(arity).fill('null').join(', ')}) as v`;
+					const nullable = prepareNullable(sql);
+					if (nullable === 'rejected') {
+						if (!variadic) violations.push(`${sql}: does not prepare`);
+						continue;
+					}
+					if (!nullable && await yieldsNull(sql)) violations.push(`${sql}: announced non-null, yielded NULL`);
+				}
+			}
+			expect(violations).to.deep.equal([]);
 		});
 	});
 });

@@ -319,8 +319,14 @@ export {
 	BOOLEAN_RETURN_NOT_NULL,
 	BLOB_RETURN,
 	JSON_RETURN,
-	ANY_RETURN
+	ANY_RETURN,
+	nullPropagatingReturn,
+	isTextValued,
+	isTextOrBlobValued,
+	isNumberValued,
+	convertsToNumber
 } from './func/builtins/return-types.js';
+export type { NullPropagatingSpec, ArgTypeAccepted } from './func/builtins/return-types.js';
 
 // The shapes a `returnType` is made of. `scalarReturn` returns a `ScalarType`, and a
 // table-valued function's relation is spelled out column by column, so a plugin
