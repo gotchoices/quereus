@@ -67,7 +67,7 @@ interface ScalarFuncOptions {
 	returnsArg?: boolean;
 	/** Argument positions this function reads as text (`'all'` for a variadic function);
 	 *  the planner converts each one with `cast(<arg> as text)`. See
-	 *  {@link import('../schema/function.js').BaseFunctionSchema.textArgs}. */
+	 *  {@link import('../schema/function.js').ScalarFunctionSchema.textArgs}. */
 	textArgs?: 'all' | readonly number[];
 }
 

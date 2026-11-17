@@ -1,7 +1,7 @@
 description: Every text function (upper, substr, trim, replace, …) now turns a non-text argument into text the same way `cast(x as text)` does: a function declares which arguments are text and the query planner inserts the conversion, instead of each function guessing on its own.
 prereq: builtin-results-announce-honest-nullability
 files:
-  - packages/quereus/src/schema/function.ts                # `textArgs` on BaseFunctionSchema
+  - packages/quereus/src/schema/function.ts                # `textArgs` on ScalarFunctionSchema
   - packages/quereus/src/func/registration.ts              # ScalarFuncOptions.textArgs + pass-through
   - packages/quereus/src/planner/building/coercion.ts      # coerceTextArgs; wrapInCast gains `synthetic` param
   - packages/quereus/src/planner/building/function-call.ts # calls coerceTextArgs before inference
@@ -21,7 +21,7 @@ files:
 
 ## What was built
 
-- **`textArgs?: 'all' | readonly number[]`** on `BaseFunctionSchema` (next to `comparesArgs`), and on `ScalarFuncOptions`, passed through by `createScalarFunction`. A hand-built schema given to `Database.registerFunction` carries it directly.
+- **`textArgs?: 'all' | readonly number[]`** on `ScalarFunctionSchema` (moved there from `BaseFunctionSchema` in review), and on `ScalarFuncOptions`, passed through by `createScalarFunction`. A hand-built schema given to `Database.registerFunction` carries it directly.
 - **`coerceTextArgs(scope, textArgs, args)`** in `planner/building/coercion.ts`: resolves positions with `comparisonGroupIndices` (out-of-range positions dropped) and wraps each argument whose static physical type is not TEXT in a **non-synthetic** `CastNode` to TEXT. Non-synthetic means it behaves exactly like a user-written `cast(x as text)`: runtime uses `lenientCast` (not `comparandConverter`), analyses do not look through it, and it fingerprints as `CA:` (same as the user spelling).
 - `wrapInCast` gained a `synthetic = true` parameter; existing callers are unchanged.
 - `buildFunctionCall` (scalar branch) calls `coerceTextArgs` right after `coerceComparisonGroup` and **before** `validateArgTypes` / `inferScalarCallType`, so inference sees TEXT arguments.
@@ -56,3 +56,24 @@ Validation run: `yarn workspace @quereus/quereus run lint` (eslint + test tsc) c
 - **Parameter-typed plans**: an untyped `?` (ANY) always gets the cast; a `?` bound to a string at prepare time gets none. Both convert identically, so this only changes plan shape.
 - **`like`/`glob` bodies still call `valueToText`** themselves (belt and braces, as the ticket asked), as do all the other implementations; the property test therefore cannot tell a broken seam from a broken implementation on its own — it fails only if the result disagrees with the spelled cast. The mutation check above shows it fails when both are removed.
 - **`split_string` column names**: the built-in declares no columns, so `select value from split_string(...)` (as `docs/functions.md` shows) fails. Pre-existing and unrelated to the conversion; filed as `bug-split-string-builtin-declares-no-columns` in backlog. The new sqllogic row reads it through `*` and pins `col_0`/`col_1`, which that fix will need to update.
+
+## Review findings
+
+Reviewed the `ticket(implement): debt-string-builtins-coerce-three-different-ways` diff first, then the handoff. Ran `yarn workspace @quereus/quereus run lint` (clean), `run typecheck` (clean), and `yarn workspace @quereus/quereus test` (11186 passing, 23 pending). `yarn test:store` not run (no store-specific path touched).
+
+**Checked by running a throwaway probe (deleted afterwards):** `upper(null)` → NULL; `trim(12, 1)` → `'2'`; `substr(12345, 2)` → `'2345'`; `instr(12345, 34)` → 3; `replace(?, 1, 2)` with 111 → `'222'`; `like('1%', 12)` → true; `glob('1*', 12)` → true; a DATE argument (physical TEXT) gets no cast and passes through; `upper(json('"x"'))` → `'X'`; `ltrim(x'202061')` → `'a'`; a nullable integer column stays NULL. `query_plan` shows `upper(cast(b as text))` for a blob column and `upper(cast(? as text))` for an untyped parameter. A prepared statement cannot be re-executed with a parameter of a different physical type (the statement rejects it with "Parameter type mismatch"), so the handoff's "a `?` typed TEXT at prepare time gets no cast" never sees a non-text value at runtime; the implementations' own `valueToText` covers it anyway.
+
+**Found and fixed (minor):**
+- Type safety: `textArgs` sat on `BaseFunctionSchema`, shared by aggregate and table-valued schemas, while the planner reads it only on scalar calls, so a hand-built aggregate or table-valued schema could declare it and have it silently ignored. Moved it to `ScalarFunctionSchema` (`src/schema/function.ts`) and updated the two `{@link}` references (`func/registration.ts`, `planner/building/coercion.ts`). The type check and the test-file type check pass, so no other site relied on it.
+
+**Checked, nothing to change:**
+- Other ways a call node gets built: `ScalarFunctionCallNode` is built in `buildFunctionCall` (now coerces), in `withChildren` (keeps the cast children), and in `rule-materialized-view-rewrite.ts` (an aggregate combine function, which declares no text arguments). No path skips the rewrite.
+- Optimizer rules that match on string-function names or argument shape: none outside `func/builtins` and value provenance.
+- Value provenance (`planner/analysis/value-provenance.ts`): `lower`/`upper` over a fresh blob now reach the inserted cast, which `conversionKeepsFresh` rejects (blob→text), so the result is the same `other` as before by a different route. The `blobSafeFunctions` branch is no longer reached for these two but stays correct. A fresh integer under `lower` becoming `other` is conservative, as the handoff says.
+- Fusion depth: one extra closure frame per converted argument. The fallback beyond `MAX_FUSION_DEPTH` is unchanged and correct, so this is not a tripwire.
+- Docs: read `docs/functions.md`, `docs/sql-functions.md`, `docs/types.md`, `docs/plugins.md` and `util/value-text.ts`; they describe the new rule and the `length`/`hex`/`unhex` exceptions. A search for `lower(?)`, "NULL if not a string" and the old ticket slug turns up no stale text.
+- Tests: the new property test (`test/string-text-args.spec.ts`) is generated from the registry and pins the contract, so it pays for itself. Its `preparesWithFillers` uses a failed prepare to skip arities a variadic function rejects. That is control flow by exception, but it is confined to a test probe, and other tests would catch a fixed-arity regression. Kept. The sqllogic rows, the `announced-result-types` row (conversion happens before inference) and the updated `101`/`scalar-fusion`/`documentation` tests are justified. Nothing cut.
+
+**Major / tickets filed:** none. The `split_string` column-name defect was already filed during implement as `bug-split-string-builtin-declares-no-columns` (backlog). Persisted results computed under the old rule are out of scope under the AGENTS.md backwards-compatibility rule. Also, expression indexes are not supported yet ("Indices on expressions are not supported yet"), so no stored index can hold an old result.
+
+**Tripwires:** none added. Each conditional concern above either has an unchanged fallback or is already conservative.

@@ -98,7 +98,7 @@ export function coerceComparisonGroup(
 
 /**
  * Convert each argument a scalar function declares as text
- * ({@link import('../../schema/function.js').BaseFunctionSchema.textArgs}) whose static
+ * ({@link import('../../schema/function.js').ScalarFunctionSchema.textArgs}) whose static
  * type is not physically TEXT, by wrapping it in `cast(<arg> as text)` — so
  * `upper(x'6162')` runs as `upper(cast(x'6162' as text))` and every string builtin
  * shares the one value-to-text rule (`util/value-text.ts`). Mutates `args` in place.
