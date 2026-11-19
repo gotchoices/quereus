@@ -6,6 +6,7 @@ import { isRelationType, type ColumnDef, type ScalarType } from '../common/datat
 import { Parser } from '../parser/parser.js';
 import type { Statement as ASTStatement } from '../parser/ast.js';
 import type { BlockNode } from '../planner/nodes/block.js';
+import { PlanNode } from '../planner/nodes/plan-node.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
@@ -544,6 +545,16 @@ export class Statement {
 			this.dropPlanOnShift();
 			const blockPlanNode = this.compile();
 			if (!blockPlanNode.statements.length) return;
+
+			// Writing statement in autocommit: open the implicit transaction before
+			// any of the plan's instructions run, so a scalar function evaluated in
+			// a `values` row (or an update/delete expression) sees the transaction
+			// the engine has opened for the DML it is part of. The committed-read
+			// path must not touch the transaction lifecycle — it is read-only by
+			// construction and ineligible for writing plans anyway.
+			if (!runtimeOverrides?.readCommitted && PlanNode.hasSideEffects(blockPlanNode.physical)) {
+				await this.db._ensureTransaction();
+			}
 
 			const emissionContext = this.getEmissionContext();
 			// Emit + schedule once and reuse across executions — the instruction tree is

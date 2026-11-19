@@ -1115,6 +1115,18 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (plan.statements.length === 0) return; // No-op for this AST
 
 		const optimizedPlan = this.optimizer.optimize(plan, this) as BlockNode;
+
+		// A writing statement's expression evaluation (e.g. a `values` row calling a
+		// scalar function that reads the open transaction) runs before the DML
+		// executor opens one. Start the implicit transaction eagerly so the function
+		// sees what the engine has already opened for the statement it is evaluated
+		// inside. A `begin`/`commit`/`rollback` plan is a `TransactionPlanNode` with
+		// no `computePhysical` override — it inherits `readonly: true` and is NOT
+		// treated as a write here.
+		if (PlanNode.hasSideEffects(optimizedPlan.physical)) {
+			await this._ensureTransaction();
+		}
+
 		const emissionContext = new EmissionContext(this);
 		const rootInstruction = emitPlanNode(optimizedPlan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
