@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sample-plugins",
-  "version": "5.6.0",
+  "version": "5.6.1",
   "description": "Sample plugins demonstrating the Quereus plugin architecture",
   "main": "index.js",
   "type": "module",

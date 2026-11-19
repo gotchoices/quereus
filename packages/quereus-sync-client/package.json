@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sync-client",
-  "version": "5.6.0",
+  "version": "5.6.1",
   "type": "module",
   "description": "WebSocket sync client for Quereus - handles connection, reconnection, and change synchronization",
   "keywords": [
