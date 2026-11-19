@@ -421,3 +421,4 @@
 {"slug":"isolation-overlay-same-pk-update-skips-unique-check","file":"isolation-overlay-same-pk-update-skips-unique-check.md","completedAt":"2026-10-05","commit":"4d6534e5b5d31fa42af8bcc7467e3ef428b659e9","prunedAt":"2026-11-04T23:10:25.818Z"}
 {"slug":"memory-vtab-pk-replace-skips-unique-check","file":"memory-vtab-pk-replace-skips-unique-check.md","completedAt":"2026-10-05","commit":"d6785083c25a9223d74579a19bfb05372f0ed824","prunedAt":"2026-11-04T23:10:25.818Z"}
 {"slug":"feat-publish-sqllogic-corpus-in-the-package","file":"feat-publish-sqllogic-corpus-in-the-package.md","completedAt":"2026-10-06","commit":"50e6eaa302d61c448037c2fbdc83fe8f043974e2","prunedAt":"2026-11-05T15:45:39.464Z"}
+{"slug":"apply-schema-creates-indexes-before-added-columns","file":"apply-schema-creates-indexes-before-added-columns.md","completedAt":"2026-10-18","commit":"b571152a70ee543abcd8724ff3319d8ec583191b","prunedAt":"2026-11-19T05:16:36.046Z"}
