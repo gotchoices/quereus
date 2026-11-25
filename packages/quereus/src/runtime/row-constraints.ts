@@ -9,6 +9,7 @@ import { ConflictResolution } from '../common/constants.js';
 import { expressionToString } from '../emit/ast-stringify.js';
 import { isTruthy } from '../util/comparison.js';
 import { referencedKeyValueChanged } from './foreign-key-actions.js';
+import { newSectionRowIdentity, type DeferredRowIdentity } from './deferred-constraint-queue.js';
 
 /**
  * Row validation shared by every site that must enforce a table's CHECK / NOT NULL /
@@ -309,6 +310,17 @@ function fkParentKeyChanged(
 	));
 }
 
+/**
+ * The row an INSERT or UPDATE writes, so commit can judge its deferred checks against
+ * that row as it then stands. Undefined for a DELETE: a DELETE-time check is about the
+ * delete itself and always runs (docs/sql-constraints.md § 7.4.1).
+ */
+function writtenRowIdentity(scope: RowConstraintScope, tableSchema: TableSchema, baseTable: string, flatRow: Row): DeferredRowIdentity | undefined {
+	if (scope.operation !== RowOpFlag.INSERT && scope.operation !== RowOpFlag.UPDATE) return undefined;
+	const primaryKeyIndices = tableSchema.primaryKeyDefinition.map(column => column.index);
+	return newSectionRowIdentity(baseTable, flatRow, tableSchema.columns.length, primaryKeyIndices);
+}
+
 async function checkCheckConstraints(
 	rctx: RuntimeContext,
 	scope: RowConstraintScope,
@@ -319,6 +331,10 @@ async function checkCheckConstraints(
 	flatRow: Row,
 	contextRow: Row | undefined,
 ): Promise<RowConstraintResult> {
+	const queue = rctx.db.getDeferredConstraints();
+	const queuedBefore = queue.lastQueuedSeq();
+	// Computed on the first deferral only; most rows defer nothing.
+	let rowIdentity: DeferredRowIdentity | undefined;
 	for (let i = 0; i < constraintMetadata.length; i++) {
 		const metadata = constraintMetadata[i];
 		const evaluator = evaluatorFunctions[i] ?? metadata.evaluator;
@@ -376,15 +392,14 @@ async function checkCheckConstraints(
 				}
 				return result ?? null;
 			};
+			rowIdentity ??= writtenRowIdentity(scope, tableSchema, metadata.baseTable, flatRow);
 			rctx.db._queueDeferredConstraintRow(
 				metadata.baseTable,
 				metadata.constraintName,
 				flatRow,
 				metadata.flatRowDescriptor,
 				deferredEvaluator,
-				activeConnectionId,
-				contextRow,
-				metadata.contextDescriptor
+				{ connectionId: activeConnectionId, contextRow, contextDescriptor: metadata.contextDescriptor, rowIdentity },
 			);
 			continue;
 		}
@@ -397,6 +412,8 @@ async function checkCheckConstraints(
 			const baseMessage = constraintViolationMessage(metadata, result);
 
 			if (effectiveAction === ConflictResolution.IGNORE) {
+				// The row is dropped, so the checks deferred above for it go too.
+				queue.withdrawRowChecks(metadata.baseTable, queuedBefore);
 				return { skip: true };
 			}
 

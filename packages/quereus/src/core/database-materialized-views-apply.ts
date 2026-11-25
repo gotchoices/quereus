@@ -44,6 +44,7 @@ import type {
 	BackingPkColumn,
 	DeltaGroupState,
 } from './database-materialized-views-plans.js';
+import { maintenanceChangeLogKey } from './database-materialized-views-plans.js';
 
 /**
  * Resolve a plan's backing table to its {@link BackingHost} + coordinated
@@ -169,9 +170,10 @@ export async function validateDerivedChanges(
 			connectionId = conn.connectionId;
 		}
 	}
+	const changeLogKey = maintenanceChangeLogKey(plan);
 	for (const change of changes) {
 		if (change.op === 'delete') continue;
-		await validateDerivedRowImage(ctx as unknown as Database, validator, change.newRow, connectionId);
+		await validateDerivedRowImage(ctx as unknown as Database, validator, change.newRow, connectionId, changeLogKey);
 	}
 }
 

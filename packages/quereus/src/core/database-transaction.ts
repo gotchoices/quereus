@@ -110,7 +110,15 @@ export class TransactionManager {
 	private inTransaction = false;
 	private transactionSource: TransactionSource | null = null;
 
-	/** Per-transaction change tracking: base table → PK JSON → CapturedRow */
+	/**
+	 * Per-transaction change tracking: base table → PK JSON → CapturedRow
+	 *
+	 * NOTE: also the commit-time answer to "does the row a deferred check was queued for
+	 * still exist" ({@link changeLogRowExists}), looked up by the table key the write was
+	 * recorded under. Not re-keyed on `alter table … rename to`, and the queued checks'
+	 * identities are not either (`DeferredConstraintQueue.notifyTableRename`); re-key one
+	 * and the other must follow, or the lookup misses and drops a check.
+	 */
 	private changeLog: ChangeLogLayer = new Map();
 	/** Savepoint layers for change tracking */
 	private changeLogLayers: ChangeLogLayer[] = [];
@@ -389,7 +397,8 @@ export class TransactionManager {
 			// (default) the first violation throws into the catch below and rolls
 			// back, discarding batched events.
 			await this.ctx.runGlobalAssertions(assertionSink ?? undefined);
-			await this.ctx.getDeferredConstraints().runDeferredRows();
+			await this.ctx.getDeferredConstraints().runDeferredRows(
+				identity => this.changeLogRowExists(identity.tableKey, identity.primaryKey));
 
 			await this.commitOpenConnections();
 			commitSucceeded = true;
@@ -794,6 +803,26 @@ export class TransactionManager {
 			this.mergeRecord(lower, oldPkKey, { op: 'delete', oldProjection });
 			this.mergeRecord(lower, newPkKey, { op: 'insert', newProjection });
 		}
+	}
+
+	/**
+	 * Whether the row this transaction wrote at `pkKey` (an {@link encodeKeyTuple} key) in
+	 * `baseTable` exists as the transaction now stands. The newest layer holding the key
+	 * decides — `insert` / `update` exist, `delete` is gone — and a key no layer holds is
+	 * gone: the row was inserted and deleted again, or its write never landed.
+	 *
+	 * Only meaningful for a key the transaction wrote, which is every key a deferred
+	 * INSERT/UPDATE check is queued for. A write the log misses errs toward running a
+	 * check: a delete it misses leaves the row present.
+	 */
+	changeLogRowExists(baseTable: string, pkKey: string): boolean {
+		const lower = baseTable.toLowerCase();
+		for (let i = this.changeLogLayers.length - 1; i >= 0; i--) {
+			const record = this.changeLogLayers[i].get(lower)?.get(pkKey);
+			if (record) return record.op !== 'delete';
+		}
+		const record = this.changeLog.get(lower)?.get(pkKey);
+		return record !== undefined && record.op !== 'delete';
 	}
 
 	/** Get the set of changed base tables */

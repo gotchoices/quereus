@@ -9,15 +9,62 @@ import { createStrictRowContextMap, wrapTableContextsStrict } from './strict-for
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { composeCombinedDescriptor } from './descriptor-helpers.js';
 import { isTruthy } from '../util/comparison.js';
+import { encodeKeyTuple } from '../util/key-tuple-codec.js';
+
+/**
+ * The row an INSERT- or UPDATE-time check is about, in the terms the transaction
+ * change log keys its writes by — so commit can ask the change log whether the row
+ * still exists (see {@link DeferredConstraintQueue.runDeferredRows}).
+ */
+export interface DeferredRowIdentity {
+	/** Lowercase `schema.table` as the change log recorded the write — NOT re-pointed by renames. */
+	tableKey: string;
+	/** `encodeKeyTuple` of the NEW section's primary-key values. */
+	primaryKey: string;
+}
+
+/** Answers, at commit, whether a row a check was queued for still exists. */
+export type DeferredRowExists = (identity: DeferredRowIdentity) => boolean;
+
+/**
+ * The identity of the row a flat OLD|NEW row writes: its NEW section's primary key.
+ *
+ * NOTE: keyed by the NEW section as checked, while the change log keys the write by the
+ * row the module stored. They agree because the DML emitters convert the NEW section to
+ * declared types up front and the in-tree modules store a `preCoerced` row as given. If a
+ * module ever normalizes primary-key values on write, the commit-time lookup misses and
+ * drops the check: key from the stored row instead.
+ */
+export function newSectionRowIdentity(baseTable: string, flatRow: Row, numColumns: number, primaryKeyIndices: readonly number[]): DeferredRowIdentity {
+	return {
+		tableKey: baseTable.toLowerCase(),
+		primaryKey: encodeKeyTuple(primaryKeyIndices.map(index => flatRow[numColumns + index] as SqlValue)),
+	};
+}
+
+/** What {@link DeferredConstraintQueue.enqueue} records beside the row and its evaluator. */
+export interface DeferredConstraintOptions {
+	connectionId?: string;
+	/** Mutation context values. */
+	contextRow?: Row;
+	/** Mutation context row descriptor. */
+	contextDescriptor?: RowDescriptor;
+	/** Set for checks queued by an INSERT or UPDATE; absent for DELETE-time checks and unkeyed callers. */
+	rowIdentity?: DeferredRowIdentity;
+}
 
 export interface DeferredConstraintRow {
 	row: Row;
 	descriptor: RowDescriptor;
 	evaluator: (ctx: RuntimeContext) => OutputValue;
 	constraintName: string;
+	/** Queue-wide enqueue order, which settles which of a row's checks is the latest. */
+	seq: number;
 	connectionId?: string;
 	contextRow?: Row; // Mutation context values
 	contextDescriptor?: RowDescriptor; // Mutation context row descriptor
+	/** See {@link DeferredConstraintOptions.rowIdentity}. */
+	rowIdentity?: DeferredRowIdentity;
 	/**
 	 * Lowercase `<schema>.<name>` as this entry's frozen evaluator names a table →
 	 * the name that table carries now. Populated by {@link DeferredConstraintQueue.notifyTableRename}
@@ -30,6 +77,39 @@ export interface DeferredConstraintRow {
 }
 
 type DeferredConstraintBuckets = Map<string, Map<string, DeferredConstraintRow[]>>;
+
+function sameRow(a: DeferredRowIdentity | undefined, b: DeferredRowIdentity): boolean {
+	return a !== undefined && a.tableKey === b.tableKey && a.primaryKey === b.primaryKey;
+}
+
+/**
+ * The entries of one constraint's list that commit must evaluate, in queue order: every
+ * entry without a row identity, and for each identified row its latest entry, provided
+ * the row still exists. An earlier entry for the same row judged values the row no
+ * longer holds — the write that replaced them queued its own check.
+ */
+function checksStillDue(entries: readonly DeferredConstraintRow[], rowExists: DeferredRowExists): DeferredConstraintRow[] {
+	const latest = latestPerRow(entries);
+	return entries.filter(entry => !entry.rowIdentity || (latest.has(entry) && rowExists(entry.rowIdentity)));
+}
+
+/** The highest-`seq` entry for each row identity in `entries`. */
+function latestPerRow(entries: readonly DeferredConstraintRow[]): Set<DeferredConstraintRow> {
+	const byTable = new Map<string, Map<string, DeferredConstraintRow>>();
+	for (const entry of entries) {
+		const identity = entry.rowIdentity;
+		if (!identity) continue;
+		let byKey = byTable.get(identity.tableKey);
+		if (!byKey) byTable.set(identity.tableKey, byKey = new Map());
+		const seen = byKey.get(identity.primaryKey);
+		if (!seen || seen.seq < entry.seq) byKey.set(identity.primaryKey, entry);
+	}
+	const latest = new Set<DeferredConstraintRow>();
+	for (const byKey of byTable.values()) {
+		for (const entry of byKey.values()) latest.add(entry);
+	}
+	return latest;
+}
 
 /** A DML source row and the deferred checks queued while it was pulled. */
 export interface RowWithHeldChecks {
@@ -99,10 +179,12 @@ export class RowScopedDeferredChecks {
 export class DeferredConstraintQueue {
 	private readonly entries: DeferredConstraintBuckets = new Map();
 	private layers: DeferredConstraintBuckets[] = [];
+	/** The `seq` of the last entry queued. Never reset, so a seq names one entry for the queue's life. */
+	private lastSeq = 0;
 
 	constructor(private readonly db: Database) { }
 
-	enqueue(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {
+	enqueue(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, options: DeferredConstraintOptions = {}): void {
 		const store = this.getActiveStore();
 		const tableKey = baseTable.toLowerCase();
 		if (!store.has(tableKey)) store.set(tableKey, new Map());
@@ -113,10 +195,52 @@ export class DeferredConstraintQueue {
 			descriptor,
 			evaluator,
 			constraintName,
-			connectionId,
-			contextRow: contextRow ? contextRow.slice() as Row : undefined,
-			contextDescriptor
+			seq: ++this.lastSeq,
+			connectionId: options.connectionId,
+			contextRow: options.contextRow ? options.contextRow.slice() as Row : undefined,
+			contextDescriptor: options.contextDescriptor,
+			rowIdentity: options.rowIdentity,
 		});
+	}
+
+	/** The `seq` of the last entry queued; a later {@link withdrawRowChecks} takes everything after it. */
+	lastQueuedSeq(): number {
+		return this.lastSeq;
+	}
+
+	/**
+	 * Removes the checks queued for one row of `baseTable` after `afterSeq`, for a row whose
+	 * own write is not going to happen: an upsert that resolved to `do nothing` or to its
+	 * `do update` arm, a module that wrote nothing, a row a constraint's IGNORE skipped.
+	 * Left queued, such a check would judge values the table never held, and as the row's
+	 * latest check it would stand in for the check of the row that is there.
+	 *
+	 * With `rowIdentity`, only that row's entries go: a statement's source can run DML of
+	 * its own (`insert … select … from (insert … returning …)`), whose checks land in the
+	 * same window.
+	 *
+	 * NOTE: walks each constraint list back from its tail and stops at the first entry at
+	 * or before `afterSeq`, relying on a list being in queue order past that point. Two
+	 * things append out of order — a rename merging into an existing bucket
+	 * ({@link rekeyBucket}), and a drained statement adopting each row's checks after earlier
+	 * rows' cascades ({@link RowScopedDeferredChecks}) — and the executor withdraws nothing
+	 * from a drained statement. If a withdrawal can ever follow an out-of-order merge, scan
+	 * the whole list instead.
+	 */
+	withdrawRowChecks(baseTable: string, afterSeq: number, rowIdentity?: DeferredRowIdentity): void {
+		if (this.lastSeq === afterSeq) return;
+		const tableKey = baseTable.toLowerCase();
+		const withdrawFrom = (store: DeferredConstraintBuckets): void => {
+			const constraints = store.get(tableKey);
+			if (!constraints) return;
+			for (const rows of constraints.values()) {
+				for (let i = rows.length - 1; i >= 0 && rows[i].seq > afterSeq; i--) {
+					if (!rowIdentity || sameRow(rows[i].rowIdentity, rowIdentity)) rows.splice(i, 1);
+				}
+			}
+		};
+		withdrawFrom(this.entries);
+		for (const layer of this.layers) withdrawFrom(layer);
 	}
 
 	/**
@@ -146,6 +270,13 @@ export class DeferredConstraintQueue {
 	 * O(entries) per rename plus one Map per entry. Fine at today's scale (renames inside
 	 * a write transaction are rare); if that combination ever shows up hot, share one
 	 * copy-on-write rename map across the entries queued between two renames.
+	 *
+	 * NOTE: an entry's `rowIdentity.tableKey` is left at the write-time name on purpose —
+	 * it is the key the transaction change log recorded the write under, and the change log
+	 * is not renamed. So a row written under the old name and deleted under the new one
+	 * still reads as present and its check runs, as it did before checks were matched to
+	 * rows. If the change log is ever re-keyed on rename, re-key the identities with it, or
+	 * the commit-time lookup misses and drops a check that should run.
 	 */
 	notifyTableRename(schemaName: string, oldName: string, newName: string): void {
 		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
@@ -222,7 +353,14 @@ export class DeferredConstraintQueue {
 		this.layers = [];
 	}
 
-	async runDeferredRows(): Promise<void> {
+	/**
+	 * Evaluates every queued check that still concerns a row. A check queued by an INSERT
+	 * or UPDATE (one carrying a `rowIdentity`) is about the row as it stands at commit, not
+	 * the write that queued it: only the latest check of each constraint for that row runs,
+	 * and none runs for a row `rowExists` reports gone. Checks without an identity — those
+	 * a DELETE queued — all run. See {@link checksStillDue}.
+	 */
+	async runDeferredRows(rowExists: DeferredRowExists): Promise<void> {
 		if (!this.hasPending()) return;
 		const activeConnections = this.db.getAllConnections();
 		const runtimeCtx: RuntimeContext = {
@@ -237,7 +375,7 @@ export class DeferredConstraintQueue {
 		const store = this.cloneAll();
 		for (const [table, constraints] of store) {
 			for (const [_, rows] of constraints) {
-				for (const entry of rows) {
+				for (const entry of checksStillDue(rows, rowExists)) {
 					const connection = this.findConnection(activeConnections, table, entry.connectionId);
 					runtimeCtx.activeConnection = connection;
 					// Per entry: the evaluator was frozen at row-write time, so any table it
@@ -300,9 +438,11 @@ export class DeferredConstraintQueue {
 						descriptor: entry.descriptor,
 						evaluator: entry.evaluator,
 						constraintName: entry.constraintName,
+						seq: entry.seq,
 						connectionId: entry.connectionId,
 						contextRow: entry.contextRow ? entry.contextRow.slice() as Row : undefined,
 						contextDescriptor: entry.contextDescriptor,
+						rowIdentity: entry.rowIdentity,
 						tableRenames: entry.tableRenames,
 					})));
 				}

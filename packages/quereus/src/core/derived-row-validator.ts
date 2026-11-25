@@ -80,6 +80,8 @@ import { StatusCode, type Row, type SqlValue } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { expressionToString } from '../emit/ast-stringify.js';
 import { isTruthy } from '../util/comparison.js';
+import { newSectionRowIdentity, type DeferredRowIdentity } from '../runtime/deferred-constraint-queue.js';
+import type { MaintenanceChangeLogKey } from './database-materialized-views-plans.js';
 
 /** One compiled declared constraint over a single derived row image. */
 interface CompiledDerivedRowCheck {
@@ -364,12 +366,16 @@ export function makePoisonedDerivedRowValidator(
  * auto-deferred checks queue to the deferred-constraint queue and validate at
  * commit. `connectionId` pins the queued entries to the backing connection the
  * maintenance write used, mirroring the DML pipeline's active-connection capture.
+ * `changeLogKey` is how the change log records the image's write; given, the queued
+ * entries carry the row's identity, so commit skips them if a later maintenance write
+ * removed the row and runs only the latest for a row written twice.
  */
 export async function validateDerivedRowImage(
 	db: Database,
 	validator: DerivedRowConstraintValidator,
 	newRow: Row,
 	connectionId?: string,
+	changeLogKey?: MaintenanceChangeLogKey,
 ): Promise<void> {
 	const fkEnabled = db.options.getBooleanOption('foreign_keys');
 	// Flat OLD/NEW row, INSERT-shaped: OLD section all-NULL, NEW section the image.
@@ -377,19 +383,23 @@ export async function validateDerivedRowImage(
 
 	let rctx: RuntimeContext | undefined;
 	let slot: ReturnType<typeof createRowSlot> | undefined;
+	let rowIdentity: DeferredRowIdentity | undefined;
 	try {
 		for (const check of validator.checks) {
 			// The FK pragma gate, re-read at evaluation time — never cached at registration.
 			if (check.kind === 'fk-child' && !fkEnabled) continue;
 
 			if (check.needsDeferred) {
+				if (changeLogKey) {
+					rowIdentity ??= newSectionRowIdentity(changeLogKey.tableKey, flatRow, validator.numColumns, changeLogKey.primaryKeyIndices);
+				}
 				db._queueDeferredConstraintRow(
 					`${validator.schemaName}.${validator.tableName}`,
 					check.constraintName,
 					flatRow,
 					validator.flatRowDescriptor,
 					check.evaluator,
-					connectionId,
+					{ connectionId, rowIdentity },
 				);
 				continue;
 			}

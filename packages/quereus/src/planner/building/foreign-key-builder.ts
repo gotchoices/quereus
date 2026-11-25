@@ -215,6 +215,10 @@ function synthesizeNotExistsCheck(
 /**
  * Builds child-side FK constraint checks (for INSERT/UPDATE on the referencing table).
  * For each FK, generates an EXISTS check ensuring the parent row exists.
+ *
+ * `assignedColumns`, given for an UPDATE, skips a FK none of whose columns the statement
+ * assigns: its values are the ones last written, already checked (or queued) then, and
+ * the parent side's actions cover the parent going away (docs/sql-constraints.md § 7.6).
  */
 export function buildChildSideFKChecks(
 	ctx: PlanningContext,
@@ -223,6 +227,7 @@ export function buildChildSideFKChecks(
 	oldAttributes: Attribute[],
 	newAttributes: Attribute[],
 	contextAttributes: ReadonlyArray<MutationContextAttribute> = [],
+	assignedColumns?: ReadonlySet<number>,
 ): ConstraintCheck[] {
 	if (!tableSchema.foreignKeys || tableSchema.foreignKeys.length === 0) return [];
 	// Child-side only applies to INSERT and UPDATE
@@ -235,6 +240,7 @@ export function buildChildSideFKChecks(
 	const shadowedByContext = mutationContextVarNames(contextAttributes);
 
 	for (const fk of tableSchema.foreignKeys) {
+		if (assignedColumns && !fk.columns.some(column => assignedColumns.has(column))) continue;
 		// Resolve parent table. If absent, MATCH SIMPLE still allows the row when any
 		// FK column is NULL — but otherwise no parent row can match, so the check must
 		// fail. Build a null-guard chain terminated by a falsy literal in that case.

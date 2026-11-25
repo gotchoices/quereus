@@ -1,0 +1,282 @@
+-- A deferred row check (child-side foreign key, or a CHECK that reads another
+-- table) queued by an INSERT or UPDATE is judged at COMMIT against the row as it
+-- stands then: a row deleted by then is not checked, and a row written again is
+-- checked with its latest values only (docs/sql-constraints.md § 7.4.1, § 7.6).
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- A. A set-null action updates a row that a later cascade deletes
+-- ===================================
+
+create table sr_ea (id integer primary key,
+	component_id integer null references sr_ea(id) on delete cascade);
+create table sr_la (entity_id integer primary key references sr_ea(id) on delete cascade,
+	path_id integer null references sr_ea(id) on delete set null);
+
+insert into sr_ea values (1, null), (2, 1), (3, 1);
+insert into sr_la values (3, 2);
+delete from sr_ea where id = 1;
+
+select count(*) as cnt from sr_ea;
+→ [{"cnt":0}]
+
+select count(*) as cnt from sr_la;
+→ [{"cnt":0}]
+
+-- ===================================
+-- B. Same shape with the line keyed the other way round (passes today; guards
+--    against dropping a check that still matters)
+-- ===================================
+
+create table sr_eb (id integer primary key,
+	component_id integer null references sr_eb(id) on delete cascade);
+create table sr_lb (entity_id integer primary key references sr_eb(id) on delete cascade,
+	path_id integer null references sr_eb(id) on delete set null);
+
+insert into sr_eb values (1, null), (2, 1), (3, 1);
+insert into sr_lb values (2, 3);
+delete from sr_eb where id = 1;
+
+select count(*) as cnt from sr_eb;
+→ [{"cnt":0}]
+
+select count(*) as cnt from sr_lb;
+→ [{"cnt":0}]
+
+-- ===================================
+-- C. UPDATEd rows are deleted later, along with their parent. Row 2's UPDATE
+--    leaves the key alone and queues no key check; row 3's assigns it.
+--    (Children first: the key is RESTRICT, checked as each row goes.)
+-- ===================================
+
+create table sr_c (id integer primary key,
+	component_id integer null references sr_c(id), name text null);
+insert into sr_c values (1, null, null), (2, 1, null), (3, 1, null);
+
+begin;
+update sr_c set name = 'x' where id = 2;
+update sr_c set component_id = 1, name = 'y' where id = 3;
+delete from sr_c where id in (2, 3);
+delete from sr_c where id = 1;
+commit;
+
+select count(*) as cnt from sr_c;
+→ [{"cnt":0}]
+
+-- ===================================
+-- D. An inserted row is deleted, then its parent
+-- ===================================
+
+create table sr_d (id integer primary key,
+	component_id integer null references sr_d(id), name text null);
+insert into sr_d values (1, null, null);
+
+begin;
+insert into sr_d values (2, 1, null);
+delete from sr_d where id = 2;
+delete from sr_d where id = 1;
+commit;
+
+select count(*) as cnt from sr_d;
+→ [{"cnt":0}]
+
+-- ===================================
+-- F, G and the variants below share one table: 1 exists, 99 never does.
+-- ===================================
+
+create table sr_f (id integer primary key,
+	component_id integer null references sr_f(id), name text null);
+insert into sr_f values (1, null, null);
+
+-- F. A row inserted with a missing parent is repointed at a real one
+begin;
+insert into sr_f values (2, 99, null);
+update sr_f set component_id = 1 where id = 2;
+commit;
+
+select id, component_id from sr_f order by id;
+→ [{"id":1,"component_id":null},{"id":2,"component_id":1}]
+
+-- G. A row inserted with a missing parent is deleted again
+begin;
+insert into sr_f values (3, 99, null);
+delete from sr_f where id = 3;
+commit;
+
+select count(*) as cnt from sr_f;
+→ [{"cnt":2}]
+
+-- A later UPDATE that leaves the key alone does not hide the bad key: the
+-- insert's check is still the latest one for that key.
+begin;
+insert into sr_f values (4, 99, null);
+update sr_f set name = 'x' where id = 4;
+-- run
+
+commit;
+-- error: constraint
+
+select count(*) as cnt from sr_f;
+→ [{"cnt":2}]
+
+-- Rolling back the repointing UPDATE restores the bad row and its check.
+begin;
+insert into sr_f values (5, 99, null);
+savepoint s;
+update sr_f set component_id = 1 where id = 5;
+rollback to s;
+-- run
+
+commit;
+-- error: constraint
+
+-- Rolling back the DELETE restores the bad row and its check.
+begin;
+insert into sr_f values (6, 99, null);
+savepoint s;
+delete from sr_f where id = 6;
+rollback to s;
+-- run
+
+commit;
+-- error: constraint
+
+-- Moving the bad row to a new key and fixing its parent in one UPDATE.
+begin;
+insert into sr_f values (7, 99, null);
+update sr_f set id = 8, component_id = 1 where id = 7;
+commit;
+
+select id, component_id from sr_f order by id;
+→ [{"id":1,"component_id":null},{"id":2,"component_id":1},{"id":8,"component_id":1}]
+
+-- An upsert whose row never lands (`do nothing`) does not stand in for the row
+-- that is there: the bad row inserted first is still checked...
+begin;
+insert into sr_f values (9, 99, null);
+insert into sr_f values (9, 1, null) on conflict (id) do nothing;
+-- run
+
+commit;
+-- error: constraint
+
+-- ...and its own values are not checked either.
+begin;
+insert into sr_f values (9, 1, null);
+insert into sr_f values (9, 99, null) on conflict (id) do nothing;
+commit;
+
+select id, component_id from sr_f where id = 9;
+→ [{"id":9,"component_id":1}]
+
+-- An upsert that repoints the row with `do update` is the row's latest check.
+begin;
+insert into sr_f values (10, 99, null);
+insert into sr_f values (10, 1, null) on conflict (id) do update set component_id = excluded.component_id;
+commit;
+
+select id, component_id from sr_f where id = 10;
+→ [{"id":10,"component_id":1}]
+
+-- ===================================
+-- An UPDATE that moves a row onto an occupied key (primary key on conflict
+-- replace) displaces that row; the moved row is still checked under that key.
+-- ===================================
+
+create table sr_mv (id integer primary key on conflict replace,
+	component_id integer null references sr_mv(id), name text null);
+insert into sr_mv values (1, null, null), (2, 1, null), (5, 1, null);
+
+begin;
+update sr_mv set id = 5, component_id = 99 where id = 2;
+-- run
+
+commit;
+-- error: constraint
+
+select id, component_id from sr_mv order by id;
+→ [{"id":1,"component_id":null},{"id":2,"component_id":1},{"id":5,"component_id":1}]
+
+-- ===================================
+-- H. The same rule for a CHECK that reads another table
+-- ===================================
+
+create table sr_p (id integer primary key);
+create table sr_hc (id integer primary key, p integer,
+	constraint has_p check (exists (select 1 from sr_p where sr_p.id = new.p)));
+insert into sr_p values (1);
+
+begin;
+insert into sr_hc values (1, 1);
+delete from sr_hc where id = 1;
+delete from sr_p where id = 1;
+commit;
+
+select count(*) as cnt from sr_hc;
+→ [{"cnt":0}]
+
+select count(*) as cnt from sr_p;
+→ [{"cnt":0}]
+
+-- ===================================
+-- A maintained table's derived rows follow the same rule
+-- ===================================
+
+create table sr_mp (pid integer primary key);
+insert into sr_mp values (1);
+create table sr_ms (id integer primary key, ref integer null);
+create table sr_mt (id integer primary key, ref integer null references sr_mp(pid))
+	maintained as select id, ref from sr_ms;
+
+-- A derived row repointed at a real parent
+begin;
+insert into sr_ms values (1, 99);
+update sr_ms set ref = 1 where id = 1;
+commit;
+
+select id, ref from sr_mt order by id;
+→ [{"id":1,"ref":1}]
+
+-- A derived row removed again
+begin;
+insert into sr_ms values (2, 99);
+delete from sr_ms where id = 2;
+commit;
+
+select count(*) as cnt from sr_mt;
+→ [{"cnt":1}]
+
+-- A derived row that stands is still checked
+begin;
+insert into sr_ms values (3, 99);
+-- run
+
+commit;
+-- error: row derived into maintained table 'main.sr_mt' references a missing 'main.sr_mp'
+
+select count(*) as cnt from sr_mt;
+→ [{"cnt":1}]
+
+-- ===================================
+-- A row a later constraint's IGNORE drops takes its already-deferred checks
+-- with it (has_p is queued before pos_n skips the row), so they cannot stand
+-- in for the row that is there.
+-- ===================================
+
+create table sr_ip (id integer primary key);
+insert into sr_ip values (1);
+create table sr_ig (id integer primary key, p integer, n integer,
+	constraint has_p check (exists (select 1 from sr_ip where sr_ip.id = new.p)),
+	constraint pos_n check (n > 0) on conflict ignore);
+
+begin;
+insert into sr_ig values (2, 99, 5);
+insert into sr_ig values (2, 1, 0);
+-- run
+
+commit;
+-- error: constraint
+
+select count(*) as cnt from sr_ig;
+→ [{"cnt":0}]

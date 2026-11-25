@@ -75,6 +75,7 @@ import type {
 	CoarseningWatchColumn,
 	BackingConnectionCache,
 } from './database-materialized-views-plans.js';
+import { maintenanceChangeLogKey } from './database-materialized-views-plans.js';
 import { buildMaintenancePlan } from './database-materialized-views-plan-builders.js';
 import {
 	applyInverseProjection,
@@ -824,7 +825,7 @@ export class MaterializedViewManager {
 	): Promise<void> {
 		await enforceParentSideReferentialActions(this.ctx, plan, backingChanges);
 		const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
-		this.recordMaintenanceChanges(plan, backingBase, backingChanges);
+		this.recordMaintenanceChanges(plan, backingChanges);
 		if (!this.rowTimeBySource.has(backingBase)) return; // leaf — no dependents
 		if (depth > 0) this.assertCascadeDepth(depth, backingBase);
 		for (const bc of backingChanges) {
@@ -888,7 +889,9 @@ export class MaterializedViewManager {
 	 *    over `w` the projection is a watch on the (previously never-change-logged) `mv1`.
 	 *    Recording makes `main.mv1` a real changed base so `mv2`'s watcher fires.
 	 *
-	 * Keyed on `plan.mv.primaryKeyDefinition` — the SAME object `AssertionEvaluator` reads
+	 * Keyed by {@link maintenanceChangeLogKey}, which the derived-row validator's queued
+	 * checks read too, so commit can tell whether a checked row still exists. Its key
+	 * columns are `plan.mv.primaryKeyDefinition` — the SAME object `AssertionEvaluator` reads
 	 * (`_findTable(base).primaryKeyDefinition`), so the two never disagree on which columns
 	 * form a row's identity. `plan.backingPkDefinition` is that same key with each column's
 	 * collation *function* resolved (`resolveBackingPkColumns`); it would give identical
@@ -928,15 +931,14 @@ export class MaterializedViewManager {
 	// which the evaluator already falls back to).
 	private recordMaintenanceChanges(
 		plan: MaintenancePlan,
-		backingBase: string,
 		backingChanges: readonly BackingRowChange[],
 	): void {
-		const pkIndices = plan.mv.primaryKeyDefinition.map(d => d.index);
+		const { tableKey, primaryKeyIndices } = maintenanceChangeLogKey(plan);
 		for (const bc of backingChanges) {
 			switch (bc.op) {
-				case 'insert': this.ctx._recordInsert(backingBase, bc.newRow, pkIndices); break;
-				case 'delete': this.ctx._recordDelete(backingBase, bc.oldRow, pkIndices); break;
-				case 'update': this.ctx._recordUpdate(backingBase, bc.oldRow, bc.newRow, pkIndices); break;
+				case 'insert': this.ctx._recordInsert(tableKey, bc.newRow, primaryKeyIndices); break;
+				case 'delete': this.ctx._recordDelete(tableKey, bc.oldRow, primaryKeyIndices); break;
+				case 'update': this.ctx._recordUpdate(tableKey, bc.oldRow, bc.newRow, primaryKeyIndices); break;
 			}
 		}
 	}

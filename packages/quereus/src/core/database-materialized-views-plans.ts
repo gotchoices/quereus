@@ -93,6 +93,26 @@ export type MaintenancePlan =
 	| PrefixDeletePlan
 	| JoinResidualPlan;
 
+/** How the transaction change log keys a maintenance write: see {@link maintenanceChangeLogKey}. */
+export interface MaintenanceChangeLogKey {
+	/** Lowercased backing `schema.table`. */
+	tableKey: string;
+	primaryKeyIndices: number[];
+}
+
+/**
+ * The table key and key columns the change log records `plan`'s maintenance writes under.
+ * The recorder ({@link MaterializedViewManager.recordMaintenanceChanges}) and the
+ * derived-row validator's queued checks both read it, so a commit-time "does this row
+ * still exist" lookup names the row the write recorded.
+ */
+export function maintenanceChangeLogKey(plan: Pick<MaintenancePlanCommon, 'mv' | 'backingSchema' | 'backingTableName'>): MaintenanceChangeLogKey {
+	return {
+		tableKey: `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase(),
+		primaryKeyIndices: plan.mv.primaryKeyDefinition.map(d => d.index),
+	};
+}
+
 /**
  * One backing primary-key column as a {@link MaintenancePlan} sees it: the btree's declared
  * `(index, direction, collation-name)` triple plus the collation *function* the name resolves

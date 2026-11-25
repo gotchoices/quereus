@@ -498,6 +498,11 @@ function buildUpsertUpdateValidation(
 	);
 
 	if (ctx.db.options.getBooleanOption('foreign_keys')) {
+		// NOTE: unlike buildUpdateStmt, every child-side FK is checked, not just those whose
+		// columns are assigned: this one validation serves every `do update` clause of the
+		// statement, so there is no single assignment set to filter by. Over-checking only
+		// re-tests values already checked when written. If a statement's `do update` arms
+		// ever get a validation each, pass each arm's assigned columns as buildUpdateStmt does.
 		checks.push(...buildChildSideFKChecks(
 			schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
 			oldAttributes, newAttributes, contextAttributes

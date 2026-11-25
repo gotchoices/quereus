@@ -230,3 +230,29 @@ commit;
 
 select count(*) as cnt from dr_ck;
 → [{"cnt":1}]
+
+-- ===================================
+-- 11. A row deleted after its table is renamed is still checked. Commit drops
+--     the check of a row that no longer exists, asking the transaction change
+--     log under the name the write was recorded with — and the change log is
+--     not renamed, so the delete (recorded under the new name) goes unseen and
+--     the insert's check runs, as it did before checks were matched to rows.
+--     If the change log is ever re-keyed on rename, this commit succeeds.
+-- ===================================
+
+create table dr_p16 (id integer primary key);
+create table dr_c16 (id integer primary key,
+	pid integer null references dr_p16(id) deferrable initially deferred);
+
+begin;
+insert into dr_c16 values (10, 99);
+alter table dr_c16 rename to dr_c17;
+delete from dr_c17 where id = 10;
+-- run
+
+commit;
+-- error: constraint
+
+-- The rename is not rolled back with the transaction; the row is.
+select count(*) as cnt from dr_c17;
+→ [{"cnt":0}]

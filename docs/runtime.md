@@ -933,11 +933,31 @@ rctx.db._queueDeferredConstraintRow(
   flatRow,           // already in declared column logical types
   flatRowDescriptor,
   evaluator,
-  connectionId,
-  contextRow,        // Captured context values
-  contextDescriptor  // Context row descriptor
+  {
+    connectionId,
+    contextRow,        // Captured context values
+    contextDescriptor, // Context row descriptor
+    rowIdentity,       // INSERT/UPDATE only: { tableKey, primaryKey } of the NEW row
+  },
 );
 ```
+
+`rowIdentity` names the row the check is about in the terms the transaction change
+log keys writes by: the lowercase `schema.table` the write is recorded under, and
+`encodeKeyTuple` of the NEW section's primary key (`newSectionRowIdentity` in
+`runtime/deferred-constraint-queue.ts`). `runtime/row-constraints.ts` sets it for
+INSERT and UPDATE rows; `core/derived-row-validator.ts` sets it for a maintained
+table's derived rows from `maintenanceChangeLogKey`, the same key the maintenance
+recorder uses. A DELETE-time check carries none. Each entry also gets a queue-wide
+`seq`.
+
+A row whose own values never land withdraws the checks its pull queued
+(`DeferredConstraintQueue.withdrawRowChecks`): the DML executor does it for an upsert
+resolved to `do nothing` or to its `do update` arm and for a module that wrote
+nothing, and `row-constraints.ts` does it when a constraint's IGNORE drops the row.
+The executor knows which checks a row queued from the queue position before each
+pull, so a drained source (UPDATE on a module without scan snapshot isolation)
+withdraws nothing.
 
 The queued row is the same one the *immediate* CHECKs read: the DML emitters
 convert the NEW section to the declared column logical types at the top of the
@@ -952,6 +972,16 @@ NULL on INSERT or read from already-converted stored rows on UPDATE.
 recomposed with its snapshotted row the same way, installed in a row slot, and the
 stored evaluator runs against them — so a deferred CHECK sees the context values the
 originating statement supplied, not whatever is current at COMMIT.
+
+Which entries run: `runDeferredRows(rowExists)`, per table bucket and constraint, keeps
+every entry without a `rowIdentity`, and of the entries for each identified row only the
+highest-`seq` one, and only if `rowExists` says the row is there.
+`TransactionManager.changeLogRowExists` answers that from the change log: the newest
+savepoint layer holding the key decides (`insert`/`update` exists, `delete` is gone),
+and a key no layer holds is gone (inserted then deleted, or never written). The
+lookup uses the identity's write-time table key; neither the change log nor the
+identities are re-keyed by `alter table … rename to`, so a row deleted after a
+rename still reads as present and is checked.
 
 ### Plan Node Structure
 

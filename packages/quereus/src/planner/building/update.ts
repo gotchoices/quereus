@@ -14,7 +14,7 @@ import { AliasedScope } from '../scopes/aliased.js';
 import { ColumnReferenceNode, type TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
-import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
+import { RowOpFlag, type RowConstraintSchema, type TableSchema } from '../../schema/table.js';
 import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
 import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
@@ -276,10 +276,12 @@ export function buildUpdateStmt(
 
   // Build FK constraint checks if foreign_keys pragma is enabled
   if (ctx.db.options.getBooleanOption('foreign_keys')) {
-    // Child-side: check new FK values reference valid parent rows
+    // Child-side: check new FK values reference valid parent rows — only for keys
+    // whose columns this statement assigns (the generated-column assignments count).
     const childFKChecks = buildChildSideFKChecks(
       schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.UPDATE,
-      oldAttributes, newAttributes, contextAttributes
+      oldAttributes, newAttributes, contextAttributes,
+      assignedColumnIndices(tableReference.tableSchema, assignments)
     );
     constraintChecks.push(...childFKChecks);
     // Parent-side: check no children reference old values being changed.
@@ -488,4 +490,14 @@ export function buildUpdateStmt(
 /** The write-scope memo for an UPDATE site, from the same values the executor takes. */
 function updateWriteSite(check: ConstraintCheckNode, table: TableReferenceNode): WriteSiteAnalysis {
   return new WriteSiteAnalysis({ check, table, operation: 'update', onConflict: undefined, upsertClauses: undefined });
+}
+
+/** Column indices an UPDATE writes: its SET targets plus the generated columns it recomputes. */
+function assignedColumnIndices(tableSchema: TableSchema, assignments: readonly UpdateAssignment[]): Set<number> {
+  const indices = new Set<number>();
+  for (const assignment of assignments) {
+    const index = tableSchema.columnIndexMap.get(assignment.targetColumn.name.toLowerCase());
+    if (index !== undefined) indices.add(index);
+  }
+  return indices;
 }

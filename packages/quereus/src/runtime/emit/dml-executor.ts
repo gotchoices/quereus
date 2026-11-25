@@ -34,7 +34,7 @@ import {
 } from '../row-constraints.js';
 import type { BackingConnectionCache, ResidualKeyBatch } from '../../core/database-materialized-views.js';
 import { poisonResidualDeltaAccumulations } from '../../core/database-materialized-views-apply.js';
-import { RowScopedDeferredChecks } from '../deferred-constraint-queue.js';
+import { RowScopedDeferredChecks, newSectionRowIdentity } from '../deferred-constraint-queue.js';
 import type { BackingRowChange } from '../../vtab/backing-host.js';
 
 /**
@@ -220,6 +220,11 @@ interface DmlRowSource {
 	rows: AsyncIterable<Row>;
 	/** Set under `statementAndRow`, where a failed row's deferred checks must not survive it. */
 	rowChecks?: RowScopedDeferredChecks;
+	/**
+	 * True when every row is read before the first is written ({@link drainBeforeWriting}),
+	 * so the checks one row queued cannot be told from the next row's.
+	 */
+	drained: boolean;
 }
 
 /**
@@ -228,11 +233,11 @@ interface DmlRowSource {
  */
 function resolveDmlRowSource(ctx: RuntimeContext, rows: AsyncIterable<Row>, savepointMode: DmlSavepointMode, drain: boolean): DmlRowSource {
 	if (savepointMode !== 'statementAndRow') {
-		return { rows: drain ? drainBeforeWriting(rows, savepointMode) : rows };
+		return { rows: drain ? drainBeforeWriting(rows, savepointMode) : rows, drained: drain };
 	}
 	const rowChecks = new RowScopedDeferredChecks(ctx.db.getDeferredConstraints());
 	const pulled = rowChecks.pull(rows);
-	return { rows: rowChecks.feed(drain ? drainBeforeWriting(pulled, savepointMode) : pulled), rowChecks };
+	return { rows: rowChecks.feed(drain ? drainBeforeWriting(pulled, savepointMode) : pulled), rowChecks, drained: drain };
 }
 
 /**
@@ -995,7 +1000,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		ctx: RuntimeContext,
 		vtab: VirtualTable,
 		source: DmlRowSource,
-		processRow: (flatRow: Row) => Promise<Row | undefined>,
+		// `checksQueuedAfter` is the deferred-queue position the row's pull started from
+		// (see withdrawOwnRowChecks), or undefined for a drained source.
+		processRow: (flatRow: Row, checksQueuedAfter: number | undefined) => Promise<Row | undefined>,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
 		backingConnCache: BackingConnectionCache,
@@ -1021,8 +1028,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// Set when a failure stops the loop but keeps the rows before it: the
 			// statement still finishes normally, then raises this.
 			let keptRowsFailure: { error: unknown } | undefined;
+			const deferredQueue = ctx.db.getDeferredConstraints();
+			// Re-read after each row is done (yield included), so the window holds the next
+			// pull's checks and nothing that row's own write or its consumer queued.
+			let queuedBeforePull = deferredQueue.lastQueuedSeq();
 			try {
 				for await (const flatRow of source.rows) {
+					const checksQueuedAfter = source.drained ? undefined : queuedBeforePull;
 					// Cooperative cancellation checkpoint for scan-less / output-less
 					// mutations. A bulk INSERT/UPDATE/DELETE whose source is not a table
 					// scan (e.g. INSERT … VALUES, or INSERT … SELECT from a TVF / CTE with
@@ -1048,7 +1060,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					let rowToYield: Row | undefined;
 					let succeeded = false;
 					try {
-						rowToYield = await processRow(flatRow);
+						rowToYield = await processRow(flatRow, checksQueuedAfter);
 						succeeded = true;
 					} catch (e) {
 						if (savepointName) {
@@ -1076,6 +1088,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					if (rowToYield !== undefined) {
 						yield rowToYield;
 					}
+					queuedBeforePull = deferredQueue.lastQueuedSeq();
 				}
 			} catch (e) {
 				if (!keepsEarlierRows(savepointMode, e)) {
@@ -1168,8 +1181,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// `stampMutationOrdinal`.
 		yield* runWithStatementSavepoints(
 			ctx, vtab, resolveDmlRowSource(ctx, stampMutationOrdinal(ctx, rows), savepointMode, false),
-			(flatRow) => processInsertRow(
-				ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds, residualBatch,
+			(flatRow, checksQueuedAfter) => processInsertRow(
+				ctx, vtab, needsAutoEvents, flatRow, checksQueuedAfter, contextRow, writeScope, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds, residualBatch,
 			),
 			deferredRebuilds, residualBatch, backingConnCache,
 		);
@@ -1200,6 +1213,28 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			rctx.mutationOrdinal = saved;
 			if (it.return) await it.return();
 		}
+	}
+
+	/**
+	 * Withdraw the deferred checks the source queued while `flatRow` was pulled, for a row
+	 * whose own values are not going to be written (an upsert arm, a module that wrote
+	 * nothing). Commit judges a row by its latest check, so one left queued here would
+	 * stand in for the check of the row the table does hold.
+	 *
+	 * NOTE: a drained source (`checksQueuedAfter` undefined) withdraws nothing — every row
+	 * was read, and queued its checks, before the first was written. Only UPDATE drains,
+	 * and its only unwritten row is one the module could not find, so such a row's check
+	 * stays queued and runs at commit as it always has. If an INSERT source ever drains,
+	 * carry each row's queue window through the drain the way RowScopedDeferredChecks
+	 * carries its held checks.
+	 */
+	function withdrawOwnRowChecks(ctx: RuntimeContext, flatRow: Row, checksQueuedAfter: number | undefined): void {
+		if (checksQueuedAfter === undefined) return;
+		const queue = ctx.db.getDeferredConstraints();
+		if (queue.lastQueuedSeq() === checksQueuedAfter) return;
+		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
+		queue.withdrawRowChecks(tableKey, checksQueuedAfter,
+			newSectionRowIdentity(tableKey, flatRow, tableSchema.columns.length, pkColumnIndicesInSchema));
 	}
 
 	/**
@@ -1266,6 +1301,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		vtab: VirtualTable,
 		needsAutoEvents: boolean,
 		flatRow: Row,
+		checksQueuedAfter: number | undefined,
 		contextRow: Row | undefined,
 		writeScope: TableWrite | undefined,
 		runtimeUpsertClauses: RuntimeUpsertClause[] | undefined,
@@ -1307,6 +1343,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			if (result.constraint === 'unique' && runtimeUpsertClauses && result.existingRow) {
 				const matchingClause = matchUpsertClause(result.existingRow, newRow, runtimeUpsertClauses);
 				if (matchingClause) {
+					// Either arm leaves the inserted values unwritten; `do update` validates the
+					// row it does write, queuing its own checks after this.
+					withdrawOwnRowChecks(ctx, flatRow, checksQueuedAfter);
 					if (matchingClause.action === 'nothing') {
 						return undefined;
 					}
@@ -1337,6 +1376,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		// Skip if row was not inserted (e.g., IGNORE mode at vtab level)
 		if (!result.row) {
+			withdrawOwnRowChecks(ctx, flatRow, checksQueuedAfter);
 			return undefined;
 		}
 
@@ -1459,7 +1499,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// anyway); memory tables set scanSnapshotIsolation and keep streaming.
 		yield* runWithStatementSavepoints(
 			ctx, vtab, resolveDmlRowSource(ctx, rows, savepointMode, !moduleHasScanSnapshotIsolation(ctx, tableSchema)),
-			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
+			(flatRow, checksQueuedAfter) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, checksQueuedAfter, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
 			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'update', fkRestrictBatch) : undefined,
 		);
@@ -1478,6 +1518,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		vtab: VirtualTable,
 		needsAutoEvents: boolean,
 		flatRow: Row,
+		checksQueuedAfter: number | undefined,
 		contextRow: Row | undefined,
 		writeScope: TableWrite | undefined,
 		backingConnCache: BackingConnectionCache,
@@ -1542,6 +1583,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		// Skip if row was not updated (row not found returns ok with no row)
 		if (!result.row) {
+			withdrawOwnRowChecks(ctx, flatRow, checksQueuedAfter);
 			return undefined;
 		}
 

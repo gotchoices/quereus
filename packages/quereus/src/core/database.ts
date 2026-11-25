@@ -51,7 +51,7 @@ import { DatabaseOptionsManager } from './database-options.js';
 import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
 import type { InstructionTracer } from '../runtime/types.js';
 import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
-import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
+import { DeferredConstraintQueue, type DeferredConstraintOptions } from '../runtime/deferred-constraint-queue.js';
 import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyNormalizerResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
@@ -2298,8 +2298,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return entry?.orderPreserving === true && entry.normalizer !== undefined;
 	}
 
-	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {
-		this.deferredConstraints.enqueue(baseTable, constraintName, row, descriptor, evaluator, connectionId, contextRow, contextDescriptor);
+	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, options?: DeferredConstraintOptions): void {
+		this.deferredConstraints.enqueue(baseTable, constraintName, row, descriptor, evaluator, options);
 	}
 
 	/** @internal Check if we're in a coordinated commit (allows sibling layer validation) */
