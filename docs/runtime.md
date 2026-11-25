@@ -1088,8 +1088,9 @@ functional source is materialized once per execution into a probed lookup set
 per-outer-row streaming short-circuit. Scalar / `EXISTS` pure inners keep their
 short-circuit fast path (`src/runtime/emit/subquery.ts`).
 
-DML in expression position is rejected as a view body at view-creation time
-(`src/planner/building/create-view.ts`). A view body re-evaluates on every
+DML in expression position — or anywhere else — is rejected inside a stored body
+(view, materialized view, maintained table, assertion) at creation time
+(`src/planner/building/reject-stored-body-writes.ts`). A view body re-evaluates on every
 reference; a DML body would re-drive writes per read, which the run-once fence
 cannot rescue (views compose, the cache lives at one emission site, and a
 downstream consumer would observe stale state). The check is permanent, not pending.

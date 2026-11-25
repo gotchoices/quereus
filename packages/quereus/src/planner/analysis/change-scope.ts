@@ -22,7 +22,7 @@ import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan
 import { TableReferenceNode, ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { ScalarFunctionCallNode } from '../nodes/function.js';
 import { SequenceNode } from '../nodes/sequence-node.js';
-import { PlanNodeType } from '../nodes/plan-node-type.js';
+import { PlanNodeType, DML_NODE_TYPES } from '../nodes/plan-node-type.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { extractBindings, type BindingMode } from './binding-extractor.js';
 import { classifyNonDetFunction } from './non-det-functions.js';
@@ -223,15 +223,6 @@ export interface WatchEvent {
  * errors do not roll back the commit — assertions own that contract).
  */
 export type WatchHandler = (event: WatchEvent) => void | Promise<void>;
-
-/* --- Constants ----------------------------------------------------------- */
-
-const DML_NODE_TYPES = new Set<PlanNodeType>([
-	PlanNodeType.Update,
-	PlanNodeType.Insert,
-	PlanNodeType.Delete,
-	PlanNodeType.UpdateExecutor,
-]);
 
 /* --- Analyzer ------------------------------------------------------------ */
 

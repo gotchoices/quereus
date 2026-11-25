@@ -7,6 +7,7 @@ import { Parser } from '../../parser/parser.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { storedBodyContext } from '../stored-body-context.js';
+import { rejectStoredBodyWrites } from './reject-stored-body-writes.js';
 
 /**
  * Plans the assertion's violation query so a body that cannot resolve fails the
@@ -22,7 +23,9 @@ import { storedBodyContext } from '../stored-body-context.js';
  * time via {@link planViewBody}: whatever the planner rejects for a view body
  * (missing table, missing column, unknown function) is rejected here too, and
  * nothing more (a type mismatch such as `x + 'abc'` is not a planner error and
- * still creates).
+ * still creates) — including the refusal of a write nested anywhere in the body
+ * ({@link rejectStoredBodyWrites}), which the commit-time evaluator would otherwise
+ * re-drive on every commit.
  *
  * What is planned is the derived violation SQL round-tripped through
  * {@link buildAssertionViolationSql} + the parser, NOT the CHECK expression
@@ -67,7 +70,7 @@ function planAssertionBody(
 				StatusCode.INTERNAL,
 			);
 		}
-		buildSelectStmt(bodyCtx, parsed);
+		rejectStoredBodyWrites(buildSelectStmt(bodyCtx, parsed), 'assertion', assertionName);
 	} catch (e) {
 		const cause = e instanceof Error ? e : undefined;
 		// Keep the underlying text — it is what names the missing table / column /

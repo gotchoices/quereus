@@ -61,10 +61,13 @@ whatever expressions they were created with.
 - User-defined functions marked as non-deterministic
 - Any expression containing non-deterministic sub-expressions
 - DML in expression position (`(insert/update/delete … returning …)` inside
-  a CHECK / DEFAULT / assertion expression). DML is non-deterministic via
+  a CHECK / DEFAULT expression). DML is non-deterministic via
   the side-effect axis — the `DmlExecutorNode` sets `deterministic: false`,
   which propagates through the AND-of-children physical-properties chain
-  and is rejected by the determinism enforcer.
+  and is rejected by the determinism enforcer. DML inside an assertion's
+  `check` is refused at `create assertion` by the stored-body check instead
+  (the same one that refuses DML anywhere in a view body — see
+  [sql-views.md](sql-views.md)).
 
 **Allowed in Constraints and Defaults:**
 - Constant literals: `42`, `'hello'`, `true`

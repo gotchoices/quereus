@@ -43,7 +43,7 @@ function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.Cr
 	// unqualified source names resolve next to the maintained table.
 	const sm = context.db.schemaManager;
 	const homeSchemaName = stmt.table.schema ? sm.canonicalSchemaName(stmt.table.schema) : sm.getCurrentSchemaName();
-	const planned = planViewBody(context, tableName, stmt.maintained!.select, homeSchemaName);
+	const planned = planViewBody(context, 'maintained table', tableName, stmt.maintained!.select, homeSchemaName);
 	const bodyArity = planned.getAttributes().length;
 	if (bodyArity !== stmt.columns.length) {
 		throw new QuereusError(

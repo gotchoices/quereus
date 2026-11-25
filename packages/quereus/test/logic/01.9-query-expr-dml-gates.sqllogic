@@ -6,9 +6,10 @@
 -- scalar / IN / EXISTS / compound-leg / CTE-body positions is gone — those
 -- positions now execute under full-drain + run-once semantics (see the
 -- companion 01.9-query-expr-dml.sqllogic file for executable cases).
--- The only remaining planner-side gate is "DML as a view body", which is
--- permanently rejected (a view re-evaluates per reference; replaying writes
--- on every read is incoherent with view semantics).
+-- The only remaining planner-side gate is DML anywhere in a stored body (view,
+-- materialized view, maintained table, assertion), which is permanently
+-- rejected at create time (a stored body re-evaluates per reference; replaying
+-- writes on every read is incoherent with view semantics).
 
 create table t (id integer primary key, name text);
 
@@ -30,3 +31,42 @@ create view v_dml as insert into t values (6, 'f') returning id;
 -- error: cannot be used as a view body
 
 drop table t;
+
+-- ===================================
+-- Planner-side gate: DML nested anywhere in a stored body is rejected at
+-- creation time, and the refused create performs no write
+-- ===================================
+
+create table e (id integer primary key);
+insert into e values (11), (12), (13), (14);
+
+-- DML as a FROM source of a view body
+create view v_from as select id from (delete from e where id = 11 returning id) d;
+-- error: body contains a DELETE on 'e'
+
+-- DML in a scalar subquery of a view body
+create view v_scalar as select (select id from (delete from e where id = 12 returning id)) as x;
+-- error: body contains a DELETE on 'e'
+
+-- Materialized view: refused before population, so the source keeps every row
+create materialized view m_from as select id from (delete from e where id = 14 returning id) d;
+-- error: body contains a DELETE on 'e'
+
+-- A write through another view reaches the base-table DML beneath it
+create view v_e as select id from e;
+create view v_through as select id from (delete from v_e where id = 13 returning id) d;
+-- error: body contains a DELETE on 'e'
+
+select id from e order by id;
+→ [{"id":11},{"id":12},{"id":13},{"id":14}]
+
+-- Assertion: refused at create, so a later unrelated write is not blocked by it
+create assertion a_from check (not exists (select 1 from (delete from e where id = 13 returning id)));
+-- error: Cannot create assertion 'a_from': Assertion 'a_from' body contains a DELETE on 'e'
+
+insert into e values (20);
+select id from e order by id;
+→ [{"id":11},{"id":12},{"id":13},{"id":14},{"id":20}]
+
+drop view v_e;
+drop table e;

@@ -116,3 +116,17 @@ export enum PlanNodeType {
   // RETURNING support
   Returning = 'Returning',
 }
+
+/**
+ * Node types that perform a base-table write. Shared by change-scope analysis
+ * (`analysis/change-scope.ts`, which classifies a DML root) and the stored-body
+ * write refusal (`building/reject-stored-body-writes.ts`), so the two agree on
+ * what counts as a write. `ViewMutation` is deliberately absent: it wraps
+ * base-table DML subtrees, so a walk over its children reaches these.
+ */
+export const DML_NODE_TYPES: ReadonlySet<PlanNodeType> = new Set<PlanNodeType>([
+	PlanNodeType.Update,
+	PlanNodeType.Insert,
+	PlanNodeType.Delete,
+	PlanNodeType.UpdateExecutor,
+]);

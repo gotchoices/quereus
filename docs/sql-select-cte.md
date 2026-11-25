@@ -60,6 +60,12 @@ the mutation to the statement that uses the query.
 **Read-only** nested `WITH` clauses are unaffected — the rule applies to data-modifying
 members only.
 
+A write that is not a `WITH` member — `select … from (delete … returning …)`, or one in a
+scalar / `EXISTS` / `IN` sub-query or a compound arm — is legal in an ordinary statement
+(see [sql-select.md](sql-select.md)). The sibling refusal for that shape applies only to stored
+bodies: a view, materialized-view, maintained-table or assertion body is rejected at create
+time if it contains DML at any depth ([sql-views.md](sql-views.md#28-create-view-statement)).
+
 **Visibility inside the declaring statement:**
 
 - A statement's own leading `WITH` clause is visible to **every clause of that statement**,

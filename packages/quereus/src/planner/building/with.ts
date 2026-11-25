@@ -66,8 +66,9 @@ export function buildWithClause(
  * whole statement rather than once per outer row when the position is a correlated subquery.
  *
  * Rejecting rather than defining those cases matches PostgreSQL, and mirrors the sibling
- * reject in `planViewBody` (building/create-view.ts), which refuses a DML *body* for a view
- * for the same re-drive reason.
+ * reject in `planViewBody` (building/create-view.ts) and `planAssertionBody`, which refuse
+ * DML at any depth of a stored body — the whole body, a `from` source, a sub-query, a
+ * compound arm — for the same re-drive reason (`building/reject-stored-body-writes.ts`).
  *
  * Sited here — one check on the clause — rather than at each nesting position, so it covers
  * every one at once (`from` sub-query, scalar / `exists` / `in` sub-query, a clause nested

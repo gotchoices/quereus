@@ -30,7 +30,7 @@ A view body is any relation-producing `QueryExpr` except DML:
 
 - **`SELECT`**: the canonical case. Updateability is FD-driven per the rules below.
 - **`VALUES (…), …`**: a literal row set. The body has no base-table lineage, so the FD walker reaches no `TableReferenceNode`; the view is read-only. Insert / update / delete against a `VALUES`-bodied view raises the standard "no recoverable base operation" diagnostic.
-- **`INSERT/UPDATE/DELETE … RETURNING`**: **rejected at view-creation time.** A view body re-evaluates on every reference; a DML body would re-drive the write per read, which is incoherent with view semantics. Mutations belong in the statement that *references* the view, not in the view body.
+- **`INSERT/UPDATE/DELETE … RETURNING`**: **rejected at view-creation time.** A view body re-evaluates on every reference; a DML body would re-drive the write per read, which is incoherent with view semantics. Mutations belong in the statement that *references* the view, not in the view body. The same refusal covers DML nested anywhere inside a `SELECT` / `VALUES` body ([sql-views.md § 2.8](sql-views.md#28-create-view-statement)).
 
 ### Capabilities at a glance
 

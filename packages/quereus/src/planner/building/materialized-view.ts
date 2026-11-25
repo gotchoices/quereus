@@ -50,7 +50,7 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 	// relational shape. Always run it so a DML body is rejected at plan time.
 	// The body plans under the MV's home-schema path so its unqualified source
 	// names resolve next to the MV, not against the creating statement's path.
-	const planned = planViewBody(ctx, viewName, stmt.select, schemaName);
+	const planned = planViewBody(ctx, 'materialized view', viewName, stmt.select, schemaName);
 
 	if (stmt.columns && stmt.columns.length > 0) {
 		const bodyArity = planned.getAttributes().length;

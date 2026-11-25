@@ -7,23 +7,33 @@ import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { storedBodyContext } from '../stored-body-context.js';
+import { rejectStoredBodyWrites, type StoredBodyKind } from './reject-stored-body-writes.js';
 
 /**
- * Plan the view body for arity validation. SELECT and VALUES bodies build
- * directly. DML bodies (INSERT/UPDATE/DELETE with RETURNING) are rejected
- * permanently — a view body re-evaluates on every reference, so a DML body
- * would re-drive writes on every read, which is incoherent with view
- * semantics. Mutations must be expressed in the query that *uses* the view.
+ * Plan a stored view-shaped body (view, materialized view, maintained table) at
+ * authoring time, for arity validation. SELECT and VALUES bodies build directly.
+ * DML is rejected permanently, whether it is the whole body (INSERT/UPDATE/DELETE
+ * with RETURNING) or nested anywhere inside it ({@link rejectStoredBodyWrites}) —
+ * a stored body re-evaluates on every reference, so a write in it would be
+ * re-driven on every read, which is incoherent with view semantics. Mutations must
+ * be expressed in the query that *uses* the view. The nested check runs before any
+ * emitter does, so a refused materialized view is never populated.
  *
  * `homeSchemaName` — the schema the view/maintained table lands in. When given,
  * the body plans under that schema's home path ({@link Database._homeSchemaPath})
  * so unqualified names in the body resolve next to the object that owns them,
  * not against the creating statement's search path.
  */
-export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.QueryExpr, homeSchemaName?: string): RelationalPlanNode {
+export function planViewBody(ctx: PlanningContext, kind: StoredBodyKind, viewName: string, body: AST.QueryExpr, homeSchemaName?: string): RelationalPlanNode {
 	if (homeSchemaName) {
 		ctx = storedBodyContext(ctx, homeSchemaName);
 	}
+	const planned = planViewBodyShape(ctx, viewName, body);
+	rejectStoredBodyWrites(planned, kind, viewName);
+	return planned;
+}
+
+function planViewBodyShape(ctx: PlanningContext, viewName: string, body: AST.QueryExpr): RelationalPlanNode {
 	switch (body.type) {
 		case 'select': {
 			const planned = buildSelectStmt(ctx, body);
@@ -55,7 +65,7 @@ export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.Q
  * at plan time and to check an explicit column list's arity against the body's projection.
  */
 function validateViewBody(ctx: PlanningContext, viewName: string, stmt: AST.CreateViewStmt, schemaName: string): void {
-	const planned = planViewBody(ctx, viewName, stmt.select, schemaName);
+	const planned = planViewBody(ctx, 'view', viewName, stmt.select, schemaName);
 	if (!stmt.columns || stmt.columns.length === 0) return;
 	const bodyArity = planned.getAttributes().length;
 	if (stmt.columns.length !== bodyArity) {
