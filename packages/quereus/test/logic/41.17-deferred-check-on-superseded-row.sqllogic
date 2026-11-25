@@ -151,6 +151,27 @@ commit;
 select id, component_id from sr_f order by id;
 → [{"id":1,"component_id":null},{"id":2,"component_id":1},{"id":8,"component_id":1}]
 
+-- Moving the bad row to a new key without touching its parent: the UPDATE queues
+-- no key check of its own, so the insert's check follows the row to its new key...
+begin;
+insert into sr_f values (11, 99, null);
+update sr_f set id = 12 where id = 11;
+-- run
+
+commit;
+-- error: constraint
+
+-- ...and stays behind when the move is rolled back.
+begin;
+insert into sr_f values (11, 99, null);
+savepoint s;
+update sr_f set id = 12 where id = 11;
+rollback to s;
+-- run
+
+commit;
+-- error: constraint
+
 -- An upsert whose row never lands (`do nothing`) does not stand in for the row
 -- that is there: the bad row inserted first is still checked...
 begin;
@@ -198,6 +219,15 @@ commit;
 select id, component_id from sr_mv order by id;
 → [{"id":1,"component_id":null},{"id":2,"component_id":1},{"id":5,"component_id":1}]
 
+-- The displaced row's own check does not stand in for the moved row's.
+begin;
+insert into sr_mv values (20, 99, null), (21, 1, null);
+update sr_mv set id = 21 where id = 20;
+-- run
+
+commit;
+-- error: constraint
+
 -- ===================================
 -- H. The same rule for a CHECK that reads another table
 -- ===================================
@@ -217,6 +247,24 @@ select count(*) as cnt from sr_hc;
 → [{"cnt":0}]
 
 select count(*) as cnt from sr_p;
+→ [{"cnt":0}]
+
+-- An `on insert`-only CHECK is not queued again by an UPDATE, so it follows a row
+-- whose key the UPDATE moves.
+create table sr_hp (id integer primary key);
+insert into sr_hp values (1);
+create table sr_hi (id integer primary key, p integer,
+	constraint has_p check on insert (exists (select 1 from sr_hp where sr_hp.id = new.p)));
+
+begin;
+insert into sr_hi values (7, 99);
+update sr_hi set id = 8 where id = 7;
+-- run
+
+commit;
+-- error: constraint
+
+select count(*) as cnt from sr_hi;
 → [{"cnt":0}]
 
 -- ===================================

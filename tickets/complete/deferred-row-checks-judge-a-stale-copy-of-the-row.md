@@ -1,4 +1,4 @@
-description: A foreign-key or cross-table CHECK that waits until commit used to be checked against the row as first written, so a transaction that later deleted or corrected that row still failed at commit. Commit now checks only rows that still exist, using their latest values; review the change and its known gaps.
+description: A foreign-key or cross-table CHECK that waits until commit used to be checked against the row as first written, so a transaction that later deleted or corrected that row still failed at commit. Commit now checks only rows that still exist, using their latest values, and a row whose key an UPDATE changes keeps its checks.
 architecture: docs/sql-constraints.md#76-foreign-key-constraint
 files: packages/quereus/src/runtime/deferred-constraint-queue.ts, packages/quereus/src/core/database-transaction.ts, packages/quereus/src/core/database.ts, packages/quereus/src/runtime/row-constraints.ts, packages/quereus/src/runtime/emit/dml-executor.ts, packages/quereus/src/core/derived-row-validator.ts, packages/quereus/src/core/database-materialized-views-plans.ts, packages/quereus/src/core/database-materialized-views-apply.ts, packages/quereus/src/core/database-materialized-views.ts, packages/quereus/src/planner/building/update.ts, packages/quereus/src/planner/building/foreign-key-builder.ts, packages/quereus/src/planner/building/insert.ts, packages/quereus/test/logic/41.17-deferred-check-on-superseded-row.sqllogic, packages/quereus/test/logic/41.11-deferred-fk-with-rename.sqllogic, docs/sql-constraints.md, docs/runtime.md
 ----
@@ -79,3 +79,45 @@ Runs: `yarn test` (all workspaces) green, with quereus at 11186 passing. `yarn t
 
 - Whether withdrawing in the upsert branch before `executeUpsertUpdate` is always right when the `do update` arm's `where` filters the row out (`!updateResult`). Nothing is written then, so withdrawing seems correct.
 - `checkCheckConstraints` withdraws without an identity: everything queued for that table since the call began. That assumes constraint evaluation never runs DML.
+
+## Review findings
+
+Read the implement diff (`ticket(implement): deferred-row-checks-judge-a-stale-copy-of-the-row`) first, then the handoff. Ran `yarn workspace @quereus/quereus lint` (clean), `yarn test` (all workspaces green; quereus 11186 passing, 23 pending) and `yarn test:store` (11179 passing, 30 pending).
+
+### Major: fixed in this pass. Moving a row to a new key dropped its checks (verified, a missed violation)
+
+`begin; insert into t values (11, 99); update t set id = 12 where id = 11; commit;` committed a row whose parent 99 does not exist. The UPDATE assigns no foreign-key column, so the new assigned-column filter queues no key check for it. The change log records key 11 as deleted, so commit dropped the insert's check as "row gone", but the row lives on at key 12. The same happened with an `on insert`-only cross-table CHECK, which an UPDATE never queues again, and it did not depend on the filter. Both committed before this fix and failed at HEAD~1, so this was a regression.
+
+Root cause: a primary-key move means the old key is gone in the change log, and nothing linked the row's earlier checks to its new key. Fix at that one place: `DeferredConstraintQueue.carryMovedRowChecks` (deferred-constraint-queue.ts). It is called by `carryMovedRowChecks` in dml-executor.ts after an UPDATE lands and after an upsert's `do update` arm. Per constraint, it re-queues the row's latest check from before the row's pull under the new key. It skips this when the move queued its own check for that constraint.
+
+- The copy goes in the **active savepoint layer**, so `rollback to` the move discards it and leaves the original where it was. Moving the entry in place would have survived the rollback and dropped the check.
+- It gets a **fresh `seq`**, so it outranks a check left at the new key by a row that the move displaced (`on conflict replace`). The original `seq` would let the displaced row's good check hide the moved row's bad one.
+- **Drained sources** (store-module UPDATE) use the statement's start as the cut-off. Their rows' own checks all queue before any write. To support that, the executor's per-row `checksQueuedAfter: number | undefined` became a `RowCheckWindow { rowStart, statementStart }`.
+- `rowIdentity()` (plain row) joins `newSectionRowIdentity()`; both share `rowIdentityAt`.
+
+Tests added to 41.17:
+- key move leaving the parent alone, then commit: fails (verified that it commits with the carry disabled);
+- the same move inside a savepoint that is rolled back: fails;
+- a move onto a displaced row that has a good check: fails;
+- the `on insert` CHECK variant, `sr_hi`: fails.
+
+A scratch case where `do update set id = …` moves the key was not kept. That arm re-checks every foreign key anyway, so it does not exercise the carry. Docs: § 7.4.1 in sql-constraints.md (moved rows keep their checks) and runtime.md (the carry mechanism).
+
+Tripwire: `carryMovedRowChecks` scans every queued entry of the table for each moved row, so it is quadratic for bulk key rewrites of a table with many queued checks. Recorded as a `NOTE:` at the method.
+
+### Checked, no change needed
+
+- **`changeLogRowExists` across savepoint layers.** I walked insert/delete/re-insert sequences split across layers, before and after RELEASE. An insert followed by a delete only erases a key from a layer when the key did not exist at that layer's start, so falling through to a lower layer always gives the right answer. Change-log recording is not gated; autocommit statements record too, which case B shows.
+- **Implementer's open question 1.** Withdrawing before `do update` when the arm's `where` filters the row out (`!updateResult`) is correct, because nothing is written.
+- **Open question 2.** The identity-less withdrawal in `checkCheckConstraints` is sound. Between `queuedBefore` and the IGNORE, only that call's deferrals enqueue; immediate constraint evaluation is read-only.
+- **Error paths.** A failing row under FAIL (`statementAndRow`) rolls back its adopted checks with the row savepoint. Withdrawal only touches entries queued during the row's pull, which sit in the current statement or row layer, so a rollback cannot resurrect them.
+- **Generated and stored-row identity.** The handoff's `NOTE:`s at `newSectionRowIdentity` (module normalizing primary keys) and `notifyTableRename` (change log not renamed) still hold, and the new carry builds identities the same way: OLD section from the scan, NEW section as checked.
+- **The upsert assigned-column `NOTE:`** in insert.ts is accurate. I left it alone.
+- **Implementer's tests.** Each 41.17 section reproduces a defect or pins a rule from § 7.4.1 / § 7.6. 41.11 § 11 pins the documented rename behaviour. None restates the implementation, so none was cut.
+- **Hygiene.** dml-executor.ts is 1826 lines (`wc -l`; it was 1800 at the implement commit, and this pass added the window type and one helper). It was already large before this ticket. No new ticket: no open ticket claims a split, and nothing here makes one more urgent.
+- **Type safety and lint.** Clean; no `any`.
+
+### Not changed
+
+- **Remaining tripwires.** The handoff's other tripwires (drained statements withdraw nothing, tail-walk ordering in `withdrawRowChecks`, absent-means-gone, same-key DML inside a statement's own source) are recorded as `NOTE:`s at their sites and are conditional. No tickets filed.
+- **Carried `on insert` checks** judge the inserted values, including the old key value if the CHECK reads `new.id`. That matches § 7.4.1 ("judges the inserted values").

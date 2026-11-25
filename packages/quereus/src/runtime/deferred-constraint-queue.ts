@@ -36,9 +36,18 @@ export type DeferredRowExists = (identity: DeferredRowIdentity) => boolean;
  * drops the check: key from the stored row instead.
  */
 export function newSectionRowIdentity(baseTable: string, flatRow: Row, numColumns: number, primaryKeyIndices: readonly number[]): DeferredRowIdentity {
+	return rowIdentityAt(baseTable, flatRow, numColumns, primaryKeyIndices);
+}
+
+/** The identity of a plain (unflattened) row of `baseTable`. */
+export function rowIdentity(baseTable: string, row: Row, primaryKeyIndices: readonly number[]): DeferredRowIdentity {
+	return rowIdentityAt(baseTable, row, 0, primaryKeyIndices);
+}
+
+function rowIdentityAt(baseTable: string, row: Row, offset: number, primaryKeyIndices: readonly number[]): DeferredRowIdentity {
 	return {
 		tableKey: baseTable.toLowerCase(),
-		primaryKey: encodeKeyTuple(primaryKeyIndices.map(index => flatRow[numColumns + index] as SqlValue)),
+		primaryKey: encodeKeyTuple(primaryKeyIndices.map(index => row[offset + index] as SqlValue)),
 	};
 }
 
@@ -185,12 +194,7 @@ export class DeferredConstraintQueue {
 	constructor(private readonly db: Database) { }
 
 	enqueue(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, options: DeferredConstraintOptions = {}): void {
-		const store = this.getActiveStore();
-		const tableKey = baseTable.toLowerCase();
-		if (!store.has(tableKey)) store.set(tableKey, new Map());
-		const constraints = store.get(tableKey)!;
-		if (!constraints.has(constraintName)) constraints.set(constraintName, []);
-		constraints.get(constraintName)!.push({
+		this.append(baseTable.toLowerCase(), {
 			row: row.slice() as Row,
 			descriptor,
 			evaluator,
@@ -201,6 +205,57 @@ export class DeferredConstraintQueue {
 			contextDescriptor: options.contextDescriptor,
 			rowIdentity: options.rowIdentity,
 		});
+	}
+
+	/**
+	 * Follows a row an UPDATE moved from primary key `from` to `to`. The change log now
+	 * records `from` as deleted, so commit would drop the checks queued there, yet the row
+	 * they judged lives on at `to` — and for a constraint the move did not queue again (a
+	 * child key it left alone, an `on insert`-only CHECK) nothing else would check it.
+	 * So, per constraint, the row's latest check queued by `queuedBy` is queued again
+	 * under `to`, unless the move queued its own check for `to` (any entry after
+	 * `queuedBy`). The copy goes in the active savepoint layer with a fresh `seq`: a
+	 * rollback of the move discards it and leaves the original as it was, and the fresh
+	 * `seq` makes it outrank any check left at `to` by a row that has since left that key.
+	 *
+	 * NOTE: scans every entry queued for the table, per moved row, so an UPDATE moving
+	 * many keys of a table with many queued checks is quadratic. If bulk key rewrites of
+	 * such tables show up as slow, index entries by row identity.
+	 */
+	carryMovedRowChecks(baseTable: string, from: DeferredRowIdentity, to: DeferredRowIdentity, queuedBy: number): void {
+		if (sameRow(from, to)) return;
+		const tableKey = baseTable.toLowerCase();
+		const latestAtFrom = new Map<string, DeferredConstraintRow>();
+		const requeuedAtTo = new Set<string>();
+		for (const store of [this.entries, ...this.layers]) {
+			for (const [constraintName, rows] of store.get(tableKey) ?? []) {
+				for (const entry of rows) {
+					if (entry.seq > queuedBy) {
+						if (sameRow(entry.rowIdentity, to)) requeuedAtTo.add(constraintName);
+					} else if (sameRow(entry.rowIdentity, from) && (latestAtFrom.get(constraintName)?.seq ?? 0) < entry.seq) {
+						latestAtFrom.set(constraintName, entry);
+					}
+				}
+			}
+		}
+		for (const [constraintName, entry] of latestAtFrom) {
+			if (requeuedAtTo.has(constraintName)) continue;
+			this.append(tableKey, {
+				...entry,
+				seq: ++this.lastSeq,
+				rowIdentity: to,
+				tableRenames: entry.tableRenames && new Map(entry.tableRenames),
+			});
+		}
+	}
+
+	private append(tableKey: string, entry: DeferredConstraintRow): void {
+		const store = this.getActiveStore();
+		let constraints = store.get(tableKey);
+		if (!constraints) store.set(tableKey, constraints = new Map());
+		let rows = constraints.get(entry.constraintName);
+		if (!rows) constraints.set(entry.constraintName, rows = []);
+		rows.push(entry);
 	}
 
 	/** The `seq` of the last entry queued; a later {@link withdrawRowChecks} takes everything after it. */

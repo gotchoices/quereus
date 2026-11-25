@@ -959,6 +959,14 @@ The executor knows which checks a row queued from the queue position before each
 pull, so a drained source (UPDATE on a module without scan snapshot isolation)
 withdraws nothing.
 
+A row an UPDATE (or an upsert's `do update` arm) moves to a new primary key would
+otherwise lose its earlier checks: the change log records the old key as deleted.
+`DeferredConstraintQueue.carryMovedRowChecks` re-queues, per constraint, the row's
+latest check from before the row's pull under the new key, unless the move queued its
+own check for that constraint. The copy goes in the active savepoint layer with a fresh
+`seq`, so rolling back the move discards it, and it outranks any check a row displaced
+from the new key left there. For a drained source the cut-off is the statement's start.
+
 The queued row is the same one the *immediate* CHECKs read: the DML emitters
 convert the NEW section to the declared column logical types at the top of the
 pipeline, driven by static types (see docs/types.md § Where coercion happens),
