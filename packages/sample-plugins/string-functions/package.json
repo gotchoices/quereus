@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quereus-plugin-string-functions",
-  "version": "5.7.0",
+  "version": "5.7.1",
   "type": "module",
   "description": "Additional string manipulation functions for SQL queries",
   "author": "Quereus Team",
