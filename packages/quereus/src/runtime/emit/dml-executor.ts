@@ -1166,9 +1166,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const contextEvaluators = allEvaluators.slice(0, numContextEvaluators);
 		const upsertEvaluators = allEvaluators.slice(numContextEvaluators) as SubProgram[];
 
-		// A no-op for a top-level statement in autocommit, which began its implicit
-		// transaction before running (see Database._executeSingleStatement); kept for
-		// nested statements run outside one.
+		// A no-op today: both plan runners (Database._executeSingleStatement and
+		// Statement._iterateRowsRawInternal, which nested statements use too) begin the
+		// transaction before running a plan that writes. Kept as a guard for any other runner.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
@@ -1492,9 +1492,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	// UPDATE ----------------------------------------------------
 	async function* runUpdate(ctx: RuntimeContext, rows: AsyncIterable<Row>, ...contextEvaluators: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
-		// A no-op for a top-level statement in autocommit, which began its implicit
-		// transaction before running (see Database._executeSingleStatement); kept for
-		// nested statements run outside one.
+		// A no-op today: both plan runners (Database._executeSingleStatement and
+		// Statement._iterateRowsRawInternal, which nested statements use too) begin the
+		// transaction before running a plan that writes. Kept as a guard for any other runner.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
@@ -1686,9 +1686,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	// DELETE ----------------------------------------------------
 	async function* runDelete(ctx: RuntimeContext, rows: AsyncIterable<Row>, ...contextEvaluators: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
-		// A no-op for a top-level statement in autocommit, which began its implicit
-		// transaction before running (see Database._executeSingleStatement); kept for
-		// nested statements run outside one.
+		// A no-op today: both plan runners (Database._executeSingleStatement and
+		// Statement._iterateRowsRawInternal, which nested statements use too) begin the
+		// transaction before running a plan that writes. Kept as a guard for any other runner.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);

@@ -950,7 +950,9 @@ export class Statement {
 
 	/**
 	 * Executes the prepared statement, binds parameters, and retrieves the first result row.
-	 * Transactions are started lazily (just-in-time) when needed.
+	 * In autocommit, a statement that writes begins its implicit transaction before
+	 * evaluating any of its expressions, DDL when it runs, and a read-only statement
+	 * opens none.
 	 *
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
 	 *   cooperative cancellation — checked before acquiring the mutex and at the
@@ -980,7 +982,9 @@ export class Statement {
 
 	/**
 	 * Executes the prepared statement, binds parameters, and retrieves all result rows.
-	 * Transactions are started lazily (just-in-time) when needed.
+	 * In autocommit, a statement that writes begins its implicit transaction before
+	 * evaluating any of its expressions, DDL when it runs, and a read-only statement
+	 * opens none.
 	 * The mutex is held for the entire iteration, including the commit that ends it.
 	 *
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
