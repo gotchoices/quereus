@@ -33,10 +33,15 @@ function isDmlPlanNode(node: PlanNode): node is DmlPlanNode {
  */
 export function rejectStoredBodyWrites(plan: PlanNode, kind: StoredBodyKind, name: string): void {
 	// Iterative worklist, as in `PlanNodeCharacteristics.subtreeHasSideEffects`, so a
-	// deep body cannot overflow the native call stack.
+	// deep body cannot overflow the native call stack. `seen` because the plan is a
+	// DAG: every reference to a CTE shares that CTE's subtree, so a chain of CTEs each
+	// reading the previous one twice would otherwise be walked 2^depth times.
 	const stack: PlanNode[] = [plan];
+	const seen = new Set<PlanNode>();
 	while (stack.length > 0) {
 		const node = stack.pop()!;
+		if (seen.has(node)) continue;
+		seen.add(node);
 		if (isDmlPlanNode(node)) {
 			throwStoredBodyWrite(node, kind, name);
 		}
@@ -49,7 +54,14 @@ function throwStoredBodyWrite(node: DmlPlanNode, kind: StoredBodyKind, name: str
 	const article = verb === 'DELETE' ? 'a' : 'an';
 	const subject = kind.charAt(0).toUpperCase() + kind.slice(1);
 	quereusError(
-		`${subject} '${name}' body contains ${article} ${verb} on '${node.table.tableSchema.name}' — a stored body is re-evaluated on every reference, which would re-drive the write. Move the mutation into the statement that uses this ${kind}, or call a function registered with side effects if the write is intended.`,
+		`${subject} '${name}' body contains ${article} ${verb} on '${node.table.tableSchema.name}' — ${redriveAdvice(kind)}, or call a function registered with side effects if the write is intended.`,
 		StatusCode.ERROR,
 	);
+}
+
+/** Nothing "uses" an assertion — it runs at commit — so it gets its own reason and remedy. */
+function redriveAdvice(kind: StoredBodyKind): string {
+	return kind === 'assertion'
+		? 'an assertion is re-evaluated at commit, which would re-drive the write. Move the mutation into the statement that changes the data'
+		: `a stored body is re-evaluated on every reference, which would re-drive the write. Move the mutation into the statement that uses this ${kind}`;
 }

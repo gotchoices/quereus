@@ -174,6 +174,27 @@ describe('view persistence: importCatalog silent view registration', () => {
 		}
 	});
 
+	it('a reloaded view with a nested write is refused on read — the write never executes', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table e (id integer primary key)');
+			await db.exec('insert into e values (1), (2)');
+			// Un-creatable since the stored-body write check, but a catalog persisted before
+			// it (or hand-edited) still imports: import defers body planning to first read.
+			await db.schemaManager.importCatalog(['create view v as select id from (delete from e where id = 1 returning id) d']);
+			let message = '';
+			try {
+				await rows(db, 'select id from v');
+			} catch (e) {
+				message = (e as Error).message;
+			}
+			expect(message).to.match(/View 'v' body contains a DELETE on 'e'/);
+			expect(await rows(db, 'select id from e order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a view over another (later-imported) view imports order-independently', async () => {
 		const db = new Database();
 		try {

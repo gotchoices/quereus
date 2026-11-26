@@ -34,6 +34,7 @@ import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 // Import decomposed functionality
 import { buildWithContext, enterStoredBodyEnv } from './select-context.js';
 import { storedBodyContext } from '../stored-body-context.js';
+import { rejectStoredBodyWrites } from './reject-stored-body-writes.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
 import { buildAggregatePhase, buildFinalAggregateProjections, assertGroupedPlanCoverage, redirectPostAggregate } from './select-aggregates.js';
@@ -560,8 +561,11 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					viewSchema,
 				);
 				// Build the view's body. The body is a QueryExpr — today only
-				// SELECT and VALUES bodies plan; DML bodies are rejected at
-				// CREATE VIEW plan time so we never get here with one.
+				// SELECT and VALUES bodies plan. DML anywhere in a body is rejected
+				// at CREATE VIEW plan time; the DML-body throw and the nested-write
+				// check below re-check it for a view that never went through create —
+				// a catalog reload (`importView` defers planning to here) of an entry
+				// persisted before the nested check existed, or hand-edited.
 				// The body plans under the VIEW's home-schema path (not the
 				// caller's) so its unqualified source names resolve next to the
 				// view — independent of the reading statement's search path.
@@ -577,6 +581,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 						StatusCode.UNSUPPORTED,
 					);
 				}
+				rejectStoredBodyWrites(viewSelectNode, 'view', viewSchema.name);
 
 				// If the view has explicit column names, wrap with a projection to rename columns
 				if (viewSchema.columns && viewSchema.columns.length > 0) {
