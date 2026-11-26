@@ -80,6 +80,7 @@ import type { CardinalityObservations } from '../runtime/cardinality-observation
 import { MaterializedViewManager, type BackingConnectionCache, type RegisterMaterializedViewOptions, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
+import { findPlanWrite } from '../planner/analysis/plan-writes.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';
 
@@ -1115,6 +1116,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (plan.statements.length === 0) return; // No-op for this AST
 
 		const optimizedPlan = this.optimizer.optimize(plan, this) as BlockNode;
+		const writes = findPlanWrite(optimizedPlan) !== undefined;
 		const emissionContext = new EmissionContext(this);
 		const rootInstruction = emitPlanNode(optimizedPlan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
@@ -1136,6 +1138,16 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		};
 
 		try {
+			// In autocommit, a writing statement opens its implicit transaction before the
+			// scheduler evaluates anything. The scheduler computes an instruction's
+			// synchronous parameters before running it, so a `values` row's expressions
+			// would otherwise run ahead of the DML emitter's own `_ensureTransaction`, and
+			// a function answering from the open transaction would find none. The caller
+			// finalizes it, as before. Read-only statements still open nothing.
+			// NOTE: accepted tradeoff — a write the run never reaches (a `returning` subquery
+			// in an untaken `case` branch) still opens and commits an empty transaction;
+			// harmless, so the plan-level test was kept over tracking reachability.
+			if (writes) await this._ensureTransaction();
 			const result = await scheduler.run(runtimeCtx);
 			// A row-returning statement does its work only as its rows are pulled. `exec` wants
 			// none of them, but it does want the work — an un-drained stream means the statement
@@ -1180,8 +1192,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Executes one or more SQL statements directly.
-	 * Statements are serialized through the execution mutex. Transactions are started
-	 * lazily (just-in-time) when the first DML or DDL operation occurs. Each
+	 * Statements are serialized through the execution mutex. In autocommit, a
+	 * statement that writes begins its implicit transaction before evaluating any of
+	 * its expressions; DDL begins one when it runs; a read-only statement opens none. Each
 	 * statement is its own implicit-transaction boundary — matching SQLite's
 	 * autocommit semantics, where every statement either commits on success or
 	 * rolls back on failure independently of its sibling statements in the same
@@ -2419,8 +2432,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * The underlying statement is automatically finalized when iteration completes
 	 * or if an error occurs.
 	 *
-	 * Transactions are started lazily (just-in-time) when the first DML or DDL
-	 * operation occurs. The mutex is held for the entire iteration, including the
+	 * In autocommit, a statement that writes begins its implicit transaction before
+	 * evaluating any of its expressions, DDL when it runs, and a read-only statement
+	 * opens none. The mutex is held for the entire iteration, including the
 	 * commit that ends it; a failed commit rejects `next()` or `return()`.
 	 *
 	 * @param sql The SQL query string to execute.

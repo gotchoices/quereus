@@ -1166,7 +1166,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const contextEvaluators = allEvaluators.slice(0, numContextEvaluators);
 		const upsertEvaluators = allEvaluators.slice(numContextEvaluators) as SubProgram[];
 
-		// Ensure we're in a transaction before any mutations (lazy/JIT transaction start)
+		// A no-op for a top-level statement in autocommit, which began its implicit
+		// transaction before running (see Database._executeSingleStatement); kept for
+		// nested statements run outside one.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
@@ -1490,7 +1492,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	// UPDATE ----------------------------------------------------
 	async function* runUpdate(ctx: RuntimeContext, rows: AsyncIterable<Row>, ...contextEvaluators: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
-		// Ensure we're in a transaction before any mutations (lazy/JIT transaction start)
+		// A no-op for a top-level statement in autocommit, which began its implicit
+		// transaction before running (see Database._executeSingleStatement); kept for
+		// nested statements run outside one.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
@@ -1682,7 +1686,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	// DELETE ----------------------------------------------------
 	async function* runDelete(ctx: RuntimeContext, rows: AsyncIterable<Row>, ...contextEvaluators: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
-		// Ensure we're in a transaction before any mutations (lazy/JIT transaction start)
+		// A no-op for a top-level statement in autocommit, which began its implicit
+		// transaction before running (see Database._executeSingleStatement); kept for
+		// nested statements run outside one.
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);

@@ -119,8 +119,9 @@ export enum PlanNodeType {
 
 /**
  * Node types that perform a base-table write. Shared by change-scope analysis
- * (`analysis/change-scope.ts`, which classifies a DML root) and the stored-body
- * write refusal (`building/reject-stored-body-writes.ts`), so the two agree on
+ * (`analysis/change-scope.ts`, which classifies a DML root) and the plan-wide write
+ * search (`analysis/plan-writes.ts`, behind the stored-body write refusal and the
+ * early begin of a writing statement's implicit transaction), so they agree on
  * what counts as a write. `ViewMutation` is deliberately absent: it wraps
  * base-table DML subtrees, so a walk over its children reaches these.
  */

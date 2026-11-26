@@ -1,20 +1,11 @@
 import type { PlanNode } from '../nodes/plan-node.js';
-import { DML_NODE_TYPES } from '../nodes/plan-node-type.js';
-import type { InsertNode } from '../nodes/insert-node.js';
-import type { UpdateNode } from '../nodes/update-node.js';
-import type { DeleteNode } from '../nodes/delete-node.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
+import { findPlanWrite, type DmlPlanNode } from '../analysis/plan-writes.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 
 /** The objects whose body Quereus stores and evaluates again on every reference. */
 export type StoredBodyKind = 'view' | 'materialized view' | 'maintained table' | 'assertion';
-
-type DmlPlanNode = InsertNode | UpdateNode | DeleteNode | DmlExecutorNode;
-
-function isDmlPlanNode(node: PlanNode): node is DmlPlanNode {
-	return DML_NODE_TYPES.has(node.nodeType);
-}
 
 /**
  * Refuses a stored body whose plan contains a base-table write at any depth — a
@@ -28,25 +19,12 @@ function isDmlPlanNode(node: PlanNode): node is DmlPlanNode {
  *
  * Sited on the plan rather than the syntax tree because every builder position that
  * admits nested DML funnels into the insert / update / delete builders, which always
- * produce one of {@link DML_NODE_TYPES}; a nesting position added later is covered
+ * produce one of `DML_NODE_TYPES`; a nesting position added later is covered
  * without touching this check.
  */
 export function rejectStoredBodyWrites(plan: PlanNode, kind: StoredBodyKind, name: string): void {
-	// Iterative worklist, as in `PlanNodeCharacteristics.subtreeHasSideEffects`, so a
-	// deep body cannot overflow the native call stack. `seen` because the plan is a
-	// DAG: every reference to a CTE shares that CTE's subtree, so a chain of CTEs each
-	// reading the previous one twice would otherwise be walked 2^depth times.
-	const stack: PlanNode[] = [plan];
-	const seen = new Set<PlanNode>();
-	while (stack.length > 0) {
-		const node = stack.pop()!;
-		if (seen.has(node)) continue;
-		seen.add(node);
-		if (isDmlPlanNode(node)) {
-			throwStoredBodyWrite(node, kind, name);
-		}
-		stack.push(...node.getChildren());
-	}
+	const write = findPlanWrite(plan);
+	if (write) throwStoredBodyWrite(write, kind, name);
 }
 
 function throwStoredBodyWrite(node: DmlPlanNode, kind: StoredBodyKind, name: string): never {

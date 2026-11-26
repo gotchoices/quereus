@@ -31,6 +31,7 @@ import { InterruptibleIteration } from './interruptible-iteration.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { analyzeWriteScope, bindWriteParameters, type WriteScope } from '../planner/analysis/write-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
+import { findPlanWrite } from '../planner/analysis/plan-writes.js';
 import { isObjectClassValue } from '../util/comparison.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import { astToString } from '../emit/ast-stringify.js';
@@ -70,6 +71,12 @@ export class Statement {
 	 * at every invalidation site, and rebuilt lazily in `_iterateRowsRawInternal`.
 	 */
 	private scheduler: Scheduler | null = null;
+	/**
+	 * Whether the plan behind {@link scheduler} writes a base table, so an execution in
+	 * autocommit begins its implicit transaction before the scheduler runs. Computed
+	 * when the scheduler is built and reset with it.
+	 */
+	private schedulerWrites = false;
 	/**
 	 * Work-counter state from the most recent metrics-enabled execution, or null
 	 * when the last execution did not collect. The plan shape is captured AT
@@ -249,6 +256,7 @@ export class Statement {
 		this.plan = null;
 		this.emissionContext = null;
 		this.scheduler = null;
+		this.schedulerWrites = false;
 		this.columnDefCache.clear();
 		this.reportedSizes = ReportedSizeSnapshot.empty;
 		this.feedbackReplan.onPlanDropped();
@@ -502,7 +510,8 @@ export class Statement {
 	}
 
 	/**
-	 * Low-level row iteration. Does NOT handle transactions - caller must manage.
+	 * Low-level row iteration. Begins the implicit transaction of a writing statement
+	 * but never finalizes one — the caller must.
 	 * @internal
 	 */
 	private async *_iterateRowsRawInternal(
@@ -559,6 +568,7 @@ export class Statement {
 			if (!this.scheduler) {
 				const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
 				this.scheduler = new Scheduler(rootInstruction);
+				this.schedulerWrites = findPlanWrite(blockPlanNode) !== undefined;
 			}
 			const scheduler = this.scheduler;
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
@@ -598,6 +608,8 @@ export class Statement {
 				emissionContext.validateCapturedSchemaObjects();
 			}
 
+			if (this.schedulerWrites) await this.beginWriteTransaction(runtimeOverrides?.readCommitted);
+
 			const results = await scheduler.run(runtimeCtx);
 			if (results) {
 				if (Array.isArray(results) && results.length) {
@@ -631,6 +643,22 @@ export class Statement {
 			this.db._publishCardinalityObservations(cardinalityObservations, runtimeOverrides?.readCommitted ?? false);
 			this.busy = false;
 		}
+	}
+
+	/**
+	 * Opens the implicit transaction of a writing statement before any of its
+	 * expressions are evaluated — see `Database._executeSingleStatement` for why. A
+	 * no-op inside an open transaction. Every serialized caller finalizes it: the
+	 * top-level iteration through `_iterateFinalizing`, a nested statement through the
+	 * enclosing statement's transaction.
+	 */
+	private async beginWriteTransaction(readCommitted: boolean | undefined): Promise<void> {
+		if (readCommitted) {
+			// `_isConcurrentReadEligible` refuses any side-effecting plan, so a write
+			// reaching the mutex-free path means that gate let one through.
+			throw new QuereusError('A writing statement reached the committed-read path', StatusCode.INTERNAL);
+		}
+		await this.db._ensureTransaction();
 	}
 
 	/**
@@ -874,6 +902,7 @@ export class Statement {
 		this.plan = null;
 		this.emissionContext = null;
 		this.scheduler = null;
+		this.schedulerWrites = false;
 		this.workCounters = null;
 		this.columnDefCache.clear();
 		this.astBatchIndex = -1;
@@ -889,8 +918,9 @@ export class Statement {
 
 	/**
 	 * Executes the prepared statement with the given parameters until completion.
-	 * Transactions are started lazily (just-in-time) when the first DML or DDL
-	 * operation occurs. Implicit transactions are committed after execution.
+	 * In autocommit, a statement that writes begins its implicit transaction before
+	 * evaluating any of its expressions, DDL when it runs, and a read-only statement
+	 * opens none. Implicit transactions are committed after execution.
 	 *
 	 * The execution is serialized through the database mutex to prevent concurrent
 	 * transactions from interfering with each other.

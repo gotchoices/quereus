@@ -144,12 +144,12 @@ export interface AutoAnalyzeManagerContext {
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
 	/**
 	 * False while a transaction is open — an explicit `BEGIN…COMMIT` **and also** the
-	 * implicit transaction a *writing* statement runs inside. Only the DML and DDL
-	 * emitters call `_ensureTransaction`, so a read-only statement leaves this `true`,
-	 * while every `insert` (`values` included — `runInsert` opens the transaction before
-	 * it consumes its first row), `update`, `delete` and any DDL make it `false` for the
-	 * rest of that statement. Since the refresh fires from a timer, it can land inside
-	 * one of those and read `false` in a database the user considers to be in autocommit.
+	 * implicit transaction a *writing* statement runs inside. A statement whose plan
+	 * writes opens that transaction before any of its instructions run, and DDL opens it
+	 * when it runs, so a read-only statement leaves this `true`, while every `insert`,
+	 * `update`, `delete` and any DDL make it `false` for the whole of that statement.
+	 * Since the refresh fires from a timer, it can land inside one of those and read
+	 * `false` in a database the user considers to be in autocommit.
 	 */
 	getAutocommit(): boolean;
 	/** Runs the refresh statement. Acquires the execution mutex — see the module doc. */

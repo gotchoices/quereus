@@ -563,15 +563,6 @@ describe('Transaction API', () => {
 		 * returns to its caller before the implicit transaction is even open, so the
 		 * old pre-mutex check saw `isInTransaction() === false` and passed by luck.
 		 */
-		beforeEach(async () => {
-			// One-row source table so the gated write's value expression is pulled from
-			// INSIDE the DML executor's drain — i.e. after it has opened the implicit
-			// transaction. A `values (...)` list is evaluated before that, which parks
-			// the statement in a state these tests are not about.
-			await db.exec('create table gate_src (id integer primary key)');
-			await db.exec('insert into gate_src values (1)');
-		});
-
 		const installGate = (name: string): { started: Promise<void>; release: () => void } => {
 			let markStarted!: () => void;
 			const started = new Promise<void>(resolve => { markStarted = resolve; });
@@ -590,7 +581,7 @@ describe('Transaction API', () => {
 
 		it("beginTransaction() queues behind another caller's in-flight write instead of refusing", async () => {
 			const gate = installGate('park_write');
-			const write = db.exec('insert into t select 3, park_write() from gate_src');
+			const write = db.exec('insert into t values (3, park_write())');
 			await gate.started;
 
 			// The in-flight write holds the mutex with its implicit transaction open —
@@ -609,7 +600,7 @@ describe('Transaction API', () => {
 
 		it("commit() during another caller's in-flight write reports no transaction instead of silently no-opping", async () => {
 			const gate = installGate('park_write2');
-			const write = db.exec('insert into t select 3, park_write2() from gate_src');
+			const write = db.exec('insert into t values (3, park_write2())');
 			await gate.started;
 
 			const attempt = db.commit();
@@ -625,7 +616,7 @@ describe('Transaction API', () => {
 
 		it("rollback() during another caller's in-flight write reports no transaction and leaves its row", async () => {
 			const gate = installGate('park_write3');
-			const write = db.exec('insert into t select 3, park_write3() from gate_src');
+			const write = db.exec('insert into t values (3, park_write3())');
 			await gate.started;
 
 			const attempt = db.rollback();
@@ -636,6 +627,73 @@ describe('Transaction API', () => {
 			void expect(err).to.be.instanceOf(QuereusError);
 			void expect((err as QuereusError).message).to.include('No transaction active');
 			void expect(await idsInT()).to.deep.equal([1, 2, 3]);
+		});
+	});
+
+	describe('a writing statement in autocommit', () => {
+		/** Whether each call of `in_txn()` found a transaction open, in call order. */
+		let seen: boolean[];
+
+		beforeEach(() => {
+			seen = [];
+			// Non-deterministic so the optimizer cannot fold the call at plan time, ahead of
+			// any transaction. Returns a fresh id per call so it can key an inserted row.
+			db.registerFunction(createScalarFunction(
+				{ name: 'in_txn', numArgs: 0, deterministic: false },
+				() => {
+					seen.push(!db.getAutocommit());
+					return 100 + seen.length;
+				},
+			));
+		});
+
+		it('evaluates every values row inside its implicit transaction, through exec and a prepared statement', async () => {
+			await db.exec("insert into t values (in_txn(), 'x')");
+			await db.exec("insert into t values (in_txn(), 'y'), (in_txn(), 'z')");
+			const stmt = db.prepare("insert into t values (in_txn(), 'p'), (in_txn(), 'q')");
+			try {
+				await stmt.run();
+			} finally {
+				await stmt.finalize();
+			}
+
+			void expect(seen).to.deep.equal([true, true, true, true, true]);
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2, 101, 102, 103, 104, 105]);
+		});
+
+		it('evaluates returning, set and where expressions inside it', async () => {
+			const returned: number[] = [];
+			for await (const row of db.eval("insert into t values (in_txn(), 'c') returning in_txn() as n")) {
+				returned.push(Number(row.n));
+			}
+			await db.exec("update t set val = 'u' || in_txn()");
+			await db.exec('delete from t where id = in_txn()');
+
+			void expect(returned).to.deep.equal([102]);
+			void expect(seen.length).to.be.greaterThan(4);
+			void expect(seen.every(inside => inside)).to.be.true;
+			void expect(db.getAutocommit()).to.be.true;
+		});
+
+		it('leaves a read-only statement outside any transaction', async () => {
+			for await (const _row of db.eval('select in_txn()')) { /* drain */ }
+
+			void expect(seen).to.deep.equal([false]);
+		});
+
+		it('rolls its transaction back when a values expression throws', async () => {
+			db.registerFunction(createScalarFunction(
+				{ name: 'boom', numArgs: 0, deterministic: false },
+				() => { throw new Error('boom'); },
+			));
+
+			const err = await rejection(db.exec("insert into t values (in_txn(), 'x'), (boom(), 'y')"));
+
+			void expect((err as Error).message).to.include('boom');
+			void expect(seen).to.deep.equal([true]);
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2]);
 		});
 	});
 });

@@ -266,7 +266,7 @@ Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLL
 
 #### Implicit Transactions
 
-When not in an explicit transaction (autocommit mode), both `db.exec()` and `statement.run()` automatically wrap their execution in an implicit transaction:
+When not in an explicit transaction (autocommit mode), both `db.exec()` and `statement.run()` automatically wrap their execution in an implicit transaction. A statement that writes begins it before evaluating any of its expressions, so a function called in its `values` rows, `set`, `where` or `returning` runs inside it; a read-only statement opens none (see [Module Transactions § Connection lifecycle](module-authoring-transactions.md#connection-lifecycle)):
 
 ```typescript
 // db.exec() - each statement is its own implicit transaction
